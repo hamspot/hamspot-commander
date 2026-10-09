@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = ["crates/rigctl", "crates/commander"]
+
+[workspace.package]
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/hamspot/hamspot-commander"
+rust-version = "1.80"

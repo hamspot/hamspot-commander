@@ -1,0 +1,16 @@
+[package]
+name = "commander"
+version = "0.1.0"
+description = "Hamspot Commander rig-control face"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "commander"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.34.3", features = ["default_fonts", "glow", "persistence"] }
+egui = "0.34.3"
+rigctl = { path = "../rigctl" }
