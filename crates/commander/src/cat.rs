@@ -6,6 +6,7 @@
 //! includes `-o`.
 
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::RawFd;
 use std::os::unix::process::CommandExt;
@@ -69,6 +70,36 @@ pub fn driver_name(driver: RadioDriver) -> &'static str {
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
+/// Computer-side devices for one radio, and whether its card should exist.
+/// `rx` and `tx` stay true until that node disappears after Commander has seen it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RadioAudio {
+    #[serde(default)]
+    pub input: String,
+    #[serde(default)]
+    pub output: String,
+    #[serde(default = "default_true")]
+    pub rx: bool,
+    #[serde(default = "default_true")]
+    pub tx: bool,
+}
+
+impl Default for RadioAudio {
+    fn default() -> Self {
+        Self {
+            input: String::new(),
+            output: String::new(),
+            rx: true,
+            tx: true,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RadioSpec {
@@ -90,6 +121,9 @@ pub struct RadioSpec {
     /// Park the hamlib dummy dials the first time this process answers.
     #[serde(default)]
     pub park: bool,
+    /// Speaker and mic this radio's card is wired to.
+    #[serde(default)]
+    pub audio: RadioAudio,
 }
 
 impl RadioSpec {
@@ -105,6 +139,7 @@ impl RadioSpec {
             ptt_file: String::new(),
             conf: String::new(),
             park: true,
+            audio: RadioAudio::default(),
         }
     }
 }
@@ -116,12 +151,23 @@ pub struct RadioRow {
     pub port: Option<u16>,
     pub status: String,
     pub selected: bool,
+    pub make: String,
+    pub model_label: String,
+    pub audio_status: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct HubView {
     pub rows: Vec<RadioRow>,
     pub serial: Vec<String>,
+    pub audio: crate::audio::AudioGraph,
+    pub playback: Vec<crate::audio::AudioNode>,
+    pub capture: Vec<crate::audio::AudioNode>,
+    /// A dump has arrived and every card that should exist has been seen,
+    /// or has been removed after it was seen. The window waits for this
+    /// before it writes the open station file.
+    pub audio_ready: bool,
+    pub audio_note: String,
 }
 
 enum HubCmd {
@@ -130,6 +176,12 @@ enum HubCmd {
     Remove(u64),
     Select(u64),
     Replace(Vec<RadioSpec>),
+    /// The station file's saved graph. Missing radio cards are created from it.
+    ApplyAudio(crate::audio::AudioGraph),
+    /// One `pw-dump` snapshot whose hamspot slice changed.
+    AudioSnap(crate::audio::AudioLook),
+    /// The Audio frame picked a computer-side source and sink.
+    SetEndpoint(u64, String, String),
     /// Stop every child this program started and leave the supervisor loop.
     Shutdown,
 }
@@ -140,6 +192,8 @@ pub struct Hub {
     /// Process groups currently running. Shutdown signals these if the
     /// supervisor has not finished stopping them itself.
     pids: Mutex<Vec<i32>>,
+    /// `pw-dump -m` process group. Shutdown signals it if the watcher is still up.
+    audio_pid: Mutex<Option<i32>>,
     wake: RawFd,
     done: Mutex<bool>,
     done_wake: Condvar,
@@ -157,6 +211,14 @@ struct Slot {
     next_idle: Option<Instant>,
     park_pending: bool,
     handed: Option<u16>,
+    rx_audio: Option<Child>,
+    tx_audio: Option<Child>,
+    audio_wired: bool,
+    saw_rx: bool,
+    saw_tx: bool,
+    make: String,
+    model_label: String,
+    audio_status: String,
 }
 
 pub fn validate_spec(spec: &RadioSpec) -> Result<(), String> {
@@ -462,14 +524,17 @@ pub fn prepare_gqrx_conf(path: &Path, port: u16, default_conf: &Path) -> Result<
     fs::write(path, patched).map_err(|err| format!("{}: {err}", path.display()))
 }
 
-pub fn spawn_gqrx(spec: &RadioSpec, port: u16) -> Result<Child, String> {
+pub fn spawn_gqrx(spec: &RadioSpec, port: u16, id: u64) -> Result<Child, String> {
     validate_spec(spec)?;
     let home = config_home();
     let path = gqrx_conf_path(&home, &spec.name);
     let default_conf = home.join("gqrx").join("default.conf");
     prepare_gqrx_conf(&path, port, &default_conf)?;
     let mut cmd = Command::new("gqrx");
-    cmd.arg("-c")
+    // The card's node names are the Pulse devices this process should open.
+    cmd.env("PULSE_SINK", crate::audio::rx_name(id))
+        .env("PULSE_SOURCE", crate::audio::tx_name(id))
+        .arg("-c")
         .arg(&path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -478,10 +543,10 @@ pub fn spawn_gqrx(spec: &RadioSpec, port: u16) -> Result<Child, String> {
     cmd.spawn().map_err(|err| format!("gqrx: {err}"))
 }
 
-fn spawn_radio(spec: &RadioSpec, port: u16) -> Result<Child, String> {
+fn spawn_radio(spec: &RadioSpec, port: u16, id: u64) -> Result<Child, String> {
     match spec.driver {
         RadioDriver::Hamlib => spawn_rigctld(spec, port),
-        RadioDriver::Gqrx => spawn_gqrx(spec, port),
+        RadioDriver::Gqrx => spawn_gqrx(spec, port, id),
     }
 }
 
@@ -575,6 +640,7 @@ impl Hub {
             cmds: Mutex::new(Vec::new()),
             view: Mutex::new(HubView::default()),
             pids: Mutex::new(Vec::new()),
+            audio_pid: Mutex::new(None),
             wake,
             done: Mutex::new(false),
             done_wake: Condvar::new(),
@@ -608,6 +674,14 @@ impl Hub {
         self.send(HubCmd::Replace(specs));
     }
 
+    pub fn apply_audio(&self, graph: crate::audio::AudioGraph) {
+        self.send(HubCmd::ApplyAudio(graph));
+    }
+
+    pub fn set_endpoint(&self, id: u64, input: String, output: String) {
+        self.send(HubCmd::SetEndpoint(id, input, output));
+    }
+
     /// Wake the supervisor without a command. Leaving Demo uses this so the
     /// selected radio is handed back without waiting out the idle read.
     pub fn wake(&self) {
@@ -633,6 +707,11 @@ impl Hub {
             return;
         }
         drop(guard);
+        if let Some(pid) = *self.audio_pid.lock().expect("audio pid") {
+            unsafe {
+                libc::kill(-pid, libc::SIGTERM);
+            }
+        }
         let pids = self.pids.lock().expect("cat pids").clone();
         for pid in pids {
             unsafe {
@@ -675,12 +754,21 @@ fn supervise(
     kick: Arc<dyn Fn() + Send + Sync>,
     ctx: egui::Context,
 ) {
+    let models = model_list().unwrap_or_default();
     let mut slots = vec![new_slot(1, RadioSpec::dummy())];
     let mut next_id = 2u64;
     let mut selected = 1u64;
     let mut serial = serial_ports_in(Path::new("/dev"));
+    let mut look = crate::audio::AudioLook::default();
+    let mut wanted = crate::audio::AudioGraph::default();
+    let mut links_pending = false;
+    let mut audio_note = String::new();
+    match watch_dump(Arc::clone(&hub)) {
+        Some(pid) => *hub.audio_pid.lock().expect("audio pid") = Some(pid),
+        None => audio_note = "pw-dump is not available".into(),
+    }
     let watch = DevWatch::open();
-    publish(&hub, &slots, selected, &serial);
+    publish(&hub, &slots, selected, &serial, &look, false, &audio_note);
     ctx.request_repaint();
     loop {
         let cmds = std::mem::take(&mut *hub.cmds.lock().expect("cat cmds"));
@@ -737,6 +825,25 @@ fn supervise(
                         }
                     }
                 }
+                HubCmd::ApplyAudio(graph) => {
+                    wanted = graph;
+                    links_pending = !wanted.links.is_empty();
+                    for slot in &mut slots {
+                        slot.audio_wired = false;
+                    }
+                    let live = crate::audio::dump_once().unwrap_or_else(|| look.graph.clone());
+                    restore_extra_devices(&wanted, &live, &slots, &mut audio_note);
+                }
+                HubCmd::AudioSnap(snap) => {
+                    note_audio(&mut slots, &snap.graph);
+                    look = snap;
+                }
+                HubCmd::SetEndpoint(id, input, output) => {
+                    if let Some(slot) = slots.iter_mut().find(|slot| slot.id == id) {
+                        retarget(slot, &input, &output, &look.graph);
+                        slot.status_dirty = true;
+                    }
+                }
                 HubCmd::Replace(specs) => {
                     for slot in &mut slots {
                         stop_slot(slot);
@@ -778,7 +885,7 @@ fn supervise(
             for slot in &mut slots {
                 stop_slot(slot);
             }
-            publish(&hub, &slots, selected, &serial);
+            publish(&hub, &slots, selected, &serial, &look, false, &audio_note);
             break;
         }
         if let Some(watch) = &watch {
@@ -801,7 +908,11 @@ fn supervise(
         if failed {
             clear_hand(&mut slots);
         }
+        if links_pending {
+            links_pending = !restore_links(&wanted, &slots, &mut audio_note);
+        }
         for slot in &mut slots {
+            service_audio(slot, &models, &wanted, &look.graph);
             tick_slot(
                 slot,
                 slot.id == selected,
@@ -813,8 +924,9 @@ fn supervise(
                 now,
             );
         }
+        let ready = audio_settled(&slots, &look.graph);
         if changed || slots.iter().any(|slot| slot.status_dirty) {
-            publish(&hub, &slots, selected, &serial);
+            publish(&hub, &slots, selected, &serial, &look, ready, &audio_note);
             for slot in &mut slots {
                 slot.status_dirty = false;
             }
@@ -846,6 +958,14 @@ fn new_slot(id: u64, spec: RadioSpec) -> Slot {
         next_idle: None,
         park_pending,
         handed: None,
+        rx_audio: None,
+        tx_audio: None,
+        audio_wired: false,
+        saw_rx: false,
+        saw_tx: false,
+        make: String::new(),
+        model_label: String::new(),
+        audio_status: String::new(),
     }
 }
 
@@ -901,7 +1021,7 @@ fn tick_slot(
             return;
         }
         match free_port(PORT_START)
-            .and_then(|port| spawn_radio(&slot.spec, port).map(|child| (port, child)))
+            .and_then(|port| spawn_radio(&slot.spec, port, slot.id).map(|child| (port, child)))
         {
             Ok((port, mut child)) => match wait_ready(port, &mut child) {
                 Ok(()) => {
@@ -1008,7 +1128,15 @@ fn next_wait(slots: &[Slot], now: Instant) -> Duration {
     wait
 }
 
-fn publish(hub: &Hub, slots: &[Slot], selected: u64, serial: &[String]) {
+fn publish(
+    hub: &Hub,
+    slots: &[Slot],
+    selected: u64,
+    serial: &[String],
+    look: &crate::audio::AudioLook,
+    audio_ready: bool,
+    audio_note: &str,
+) {
     let rows = slots
         .iter()
         .map(|slot| RadioRow {
@@ -1017,16 +1145,32 @@ fn publish(hub: &Hub, slots: &[Slot], selected: u64, serial: &[String]) {
             port: slot.port,
             status: slot.status.clone(),
             selected: slot.id == selected,
+            make: slot.make.clone(),
+            model_label: slot.model_label.clone(),
+            audio_status: slot.audio_status.clone(),
         })
         .collect();
-    let pids = slots
-        .iter()
-        .filter_map(|slot| slot.child.as_ref().map(|child| child.id() as i32))
-        .collect();
+    let mut pids = Vec::new();
+    for slot in slots {
+        if let Some(child) = &slot.child {
+            pids.push(child.id() as i32);
+        }
+        if let Some(child) = &slot.rx_audio {
+            pids.push(child.id() as i32);
+        }
+        if let Some(child) = &slot.tx_audio {
+            pids.push(child.id() as i32);
+        }
+    }
     *hub.pids.lock().expect("cat pids") = pids;
     *hub.view.lock().expect("cat view") = HubView {
         rows,
         serial: serial.to_vec(),
+        audio: look.graph.clone(),
+        playback: look.playback.clone(),
+        capture: look.capture.clone(),
+        audio_ready,
+        audio_note: audio_note.to_string(),
     };
 }
 
@@ -1038,6 +1182,7 @@ fn stop_slot(slot: &mut Slot) {
     slot.child = None;
     slot.port = None;
     slot.handed = None;
+    stop_audio(slot);
 }
 
 fn park_until(hub: &Hub, watch: &Option<DevWatch>, wait: Duration) {
@@ -1117,6 +1262,407 @@ impl Drop for DevWatch {
     }
 }
 
+fn radio_make_model(
+    driver: RadioDriver,
+    name: &str,
+    model: i32,
+    rows: &[HamlibModel],
+) -> (String, String) {
+    match driver {
+        RadioDriver::Gqrx => ("GQRX".into(), name.trim().to_string()),
+        RadioDriver::Hamlib => {
+            if let Some(row) = rows.iter().find(|row| row.id == model) {
+                (row.mfg.clone(), row.model.clone())
+            } else {
+                ("Hamlib".into(), model.to_string())
+            }
+        }
+    }
+}
+
+fn watch_dump(hub: Arc<Hub>) -> Option<i32> {
+    let mut child = Command::new("pw-dump")
+        .args(["-m", "-N", "-R", "-i", "0"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .ok()?;
+    let pid = child.id() as i32;
+    let stdout = child.stdout.take()?;
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        let mut merge = crate::audio::DumpMerge::default();
+        let mut last = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    // A later line is only the objects that changed. Merging
+                    // keeps the radio card when PipeWire reports a port update.
+                    if let Some(look) = merge.apply(&line) {
+                        let key = crate::audio::look_key(&look);
+                        if key != last {
+                            last = key;
+                            hub.send(HubCmd::AudioSnap(look));
+                        }
+                    }
+                }
+            }
+        }
+        let _ = child.wait();
+    });
+    Some(pid)
+}
+
+fn note_audio(slots: &mut [Slot], graph: &crate::audio::AudioGraph) {
+    for slot in slots {
+        let rx = crate::audio::rx_name(slot.id);
+        let tx = crate::audio::tx_name(slot.id);
+        let seen_rx = crate::audio::has_device(graph, &rx);
+        let seen_tx = crate::audio::has_device(graph, &tx);
+        if seen_rx {
+            slot.saw_rx = true;
+            slot.spec.audio.rx = true;
+        } else if slot.saw_rx {
+            slot.spec.audio.rx = false;
+        }
+        if seen_tx {
+            slot.saw_tx = true;
+            slot.spec.audio.tx = true;
+        } else if slot.saw_tx {
+            slot.spec.audio.tx = false;
+        }
+        if let Some(node) = crate::audio::peer_node(graph, &crate::audio::rx_stream(slot.id), true)
+        {
+            slot.spec.audio.output = node;
+        }
+        if let Some(node) = crate::audio::peer_node(graph, &crate::audio::tx_stream(slot.id), false)
+        {
+            slot.spec.audio.input = node;
+        }
+        slot.status_dirty = true;
+    }
+}
+
+fn audio_settled(slots: &[Slot], graph: &crate::audio::AudioGraph) -> bool {
+    slots.iter().all(|slot| {
+        let rx_ok = !slot.spec.audio.rx
+            || slot.saw_rx
+            || crate::audio::has_device(graph, &crate::audio::rx_name(slot.id));
+        let tx_ok = !slot.spec.audio.tx
+            || slot.saw_tx
+            || crate::audio::has_device(graph, &crate::audio::tx_name(slot.id));
+        rx_ok && tx_ok
+    })
+}
+
+fn service_audio(
+    slot: &mut Slot,
+    models: &[HamlibModel],
+    wanted: &crate::audio::AudioGraph,
+    live: &crate::audio::AudioGraph,
+) {
+    let (make, model_label) =
+        radio_make_model(slot.spec.driver, &slot.spec.name, slot.spec.model, models);
+    if slot.make != make || slot.model_label != model_label {
+        slot.make = make;
+        slot.model_label = model_label;
+        slot.status_dirty = true;
+    }
+    reap_audio(&mut slot.rx_audio);
+    reap_audio(&mut slot.tx_audio);
+    if !slot.spec.audio.rx {
+        if slot.rx_audio.is_some() {
+            stop_audio_end(&mut slot.rx_audio);
+        }
+    } else if slot.rx_audio.is_none()
+        && !crate::audio::has_device(live, &crate::audio::rx_name(slot.id))
+    {
+        let description = crate::audio::describe(&slot.make, &slot.model_label, slot.id, "RX");
+        match spawn_loopback(&crate::audio::rx_loopback_args(slot.id, &description)) {
+            Ok(child) => {
+                slot.rx_audio = Some(child);
+                slot.audio_wired = false;
+                if slot.audio_status.starts_with("pw-loopback") {
+                    slot.audio_status.clear();
+                    slot.status_dirty = true;
+                }
+            }
+            Err(err) => {
+                if slot.audio_status != err {
+                    slot.audio_status = err;
+                    slot.status_dirty = true;
+                }
+            }
+        }
+    }
+    if !slot.spec.audio.tx {
+        if slot.tx_audio.is_some() {
+            stop_audio_end(&mut slot.tx_audio);
+        }
+    } else if slot.tx_audio.is_none()
+        && !crate::audio::has_device(live, &crate::audio::tx_name(slot.id))
+    {
+        let description = crate::audio::describe(&slot.make, &slot.model_label, slot.id, "TX");
+        match spawn_loopback(&crate::audio::tx_loopback_args(slot.id, &description)) {
+            Ok(child) => {
+                slot.tx_audio = Some(child);
+                slot.audio_wired = false;
+            }
+            Err(err) => {
+                if slot.audio_status != err {
+                    slot.audio_status = err;
+                    slot.status_dirty = true;
+                }
+            }
+        }
+    }
+    if !slot.audio_wired {
+        wire_slot(slot, wanted);
+    }
+}
+
+fn reap_audio(child: &mut Option<Child>) {
+    let finished = match child.as_mut() {
+        Some(child) => match child.try_wait() {
+            Ok(Some(_)) | Err(_) => true,
+            Ok(None) => false,
+        },
+        None => false,
+    };
+    if finished {
+        *child = None;
+    }
+}
+
+fn stop_audio_end(child: &mut Option<Child>) {
+    if let Some(child) = child.as_mut() {
+        stop_child(child);
+    }
+    *child = None;
+}
+
+fn stop_audio(slot: &mut Slot) {
+    stop_audio_end(&mut slot.rx_audio);
+    stop_audio_end(&mut slot.tx_audio);
+}
+
+fn spawn_loopback(args: &[String]) -> Result<Child, String> {
+    let mut cmd = Command::new("pw-loopback");
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0);
+    cmd.spawn().map_err(|err| format!("pw-loopback: {err}"))
+}
+
+fn wire_slot(slot: &mut Slot, wanted: &crate::audio::AudioGraph) {
+    let outputs = crate::audio::pw_ports(true).unwrap_or_default();
+    let inputs = crate::audio::pw_ports(false).unwrap_or_default();
+    if slot.spec.audio.rx
+        && crate::audio::ports_of(&outputs, &crate::audio::rx_stream(slot.id)).is_empty()
+    {
+        return;
+    }
+    if slot.spec.audio.tx
+        && crate::audio::ports_of(&inputs, &crate::audio::tx_stream(slot.id)).is_empty()
+    {
+        return;
+    }
+    let saved = wanted_links(slot.id, wanted);
+    if saved.is_empty() {
+        wire_default(slot, &outputs, &inputs);
+    } else {
+        for link in saved {
+            if let Err(err) = crate::audio::pw_link(&link.output, &link.input) {
+                slot.audio_status = err;
+                slot.status_dirty = true;
+            }
+        }
+    }
+    slot.audio_wired = true;
+    slot.status_dirty = true;
+}
+
+fn wanted_links(id: u64, graph: &crate::audio::AudioGraph) -> Vec<crate::audio::AudioLink> {
+    graph
+        .links
+        .iter()
+        .filter(|link| mentions(id, &link.output) || mentions(id, &link.input))
+        .cloned()
+        .collect()
+}
+
+fn mentions(id: u64, port: &str) -> bool {
+    let node = crate::audio::port_node(port);
+    node == crate::audio::rx_name(id)
+        || node == crate::audio::tx_name(id)
+        || node == crate::audio::rx_stream(id)
+        || node == crate::audio::tx_stream(id)
+}
+
+fn wire_default(slot: &mut Slot, outputs: &[String], inputs: &[String]) {
+    if slot.spec.audio.rx {
+        let sink = if slot.spec.audio.output.trim().is_empty() {
+            crate::audio::default_sink().unwrap_or_default()
+        } else {
+            slot.spec.audio.output.clone()
+        };
+        if sink.is_empty() {
+            slot.audio_status = "no default output".into();
+        } else {
+            let from = crate::audio::ports_of(outputs, &crate::audio::rx_stream(slot.id));
+            let to = crate::audio::ports_of(inputs, &sink);
+            for (output, input) in crate::audio::pair_ports(&from, &to) {
+                if let Err(err) = crate::audio::pw_link(&output, &input) {
+                    slot.audio_status = err;
+                }
+            }
+            slot.spec.audio.output = sink;
+        }
+    }
+    if slot.spec.audio.tx {
+        let source = if slot.spec.audio.input.trim().is_empty() {
+            crate::audio::default_source().unwrap_or_default()
+        } else {
+            slot.spec.audio.input.clone()
+        };
+        if source.is_empty() {
+            slot.audio_status = "no default input".into();
+        } else {
+            let from = crate::audio::ports_of(outputs, &source);
+            let to = crate::audio::ports_of(inputs, &crate::audio::tx_stream(slot.id));
+            for (output, input) in crate::audio::pair_ports(&from, &to) {
+                if let Err(err) = crate::audio::pw_link(&output, &input) {
+                    slot.audio_status = err;
+                }
+            }
+            slot.spec.audio.input = source;
+        }
+    }
+}
+
+fn retarget(slot: &mut Slot, input: &str, output: &str, live: &crate::audio::AudioGraph) {
+    let outputs = crate::audio::pw_ports(true).unwrap_or_default();
+    let inputs = crate::audio::pw_ports(false).unwrap_or_default();
+    if output != slot.spec.audio.output {
+        unlink_stream(&crate::audio::rx_stream(slot.id), true, live);
+        let from = crate::audio::ports_of(&outputs, &crate::audio::rx_stream(slot.id));
+        let to = crate::audio::ports_of(&inputs, output);
+        for (left, right) in crate::audio::pair_ports(&from, &to) {
+            if let Err(err) = crate::audio::pw_link(&left, &right) {
+                slot.audio_status = err;
+            }
+        }
+        slot.spec.audio.output = output.to_string();
+    }
+    if input != slot.spec.audio.input {
+        unlink_stream(&crate::audio::tx_stream(slot.id), false, live);
+        let from = crate::audio::ports_of(&outputs, input);
+        let to = crate::audio::ports_of(&inputs, &crate::audio::tx_stream(slot.id));
+        for (left, right) in crate::audio::pair_ports(&from, &to) {
+            if let Err(err) = crate::audio::pw_link(&left, &right) {
+                slot.audio_status = err;
+            }
+        }
+        slot.spec.audio.input = input.to_string();
+    }
+}
+
+fn unlink_stream(stream: &str, stream_is_output: bool, graph: &crate::audio::AudioGraph) {
+    for link in &graph.links {
+        let ours = if stream_is_output {
+            &link.output
+        } else {
+            &link.input
+        };
+        let peer = if stream_is_output {
+            &link.input
+        } else {
+            &link.output
+        };
+        if crate::audio::port_node(ours) != stream {
+            continue;
+        }
+        if crate::audio::watched_node(crate::audio::port_node(peer)) {
+            continue;
+        }
+        let _ = crate::audio::pw_unlink(&link.output, &link.input);
+    }
+}
+
+/// Saved wires whose ports both exist are put back. Returns true when every
+/// saved wire was applied. A missing port keeps the caller trying.
+fn restore_links(wanted: &crate::audio::AudioGraph, slots: &[Slot], note: &mut String) -> bool {
+    let outputs = match crate::audio::pw_ports(true) {
+        Ok(ports) => ports,
+        Err(err) => {
+            *note = err;
+            return false;
+        }
+    };
+    let inputs = match crate::audio::pw_ports(false) {
+        Ok(ports) => ports,
+        Err(err) => {
+            *note = err;
+            return false;
+        }
+    };
+    let mut complete = true;
+    for link in &wanted.links {
+        let output_ready = outputs.iter().any(|port| port == &link.output);
+        let input_ready = inputs.iter().any(|port| port == &link.input);
+        if output_ready && input_ready {
+            if let Err(err) = crate::audio::pw_link(&link.output, &link.input) {
+                *note = err;
+            }
+            continue;
+        }
+        let waiting_on_radio = slots.iter().any(|slot| {
+            (slot.spec.audio.rx && mentions(slot.id, &link.output))
+                || (slot.spec.audio.tx && mentions(slot.id, &link.input))
+                || (slot.spec.audio.rx && mentions(slot.id, &link.input))
+                || (slot.spec.audio.tx && mentions(slot.id, &link.output))
+        });
+        if waiting_on_radio {
+            complete = false;
+        }
+    }
+    complete
+}
+
+fn restore_extra_devices(
+    wanted: &crate::audio::AudioGraph,
+    live: &crate::audio::AudioGraph,
+    slots: &[Slot],
+    note: &mut String,
+) {
+    for device in &wanted.devices {
+        if !crate::audio::safe_hamspot_name(&device.name) {
+            continue;
+        }
+        if crate::audio::has_device(live, &device.name) {
+            continue;
+        }
+        if slots.iter().any(|slot| {
+            device.name == crate::audio::rx_name(slot.id)
+                || device.name == crate::audio::tx_name(slot.id)
+        }) {
+            continue;
+        }
+        if let Err(err) =
+            crate::audio::create_linger(&device.name, &device.description, &device.class)
+        {
+            *note = err;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1134,6 +1680,7 @@ mod tests {
             ptt_file: "/dev/ttyUSB1".into(),
             conf: "rts_state=ON".into(),
             park: false,
+            audio: RadioAudio::default(),
         };
         let args = hamlib_argv(&spec, 4534);
         assert_eq!(
@@ -1262,6 +1809,7 @@ mod tests {
             ptt_file: String::new(),
             conf: String::new(),
             park: false,
+            audio: RadioAudio::default(),
         };
         assert!(validate_spec(&spec).is_ok());
         assert_eq!(driver_name(RadioDriver::Gqrx), "gqrx");

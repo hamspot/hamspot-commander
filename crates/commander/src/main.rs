@@ -4,6 +4,7 @@
 //! grouped frames in the body, and a status line. The controls are the rig
 //! face (frequency, meters, VFO, band scales, levels).
 
+mod audio;
 mod cat;
 mod channels;
 mod config;
@@ -200,6 +201,72 @@ struct App {
     /// Last folder chosen in the config browser. Absent means the working directory.
     config_dir: Option<PathBuf>,
     config_note: String,
+    /// Canonical audio graph last written, so a quiet PipeWire graph is not saved again.
+    audio_saved: String,
+    /// A loaded file is not written back until the cards it asked for have appeared.
+    audio_hold: bool,
+}
+
+/// True when `name` is a file on `PATH` with an execute bit. A missing
+/// `PATH` or a non-executable file is false, so the Audio frame can keep
+/// the Helvum button visible and disabled.
+fn executable_in_path(path_env: Option<&std::ffi::OsStr>, name: &str) -> bool {
+    let Some(path_env) = path_env else {
+        return false;
+    };
+    std::env::split_paths(path_env).any(|dir| is_executable(&dir.join(name)))
+}
+
+fn is_executable(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode() & 0o111 != 0
+}
+
+fn helvum_on_path() -> bool {
+    executable_in_path(std::env::var_os("PATH").as_deref(), "helvum")
+}
+
+/// Starts Helvum in its own process group. Hub shutdown only signals the
+/// radio and `pw-dump` process groups, so this editor stays up. The waiter
+/// reaps Helvum when it exits.
+fn launch_helvum() {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = std::process::Command::new("helvum");
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0);
+    if let Ok(mut child) = cmd.spawn() {
+        thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
+}
+
+fn audio_device_label(devices: &[crate::audio::AudioNode], name: &str) -> String {
+    devices
+        .iter()
+        .find(|device| device.name == name)
+        .map(|device| {
+            if device.description.is_empty() {
+                device.name.clone()
+            } else {
+                device.description.clone()
+            }
+        })
+        .unwrap_or_else(|| {
+            if name.is_empty() {
+                "default".into()
+            } else {
+                name.to_string()
+            }
+        })
 }
 
 fn rx_pairs(snap: &Snapshot) -> Vec<(f64, f64)> {
@@ -237,6 +304,30 @@ fn mode_choices(snap: &Snapshot) -> Vec<String> {
             .collect()
     } else {
         snap.caps.modes.clone()
+    }
+}
+
+#[cfg(test)]
+mod helvum_tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn helvum_is_enabled_only_when_the_file_on_path_is_executable() {
+        let dir = std::env::temp_dir().join(format!("hs-helvum-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("helvum");
+        fs::write(&bin, b"").unwrap();
+        let mut perms = fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o644);
+        fs::set_permissions(&bin, perms.clone()).unwrap();
+        assert!(!super::executable_in_path(Some(dir.as_os_str()), "helvum"));
+        perms.set_mode(0o755);
+        fs::set_permissions(&bin, perms).unwrap();
+        assert!(super::executable_in_path(Some(dir.as_os_str()), "helvum"));
+        assert!(!super::executable_in_path(None, "helvum"));
+        let _ = fs::remove_dir_all(&dir);
     }
 }
 
@@ -477,6 +568,8 @@ impl App {
             config_path: String::new(),
             config_dir,
             config_note: String::new(),
+            audio_saved: crate::audio::canonical(&crate::audio::AudioGraph::default()),
+            audio_hold: false,
         }
     }
 
@@ -707,6 +800,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let (mut snap, live_gen) = self.snap_gen();
         self.maybe_push_loaded(&snap, live_gen);
+        self.autosave_audio(&snap);
         if let Some(row) = self.hub.view().rows.iter().find(|row| row.selected) {
             self.host = "127.0.0.1".into();
             if let Some(port) = row.port {
@@ -1668,6 +1762,8 @@ impl App {
         ui.label(format!("Channels: {} zones", self.channels.zones.len()));
         ui.add_space(8.0);
         self.cat_frame(ui);
+        ui.add_space(8.0);
+        self.audio_frame(ui);
     }
 
     fn cat_frame(&mut self, ui: &mut egui::Ui) {
@@ -1757,6 +1853,116 @@ impl App {
         });
         if let Some(id) = select {
             self.hub.select(id);
+        }
+    }
+
+    fn audio_frame(&mut self, ui: &mut egui::Ui) {
+        let view = self.hub.view();
+        let mut endpoint = None;
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Audio");
+                if ui
+                    .add_enabled(helvum_on_path(), egui::Button::new("Helvum").small())
+                    .clicked()
+                {
+                    launch_helvum();
+                }
+            });
+            ui.add_space(4.0);
+            if self.config_path.is_empty() {
+                ui.label("Open a station file to keep PipeWire changes.");
+            }
+            if !view.audio_note.is_empty() {
+                ui.label(
+                    egui::RichText::new(&view.audio_note)
+                        .color(egui::Color32::from_rgb(220, 160, 80)),
+                );
+            }
+            for row in &view.rows {
+                let rx = crate::audio::describe(&row.make, &row.model_label, row.id, "RX");
+                let tx = crate::audio::describe(&row.make, &row.model_label, row.id, "TX");
+                ui.label(format!("{}  {} {}", row.id, row.make, row.model_label));
+                ui.horizontal(|ui| {
+                    ui.label(rx);
+                    let current = audio_device_label(&view.playback, &row.spec.audio.output);
+                    egui::ComboBox::from_id_salt(("audio-out", row.id))
+                        .selected_text(current)
+                        .show_ui(ui, |ui| {
+                            for dev in &view.playback {
+                                let text = audio_device_label(&view.playback, &dev.name);
+                                if ui
+                                    .selectable_label(row.spec.audio.output == dev.name, text)
+                                    .clicked()
+                                {
+                                    endpoint = Some((
+                                        row.id,
+                                        row.spec.audio.input.clone(),
+                                        dev.name.clone(),
+                                    ));
+                                }
+                            }
+                        });
+                });
+                ui.horizontal(|ui| {
+                    ui.label(tx);
+                    let current = audio_device_label(&view.capture, &row.spec.audio.input);
+                    egui::ComboBox::from_id_salt(("audio-in", row.id))
+                        .selected_text(current)
+                        .show_ui(ui, |ui| {
+                            for dev in &view.capture {
+                                let text = audio_device_label(&view.capture, &dev.name);
+                                if ui
+                                    .selectable_label(row.spec.audio.input == dev.name, text)
+                                    .clicked()
+                                {
+                                    endpoint = Some((
+                                        row.id,
+                                        dev.name.clone(),
+                                        row.spec.audio.output.clone(),
+                                    ));
+                                }
+                            }
+                        });
+                });
+                if !row.audio_status.is_empty() {
+                    ui.label(
+                        egui::RichText::new(&row.audio_status)
+                            .color(egui::Color32::from_rgb(220, 160, 80)),
+                    );
+                }
+                ui.add_space(4.0);
+            }
+            let owned: Vec<String> = view
+                .rows
+                .iter()
+                .flat_map(|row| [crate::audio::rx_name(row.id), crate::audio::tx_name(row.id)])
+                .collect();
+            let extras: Vec<_> = view
+                .audio
+                .devices
+                .iter()
+                .filter(|device| !owned.iter().any(|name| name == &device.name))
+                .collect();
+            if !extras.is_empty() {
+                ui.label("Other hamspot devices");
+                for device in extras {
+                    ui.label(format!(
+                        "{}  {}  {}",
+                        device.name, device.class, device.description
+                    ));
+                }
+            }
+            if !view.audio.links.is_empty() {
+                ui.add_space(4.0);
+                ui.label("Wires");
+                for link in &view.audio.links {
+                    ui.label(format!("{}    {}", link.output, link.input));
+                }
+            }
+        });
+        if let Some((id, input, output)) = endpoint {
+            self.hub.set_endpoint(id, input, output);
         }
     }
 
@@ -2005,6 +2211,17 @@ impl App {
             ptt_file: edit.ptt_file.trim().to_string(),
             conf: edit.conf.trim().to_string(),
             park: edit.park,
+            audio: edit
+                .id
+                .and_then(|id| {
+                    self.hub
+                        .view()
+                        .rows
+                        .into_iter()
+                        .find(|row| row.id == id)
+                        .map(|row| row.spec.audio)
+                })
+                .unwrap_or_default(),
         };
         if let Err(err) = cat::validate_spec(&spec) {
             if let Some(edit) = &mut self.cat_edit {
@@ -2094,9 +2311,32 @@ impl App {
             }
         };
         match config::save_file(Path::new(&self.config_path), &file) {
-            Ok(()) => self.config_note.clear(),
+            Ok(()) => {
+                self.audio_saved = crate::audio::canonical(&file.audio);
+                self.audio_hold = false;
+                self.config_note.clear();
+            }
             Err(err) => self.config_note = err,
         }
+    }
+
+    /// PipeWire edits land in the open station file. No open file means there
+    /// is nowhere to write, and a load waits until the saved cards are back.
+    fn autosave_audio(&mut self, snap: &Snapshot) {
+        if self.config_path.is_empty() {
+            return;
+        }
+        let view = self.hub.view();
+        if !view.audio_ready {
+            return;
+        }
+        let canon = crate::audio::canonical(&view.audio);
+        if canon == self.audio_saved {
+            self.audio_hold = false;
+            return;
+        }
+        self.audio_hold = false;
+        self.save_config(snap);
     }
 
     /// The open plan, channel file, Tune face, and settable levels.
@@ -2153,6 +2393,7 @@ impl App {
                 .into_iter()
                 .map(|row| row.spec)
                 .collect(),
+            audio: self.hub.view().audio.clone(),
         })
     }
 
@@ -2164,6 +2405,7 @@ impl App {
             tune,
             levels,
             radios,
+            audio,
             ..
         } = file;
         self.plan = bsp;
@@ -2184,7 +2426,10 @@ impl App {
             levels: levels.clone(),
             after_gen,
         });
+        self.audio_saved = crate::audio::canonical(&audio);
+        self.audio_hold = true;
         self.hub.replace(radios);
+        self.hub.apply_audio(audio);
         self.show_spread = tune.show_spread;
         self.step_hz = tune.step_hz;
         self.zone_sel = tune.zone_sel;

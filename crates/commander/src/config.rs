@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::audio::AudioGraph;
 use crate::channels::ChannelFile;
 use crate::plan::{self, BandPlan};
 
@@ -23,6 +24,10 @@ pub struct ConfigFile {
     /// frame existed, which still loads and starts the hamlib dummy.
     #[serde(default)]
     pub radios: Vec<crate::cat::RadioSpec>,
+    /// Hamspot PipeWire devices and the wires other tools have left on them.
+    /// Absent in a file written before the Audio frame existed.
+    #[serde(default)]
+    pub audio: AudioGraph,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -223,6 +228,7 @@ mod tests {
             },
             levels: BTreeMap::from([("AF".into(), 0.25)]),
             radios: Vec::new(),
+            audio: AudioGraph::default(),
         }
     }
 
@@ -277,6 +283,7 @@ mod tests {
             ptt_file: String::new(),
             conf: String::new(),
             park: false,
+            audio: crate::cat::RadioAudio::default(),
         });
         let back = parse(&to_string(&file).unwrap()).unwrap();
         assert_eq!(back.radios.len(), 1);
@@ -284,6 +291,27 @@ mod tests {
         assert_eq!(back.radios[0].model, 3073);
         assert_eq!(back.radios[0].device, "/dev/ttyUSB0");
         assert!(!back.radios[0].park);
+        assert!(back.radios[0].audio.rx);
+        assert!(back.radios[0].audio.input.is_empty());
+        let mut value: serde_json::Value =
+            serde_json::from_str(&to_string(&file).unwrap()).unwrap();
+        value["radios"][0].as_object_mut().unwrap().remove("audio");
+        value.as_object_mut().unwrap().remove("audio");
+        let loaded = parse(&value.to_string()).unwrap();
+        assert!(loaded.audio.devices.is_empty());
+        assert!(loaded.radios[0].audio.tx);
+        file.audio.devices.push(crate::audio::AudioNode {
+            name: "hamspot_custom".into(),
+            description: "Extra".into(),
+            class: "Audio/Sink".into(),
+        });
+        file.audio.links.push(crate::audio::AudioLink {
+            output: "output.hamspot_1_rx:output_FL".into(),
+            input: "alsa_output.speakers:playback_FL".into(),
+        });
+        let back = parse(&to_string(&file).unwrap()).unwrap();
+        assert_eq!(back.audio.devices[0].name, "hamspot_custom");
+        assert_eq!(back.audio.links[0].output, "output.hamspot_1_rx:output_FL");
     }
 
     #[test]
