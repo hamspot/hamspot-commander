@@ -15,10 +15,10 @@ cargo run -p commander
 The window opens on an in-process demo rig at 14.153.608 MHz USB. **Demo** returns to that rig. **Connect** talks to a `rigctld` that is already running. This program does not start `rigctld`.
 
 ```bash
-rigctld -m 1 -t 4532
+scripts/dummy-rig.sh
 ```
 
-Model `1` is Hamlib's dummy rig. Use your radio's model number and serial port when you connect a real rig. Levels the backend lists with an empty range stay disabled.
+That starts Hamlib's dummy rig (`rigctld -m 1`) on `127.0.0.1:4532` and parks 20 m on VFO A, 2 m on VFO B, and 70 cm on VFO C. The dummy's range is 150 kHz–1.5 GHz, so those HF, VHF, and UHF frequencies are all in band. Use your radio's model number and serial port when you connect a real rig. Levels the backend lists with an empty range stay disabled.
 
 ## Layout
 

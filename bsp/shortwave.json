@@ -1,0 +1,1106 @@
+{
+  "version": 1,
+  "zones": [
+    {
+      "name": "Broadcast",
+      "color": [
+        90,
+        150,
+        210
+      ],
+      "bands": [
+        {
+          "name": "LW",
+          "chip": "lw",
+          "lo_hz": 153000,
+          "hi_hz": 279000,
+          "home_hz": 198000,
+          "mode": "AM",
+          "segments": [
+            {
+              "lo_hz": 153000,
+              "hi_hz": 279000,
+              "use": "mixed",
+              "service": "broadcast"
+            }
+          ]
+        },
+        {
+          "name": "MW",
+          "chip": "mw",
+          "lo_hz": 520000,
+          "hi_hz": 1710000,
+          "home_hz": 1000000,
+          "mode": "AM",
+          "segments": [
+            {
+              "lo_hz": 520000,
+              "hi_hz": 1710000,
+              "use": "mixed",
+              "service": "broadcast"
+            }
+          ]
+        },
+        {
+          "name": "120 m",
+          "chip": "120m",
+          "lo_hz": 2300000,
+          "hi_hz": 2495000,
+          "home_hz": 2400000,
+          "mode": "AM",
+          "segments": [
+            {
+              "lo_hz": 2300000,
+              "hi_hz": 2495000,
+              "use": "mixed",
+              "service": "broadcast"
+            }
+          ]
+        },
+        {
+          "name": "90 m",
+          "chip": "90m",
+          "lo_hz": 3200000,
+          "hi_hz": 3400000,
+          "home_hz": 3300000,
+          "mode": "AM",
+          "segments": [
+            {
+              "lo_hz": 3200000,
+              "hi_hz": 3400000,
+              "use": "mixed",
+              "service": "broadcast"
+            }
+          ]
+        },
+        {
+          "name": "60 m BC",
+          "chip": "60bc",
+          "lo_hz": 4750000,
+          "hi_hz": 4995000,
+          "home_hz": 4900000,
+          "mode": "AM",
+          "segments": [
+            {
+              "lo_hz": 4750000,
+              "hi_hz": 4995000,
+              "use": "mixed",
+              "service": "broadcast"
+            }
+          ]
+        },
+        {
+          "name": "49 m",
+          "chip": "49m",
+          "lo_hz": 5900000,
+          "hi_hz": 6200000,
+          "home_hz": 6000000,
+          "mode": "AM",
+          "segments": [
+            {
+              "lo_hz": 5900000,
+              "hi_hz": 6200000,
+              "use": "mixed",
+              "service": "broadcast"
+            }
+          ]
+        },
+        {
+          "name": "41 m",
+          "chip": "41m",
+          "lo_hz": 7200000,
+          "hi_hz": 7600000,
+          "home_hz": 7400000,
+          "mode": "AM",
+          "segments": [
+            {
+              "lo_hz": 7200000,
+              "hi_hz": 7600000,
+              "use": "mixed",
+              "service": "broadcast"
+            }
+          ]
+        },
+        {
+          "name": "31 m",
+          "chip": "31m",
+          "lo_hz": 9400000,
+          "hi_hz": 9900000,
+          "home_hz": 9600000,
+          "mode": "AM",
+          "segments": [
+            {
+              "lo_hz": 9400000,
+              "hi_hz": 9900000,
+              "use": "mixed",
+              "service": "broadcast"
+            }
+          ]
+        },
+        {
+          "name": "25 m",
+          "chip": "25m",
+          "lo_hz": 11600000,
+          "hi_hz": 12100000,
+          "home_hz": 11800000,
+          "mode": "AM",
+          "segments": [
+            {
+              "lo_hz": 11600000,
+              "hi_hz": 12100000,
+              "use": "mixed",
+              "service": "broadcast"
+            }
+          ]
+        },
+        {
+          "name": "22 m",
+          "chip": "22m",
+          "lo_hz": 13570000,
+          "hi_hz": 13870000,
+          "home_hz": 13700000,
+          "mode": "AM",
+          "segments": [
+            {
+              "lo_hz": 13570000,
+              "hi_hz": 13870000,
+              "use": "mixed",
+              "service": "broadcast"
+            }
+          ]
+        },
+        {
+          "name": "19 m",
+          "chip": "19m",
+          "lo_hz": 15100000,
+          "hi_hz": 15800000,
+          "home_hz": 15400000,
+          "mode": "AM",
+          "segments": [
+            {
+              "lo_hz": 15100000,
+              "hi_hz": 15800000,
+              "use": "mixed",
+              "service": "broadcast"
+            }
+          ]
+        },
+        {
+          "name": "16 m",
+          "chip": "16m",
+          "lo_hz": 17480000,
+          "hi_hz": 17900000,
+          "home_hz": 17600000,
+          "mode": "AM",
+          "segments": [
+            {
+              "lo_hz": 17480000,
+              "hi_hz": 17900000,
+              "use": "mixed",
+              "service": "broadcast"
+            }
+          ]
+        },
+        {
+          "name": "15 m BC",
+          "chip": "15bc",
+          "lo_hz": 18900000,
+          "hi_hz": 19020000,
+          "home_hz": 18950000,
+          "mode": "AM",
+          "segments": [
+            {
+              "lo_hz": 18900000,
+              "hi_hz": 19020000,
+              "use": "mixed",
+              "service": "broadcast"
+            }
+          ]
+        },
+        {
+          "name": "13 m",
+          "chip": "13m",
+          "lo_hz": 21450000,
+          "hi_hz": 21850000,
+          "home_hz": 21600000,
+          "mode": "AM",
+          "segments": [
+            {
+              "lo_hz": 21450000,
+              "hi_hz": 21850000,
+              "use": "mixed",
+              "service": "broadcast"
+            }
+          ]
+        },
+        {
+          "name": "11 m BC",
+          "chip": "11bc",
+          "lo_hz": 25670000,
+          "hi_hz": 26100000,
+          "home_hz": 25800000,
+          "mode": "AM",
+          "segments": [
+            {
+              "lo_hz": 25670000,
+              "hi_hz": 26100000,
+              "use": "mixed",
+              "service": "broadcast"
+            }
+          ]
+        }
+      ],
+      "layout": "spans"
+    },
+    {
+      "name": "Aero",
+      "color": [
+        214,
+        168,
+        72
+      ],
+      "bands": [
+        {
+          "name": "Aero 3 MHz",
+          "chip": "aero3-aer",
+          "lo_hz": 2850000,
+          "hi_hz": 3025000,
+          "home_hz": 3000000,
+          "mode": "USB",
+          "segments": [
+            {
+              "lo_hz": 2850000,
+              "hi_hz": 3025000,
+              "use": "mixed",
+              "service": "aero"
+            }
+          ]
+        },
+        {
+          "name": "Aero 3.4 MHz",
+          "chip": "aero34",
+          "lo_hz": 3400000,
+          "hi_hz": 3500000,
+          "home_hz": 3485000,
+          "mode": "USB",
+          "segments": [
+            {
+              "lo_hz": 3400000,
+              "hi_hz": 3500000,
+              "use": "mixed",
+              "service": "aero"
+            }
+          ]
+        },
+        {
+          "name": "Aero 4 MHz",
+          "chip": "aero4-aer",
+          "lo_hz": 4650000,
+          "hi_hz": 4700000,
+          "home_hz": 4680000,
+          "mode": "USB",
+          "segments": [
+            {
+              "lo_hz": 4650000,
+              "hi_hz": 4700000,
+              "use": "mixed",
+              "service": "aero"
+            }
+          ]
+        },
+        {
+          "name": "Aero 5 MHz",
+          "chip": "aero5-aer",
+          "lo_hz": 5450000,
+          "hi_hz": 5680000,
+          "home_hz": 5649000,
+          "mode": "USB",
+          "segments": [
+            {
+              "lo_hz": 5450000,
+              "hi_hz": 5680000,
+              "use": "mixed",
+              "service": "aero"
+            }
+          ]
+        },
+        {
+          "name": "Aero 6 MHz",
+          "chip": "aero6-aer",
+          "lo_hz": 6525000,
+          "hi_hz": 6685000,
+          "home_hz": 6577000,
+          "mode": "USB",
+          "segments": [
+            {
+              "lo_hz": 6525000,
+              "hi_hz": 6685000,
+              "use": "mixed",
+              "service": "aero"
+            }
+          ]
+        },
+        {
+          "name": "Aero 8 MHz",
+          "chip": "aero8-aer",
+          "lo_hz": 8815000,
+          "hi_hz": 8965000,
+          "home_hz": 8864000,
+          "mode": "USB",
+          "segments": [
+            {
+              "lo_hz": 8815000,
+              "hi_hz": 8965000,
+              "use": "mixed",
+              "service": "aero"
+            }
+          ]
+        },
+        {
+          "name": "Aero 10 MHz",
+          "chip": "aero10",
+          "lo_hz": 10005000,
+          "hi_hz": 10100000,
+          "home_hz": 10051000,
+          "mode": "USB",
+          "segments": [
+            {
+              "lo_hz": 10005000,
+              "hi_hz": 10100000,
+              "use": "mixed",
+              "service": "aero"
+            }
+          ]
+        },
+        {
+          "name": "Aero 11 MHz",
+          "chip": "aero11",
+          "lo_hz": 11275000,
+          "hi_hz": 11400000,
+          "home_hz": 11300000,
+          "mode": "USB",
+          "segments": [
+            {
+              "lo_hz": 11275000,
+              "hi_hz": 11400000,
+              "use": "mixed",
+              "service": "aero"
+            }
+          ]
+        },
+        {
+          "name": "Aero 13 MHz",
+          "chip": "aero13",
+          "lo_hz": 13260000,
+          "hi_hz": 13360000,
+          "home_hz": 13270000,
+          "mode": "USB",
+          "segments": [
+            {
+              "lo_hz": 13260000,
+              "hi_hz": 13360000,
+              "use": "mixed",
+              "service": "aero"
+            }
+          ]
+        },
+        {
+          "name": "Aero 17 MHz",
+          "chip": "aero17-aer",
+          "lo_hz": 17900000,
+          "hi_hz": 17970000,
+          "home_hz": 17925000,
+          "mode": "USB",
+          "segments": [
+            {
+              "lo_hz": 17900000,
+              "hi_hz": 17970000,
+              "use": "mixed",
+              "service": "aero"
+            }
+          ]
+        }
+      ],
+      "layout": "spans"
+    },
+    {
+      "name": "Military",
+      "color": [
+        176,
+        96,
+        96
+      ],
+      "bands": [
+        {
+          "name": "Military 3 MHz",
+          "chip": "aero3-mil",
+          "lo_hz": 3025000,
+          "hi_hz": 3155000,
+          "home_hz": 3090000.0,
+          "mode": "USB",
+          "segments": [
+            {
+              "lo_hz": 3025000,
+              "hi_hz": 3155000,
+              "use": "mixed",
+              "service": "military"
+            }
+          ]
+        },
+        {
+          "name": "Military 4 MHz",
+          "chip": "aero4-mil",
+          "lo_hz": 4700000,
+          "hi_hz": 4750000,
+          "home_hz": 4725000.0,
+          "mode": "USB",
+          "segments": [
+            {
+              "lo_hz": 4700000,
+              "hi_hz": 4750000,
+              "use": "mixed",
+              "service": "military"
+            }
+          ]
+        },
+        {
+          "name": "Military 5 MHz",
+          "chip": "aero5-mil",
+          "lo_hz": 5680000,
+          "hi_hz": 5730000,
+          "home_hz": 5705000.0,
+          "mode": "USB",
+          "segments": [
+            {
+              "lo_hz": 5680000,
+              "hi_hz": 5730000,
+              "use": "mixed",
+              "service": "military"
+            }
+          ]
+        },
+        {
+          "name": "Military 6 MHz",
+          "chip": "aero6-mil",
+          "lo_hz": 6685000,
+          "hi_hz": 6765000,
+          "home_hz": 6725000.0,
+          "mode": "USB",
+          "segments": [
+            {
+              "lo_hz": 6685000,
+              "hi_hz": 6765000,
+              "use": "mixed",
+              "service": "military"
+            }
+          ]
+        },
+        {
+          "name": "Military 8 MHz",
+          "chip": "aero8-mil",
+          "lo_hz": 8965000,
+          "hi_hz": 9040000,
+          "home_hz": 9002500.0,
+          "mode": "USB",
+          "segments": [
+            {
+              "lo_hz": 8965000,
+              "hi_hz": 9040000,
+              "use": "mixed",
+              "service": "military"
+            }
+          ]
+        },
+        {
+          "name": "Military 17 MHz",
+          "chip": "aero17-mil",
+          "lo_hz": 17970000,
+          "hi_hz": 18030000,
+          "home_hz": 18000000.0,
+          "mode": "USB",
+          "segments": [
+            {
+              "lo_hz": 17970000,
+              "hi_hz": 18030000,
+              "use": "mixed",
+              "service": "military"
+            }
+          ]
+        }
+      ],
+      "layout": "spans"
+    },
+    {
+      "name": "Marine",
+      "color": [
+        72,
+        168,
+        184
+      ],
+      "bands": [
+        {
+          "name": "2 MHz ship",
+          "chip": "mar2s",
+          "lo_hz": 2065000,
+          "hi_hz": 2107000,
+          "home_hz": 2080000,
+          "mode": "USB",
+          "segments": [
+            {
+              "lo_hz": 2065000,
+              "hi_hz": 2107000,
+              "use": "mixed",
+              "service": "marine"
+            }
+          ]
+        },
+        {
+          "name": "2 MHz distress",
+          "chip": "mar2d",
+          "lo_hz": 2173500,
+          "hi_hz": 2190500,
+          "home_hz": 2182000,
+          "mode": "USB",
+          "segments": [
+            {
+              "lo_hz": 2173500,
+              "hi_hz": 2190500,
+              "use": "mixed",
+              "service": "marine"
+            }
+          ]
+        },
+        {
+          "name": "4 MHz ship",
+          "chip": "mar4s",
+          "lo_hz": 4000000,
+          "hi_hz": 4063000,
+          "home_hz": 4060000,
+          "mode": "USB",
+          "segments": [
+            {
+              "lo_hz": 4000000,
+              "hi_hz": 4063000,
+              "use": "mixed",
+              "service": "marine"
+            }
+          ]
+        },
+        {
+          "name": "4 MHz",
+          "chip": "mar4",
+          "lo_hz": 4063000,
+          "hi_hz": 4438000,
+          "home_hz": 4125000,
+          "mode": "USB",
+          "segments": [
+            {
+              "lo_hz": 4063000,
+              "hi_hz": 4438000,
+              "use": "mixed",
+              "service": "marine"
+            }
+          ]
+        },
+        {
+          "name": "6 MHz",
+          "chip": "mar6",
+          "lo_hz": 6200000,
+          "hi_hz": 6525000,
+          "home_hz": 6215000,
+          "mode": "USB",
+          "segments": [
+            {
+              "lo_hz": 6200000,
+              "hi_hz": 6525000,
+              "use": "mixed",
+              "service": "marine"
+            }
+          ]
+        },
+        {
+          "name": "8 MHz ship",
+          "chip": "mar8s",
+          "lo_hz": 8100000,
+          "hi_hz": 8195000,
+          "home_hz": 8150000,
+          "mode": "USB",
+          "segments": [
+            {
+              "lo_hz": 8100000,
+              "hi_hz": 8195000,
+              "use": "mixed",
+              "service": "marine"
+            }
+          ]
+        },
+        {
+          "name": "8 MHz",
+          "chip": "mar8",
+          "lo_hz": 8195000,
+          "hi_hz": 8815000,
+          "home_hz": 8291000,
+          "mode": "USB",
+          "segments": [
+            {
+              "lo_hz": 8195000,
+              "hi_hz": 8815000,
+              "use": "mixed",
+              "service": "marine"
+            }
+          ]
+        },
+        {
+          "name": "12 MHz",
+          "chip": "mar12",
+          "lo_hz": 12230000,
+          "hi_hz": 13200000,
+          "home_hz": 12290000,
+          "mode": "USB",
+          "segments": [
+            {
+              "lo_hz": 12230000,
+              "hi_hz": 13200000,
+              "use": "mixed",
+              "service": "marine"
+            }
+          ]
+        },
+        {
+          "name": "16 MHz",
+          "chip": "mar16",
+          "lo_hz": 16360000,
+          "hi_hz": 17410000,
+          "home_hz": 16420000,
+          "mode": "USB",
+          "segments": [
+            {
+              "lo_hz": 16360000,
+              "hi_hz": 17410000,
+              "use": "mixed",
+              "service": "marine"
+            }
+          ]
+        },
+        {
+          "name": "18 MHz",
+          "chip": "mar18",
+          "lo_hz": 18780000,
+          "hi_hz": 18900000,
+          "home_hz": 18800000,
+          "mode": "USB",
+          "segments": [
+            {
+              "lo_hz": 18780000,
+              "hi_hz": 18900000,
+              "use": "mixed",
+              "service": "marine"
+            }
+          ]
+        },
+        {
+          "name": "19 MHz",
+          "chip": "mar19",
+          "lo_hz": 19680000,
+          "hi_hz": 19800000,
+          "home_hz": 19755000,
+          "mode": "USB",
+          "segments": [
+            {
+              "lo_hz": 19680000,
+              "hi_hz": 19800000,
+              "use": "mixed",
+              "service": "marine"
+            }
+          ]
+        },
+        {
+          "name": "22 MHz",
+          "chip": "mar22",
+          "lo_hz": 22000000,
+          "hi_hz": 22855000,
+          "home_hz": 22100000,
+          "mode": "USB",
+          "segments": [
+            {
+              "lo_hz": 22000000,
+              "hi_hz": 22855000,
+              "use": "mixed",
+              "service": "marine"
+            }
+          ]
+        },
+        {
+          "name": "25 MHz",
+          "chip": "mar25",
+          "lo_hz": 25070000,
+          "hi_hz": 25210000,
+          "home_hz": 25100000,
+          "mode": "USB",
+          "segments": [
+            {
+              "lo_hz": 25070000,
+              "hi_hz": 25210000,
+              "use": "mixed",
+              "service": "marine"
+            }
+          ]
+        },
+        {
+          "name": "26 MHz",
+          "chip": "mar26",
+          "lo_hz": 26145000,
+          "hi_hz": 26175000,
+          "home_hz": 26160000,
+          "mode": "USB",
+          "segments": [
+            {
+              "lo_hz": 26145000,
+              "hi_hz": 26175000,
+              "use": "mixed",
+              "service": "marine"
+            }
+          ]
+        }
+      ],
+      "layout": "spans"
+    },
+    {
+      "name": "Ham",
+      "color": [
+        92,
+        184,
+        120
+      ],
+      "bands": [
+        {
+          "name": "160 m",
+          "chip": "160m",
+          "lo_hz": 1800000,
+          "hi_hz": 2000000,
+          "home_hz": 1900000,
+          "mode": "USB",
+          "segments": [
+            {
+              "lo_hz": 1800000,
+              "hi_hz": 2000000,
+              "use": "mixed",
+              "service": "ham"
+            }
+          ]
+        },
+        {
+          "name": "80 m",
+          "chip": "80m",
+          "lo_hz": 3500000,
+          "hi_hz": 4000000,
+          "home_hz": 3750000,
+          "mode": "LSB",
+          "segments": [
+            {
+              "lo_hz": 3500000,
+              "hi_hz": 4000000,
+              "use": "mixed",
+              "service": "ham"
+            }
+          ]
+        },
+        {
+          "name": "60 m",
+          "chip": "60m",
+          "lo_hz": 5330000,
+          "hi_hz": 5410000,
+          "home_hz": 5403500,
+          "mode": "USB",
+          "segments": [
+            {
+              "lo_hz": 5330000,
+              "hi_hz": 5410000,
+              "use": "mixed",
+              "service": "ham"
+            }
+          ]
+        },
+        {
+          "name": "40 m",
+          "chip": "40m",
+          "lo_hz": 7000000,
+          "hi_hz": 7300000,
+          "home_hz": 7150000,
+          "mode": "LSB",
+          "segments": [
+            {
+              "lo_hz": 7000000,
+              "hi_hz": 7300000,
+              "use": "mixed",
+              "service": "ham"
+            }
+          ]
+        },
+        {
+          "name": "30 m",
+          "chip": "30m",
+          "lo_hz": 10100000,
+          "hi_hz": 10150000,
+          "home_hz": 10136000,
+          "mode": "CW",
+          "segments": [
+            {
+              "lo_hz": 10100000,
+              "hi_hz": 10150000,
+              "use": "mixed",
+              "service": "ham"
+            }
+          ]
+        },
+        {
+          "name": "20 m",
+          "chip": "20m",
+          "lo_hz": 14000000,
+          "hi_hz": 14350000,
+          "home_hz": 14153608,
+          "mode": "USB",
+          "segments": [
+            {
+              "lo_hz": 14000000,
+              "hi_hz": 14350000,
+              "use": "mixed",
+              "service": "ham"
+            }
+          ]
+        },
+        {
+          "name": "17 m",
+          "chip": "17m",
+          "lo_hz": 18068000,
+          "hi_hz": 18168000,
+          "home_hz": 18110000,
+          "mode": "USB",
+          "segments": [
+            {
+              "lo_hz": 18068000,
+              "hi_hz": 18168000,
+              "use": "mixed",
+              "service": "ham"
+            }
+          ]
+        },
+        {
+          "name": "15 m",
+          "chip": "15m",
+          "lo_hz": 21000000,
+          "hi_hz": 21450000,
+          "home_hz": 21300000,
+          "mode": "USB",
+          "segments": [
+            {
+              "lo_hz": 21000000,
+              "hi_hz": 21450000,
+              "use": "mixed",
+              "service": "ham"
+            }
+          ]
+        },
+        {
+          "name": "12 m",
+          "chip": "12m",
+          "lo_hz": 24890000,
+          "hi_hz": 24990000,
+          "home_hz": 24940000,
+          "mode": "USB",
+          "segments": [
+            {
+              "lo_hz": 24890000,
+              "hi_hz": 24990000,
+              "use": "mixed",
+              "service": "ham"
+            }
+          ]
+        },
+        {
+          "name": "10 m",
+          "chip": "10m",
+          "lo_hz": 28000000,
+          "hi_hz": 29700000,
+          "home_hz": 28400000,
+          "mode": "USB",
+          "segments": [
+            {
+              "lo_hz": 28000000,
+              "hi_hz": 29700000,
+              "use": "mixed",
+              "service": "ham"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "CB",
+      "color": [
+        196,
+        112,
+        72
+      ],
+      "bands": [
+        {
+          "name": "11 m",
+          "chip": "cb",
+          "lo_hz": 26965000,
+          "hi_hz": 27405000,
+          "home_hz": 27185000,
+          "mode": "AM",
+          "segments": [
+            {
+              "lo_hz": 26965000,
+              "hi_hz": 27405000,
+              "use": "mixed",
+              "service": "cb"
+            }
+          ]
+        }
+      ],
+      "layout": "spans"
+    },
+    {
+      "name": "Government",
+      "color": [
+        130,
+        136,
+        150
+      ],
+      "bands": [
+        {
+          "name": "Government",
+          "chip": "gov",
+          "lo_hz": 5060000,
+          "hi_hz": 5450000,
+          "home_hz": 5100000,
+          "mode": "USB",
+          "segments": [
+            {
+              "lo_hz": 5060000,
+              "hi_hz": 5330000,
+              "use": "mixed",
+              "service": "government"
+            },
+            {
+              "lo_hz": 5410000,
+              "hi_hz": 5450000,
+              "use": "mixed",
+              "service": "government"
+            }
+          ]
+        }
+      ],
+      "layout": "spans"
+    },
+    {
+      "name": "Time",
+      "color": [
+        176,
+        140,
+        220
+      ],
+      "bands": [
+        {
+          "name": "Time 2.5 MHz",
+          "chip": "t25",
+          "lo_hz": 2495000,
+          "hi_hz": 2505000,
+          "home_hz": 2500000,
+          "mode": "AM",
+          "segments": [
+            {
+              "lo_hz": 2495000,
+              "hi_hz": 2505000,
+              "use": "mixed",
+              "service": "time"
+            }
+          ]
+        },
+        {
+          "name": "Time 5 MHz",
+          "chip": "t5",
+          "lo_hz": 4995000,
+          "hi_hz": 5005000,
+          "home_hz": 5000000,
+          "mode": "AM",
+          "segments": [
+            {
+              "lo_hz": 4995000,
+              "hi_hz": 5005000,
+              "use": "mixed",
+              "service": "time"
+            }
+          ]
+        },
+        {
+          "name": "Time 10 MHz",
+          "chip": "t10",
+          "lo_hz": 9995000,
+          "hi_hz": 10005000,
+          "home_hz": 10000000,
+          "mode": "AM",
+          "segments": [
+            {
+              "lo_hz": 9995000,
+              "hi_hz": 10005000,
+              "use": "mixed",
+              "service": "time"
+            }
+          ]
+        },
+        {
+          "name": "Time 15 MHz",
+          "chip": "t15",
+          "lo_hz": 14990000,
+          "hi_hz": 15010000,
+          "home_hz": 15000000,
+          "mode": "AM",
+          "segments": [
+            {
+              "lo_hz": 14990000,
+              "hi_hz": 15010000,
+              "use": "mixed",
+              "service": "time"
+            }
+          ]
+        },
+        {
+          "name": "Time 20 MHz",
+          "chip": "t20",
+          "lo_hz": 19990000,
+          "hi_hz": 20010000,
+          "home_hz": 20000000,
+          "mode": "AM",
+          "segments": [
+            {
+              "lo_hz": 19990000,
+              "hi_hz": 20010000,
+              "use": "mixed",
+              "service": "time"
+            }
+          ]
+        },
+        {
+          "name": "Time 25 MHz",
+          "chip": "t25m",
+          "lo_hz": 24990000,
+          "hi_hz": 25010000,
+          "home_hz": 25000000,
+          "mode": "AM",
+          "segments": [
+            {
+              "lo_hz": 24990000,
+              "hi_hz": 25010000,
+              "use": "mixed",
+              "service": "time"
+            }
+          ]
+        }
+      ],
+      "layout": "spans"
+    }
+  ]
+}

@@ -97,7 +97,10 @@ impl Rig for DemoRig {
     fn apply(&mut self, cmd: &Command) -> Result<(), RigError> {
         match cmd {
             Command::SetFreq(hz) => {
-                self.current_mut().freq_hz = *hz;
+                let Some(hz) = self.caps.allow_freq(*hz) else {
+                    return Ok(());
+                };
+                self.current_mut().freq_hz = hz;
             }
             Command::SetMode { mode, passband_hz } => {
                 let vfo = self.current_mut();
@@ -254,6 +257,21 @@ fn demo_caps() -> Caps {
         (6, "AUTO".into()),
     ];
     caps.can_set_freq = true;
+    // Same edges as the face's band scales. The demo has no dump_caps.
+    for (min, max) in [
+        (1_800_000.0, 2_000_000.0),
+        (3_500_000.0, 4_000_000.0),
+        (5_250_000.0, 5_450_000.0),
+        (7_000_000.0, 7_300_000.0),
+        (10_100_000.0, 10_150_000.0),
+        (14_000_000.0, 14_350_000.0),
+        (18_068_000.0, 18_168_000.0),
+        (21_000_000.0, 21_450_000.0),
+        (24_890_000.0, 24_990_000.0),
+        (28_000_000.0, 29_700_000.0),
+    ] {
+        caps.rx_ranges.push(range(min, max, 1.0));
+    }
     caps.can_set_mode = true;
     caps.can_set_ant = true;
     caps.can_set_ptt = true;
@@ -300,5 +318,19 @@ mod tests {
         assert!((snap.freq_hz - 14_230_000.0).abs() < 0.5);
         assert!((snap.levels["AF"] - 0.42).abs() < 1e-6);
         assert!((snap.levels["RFPOWER_METER"] - 0.78).abs() < 1e-6);
+    }
+
+    #[test]
+    fn negative_and_out_of_band_frequencies_are_ignored() {
+        let mut rig = DemoRig::new();
+        rig.apply(&Command::SetFreq(-1.0)).unwrap();
+        let snap = rig.poll().unwrap();
+        assert!((snap.freq_hz - DEMO_FREQ_HZ).abs() < 0.5);
+        rig.apply(&Command::SetFreq(50_000_000.0)).unwrap();
+        let snap = rig.poll().unwrap();
+        assert!((snap.freq_hz - DEMO_FREQ_HZ).abs() < 0.5);
+        rig.apply(&Command::SetFreq(14_200_000.0)).unwrap();
+        let snap = rig.poll().unwrap();
+        assert!((snap.freq_hz - 14_200_000.0).abs() < 0.5);
     }
 }

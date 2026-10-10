@@ -32,6 +32,10 @@ pub struct Caps {
     pub can_set_rit: bool,
     pub can_set_power: bool,
     pub can_set_split: bool,
+    /// Receive spans from `RX ranges #1` in `dump_caps`. Transmit lists are
+    /// not stored. An empty list means the radio advertised no receive range,
+    /// so tuning stays closed.
+    pub rx_ranges: Vec<Range>,
 }
 
 impl Caps {
@@ -52,7 +56,48 @@ impl Caps {
             can_set_rit: false,
             can_set_power: false,
             can_set_split: false,
+            rx_ranges: Vec::new(),
         }
+    }
+
+    /// The receive segment that contains `hz`, if any.
+    pub fn rx_segment(&self, hz: f64) -> Option<Range> {
+        if !hz.is_finite() {
+            return None;
+        }
+        self.rx_ranges
+            .iter()
+            .copied()
+            .find(|range| hz >= range.min && hz <= range.max)
+    }
+
+    /// Absolute tune. `None` when `hz` is negative, non-finite, or outside
+    /// every receive segment. An empty range list does not mean unlimited.
+    pub fn allow_freq(&self, hz: f64) -> Option<f64> {
+        if hz < 0.0 {
+            return None;
+        }
+        self.rx_segment(hz).map(|_| hz)
+    }
+
+    /// Step from `current` toward `target`, stopping at the edge of the
+    /// segment that contains `current`. A frequency sitting in a gap uses
+    /// the nearest segment. The result is never negative.
+    pub fn step_freq(&self, current: f64, target: f64) -> Option<f64> {
+        if !target.is_finite() {
+            return None;
+        }
+        let seg = if current.is_finite() {
+            self.rx_segment(current)
+                .or_else(|| nearest_segment(&self.rx_ranges, current))
+        } else {
+            None
+        }?;
+        let hz = target.clamp(seg.min, seg.max);
+        if !hz.is_finite() || hz < 0.0 {
+            return None;
+        }
+        Some(hz)
     }
 
     pub fn has_func(&self, name: &str) -> bool {
@@ -101,7 +146,69 @@ pub fn parse_caps(lines: &[String]) -> Caps {
             caps.can_set_split = yes(rest);
         }
     }
+    caps.rx_ranges = parse_rx_ranges(lines);
     caps
+}
+
+/// Spans under `RX ranges #1` only. Hamlib also prints lists #2–#5 and a
+/// later `RX ranges #1 status` line. Those are not the selected receive list.
+fn parse_rx_ranges(lines: &[String]) -> Vec<Range> {
+    let mut out = Vec::new();
+    let mut in_list = false;
+    for raw in lines {
+        let line = raw.trim();
+        if is_rx_list1_header(line) {
+            in_list = true;
+            continue;
+        }
+        if line.starts_with("RX ranges #") || line.starts_with("TX ranges #") {
+            in_list = false;
+            continue;
+        }
+        if in_list {
+            if let Some(range) = parse_hz_span(line) {
+                out.push(range);
+            }
+        }
+    }
+    out
+}
+
+fn is_rx_list1_header(line: &str) -> bool {
+    line.starts_with("RX ranges #1 ") && !line.contains("status")
+}
+
+fn parse_hz_span(line: &str) -> Option<Range> {
+    let (left, right) = line.split_once("Hz - ")?;
+    let min: f64 = left.trim().parse().ok()?;
+    let max: f64 = right.trim().strip_suffix("Hz")?.trim().parse().ok()?;
+    if min.is_finite() && max.is_finite() && min >= 0.0 && max > min {
+        Some(Range {
+            min,
+            max,
+            step: 1.0,
+        })
+    } else {
+        None
+    }
+}
+
+fn nearest_segment(ranges: &[Range], hz: f64) -> Option<Range> {
+    ranges.iter().copied().min_by(|a, b| {
+        edge_distance(*a, hz)
+            .partial_cmp(&edge_distance(*b, hz))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })
+}
+
+fn edge_distance(range: Range, hz: f64) -> f64 {
+    if hz < range.min {
+        range.min - hz
+    } else if hz > range.max {
+        hz - range.max
+    } else {
+        0.0
+    }
 }
 
 fn strip_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
@@ -232,5 +339,72 @@ mod tests {
         let range = map["PREAMP"];
         assert!((range.max - 20.0).abs() < 1e-6);
         assert!(range.step.abs() < 1e-30);
+    }
+
+    #[test]
+    fn rx_list_one_ignores_tx_and_later_lists() {
+        let lines = vec![
+            line("TX ranges #1 for Demo:"),
+            line("\t1800000 Hz - 2000000 Hz"),
+            line("RX ranges #1 for Demo:"),
+            line("\t1800000 Hz - 2000000 Hz"),
+            line("\t14000000 Hz - 14350000 Hz"),
+            line("TX ranges #2 for Other:"),
+            line("\t50000000 Hz - 54000000 Hz"),
+            line("RX ranges #2 for Other:"),
+            line("\t30000 Hz - 60000000 Hz"),
+            line("RX ranges #1 status for Demo:\tOK (0)"),
+        ];
+        let caps = parse_caps(&lines);
+        assert_eq!(caps.rx_ranges.len(), 2);
+        assert!((caps.rx_ranges[0].min - 1_800_000.0).abs() < 0.5);
+        assert!((caps.rx_ranges[0].max - 2_000_000.0).abs() < 0.5);
+        assert!((caps.rx_ranges[1].max - 14_350_000.0).abs() < 0.5);
+    }
+
+    fn demo_segments() -> Caps {
+        let mut caps = Caps::empty();
+        for (min, max) in [
+            (1_800_000.0, 2_000_000.0),
+            (14_000_000.0, 14_350_000.0),
+        ] {
+            caps.rx_ranges.push(Range {
+                min,
+                max,
+                step: 1.0,
+            });
+        }
+        caps
+    }
+
+    #[test]
+    fn step_stops_at_the_band_edge() {
+        let caps = demo_segments();
+        let stopped = caps
+            .step_freq(14_153_608.0, 14_153_608.0 - 10_000_000.0)
+            .unwrap();
+        assert!((stopped - 14_000_000.0).abs() < 0.5);
+        let negative = caps.step_freq(14_153_608.0, -1.0).unwrap();
+        assert!(negative >= 0.0);
+        assert!((negative - 14_000_000.0).abs() < 0.5);
+        assert!(caps.allow_freq(-1.0).is_none());
+    }
+
+    #[test]
+    fn dummy_span_accepts_vhf_and_uhf_demo_segments_do_not() {
+        let mut dummy = Caps::empty();
+        dummy.rx_ranges.push(Range {
+            min: 150_000.0,
+            max: 1_500_000_000.0,
+            step: 1.0,
+        });
+        let demo = demo_segments();
+        for hz in [146_520_000.0, 446_000_000.0] {
+            assert!(dummy.allow_freq(hz).is_some(), "{hz}");
+            assert!(demo.allow_freq(hz).is_none(), "{hz}");
+        }
+        assert!(dummy.allow_freq(14_153_608.0).is_some());
+        assert!(dummy.allow_freq(100.0).is_none());
+        assert!(dummy.allow_freq(-5.0).is_none());
     }
 }

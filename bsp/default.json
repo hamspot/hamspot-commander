@@ -1,0 +1,189 @@
+{
+  "version": 1,
+  "zones": [
+    {
+      "name": "Ham",
+      "color": [92, 184, 120],
+      "bands": [
+        {
+          "name": "160 m",
+          "chip": "160m",
+          "lo_hz": 1800000,
+          "hi_hz": 2000000,
+          "home_hz": 1900000,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 1800000, "hi_hz": 1810000, "use": "digital"},
+            {"lo_hz": 1810000, "hi_hz": 1843000, "use": "cw"},
+            {"lo_hz": 1843000, "hi_hz": 2000000, "use": "voice"}
+          ]
+        },
+        {
+          "name": "80 m",
+          "chip": "80m",
+          "lo_hz": 3500000,
+          "hi_hz": 4000000,
+          "home_hz": 3750000,
+          "mode": "LSB",
+          "segments": [
+            {"lo_hz": 3500000, "hi_hz": 3570000, "use": "cw"},
+            {"lo_hz": 3570000, "hi_hz": 3600000, "use": "digital"},
+            {"lo_hz": 3600000, "hi_hz": 4000000, "use": "voice"}
+          ]
+        },
+        {
+          "name": "60 m",
+          "chip": "60m",
+          "lo_hz": 5330500,
+          "hi_hz": 5406300,
+          "home_hz": 5403500,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 5330500, "hi_hz": 5333300, "use": "mixed"},
+            {"lo_hz": 5346500, "hi_hz": 5349300, "use": "mixed"},
+            {"lo_hz": 5351500, "hi_hz": 5366500, "use": "mixed"},
+            {"lo_hz": 5371500, "hi_hz": 5374300, "use": "mixed"},
+            {"lo_hz": 5403500, "hi_hz": 5406300, "use": "mixed"}
+          ]
+        },
+        {
+          "name": "40 m",
+          "chip": "40m",
+          "lo_hz": 7000000,
+          "hi_hz": 7300000,
+          "home_hz": 7150000,
+          "mode": "LSB",
+          "segments": [
+            {"lo_hz": 7000000, "hi_hz": 7080000, "use": "cw"},
+            {"lo_hz": 7080000, "hi_hz": 7125000, "use": "digital"},
+            {"lo_hz": 7125000, "hi_hz": 7300000, "use": "voice"}
+          ]
+        },
+        {
+          "name": "30 m",
+          "chip": "30m",
+          "lo_hz": 10100000,
+          "hi_hz": 10150000,
+          "home_hz": 10136000,
+          "mode": "CW",
+          "segments": [
+            {"lo_hz": 10100000, "hi_hz": 10130000, "use": "cw"},
+            {"lo_hz": 10130000, "hi_hz": 10150000, "use": "digital"}
+          ]
+        },
+        {
+          "name": "20 m",
+          "chip": "20m",
+          "lo_hz": 14000000,
+          "hi_hz": 14350000,
+          "home_hz": 14153608,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 14000000, "hi_hz": 14070000, "use": "cw"},
+            {"lo_hz": 14070000, "hi_hz": 14150000, "use": "digital"},
+            {"lo_hz": 14150000, "hi_hz": 14350000, "use": "voice"}
+          ]
+        },
+        {
+          "name": "17 m",
+          "chip": "17m",
+          "lo_hz": 18068000,
+          "hi_hz": 18168000,
+          "home_hz": 18110000,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 18068000, "hi_hz": 18100000, "use": "cw"},
+            {"lo_hz": 18100000, "hi_hz": 18110000, "use": "digital"},
+            {"lo_hz": 18110000, "hi_hz": 18168000, "use": "voice"}
+          ]
+        },
+        {
+          "name": "15 m",
+          "chip": "15m",
+          "lo_hz": 21000000,
+          "hi_hz": 21450000,
+          "home_hz": 21300000,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 21000000, "hi_hz": 21070000, "use": "cw"},
+            {"lo_hz": 21070000, "hi_hz": 21200000, "use": "digital"},
+            {"lo_hz": 21200000, "hi_hz": 21450000, "use": "voice"}
+          ]
+        },
+        {
+          "name": "12 m",
+          "chip": "12m",
+          "lo_hz": 24890000,
+          "hi_hz": 24990000,
+          "home_hz": 24940000,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 24890000, "hi_hz": 24920000, "use": "cw"},
+            {"lo_hz": 24920000, "hi_hz": 24930000, "use": "digital"},
+            {"lo_hz": 24930000, "hi_hz": 24990000, "use": "voice"}
+          ]
+        },
+        {
+          "name": "10 m",
+          "chip": "10m",
+          "lo_hz": 28000000,
+          "hi_hz": 29700000,
+          "home_hz": 28400000,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 28000000, "hi_hz": 28070000, "use": "cw"},
+            {"lo_hz": 28070000, "hi_hz": 28150000, "use": "digital"},
+            {"lo_hz": 28150000, "hi_hz": 28300000, "use": "cw"},
+            {"lo_hz": 28300000, "hi_hz": 29300000, "use": "voice"},
+            {"lo_hz": 29300000, "hi_hz": 29510000, "use": "mixed"},
+            {"lo_hz": 29510000, "hi_hz": 29700000, "use": "voice"}
+          ]
+        },
+        {
+          "name": "6 m",
+          "chip": "6m",
+          "lo_hz": 50000000,
+          "hi_hz": 54000000,
+          "home_hz": 50125000,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 50000000, "hi_hz": 50100000, "use": "cw"},
+            {"lo_hz": 50100000, "hi_hz": 50300000, "use": "voice"},
+            {"lo_hz": 50300000, "hi_hz": 50600000, "use": "mixed"},
+            {"lo_hz": 50600000, "hi_hz": 51000000, "use": "digital"},
+            {"lo_hz": 51000000, "hi_hz": 54000000, "use": "voice"}
+          ]
+        },
+        {
+          "name": "2 m",
+          "chip": "2m",
+          "lo_hz": 144000000,
+          "hi_hz": 148000000,
+          "home_hz": 146520000,
+          "mode": "FM",
+          "segments": [
+            {"lo_hz": 144000000, "hi_hz": 144100000, "use": "cw"},
+            {"lo_hz": 144100000, "hi_hz": 144900000, "use": "voice"},
+            {"lo_hz": 144900000, "hi_hz": 145100000, "use": "digital"},
+            {"lo_hz": 145100000, "hi_hz": 148000000, "use": "voice"}
+          ]
+        },
+        {
+          "name": "70 cm",
+          "chip": "70cm",
+          "lo_hz": 420000000,
+          "hi_hz": 450000000,
+          "home_hz": 446000000,
+          "mode": "FM",
+          "segments": [
+            {"lo_hz": 432000000, "hi_hz": 432100000, "use": "cw"},
+            {"lo_hz": 432100000, "hi_hz": 433000000, "use": "voice"},
+            {"lo_hz": 433000000, "hi_hz": 435000000, "use": "mixed"},
+            {"lo_hz": 435000000, "hi_hz": 438000000, "use": "mixed"},
+            {"lo_hz": 438000000, "hi_hz": 450000000, "use": "voice"}
+          ]
+        }
+      ]
+    }
+  ]
+}

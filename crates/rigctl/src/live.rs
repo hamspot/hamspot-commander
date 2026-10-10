@@ -504,5 +504,8 @@ RPRT 0
             "dummy AF is degenerate"
         );
         assert!(snap.caps.level_range("RFPOWER").is_some());
+        assert_eq!(snap.caps.rx_ranges.len(), 1);
+        assert!((snap.caps.rx_ranges[0].min - 150_000.0).abs() < 0.5);
+        assert!((snap.caps.rx_ranges[0].max - 1_500_000_000.0).abs() < 0.5);
     }
 }
