@@ -42,16 +42,15 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          notes=$(cat <<EOF
-Portable Linux build of Hamspot Commander ${version}.
-
-Unzip HamSpotCommander and start hamspot-commander.sh. Config, window state, and Gqrx files stay inside that folder. The machine still needs gqrx, rigctld (libhamlib-utils), and PipeWire.
-EOF
-          )
+          printf '%s\n' \
+            "Portable Linux build of Hamspot Commander ${version}." \
+            "" \
+            "Unzip HamSpotCommander and start hamspot-commander.sh. Config, window state, and Gqrx files stay inside that folder. The machine still needs gqrx, rigctld (libhamlib-utils), and PipeWire." \
+            > release-notes.txt
           if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release create "$GITHUB_REF_NAME" \
               --title "$version" \
-              --notes "$notes" \
+              --notes-file release-notes.txt \
               --verify-tag
           fi
           gh release upload "$GITHUB_REF_NAME" "$archive" --clobber
