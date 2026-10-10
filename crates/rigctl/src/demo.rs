@@ -85,6 +85,14 @@ impl DemoRig {
             &mut self.a
         }
     }
+
+    fn other_mut(&mut self) -> &mut Vfo {
+        if self.current == "VFOB" {
+            &mut self.a
+        } else {
+            &mut self.b
+        }
+    }
 }
 
 impl Default for DemoRig {
@@ -108,13 +116,15 @@ impl Rig for DemoRig {
                 vfo.passband_hz = *passband_hz;
             }
             Command::SetSubMode { mode, passband_hz } => {
-                let vfo = if self.current == "VFOB" {
-                    &mut self.a
-                } else {
-                    &mut self.b
-                };
+                let vfo = self.other_mut();
                 vfo.mode = mode.clone();
                 vfo.passband_hz = *passband_hz;
+            }
+            Command::SetSplitFreq(hz) => {
+                let Some(hz) = self.caps.allow_freq(*hz) else {
+                    return Ok(());
+                };
+                self.other_mut().freq_hz = hz;
             }
             Command::SetVfo(name) => {
                 if name == "VFOA" || name == "VFOB" {
@@ -163,12 +173,13 @@ impl Rig for DemoRig {
     }
 
     fn poll(&mut self) -> Result<Snapshot, RigError> {
-        let (freq_hz, mode, passband_hz, sub_mode) = if self.current == "VFOB" {
+        let (freq_hz, mode, passband_hz, sub_mode, sub_freq_hz) = if self.current == "VFOB" {
             (
                 self.b.freq_hz,
                 self.b.mode.clone(),
                 self.b.passband_hz,
                 self.a.mode.clone(),
+                self.a.freq_hz,
             )
         } else {
             (
@@ -176,17 +187,22 @@ impl Rig for DemoRig {
                 self.a.mode.clone(),
                 self.a.passband_hz,
                 self.b.mode.clone(),
+                self.b.freq_hz,
             )
         };
+        let sub_vfo = crate::other_vfo_name(&self.current, &self.caps.vfos).unwrap_or_default();
         Ok(Snapshot {
             kind: LinkKind::Demo,
             model: "Demo".into(),
             endpoint: "in-process".into(),
             message: String::new(),
+            last_cat: String::new(),
             freq_hz,
             mode,
             passband_hz,
             sub_mode,
+            sub_freq_hz,
+            sub_vfo,
             vfo: self.current.clone(),
             tx_vfo: self.tx_vfo.clone(),
             rit_hz: self.rit_hz,
@@ -293,6 +309,25 @@ mod tests {
         assert!((snap.strength_db - 20.0).abs() < 0.1);
         assert_eq!(snap.roofing.as_deref(), Some("15 kHz"));
         assert_eq!(snap.sub_mode, "LSB");
+        assert_eq!(snap.sub_vfo, "VFOB");
+        assert!((snap.sub_freq_hz - 7_074_000.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn split_freq_leaves_the_main_vfo() {
+        let mut rig = DemoRig::new();
+        let main = rig.poll().unwrap().freq_hz;
+        rig.apply(&Command::SetSplitFreq(14_230_000.0)).unwrap();
+        rig.apply(&Command::SetSubMode {
+            mode: "CW".into(),
+            passband_hz: 500,
+        })
+        .unwrap();
+        let snap = rig.poll().unwrap();
+        assert!((snap.freq_hz - main).abs() < 0.5);
+        assert_eq!(snap.mode, "USB");
+        assert!((snap.sub_freq_hz - 14_230_000.0).abs() < 0.5);
+        assert_eq!(snap.sub_mode, "CW");
     }
 
     #[test]

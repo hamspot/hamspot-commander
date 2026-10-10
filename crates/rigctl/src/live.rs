@@ -88,32 +88,61 @@ impl LiveRig {
     fn exchange(&mut self, body: &str) -> Result<Reply, RigError> {
         transact(&mut self.stream, body)
     }
+
+    /// Read the paired VFO without leaving the rig on it.
+    ///
+    /// `rigctld` was not started with `-o`, so `get_freq VFOB` stays on the
+    /// current VFO. Selecting the pair and selecting the original back is the
+    /// hamlib command that actually returns the other frequency. This runs
+    /// inside one poll, before the rig thread applies another window command.
+    fn read_other_vfo(&mut self, current: &str) -> Result<(String, f64, String), RigError> {
+        let Some(other) = crate::other_vfo_name(current, &self.caps.vfos) else {
+            return Ok((String::new(), 0.0, String::new()));
+        };
+        let switched = self.exchange(&format!("set_vfo {other}"))?;
+        if switched.rprt != 0 {
+            return Ok((String::new(), 0.0, String::new()));
+        }
+        let read = (|| -> Result<(f64, String), RigError> {
+            let freq_reply = self.exchange("get_freq")?;
+            let freq = if freq_reply.rprt == 0 {
+                labeled(&freq_reply.lines, "Frequency")
+                    .and_then(|text| text.parse().ok())
+                    .unwrap_or(0.0)
+            } else {
+                0.0
+            };
+            let mode_reply = self.exchange("get_mode")?;
+            let mode = if mode_reply.rprt == 0 {
+                labeled(&mode_reply.lines, "Mode").unwrap_or("").to_string()
+            } else {
+                String::new()
+            };
+            Ok((freq, mode))
+        })();
+        let restored = self.exchange(&format!("set_vfo {current}"));
+        if let Err(err) = &restored {
+            if matches!(err, RigError::Io(_)) {
+                return Err(RigError::Io(err.to_string()));
+            }
+        }
+        if !matches!(restored, Ok(reply) if reply.rprt == 0) {
+            let again = self.exchange(&format!("set_vfo {current}"))?;
+            if again.rprt != 0 {
+                return Err(RigError::Remote(format!(
+                    "set_vfo {current} RPRT {}",
+                    again.rprt
+                )));
+            }
+        }
+        let (freq, mode) = read?;
+        Ok((other, freq, mode))
+    }
 }
 
 impl Rig for LiveRig {
     fn apply(&mut self, cmd: &Command) -> Result<(), RigError> {
-        let body = match cmd {
-            Command::SetFreq(hz) => format!("set_freq {}", hz.round() as i64),
-            Command::SetMode { mode, passband_hz } => {
-                format!("set_mode {mode} {passband_hz}")
-            }
-            Command::SetSubMode { mode, passband_hz } => {
-                format!("set_split_mode {mode} {passband_hz}")
-            }
-            Command::SetVfo(name) => format!("set_vfo {name}"),
-            Command::VfoOp(op) => format!("vfo_op {op}"),
-            Command::SetRit(hz) => format!("set_rit {hz}"),
-            Command::SetLevel { name, value } => format!("set_level {name} {value}"),
-            Command::SetFunc { name, on } => {
-                format!("set_func {name} {}", if *on { 1 } else { 0 })
-            }
-            Command::SetPtt(on) => format!("set_ptt {}", if *on { 1 } else { 0 }),
-            Command::SetAnt(n) => format!("set_ant {n} 0"),
-            Command::SetSplit { on, tx_vfo } => {
-                format!("set_split_vfo {} {tx_vfo}", if *on { 1 } else { 0 })
-            }
-            Command::SetPower(on) => format!("set_powerstat {}", if *on { 1 } else { 0 }),
-        };
+        let body = cmd.cat_line();
         let reply = self.exchange(&body)?;
         if reply.rprt != 0 {
             let msg = format!("{body} RPRT {}", reply.rprt);
@@ -210,7 +239,19 @@ impl Rig for LiveRig {
             .and_then(|r| labeled(&r.lines, "Power Status").map(|s| s.trim() != "0"))
             .unwrap_or(true);
 
-        let (sub_mode, tx_vfo) = if self.caps.can_set_split {
+        let (sub_vfo, sub_freq_hz, sub_mode) = self.read_other_vfo(&vfo)?;
+        let (sub_mode, sub_freq_hz, sub_vfo, tx_vfo) = if self.caps.can_set_split {
+            let split_freq = self
+                .exchange("get_split_freq")
+                .ok()
+                .and_then(|r| {
+                    if r.rprt == 0 {
+                        labeled(&r.lines, "TX Frequency").and_then(|s| s.parse().ok())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0.0);
             let reply = self.exchange("get_split_vfo").ok();
             let split_on = reply
                 .as_ref()
@@ -225,22 +266,29 @@ impl Rig for LiveRig {
             } else {
                 vfo.clone()
             };
-            let sub = self
+            let split_mode = self
                 .exchange("get_split_mode")
                 .ok()
                 .and_then(|r| {
                     if r.rprt == 0 {
-                        labeled(&r.lines, "Mode")
+                        labeled(&r.lines, "TX Mode")
                             .or_else(|| labeled(&r.lines, "Split Mode"))
+                            .or_else(|| labeled(&r.lines, "Mode"))
                             .map(str::to_string)
                     } else {
                         None
                     }
                 })
                 .unwrap_or_default();
-            (sub, tx)
+            // The paired VFO is the readout. Split is only a fallback when
+            // selecting that VFO failed and hamlib still has a distinct TX VFO.
+            if sub_vfo.is_empty() && !tx.eq_ignore_ascii_case(&vfo) && split_freq > 0.0 {
+                (split_mode, split_freq, tx.clone(), tx)
+            } else {
+                (sub_mode, sub_freq_hz, sub_vfo, tx)
+            }
         } else {
-            (String::new(), vfo.clone())
+            (sub_mode, sub_freq_hz, sub_vfo, vfo.clone())
         };
 
         Ok(Snapshot {
@@ -248,10 +296,13 @@ impl Rig for LiveRig {
             model: self.caps.model.clone(),
             endpoint: self.endpoint.clone(),
             message: self.message.clone(),
+            last_cat: String::new(),
             freq_hz: freq,
             mode,
             passband_hz,
             sub_mode,
+            sub_freq_hz,
+            sub_vfo,
             vfo,
             tx_vfo,
             rit_hz,
@@ -485,12 +536,21 @@ RPRT 0
                 panic!("rigctld did not accept a connection");
             }
         };
+        rig.apply(&Command::SetVfo("VFOA".into())).unwrap();
         rig.apply(&Command::SetFreq(14_153_608.0)).unwrap();
         rig.apply(&Command::SetMode {
             mode: "USB".into(),
             passband_hz: 2400,
         })
         .unwrap();
+        rig.apply(&Command::SetVfo("VFOB".into())).unwrap();
+        rig.apply(&Command::SetFreq(146_520_000.0)).unwrap();
+        rig.apply(&Command::SetMode {
+            mode: "FM".into(),
+            passband_hz: 15000,
+        })
+        .unwrap();
+        rig.apply(&Command::SetVfo("VFOA".into())).unwrap();
         let snap = rig.poll().unwrap();
         let _ = child.kill();
         assert!(
@@ -499,6 +559,10 @@ RPRT 0
             snap.freq_hz
         );
         assert_eq!(snap.mode, "USB");
+        assert_eq!(snap.vfo, "VFOA");
+        assert_eq!(snap.sub_vfo, "VFOB");
+        assert!((snap.sub_freq_hz - 146_520_000.0).abs() < 1.0);
+        assert_eq!(snap.sub_mode, "FM");
         assert!(
             snap.caps.level_range("AF").is_none(),
             "dummy AF is degenerate"

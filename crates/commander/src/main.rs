@@ -19,16 +19,69 @@ use rigctl::{Command, DemoRig, LinkKind, LiveRig, Rig, RigError, Snapshot};
 
 use dial::{
     channel_dial, channel_window, digit_steps, format_hz, meter, parse_freq, scale, strength_frac,
-    strength_label, swatch, zone_scale, PaintSpan, SubBand, HAM,
+    strength_label, swatch, vfo_label, wheel_notches, zone_scale, PaintSpan, SubBand, HAM,
 };
 use plan::{BandPlan, Use};
+
+/// The hamspot.com favicon, scaled with nearest-neighbor so the window list
+/// and the dock stay sharp. The site file is 16×17, so the result is padded
+/// out to a square.
+fn hamspot_icon() -> egui::IconData {
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/hamspot-favicon.png"))
+        .expect("embedded hamspot favicon");
+    square_icon(&scale_nearest(&icon, 8))
+}
+
+fn scale_nearest(icon: &egui::IconData, factor: u32) -> egui::IconData {
+    let width = icon.width * factor;
+    let height = icon.height * factor;
+    let mut rgba = vec![0u8; (width * height * 4) as usize];
+    for y in 0..height {
+        for x in 0..width {
+            let src = (((y / factor) * icon.width + (x / factor)) * 4) as usize;
+            let dst = ((y * width + x) * 4) as usize;
+            rgba[dst..dst + 4].copy_from_slice(&icon.rgba[src..src + 4]);
+        }
+    }
+    egui::IconData {
+        rgba,
+        width,
+        height,
+    }
+}
+
+fn square_icon(icon: &egui::IconData) -> egui::IconData {
+    let side = icon.width.max(icon.height);
+    if icon.width == side && icon.height == side {
+        return icon.clone();
+    }
+    let mut rgba = vec![0u8; (side * side * 4) as usize];
+    let x0 = (side - icon.width) / 2;
+    let y0 = (side - icon.height) / 2;
+    for y in 0..icon.height {
+        for x in 0..icon.width {
+            let src = ((y * icon.width + x) * 4) as usize;
+            let dst = (((y + y0) * side + (x + x0)) * 4) as usize;
+            rgba[dst..dst + 4].copy_from_slice(&icon.rgba[src..src + 4]);
+        }
+    }
+    egui::IconData {
+        rgba,
+        width: side,
+        height: side,
+    }
+}
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1180.0, 780.0])
             .with_min_inner_size([960.0, 640.0])
-            .with_title("Hamspot Commander"),
+            .with_title("Hamspot Commander")
+            // Wayland uses this id to find hamspotcommander.desktop, which is
+            // what puts the icon in the window list and on the dock.
+            .with_app_id("hamspotcommander")
+            .with_icon(hamspot_icon()),
         ..Default::default()
     };
     eframe::run_native(
@@ -68,6 +121,7 @@ struct App {
     band_mem: HashMap<String, f64>,
     step_hz: f64,
     freq_text: String,
+    sub_freq_text: String,
     local_mem: Option<f64>,
     hold_freq: Option<f64>,
     hold_levels: HashMap<String, f64>,
@@ -85,6 +139,22 @@ struct App {
     /// True when `plan_note` is a transmit refusal. Load and save errors stay
     /// until the next load or save.
     plan_note_ptt: bool,
+    /// Text in the open zone-tab rename field. The plan keeps the previous
+    /// name while this is empty or only spaces.
+    zone_rename: Option<(usize, String)>,
+    /// Mode last requested from a bandspread click. A drag across one segment
+    /// does not send the same mode again until the rig reports it or the
+    /// operator picks another mode.
+    mode_hold: Option<String>,
+    /// Last split frequency and mode requested by a right-click on the bandspread.
+    sub_freq_hold: Option<f64>,
+    /// Heights of the Tune VFO row from the previous frame. A horizontal row
+    /// pins a shorter neighbor to the top, so each piece is padded to the
+    /// tallest of the current VFO, the VFO button frame, and the paired VFO.
+    main_cluster_height: f32,
+    vfo_frame_height: f32,
+    sub_vfo_height: f32,
+    sub_mode_hold: Option<String>,
     channels: channels::ChannelFile,
     channel_zone: usize,
     channel_sel: usize,
@@ -92,6 +162,14 @@ struct App {
     /// Last folder chosen in the channel browser. Absent means the working directory.
     channel_dir: Option<PathBuf>,
     channel_note: String,
+}
+
+fn rx_pairs(snap: &Snapshot) -> Vec<(f64, f64)> {
+    snap.caps
+        .rx_ranges
+        .iter()
+        .map(|range| (range.min, range.max))
+        .collect()
 }
 
 fn rx_fallback(snap: &Snapshot) -> (f64, f64) {
@@ -121,6 +199,20 @@ fn mode_choices(snap: &Snapshot) -> Vec<String> {
             .collect()
     } else {
         snap.caps.modes.clone()
+    }
+}
+
+#[cfg(test)]
+mod icon_tests {
+    #[test]
+    fn favicon_becomes_a_square_window_icon() {
+        let icon = super::hamspot_icon();
+        assert_eq!(icon.width, icon.height);
+        assert!(icon.width >= 128);
+        assert_eq!(
+            icon.rgba.len(),
+            icon.width as usize * icon.height as usize * 4
+        );
     }
 }
 
@@ -236,9 +328,7 @@ enum Page {
     Tune,
     Plan,
     Channels,
-    Vfo,
     Meters,
-    Controls,
     Levels,
 }
 
@@ -246,20 +336,23 @@ const PAGES: &[(Page, &str)] = &[
     (Page::Tune, "Tune"),
     (Page::Plan, "Plan"),
     (Page::Channels, "Channels"),
-    (Page::Vfo, "VFO"),
     (Page::Meters, "Meters"),
-    (Page::Controls, "Controls"),
     (Page::Levels, "Levels"),
 ];
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
-        let snap = DemoRig::new().poll().expect("demo rig polls");
+        // The face talks to hamlib. The in-process demo is only the Demo button.
+        let mut snap = empty_snap();
+        snap.message = "connecting to 127.0.0.1:4532".into();
         let shared = Arc::new(Mutex::new(Shared {
             snap,
             cmds: Vec::new(),
-            switch: None,
+            switch: Some(Switch::Connect {
+                host: "127.0.0.1".into(),
+                port: 4532,
+            }),
         }));
         let wake = Arc::new(Condvar::new());
         let ctx = cc.egui_ctx.clone();
@@ -272,7 +365,8 @@ impl App {
             .storage
             .and_then(|storage| storage.get_string("plan_dir"))
             .map(PathBuf::from)
-            .filter(|dir| dir.is_dir());
+            .filter(|dir| dir.is_dir())
+            .or_else(plan::bsp_dir);
         let channel_dir = cc
             .storage
             .and_then(|storage| storage.get_string("channel_dir"))
@@ -295,6 +389,7 @@ impl App {
             band_mem: HashMap::new(),
             step_hz: 100.0,
             freq_text: format_hz(rigctl::DEMO_FREQ_HZ),
+            sub_freq_text: format_hz(7_074_000.0),
             local_mem: None,
             hold_freq: None,
             hold_levels: HashMap::new(),
@@ -309,6 +404,13 @@ impl App {
             plan_dir,
             plan_note: String::new(),
             plan_note_ptt: false,
+            zone_rename: None,
+            mode_hold: None,
+            sub_freq_hold: None,
+            sub_mode_hold: None,
+            main_cluster_height: 0.0,
+            vfo_frame_height: 0.0,
+            sub_vfo_height: 0.0,
             channels: channels::empty(),
             channel_zone: 0,
             channel_sel: 0,
@@ -347,6 +449,101 @@ impl App {
         }
     }
 
+    /// Point the Tune chips and the bandspread at the band that contains `hz`.
+    /// The current band wins when it still contains `hz`, so a shared
+    /// frequency stays on the line the operator clicked. A gap leaves the
+    /// selection alone.
+    fn follow_band(&mut self, hz: f64, rx: &[(f64, f64)]) {
+        if let Some(band) = self
+            .plan
+            .zones
+            .get(self.zone_sel)
+            .and_then(|zone| zone.bands.get(self.band_sel))
+        {
+            let inside = plan::pieces_inside(band.lo_hz, band.hi_hz, rx)
+                .iter()
+                .any(|(lo, hi)| hz >= *lo && hz <= *hi);
+            if inside {
+                return;
+            }
+        }
+        let bands = plan::tunable_bands(&self.plan, rx);
+        let Some(idx) = plan::band_at(&bands, hz) else {
+            return;
+        };
+        self.zone_sel = bands[idx].zone;
+        self.band_sel = bands[idx].band;
+    }
+
+    fn shown_sub_freq(&self, snap: &Snapshot) -> f64 {
+        self.sub_freq_hold.unwrap_or(snap.sub_freq_hz)
+    }
+
+    fn send_plan_mode(&mut self, snap: &Snapshot, wanted: &str) {
+        if !snap.online() || !snap.caps.can_set_mode {
+            return;
+        }
+        let Some(mode) = plan::choose_mode(wanted, &snap.caps.modes) else {
+            return;
+        };
+        if snap.mode.eq_ignore_ascii_case(&mode) {
+            return;
+        }
+        if self
+            .mode_hold
+            .as_deref()
+            .is_some_and(|held| held.eq_ignore_ascii_case(&mode))
+        {
+            return;
+        }
+        self.mode_hold = Some(mode.clone());
+        self.send(Command::SetMode {
+            mode,
+            passband_hz: snap.passband_hz,
+        });
+    }
+
+    /// Right-click path. Same frequency and plan mode as the main VFO, sent
+    /// to the other VFO. The main frequency and mode are left alone.
+    fn tune_sub(&mut self, snap: &Snapshot, hz: f64, wanted: Option<&str>) {
+        let Some(hz) = snap.caps.allow_freq(hz) else {
+            return;
+        };
+        if !snap.online() || !snap.caps.can_set_split {
+            return;
+        }
+        self.sub_freq_text = format_hz(hz);
+        let held = self
+            .sub_freq_hold
+            .is_some_and(|held| (held - hz).abs() < 0.5);
+        let reported = snap.sub_freq_hz > 0.0 && (snap.sub_freq_hz - hz).abs() < 0.5;
+        if !held && !reported {
+            self.sub_freq_hold = Some(hz);
+            self.send(Command::SetSplitFreq(hz));
+        }
+        let Some(wanted) = wanted else {
+            return;
+        };
+        let Some(mode) = plan::choose_mode(wanted, &snap.caps.modes) else {
+            return;
+        };
+        if snap.sub_mode.eq_ignore_ascii_case(&mode) {
+            return;
+        }
+        if self
+            .sub_mode_hold
+            .as_deref()
+            .is_some_and(|held| held.eq_ignore_ascii_case(&mode))
+        {
+            return;
+        }
+        self.sub_mode_hold = Some(mode.clone());
+        self.send(Command::SetSubMode {
+            mode,
+            passband_hz: snap.passband_hz,
+        });
+    }
+
     fn tune(&mut self, snap: &Snapshot, hz: f64) {
         let Some(hz) = snap.caps.allow_freq(hz) else {
             let current = self.shown_freq(snap);
@@ -354,6 +551,17 @@ impl App {
             return;
         };
         self.hold_and_send(hz);
+    }
+
+    /// Move one VFO by `delta` hertz. One digit click or one wheel notch
+    /// passes a single place value. The step stops at the receive edge.
+    fn step_digit(&mut self, snap: &Snapshot, current: f64, delta: f64, main: bool) {
+        let target = current + delta;
+        if main {
+            self.nudge(snap, current, target);
+        } else {
+            self.nudge_sub(snap, current, target);
+        }
     }
 
     /// Wheel and digit steps. Stops on the edge of the current receive
@@ -366,6 +574,16 @@ impl App {
             return;
         }
         self.hold_and_send(hz);
+    }
+
+    fn nudge_sub(&mut self, snap: &Snapshot, current: f64, target: f64) {
+        let Some(hz) = snap.caps.step_freq(current, target) else {
+            return;
+        };
+        if (hz - current).abs() < 0.5 {
+            return;
+        }
+        self.tune_sub(snap, hz, None);
     }
 
     fn hold_and_send(&mut self, hz: f64) {
@@ -420,21 +638,52 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let mut snap = self.snap();
+        // Tune follows the frequency the readout is showing, including a
+        // set_freq that the radio has not confirmed yet. The Plan editor
+        // keeps its own zone tab.
+        let face_hz = if self.page == Page::Tune {
+            let hz = self.shown_freq(&snap);
+            self.follow_band(hz, &rx_pairs(&snap));
+            hz
+        } else {
+            snap.freq_hz
+        };
         if snap.online() {
-            if let Some(zone) = self.plan.zones.get(self.zone_sel) {
-                if let Some(band) = zone
-                    .bands
-                    .iter()
-                    .find(|band| snap.freq_hz >= band.lo_hz && snap.freq_hz <= band.hi_hz)
-                {
+            if let Some(band) = self
+                .plan
+                .zones
+                .get(self.zone_sel)
+                .and_then(|zone| zone.bands.get(self.band_sel))
+            {
+                if snap.freq_hz >= band.lo_hz && snap.freq_hz <= band.hi_hz {
                     self.band_mem.insert(band.name.clone(), snap.freq_hz);
                 }
             }
         }
+        if self
+            .mode_hold
+            .as_deref()
+            .is_some_and(|held| snap.mode.eq_ignore_ascii_case(held))
+        {
+            self.mode_hold = None;
+        }
+        if self
+            .sub_freq_hold
+            .is_some_and(|held| (snap.sub_freq_hz - held).abs() < 0.5)
+        {
+            self.sub_freq_hold = None;
+        }
+        if self
+            .sub_mode_hold
+            .as_deref()
+            .is_some_and(|held| snap.sub_mode.eq_ignore_ascii_case(held))
+        {
+            self.sub_mode_hold = None;
+        }
         if self.plan_note_ptt
             && self
                 .plan
-                .transmit_block(self.zone_sel, snap.freq_hz, &snap.mode)
+                .transmit_block_on(self.zone_sel, self.band_sel, snap.freq_hz, &snap.mode)
                 .is_none()
         {
             self.plan_note.clear();
@@ -467,7 +716,7 @@ impl eframe::App for App {
                 });
         });
         egui::Panel::bottom("status").show_inside(ui, |ui| {
-            self.status_line(ui, &snap);
+            self.status_line(ui, &snap, face_hz);
         });
         egui::CentralPanel::default().show_inside(ui, |ui| {
             // Tune owns the wheel. Plan and Channels own a bandspread click.
@@ -518,7 +767,7 @@ impl App {
         });
     }
 
-    fn status_line(&self, ui: &mut egui::Ui, snap: &Snapshot) {
+    fn status_line(&self, ui: &mut egui::Ui, snap: &Snapshot, face_hz: f64) {
         let link = match snap.kind {
             LinkKind::Demo => "Demo".to_string(),
             LinkKind::Live => format!("{}  {}", snap.model, snap.endpoint),
@@ -532,7 +781,10 @@ impl App {
                     egui::RichText::new(&snap.message).color(egui::Color32::from_rgb(220, 160, 80)),
                 );
             }
-            if let Some(label) = self.plan.segment_label(self.zone_sel, snap.freq_hz) {
+            if let Some(label) = self
+                .plan
+                .reference_label(self.zone_sel, self.band_sel, face_hz)
+            {
                 ui.separator();
                 ui.label(label);
             }
@@ -550,6 +802,11 @@ impl App {
                         .color(egui::Color32::from_rgb(220, 160, 80)),
                 );
             }
+            if !snap.last_cat.is_empty() {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new(&snap.last_cat).monospace());
+                });
+            }
         });
     }
 
@@ -558,32 +815,54 @@ impl App {
             Page::Tune => self.page_tune(ui, snap),
             Page::Plan => self.page_plan(ui, snap),
             Page::Channels => self.page_channels(ui, snap),
-            Page::Vfo => self.page_vfo(ui, snap),
             Page::Meters => self.page_meters(ui, snap),
-            Page::Controls => self.page_controls(ui, snap),
             Page::Levels => self.page_levels(ui, snap),
         }
     }
 
     fn page_tune(&mut self, ui: &mut egui::Ui, snap: &mut Snapshot) {
         let freq = self.shown_freq(snap);
+        let sub_freq = self.shown_sub_freq(snap);
         egui::Frame::group(ui.style()).show(ui, |ui| {
+            // Same width as the controls frame and the bandspread.
+            ui.take_available_width();
             ui.horizontal(|ui| {
-                self.frequency(ui, snap, freq);
-                ui.add_space(18.0);
-                ui.vertical(|ui| {
-                    ui.label(
-                        egui::RichText::new(&snap.mode)
-                            .size(22.0)
-                            .strong()
-                            .color(HAM),
-                    );
-                    if snap.rit_hz != 0 {
-                        ui.label(format!("RIT {:+} Hz", snap.rit_hz));
-                    }
-                    let frac = strength_frac(snap.strength_db);
-                    meter(ui, &strength_label(snap.strength_db), frac, "");
+                let known_main = self.main_cluster_height;
+                let known_frame = self.vfo_frame_height;
+                let known_sub = self.sub_vfo_height;
+                let show_sub = !snap.sub_vfo.is_empty();
+                let row_h = known_main
+                    .max(known_frame)
+                    .max(if show_sub { known_sub } else { 0.0 });
+                let main_h = place_centered(ui, row_h, known_main, |ui| {
+                    self.vfo_cluster(ui, snap, true, freq);
                 });
+                ui.add_space(16.0);
+                let frame_h = place_centered(ui, row_h, known_frame, |ui| {
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        self.vfo_column(ui, snap);
+                    });
+                });
+                let sub_h = if show_sub {
+                    ui.add_space(16.0);
+                    place_centered(ui, row_h, known_sub, |ui| {
+                        self.vfo_cluster(ui, snap, false, sub_freq);
+                    })
+                } else {
+                    known_sub
+                };
+                let moved = (main_h - known_main).abs() > 0.5
+                    || (frame_h - known_frame).abs() > 0.5
+                    || (show_sub && (sub_h - known_sub).abs() > 0.5);
+                self.main_cluster_height = main_h;
+                self.vfo_frame_height = frame_h;
+                if show_sub {
+                    self.sub_vfo_height = sub_h;
+                }
+                if moved {
+                    ui.ctx()
+                        .request_discard("center the VFO frame with the readouts");
+                }
             });
             ui.add_space(6.0);
             let (lo, hi) = self.fine_window(snap, freq);
@@ -610,7 +889,8 @@ impl App {
                 }
                 let mut chip_pick = None;
                 // Memory is keyed by band name, the same key `band_step` uses.
-                let chips: Vec<(usize, String, String, f64, f64, f64)> = self
+                let rx = rx_pairs(snap);
+                let listed: Vec<(usize, String, String, f64, Vec<(f64, f64)>)> = self
                     .plan
                     .zones
                     .get(self.zone_sel)
@@ -618,26 +898,44 @@ impl App {
                         zone.bands
                             .iter()
                             .enumerate()
-                            .map(|(idx, band)| {
-                                (
+                            .filter_map(|(idx, band)| {
+                                let pieces = plan::pieces_inside(band.lo_hz, band.hi_hz, &rx);
+                                if pieces.is_empty() {
+                                    return None;
+                                }
+                                Some((
                                     idx,
-                                    band.name.clone(),
                                     band.chip.clone(),
-                                    band.lo_hz,
-                                    band.hi_hz,
+                                    band.name.clone(),
                                     band.home_hz,
-                                )
+                                    pieces,
+                                ))
                             })
                             .collect()
                     })
                     .unwrap_or_default();
-                for (idx, name, chip, lo, hi, home) in &chips {
-                    let on = freq >= *lo && freq <= *hi;
+                let chips: Vec<(usize, String, String, f64)> = listed
+                    .into_iter()
+                    .map(|(idx, chip, name, home, pieces)| {
+                        let remembered = self.band_mem.get(&name).copied().unwrap_or(home);
+                        let hz = if pieces
+                            .iter()
+                            .any(|(start, end)| remembered >= *start && remembered <= *end)
+                        {
+                            remembered
+                        } else {
+                            pieces[0].0
+                        };
+                        (idx, chip, name, hz)
+                    })
+                    .collect();
+                for (idx, chip, name, hz) in &chips {
+                    let on = self.band_sel == *idx;
                     if ui.selectable_label(on, chip).clicked() {
                         self.band_sel = *idx;
                         if snap.caps.can_set_freq {
-                            let hz = self.band_mem.get(name).copied().unwrap_or(*home);
-                            chip_pick = Some(hz);
+                            let tuned = self.band_mem.get(name).copied().unwrap_or(*hz);
+                            chip_pick = Some(tuned);
                         }
                     }
                 }
@@ -653,6 +951,11 @@ impl App {
                 });
             });
         });
+        ui.add_space(8.0);
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.take_available_width();
+            self.buttons(ui, snap);
+        });
         if self.show_spread {
             ui.add_space(8.0);
             // One line per zone. Subbands share that line, with a small gap
@@ -661,85 +964,110 @@ impl App {
             let chrome =
                 frame.inner_margin.sum().y + frame.stroke.width * 2.0 + frame.outer_margin.sum().y;
             let height = (ui.available_height() - chrome).max(80.0);
-            let mut scale_pick = None;
+            let mut scale_pick: Option<(usize, usize, f64, bool)> = None;
             frame.show(ui, |ui| {
+                ui.take_available_width();
                 egui::ScrollArea::vertical()
                     .id_salt("tune-bsp")
+                    .auto_shrink([false, true])
                     .max_height(height)
                     .show(ui, |ui| {
+                        let rx = rx_pairs(snap);
                         for (zone_idx, zone) in self.plan.zones.iter().enumerate().rev() {
-                            if zone.bands.is_empty() {
+                            let mut subs = Vec::new();
+                            let mut ids = Vec::new();
+                            for (band_idx, band) in zone.bands.iter().enumerate() {
+                                let spans: Vec<PaintSpan> = band
+                                    .segments
+                                    .iter()
+                                    .map(|seg| {
+                                        let [r, g, b] = plan::segment_rgb(seg);
+                                        PaintSpan {
+                                            lo: seg.lo_hz,
+                                            hi: seg.hi_hz,
+                                            color: egui::Color32::from_rgb(r, g, b),
+                                        }
+                                    })
+                                    .collect();
+                                for (lo, hi) in plan::pieces_inside(band.lo_hz, band.hi_hz, &rx) {
+                                    ids.push(band_idx);
+                                    subs.push(SubBand {
+                                        lo,
+                                        hi,
+                                        chip: band.chip.clone(),
+                                        spans: spans.clone(),
+                                    });
+                                }
+                            }
+                            if subs.is_empty() {
                                 continue;
                             }
-                            let subs: Vec<SubBand> = zone
-                                .bands
-                                .iter()
-                                .map(|band| SubBand {
-                                    lo: band.lo_hz,
-                                    hi: band.hi_hz,
-                                    chip: band.chip.clone(),
-                                    spans: band
-                                        .segments
-                                        .iter()
-                                        .map(|seg| {
-                                            let [r, g, b] = plan::segment_rgb(seg);
-                                            PaintSpan {
-                                                lo: seg.lo_hz,
-                                                hi: seg.hi_hz,
-                                                color: egui::Color32::from_rgb(r, g, b),
-                                            }
+                            let picked = (zone_idx == self.zone_sel)
+                                .then(|| {
+                                    ids.iter()
+                                        .enumerate()
+                                        .find(|(i, id)| {
+                                            **id == self.band_sel
+                                                && freq >= subs[*i].lo
+                                                && freq <= subs[*i].hi
                                         })
-                                        .collect(),
+                                        .or_else(|| {
+                                            ids.iter()
+                                                .enumerate()
+                                                .find(|(_, id)| **id == self.band_sel)
+                                        })
+                                        .map(|(i, _)| i)
                                 })
-                                .collect();
-                            if let Some((band_idx, hz)) =
-                                zone_scale(ui, &zone.name, freq, &subs, 28.0)
+                                .flatten();
+                            if let Some((slot, hz, sub)) =
+                                zone_scale(ui, &zone.name, freq, &subs, picked, 28.0)
                             {
-                                if snap.caps.can_set_freq {
-                                    scale_pick = Some((zone_idx, band_idx, hz));
+                                // Left click needs set_freq. Right click needs split.
+                                // The other button is ignored when its command is closed.
+                                let allowed = if sub {
+                                    snap.caps.can_set_split
+                                } else {
+                                    snap.caps.can_set_freq
+                                };
+                                if allowed {
+                                    scale_pick = Some((zone_idx, ids[slot], hz, sub));
                                 }
                             }
                         }
                     });
             });
-            if let Some((zone_idx, band_idx, hz)) = scale_pick {
+            if let Some((zone_idx, band_idx, hz, sub)) = scale_pick {
+                let mode = self
+                    .plan
+                    .zones
+                    .get(zone_idx)
+                    .and_then(|zone| zone.bands.get(band_idx))
+                    .map(|band| plan::mode_at(band, hz));
                 self.zone_sel = zone_idx;
                 self.band_sel = band_idx;
-                self.tune(snap, hz);
+                if sub {
+                    self.tune_sub(snap, hz, mode.as_deref());
+                } else if snap.caps.allow_freq(hz).is_some() {
+                    self.tune(snap, hz);
+                    if let Some(mode) = mode {
+                        self.send_plan_mode(snap, &mode);
+                    }
+                }
             }
         }
     }
 
     fn page_plan(&mut self, ui: &mut egui::Ui, snap: &mut Snapshot) {
-        if self.plan.zones.is_empty() {
-            ui.label("No zones in this plan.");
-            if ui.button("Save").clicked() {
-                self.browse_plan(true);
-            }
-            return;
-        }
         if self.zone_sel >= self.plan.zones.len() {
             self.zone_sel = 0;
             self.band_sel = 0;
         }
         ui.add_space(6.0);
-        let names: Vec<String> = self
-            .plan
-            .zones
-            .iter()
-            .map(|zone| zone.name.clone())
-            .collect();
-        ui.horizontal(|ui| {
-            for (idx, name) in names.iter().enumerate() {
-                if ui
-                    .add(egui::Button::selectable(self.zone_sel == idx, name))
-                    .clicked()
-                {
-                    self.zone_sel = idx;
-                    self.band_sel = 0;
-                }
-            }
-        });
+        self.zone_tabs(ui, snap);
+        if self.plan.zones.is_empty() {
+            ui.label("No zones in this plan.");
+            return;
+        }
         let band_count = self.plan.zones[self.zone_sel].bands.len();
         if self.band_sel >= band_count {
             self.band_sel = 0;
@@ -842,6 +1170,80 @@ impl App {
                     .show(ui, |ui| self.band_editor(ui, snap, right_w));
             });
         });
+    }
+
+    fn zone_tabs(&mut self, ui: &mut egui::Ui, snap: &Snapshot) {
+        let names: Vec<String> = self
+            .plan
+            .zones
+            .iter()
+            .map(|zone| zone.name.clone())
+            .collect();
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("LOAD").clicked() {
+                self.browse_plan(false);
+            }
+            if ui.button("Save").clicked() {
+                self.browse_plan(true);
+            }
+            if ui.button("ADD").clicked() {
+                let color = self
+                    .plan
+                    .zones
+                    .get(self.zone_sel)
+                    .map(|zone| zone.color)
+                    .unwrap_or([92, 184, 120]);
+                let home = self.shown_freq(snap);
+                self.zone_sel = plan::push_zone(&mut self.plan, color, home, &snap.mode);
+                self.band_sel = 0;
+                self.zone_rename = None;
+            }
+            for (idx, name) in names.iter().enumerate() {
+                let response = ui.add(egui::Button::selectable(self.zone_sel == idx, name));
+                if response.clicked() || response.secondary_clicked() {
+                    self.zone_sel = idx;
+                    self.band_sel = 0;
+                }
+                response.context_menu(|ui| self.zone_menu(ui, idx));
+            }
+        });
+    }
+
+    fn zone_menu(&mut self, ui: &mut egui::Ui, idx: usize) {
+        let current = self
+            .plan
+            .zones
+            .get(idx)
+            .map(|zone| zone.name.clone())
+            .unwrap_or_default();
+        let mut text = self
+            .zone_rename
+            .as_ref()
+            .filter(|(stored, _)| *stored == idx)
+            .map(|(_, text)| text.clone())
+            .unwrap_or(current);
+        let edited = ui
+            .add(
+                egui::TextEdit::singleline(&mut text)
+                    .id_salt(("zone-rename", idx))
+                    .desired_width(160.0),
+            )
+            .changed();
+        if edited {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                if let Some(zone) = self.plan.zones.get_mut(idx) {
+                    plan::rename_zone(zone, trimmed);
+                }
+            }
+            self.zone_rename = Some((idx, text));
+        }
+        if ui.button("Delete").clicked() {
+            self.zone_sel = plan::delete_zone(&mut self.plan, idx, self.zone_sel);
+            self.band_sel = 0;
+            self.zone_rename = None;
+            ui.close();
+        }
     }
 
     fn plan_save_row(&mut self, ui: &mut egui::Ui) {
@@ -1574,26 +1976,12 @@ impl App {
         }
     }
 
-    fn page_vfo(&mut self, ui: &mut egui::Ui, snap: &mut Snapshot) {
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.label(egui::RichText::new("VFO").strong());
-            self.vfo_column(ui, snap);
-        });
-    }
-
     fn page_meters(&self, ui: &mut egui::Ui, snap: &Snapshot) {
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.label(egui::RichText::new("Meters").strong());
             let frac = strength_frac(snap.strength_db);
             meter(ui, &strength_label(snap.strength_db), frac, "");
             self.status_column(ui, snap);
-        });
-    }
-
-    fn page_controls(&mut self, ui: &mut egui::Ui, snap: &mut Snapshot) {
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.label(egui::RichText::new("Controls").strong());
-            self.buttons(ui, snap);
         });
     }
 
@@ -1724,14 +2112,98 @@ impl App {
         });
     }
 
-    fn frequency(&mut self, ui: &mut egui::Ui, snap: &Snapshot, freq: f64) {
+    /// One VFO: the digit row, the typed frequency, and the hamlib name with
+    /// its mode. `main` is the current VFO (`get_vfo`). The other cluster is
+    /// `snap.sub_vfo`. The S-meter is the receiver, so it stays on the current
+    /// VFO. Hamlib reports one strength.
+    fn vfo_cluster(&mut self, ui: &mut egui::Ui, snap: &Snapshot, main: bool, freq: f64) {
+        let name = if main {
+            snap.vfo.as_str()
+        } else {
+            snap.sub_vfo.as_str()
+        };
+        let mode = if main {
+            snap.mode.as_str()
+        } else {
+            snap.sub_mode.as_str()
+        };
+        let cluster = ui.horizontal(|ui| {
+            // The sub VFO stays at 70% of the main. Both are then 90% so the
+            // VFO button frame fits between them on the default window.
+            let scale = if main { 0.9 } else { 0.7 * 0.9 };
+            scale_vfo(ui, scale);
+            let hovered_digit = self.frequency(ui, snap, freq, main, scale);
+            ui.add_space(18.0 * scale);
+            ui.vertical(|ui| {
+                ui.label(egui::RichText::new(vfo_label(name)).strong());
+                ui.label(
+                    egui::RichText::new(mode)
+                        .size(22.0 * scale)
+                        .strong()
+                        .color(HAM),
+                );
+                if main && snap.rit_hz != 0 {
+                    ui.label(format!("RIT {:+} Hz", snap.rit_hz));
+                }
+                if main {
+                    let frac = strength_frac(snap.strength_db);
+                    meter(ui, &strength_label(snap.strength_db), frac, "");
+                }
+            });
+            hovered_digit
+        });
+        let can_tune = snap.online()
+            && if main {
+                snap.caps.can_set_freq
+            } else {
+                snap.caps.can_set_split
+            };
+        // The cluster, not just the digit buttons. A digit under the pointer
+        // wins. Anywhere else on this VFO, the wheel turns the selected digit.
+        let over_cluster = ui
+            .input(|i| i.pointer.hover_pos())
+            .is_some_and(|pos| cluster.response.rect.contains(pos));
+        if over_cluster && can_tune {
+            let notches = ui.input(|input| {
+                wheel_notches(input.events.iter().filter_map(|event| match event {
+                    egui::Event::MouseWheel { delta, phase, .. } => match phase {
+                        egui::TouchPhase::End | egui::TouchPhase::Cancel => None,
+                        _ => Some(delta.y),
+                    },
+                    _ => None,
+                }))
+            });
+            if notches != 0 {
+                let step = cluster.inner.unwrap_or(self.step_hz);
+                self.step_digit(snap, freq, f64::from(notches) * step, main);
+            }
+        }
+    }
+
+    /// The digit under the pointer, if the pointer is on one.
+    fn frequency(
+        &mut self,
+        ui: &mut egui::Ui,
+        snap: &Snapshot,
+        freq: f64,
+        main: bool,
+        scale: f32,
+    ) -> Option<f64> {
+        let can_tune = snap.online()
+            && if main {
+                snap.caps.can_set_freq
+            } else {
+                snap.caps.can_set_split
+            };
         ui.vertical(|ui| {
-            ui.horizontal(|ui| {
+            let digits = ui.horizontal(|ui| {
+                let pointer = ui.input(|i| i.pointer.hover_pos());
+                let mut hovered_step = None;
                 for (ch, step) in digit_steps(freq) {
                     let Some(step) = step else {
                         ui.label(
                             egui::RichText::new(ch.to_string())
-                                .size(48.0)
+                                .size(48.0 * scale)
                                 .strong()
                                 .monospace(),
                         );
@@ -1739,43 +2211,67 @@ impl App {
                     };
                     let selected = (step - self.step_hz).abs() < 0.1;
                     let text = egui::RichText::new(ch.to_string())
-                        .size(48.0)
+                        .size(48.0 * scale)
                         .strong()
                         .monospace();
-                    if ui
-                        .add_enabled(
-                            snap.caps.can_set_freq,
-                            egui::Button::new(text).selected(selected),
-                        )
-                        .clicked()
-                    {
+                    let response =
+                        ui.add_enabled(can_tune, egui::Button::new(text).selected(selected));
+                    // The pointer position, not widget hover: a later hover
+                    // sense would sit on top of these buttons and steal it.
+                    if pointer.is_some_and(|pos| response.rect.contains(pos)) {
+                        hovered_step = Some(step);
+                    }
+                    if response.clicked() {
+                        // The clicked digit becomes the step, and this click
+                        // turns that digit by one.
                         self.step_hz = step;
+                        self.step_digit(snap, freq, step, main);
                     }
                 }
+                hovered_step
             });
-            let wheel = ui.interact(
-                ui.min_rect(),
-                ui.id().with("freq-wheel"),
-                egui::Sense::hover(),
-            );
-            if wheel.hovered() && snap.caps.can_set_freq {
-                let dy = ui.input(|i| i.smooth_scroll_delta.y);
-                if dy.abs() > 0.0 {
-                    let dir = if dy > 0.0 { 1.0 } else { -1.0 };
-                    self.nudge(snap, freq, freq + dir * self.step_hz);
-                }
-            }
             ui.horizontal(|ui| {
-                let edit = egui::TextEdit::singleline(&mut self.freq_text).desired_width(160.0);
-                let resp = ui.add_enabled(snap.caps.can_set_freq, edit);
+                let salt = if main { "main-freq" } else { "sub-freq" };
+                let id = ui.id().with(salt);
+                if !ui.memory(|mem| mem.has_focus(id)) {
+                    let shown = format_hz(freq);
+                    if main {
+                        self.freq_text = shown;
+                    } else {
+                        self.sub_freq_text = shown;
+                    }
+                }
+                let width = 160.0 * scale;
+                let resp = if main {
+                    let edit = egui::TextEdit::singleline(&mut self.freq_text)
+                        .id_salt(salt)
+                        .desired_width(width);
+                    ui.add_enabled(can_tune, edit)
+                } else {
+                    let edit = egui::TextEdit::singleline(&mut self.sub_freq_text)
+                        .id_salt(salt)
+                        .desired_width(width);
+                    ui.add_enabled(can_tune, edit)
+                };
                 if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    if let Some(hz) = parse_freq(&self.freq_text) {
-                        self.tune(snap, hz);
+                    let raw = if main {
+                        self.freq_text.clone()
+                    } else {
+                        self.sub_freq_text.clone()
+                    };
+                    if let Some(hz) = parse_freq(&raw) {
+                        if main {
+                            self.tune(snap, hz);
+                        } else {
+                            self.tune_sub(snap, hz, None);
+                        }
                     }
                 }
                 ui.label(egui::RichText::new(format!("step {}", step_label(self.step_hz))).weak());
             });
-        });
+            digits.inner
+        })
+        .inner
     }
 
     fn buttons(&mut self, ui: &mut egui::Ui, snap: &Snapshot) {
@@ -1866,10 +2362,12 @@ impl App {
         {
             let next = !snap.ptt;
             if next {
-                if let Some(why) = self
-                    .plan
-                    .transmit_block(self.zone_sel, snap.freq_hz, &snap.mode)
-                {
+                if let Some(why) = self.plan.transmit_block_on(
+                    self.zone_sel,
+                    self.band_sel,
+                    snap.freq_hz,
+                    &snap.mode,
+                ) {
                     self.plan_note = why;
                     self.plan_note_ptt = true;
                     return;
@@ -1885,49 +2383,27 @@ impl App {
         let enabled = snap.online() && snap.caps.can_set_freq;
         if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
             let freq = self.shown_freq(snap);
-            let rows = self.zone_rows();
-            if rows.is_empty() {
+            let bands = plan::tunable_bands(&self.plan, &rx_pairs(snap));
+            let Some(idx) = plan::adjacent_band(&bands, freq, dir as i32) else {
+                return;
+            };
+            let band = &bands[idx];
+            let remembered = self.band_mem.get(&band.name).copied();
+            let hz = plan::band_tune_hz(band, remembered);
+            // Hamlib has no band-up command. set_freq is the CAT command.
+            // A frequency the radio will refuse does not move the chips.
+            if snap.caps.allow_freq(hz).is_none() {
                 return;
             }
-            let idx = rows
-                .iter()
-                .position(|row| freq >= row.lo && freq <= row.hi)
-                .unwrap_or(0);
-            let next = idx as isize + dir;
-            if (0..rows.len() as isize).contains(&next) {
-                let row = &rows[next as usize];
-                let hz = self.band_mem.get(&row.name).copied().unwrap_or(row.home);
-                self.band_sel = next as usize;
-                self.tune(snap, hz);
-            }
+            self.zone_sel = band.zone;
+            self.band_sel = band.band;
+            self.tune(snap, hz);
         }
     }
 }
 
-struct ZoneRow {
-    name: String,
-    lo: f64,
-    hi: f64,
-    home: f64,
-}
-
 impl App {
-    fn zone_rows(&self) -> Vec<ZoneRow> {
-        let Some(zone) = self.plan.zones.get(self.zone_sel) else {
-            return Vec::new();
-        };
-        zone.bands
-            .iter()
-            .map(|band| ZoneRow {
-                name: band.name.clone(),
-                lo: band.lo_hz,
-                hi: band.hi_hz,
-                home: band.home_hz,
-            })
-            .collect()
-    }
-
-    fn mode_box(&self, ui: &mut egui::Ui, snap: &Snapshot, label: &str, main: bool) {
+    fn mode_box(&mut self, ui: &mut egui::Ui, snap: &Snapshot, label: &str, main: bool) {
         let current = if main {
             snap.mode.as_str()
         } else {
@@ -1946,11 +2422,13 @@ impl App {
                     for mode in &snap.caps.modes {
                         if ui.selectable_label(mode == current, mode).clicked() {
                             let cmd = if main {
+                                self.mode_hold = Some(mode.clone());
                                 Command::SetMode {
                                     mode: mode.clone(),
                                     passband_hz: snap.passband_hz,
                                 }
                             } else {
+                                self.sub_mode_hold = Some(mode.clone());
                                 Command::SetSubMode {
                                     mode: mode.clone(),
                                     passband_hz: snap.passband_hz,
@@ -2109,7 +2587,7 @@ impl App {
                         self.connect_open = false;
                     }
                 });
-                ui.label("A dummy rig is `rigctld -m 1 -t 4532`.");
+                ui.label("The hamlib dummy is scripts/dummy-rig.sh, which is rigctld -m 1 on 127.0.0.1:4532.");
             });
         self.connect_open = open;
     }
@@ -2157,7 +2635,9 @@ impl App {
 }
 
 fn drive(shared: Arc<Mutex<Shared>>, wake: Arc<Condvar>, ctx: egui::Context) {
-    let mut session = Session::Demo(DemoRig::new());
+    let mut session = Session::Down {
+        message: "connecting to 127.0.0.1:4532".into(),
+    };
     let mut last = shared.lock().expect("ui").snap.clone();
     loop {
         let (cmds, switch) = {
@@ -2196,8 +2676,10 @@ fn drive(shared: Arc<Mutex<Shared>>, wake: Arc<Condvar>, ctx: egui::Context) {
             };
         }
 
+        let mut sent = None;
         let mut remote = None;
         for cmd in &cmds {
+            sent = Some(cmd.cat_line());
             match session.apply(cmd) {
                 Ok(()) => {}
                 Err(RigError::Remote(msg)) => remote = Some(msg),
@@ -2230,8 +2712,14 @@ fn drive(shared: Arc<Mutex<Shared>>, wake: Arc<Condvar>, ctx: egui::Context) {
             parked.message = snap.message.clone();
             parked.caps = rigctl::Caps::empty();
             snap = parked;
-        } else {
+        }
+        // Polls replace the snapshot. Keep the last operator command, and
+        // record a command from this pass after that replacement.
+        snap.last_cat = sent.unwrap_or_else(|| last.last_cat.clone());
+        if snap.kind != LinkKind::Down {
             last = snap.clone();
+        } else {
+            last.last_cat.clone_from(&snap.last_cat);
         }
         {
             let mut guard = shared.lock().expect("ui");
@@ -2269,6 +2757,43 @@ impl Session {
     }
 }
 
+/// Scale a VFO cluster's type, button padding, and gaps. Child rows copy this
+/// style when they are created, so it has to be set on the cluster before
+/// those rows exist.
+fn scale_vfo(ui: &mut egui::Ui, scale: f32) {
+    let style = ui.style_mut();
+    style.spacing.item_spacing *= scale;
+    style.spacing.button_padding *= scale;
+    style.spacing.interact_size *= scale;
+    style.spacing.icon_width *= scale;
+    style.spacing.icon_width_inner *= scale;
+    for font in style.text_styles.values_mut() {
+        font.size *= scale;
+    }
+}
+
+/// egui keeps a shorter widget on the top edge of a horizontal row. Pad it so
+/// its middle lines up with `row_h`. `known_h` is last frame's measurement;
+/// the returned height is this frame's.
+fn place_centered(
+    ui: &mut egui::Ui,
+    row_h: f32,
+    known_h: f32,
+    add: impl FnOnce(&mut egui::Ui),
+) -> f32 {
+    let pad = ((row_h - known_h) * 0.5).max(0.0);
+    let mut measured = 0.0;
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        if pad > 0.0 {
+            ui.add_space(pad);
+        }
+        let piece = ui.scope(add);
+        measured = piece.response.rect.height();
+    });
+    measured
+}
+
 fn offline(last: &Snapshot, message: &str) -> Snapshot {
     let mut snap = last.clone();
     snap.kind = LinkKind::Down;
@@ -2284,10 +2809,13 @@ fn empty_snap() -> Snapshot {
             model: String::new(),
             endpoint: String::new(),
             message: String::new(),
+            last_cat: String::new(),
             freq_hz: 0.0,
             mode: String::new(),
             passband_hz: 0,
             sub_mode: String::new(),
+            sub_freq_hz: 0.0,
+            sub_vfo: String::new(),
             vfo: String::new(),
             tx_vfo: String::new(),
             rit_hz: 0,

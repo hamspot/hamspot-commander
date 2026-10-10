@@ -119,6 +119,7 @@ pub fn bar_freq(lo: f64, hi: f64, frac: f64) -> f64 {
 }
 
 /// One bandspread line. Click returns a frequency in Hz inside `lo..=hi`.
+#[derive(Clone, Copy)]
 pub struct PaintSpan {
     pub lo: f64,
     pub hi: f64,
@@ -226,6 +227,23 @@ pub fn swatch(ui: &mut egui::Ui, color: egui::Color32, text: &str) {
 /// `0014.153.608`: four megahertz digits, then kilohertz and hertz.
 /// The field stays four wide through 9999 MHz so 20 m, 2 m, and 70 cm
 /// keep the same columns. Wider values still print in full.
+/// `VFOA` is `VFO A`, `Main` stays `Main`, `SubA` is `Sub A`.
+pub fn vfo_label(token: &str) -> String {
+    let token = token.trim();
+    for prefix in ["VFO", "Main", "Sub"] {
+        if token.len() >= prefix.len() && token[..prefix.len()].eq_ignore_ascii_case(prefix) {
+            let rest = &token[prefix.len()..];
+            if rest.is_empty() {
+                return prefix.to_string();
+            }
+            if rest.len() <= 2 && rest.chars().all(|ch| ch.is_ascii_alphanumeric()) {
+                return format!("{prefix} {rest}");
+            }
+        }
+    }
+    token.to_string()
+}
+
 pub fn format_hz(hz: f64) -> String {
     let rounded = if hz.is_finite() { hz.round() } else { 0.0 };
     let neg = rounded < 0.0;
@@ -366,28 +384,31 @@ fn freq_in_slot(x: f32, x0: f32, x1: f32, lo: f64, hi: f64) -> f64 {
     lo + frac * span
 }
 
-fn active_subband(hz: f64, bands: &[SubBand]) -> Option<usize> {
+/// The clicked subband, when the frequency is still inside it.
+/// Another subband that also covers `hz` does not take the needle.
+fn active_subband(hz: f64, bands: &[SubBand], picked: Option<usize>) -> Option<usize> {
     if !hz.is_finite() {
         return None;
     }
-    bands
-        .iter()
-        .enumerate()
-        .filter(|(_, band)| hz >= band.lo && hz <= band.hi && band.hi >= band.lo)
-        .max_by(|(_, a), (_, b)| a.lo.partial_cmp(&b.lo).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(idx, _)| idx)
+    picked.filter(|idx| {
+        bands
+            .get(*idx)
+            .is_some_and(|band| hz >= band.lo && hz <= band.hi && band.hi >= band.lo)
+    })
 }
 
 /// One zone on one line. Subbands share the row and keep a small gap between them.
-/// Click or drag returns the subband index and a frequency inside that subband.
-/// A press in the gap returns nothing.
+/// Click or drag returns the subband index, a frequency inside that subband, and
+/// whether the press was the secondary button (sub VFO). A press in the gap
+/// returns nothing.
 pub fn zone_scale(
     ui: &mut egui::Ui,
     label: &str,
     hz: f64,
     bands: &[SubBand],
+    picked: Option<usize>,
     height: f32,
-) -> Option<(usize, f64)> {
+) -> Option<(usize, f64, bool)> {
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), height),
         egui::Sense::click_and_drag(),
@@ -404,7 +425,7 @@ pub fn zone_scale(
         egui::pos2(rect.right() - 4.0, rect.bottom() - 4.0),
     );
     let slots = subband_slots(bands.len(), area.width(), SUBBAND_PAD);
-    let active = active_subband(hz, bands);
+    let active = active_subband(hz, bands, picked);
     for (idx, band) in bands.iter().enumerate() {
         let Some(&(x0, x1)) = slots.get(idx) else {
             continue;
@@ -490,16 +511,24 @@ pub fn zone_scale(
             }
         }
     }
-    if response.clicked() || response.dragged() {
-        let pos = response.interact_pointer_pos()?;
-        let x = pos.x - area.left();
-        let idx = subband_at(x, &slots)?;
-        let (x0, x1) = slots[idx];
-        let band = bands.get(idx)?;
-        Some((idx, freq_in_slot(x, x0, x1, band.lo, band.hi)))
-    } else {
-        None
+    // Primary tunes the main VFO. Secondary tunes the sub VFO. `dragged()` is
+    // true for either button, so the button has to be checked on its own.
+    let primary = response.clicked() || response.dragged_by(egui::PointerButton::Primary);
+    let secondary =
+        response.secondary_clicked() || response.dragged_by(egui::PointerButton::Secondary);
+    if !primary && !secondary {
+        return None;
     }
+    let pos = response.interact_pointer_pos()?;
+    let x = pos.x - area.left();
+    let idx = subband_at(x, &slots)?;
+    let (x0, x1) = slots[idx];
+    let band = bands.get(idx)?;
+    Some((
+        idx,
+        freq_in_slot(x, x0, x1, band.lo, band.hi),
+        secondary && !primary,
+    ))
 }
 
 /// Click or drag returns a frequency in Hz inside `lo..=hi`.
@@ -600,6 +629,21 @@ pub fn meter(ui: &mut egui::Ui, label: &str, frac: f32, text: &str) {
     });
 }
 
+/// One step per wheel event. A notch often reports a large delta (14 points,
+/// or a whole line) and egui then eases that delta across later frames.
+/// Those later frames are not more clicks. A zero delta is not a click.
+pub fn wheel_notches(deltas_y: impl IntoIterator<Item = f32>) -> i32 {
+    deltas_y.into_iter().fold(0, |count, dy| {
+        if dy > 0.0 {
+            count + 1
+        } else if dy < 0.0 {
+            count - 1
+        } else {
+            count
+        }
+    })
+}
+
 /// Place values of the digits in `0014.153.608`, from the left.
 /// Dots and a leading minus are returned with no step. Counting those
 /// characters as digits underflows once the real digits run out.
@@ -625,6 +669,17 @@ pub fn digit_steps(hz: f64) -> Vec<(char, Option<f64>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vfo_names_come_from_the_hamlib_token() {
+        assert_eq!(vfo_label("VFOA"), "VFO A");
+        assert_eq!(vfo_label("VFOB"), "VFO B");
+        assert_eq!(vfo_label("Main"), "Main");
+        assert_eq!(vfo_label("Sub"), "Sub");
+        assert_eq!(vfo_label("MainA"), "Main A");
+        assert_eq!(vfo_label("SubB"), "Sub B");
+        assert_eq!(vfo_label("MEM"), "MEM");
+    }
 
     #[test]
     fn screenshot_frequency_round_trips() {
@@ -685,7 +740,7 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_subband_needle_keeps_the_later_start() {
+    fn overlapping_subband_keeps_the_clicked_line() {
         let bands = [
             SubBand {
                 lo: 7_000_000.0,
@@ -700,8 +755,10 @@ mod tests {
                 spans: Vec::new(),
             },
         ];
-        assert_eq!(active_subband(7_250_000.0, &bands), Some(1));
-        assert!(active_subband(1_000.0, &bands).is_none());
+        assert_eq!(active_subband(7_250_000.0, &bands, Some(0)), Some(0));
+        assert_eq!(active_subband(7_250_000.0, &bands, Some(1)), Some(1));
+        assert!(active_subband(7_250_000.0, &bands, None).is_none());
+        assert!(active_subband(1_000.0, &bands, Some(0)).is_none());
     }
 
     #[test]
@@ -710,6 +767,16 @@ mod tests {
         let hi = 14_350_000.0;
         let mid: f64 = lo + 0.5 * (hi - lo);
         assert!((mid - 14_175_000.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn one_wheel_notch_is_one_digit() {
+        assert_eq!(wheel_notches([14.0]), 1);
+        assert_eq!(wheel_notches([120.0]), 1);
+        assert_eq!(wheel_notches([-53.0]), -1);
+        assert_eq!(wheel_notches([14.0, 14.0]), 2);
+        assert_eq!(wheel_notches([0.0]), 0);
+        assert_eq!(wheel_notches(std::iter::empty()), 0);
     }
 
     #[test]

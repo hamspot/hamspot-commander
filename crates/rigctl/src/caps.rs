@@ -364,10 +364,7 @@ mod tests {
 
     fn demo_segments() -> Caps {
         let mut caps = Caps::empty();
-        for (min, max) in [
-            (1_800_000.0, 2_000_000.0),
-            (14_000_000.0, 14_350_000.0),
-        ] {
+        for (min, max) in [(1_800_000.0, 2_000_000.0), (14_000_000.0, 14_350_000.0)] {
             caps.rx_ranges.push(Range {
                 min,
                 max,

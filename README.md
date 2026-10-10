@@ -12,7 +12,7 @@ The window is a Rust [`egui`](https://github.com/emilk/egui) app in the same spi
 cargo run -p commander
 ```
 
-The window opens on an in-process demo rig at 14.153.608 MHz USB. **Demo** returns to that rig. **Connect** talks to a `rigctld` that is already running. This program does not start `rigctld`.
+The window connects to a `rigctld` that is already listening on `127.0.0.1:4532`. **Demo** switches to a small in-process stand-in. **Connect** picks another host or port. This program does not start `rigctld`.
 
 ```bash
 scripts/dummy-rig.sh

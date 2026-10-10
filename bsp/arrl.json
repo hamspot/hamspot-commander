@@ -1,0 +1,1078 @@
+{
+  "version": 1,
+  "zones": [
+    {
+      "name": "2200 m",
+      "color": [92, 184, 120],
+      "bands": [
+        {
+          "name": "2200 m CW",
+          "chip": "CW",
+          "lo_hz": 135700,
+          "hi_hz": 137800,
+          "home_hz": 136750,
+          "mode": "CW",
+          "segments": [
+            {"lo_hz": 135700, "hi_hz": 137800, "use": "cw"}
+          ]
+        }
+      ]
+    },
+    {
+      "name": "630 m",
+      "color": [92, 184, 120],
+      "bands": [
+        {
+          "name": "630 m CW",
+          "chip": "CW",
+          "lo_hz": 472000,
+          "hi_hz": 479000,
+          "home_hz": 475500,
+          "mode": "CW",
+          "segments": [
+            {"lo_hz": 472000, "hi_hz": 479000, "use": "cw"}
+          ]
+        }
+      ]
+    },
+    {
+      "name": "160 m",
+      "color": [92, 184, 120],
+      "bands": [
+        {
+          "name": "160 m Digital",
+          "chip": "Digital",
+          "lo_hz": 1800000,
+          "hi_hz": 1810000,
+          "home_hz": 1805000,
+          "mode": "RTTY",
+          "segments": [
+            {"lo_hz": 1800000, "hi_hz": 1810000, "use": "digital"}
+          ]
+        },
+        {
+          "name": "160 m CW",
+          "chip": "CW",
+          "lo_hz": 1810000,
+          "hi_hz": 1843000,
+          "home_hz": 1826500,
+          "mode": "CW",
+          "segments": [
+            {"lo_hz": 1810000, "hi_hz": 1843000, "use": "cw"}
+          ]
+        },
+        {
+          "name": "160 m Voice",
+          "chip": "Voice",
+          "lo_hz": 1843000,
+          "hi_hz": 2000000,
+          "home_hz": 1900000,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 1843000, "hi_hz": 2000000, "use": "voice"}
+          ]
+        }
+      ]
+    },
+    {
+      "name": "80 m",
+      "color": [92, 184, 120],
+      "bands": [
+        {
+          "name": "80 m CW",
+          "chip": "CW",
+          "lo_hz": 3500000,
+          "hi_hz": 3570000,
+          "home_hz": 3535000,
+          "mode": "CW",
+          "segments": [
+            {"lo_hz": 3500000, "hi_hz": 3570000, "use": "cw"}
+          ]
+        },
+        {
+          "name": "80 m Digital",
+          "chip": "Digital",
+          "lo_hz": 3570000,
+          "hi_hz": 3600000,
+          "home_hz": 3585000,
+          "mode": "RTTY",
+          "segments": [
+            {"lo_hz": 3570000, "hi_hz": 3600000, "use": "digital"}
+          ]
+        },
+        {
+          "name": "80 m Voice",
+          "chip": "Voice",
+          "lo_hz": 3600000,
+          "hi_hz": 4000000,
+          "home_hz": 3750000,
+          "mode": "LSB",
+          "segments": [
+            {"lo_hz": 3600000, "hi_hz": 4000000, "use": "voice"}
+          ]
+        }
+      ]
+    },
+    {
+      "name": "60 m",
+      "color": [92, 184, 120],
+      "bands": [
+        {
+          "name": "60 m Mixed 1",
+          "chip": "Mixed 1",
+          "lo_hz": 5330500,
+          "hi_hz": 5333300,
+          "home_hz": 5331900,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 5330500, "hi_hz": 5333300, "use": "mixed"}
+          ]
+        },
+        {
+          "name": "60 m Mixed 2",
+          "chip": "Mixed 2",
+          "lo_hz": 5346500,
+          "hi_hz": 5349300,
+          "home_hz": 5347900,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 5346500, "hi_hz": 5349300, "use": "mixed"}
+          ]
+        },
+        {
+          "name": "60 m Mixed 3",
+          "chip": "Mixed 3",
+          "lo_hz": 5351500,
+          "hi_hz": 5366500,
+          "home_hz": 5359000,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 5351500, "hi_hz": 5366500, "use": "mixed"}
+          ]
+        },
+        {
+          "name": "60 m Mixed 4",
+          "chip": "Mixed 4",
+          "lo_hz": 5371500,
+          "hi_hz": 5374300,
+          "home_hz": 5372900,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 5371500, "hi_hz": 5374300, "use": "mixed"}
+          ]
+        },
+        {
+          "name": "60 m Mixed 5",
+          "chip": "Mixed 5",
+          "lo_hz": 5403500,
+          "hi_hz": 5406300,
+          "home_hz": 5403500,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 5403500, "hi_hz": 5406300, "use": "mixed"}
+          ]
+        }
+      ]
+    },
+    {
+      "name": "40 m",
+      "color": [92, 184, 120],
+      "bands": [
+        {
+          "name": "40 m CW",
+          "chip": "CW",
+          "lo_hz": 7000000,
+          "hi_hz": 7080000,
+          "home_hz": 7040000,
+          "mode": "CW",
+          "segments": [
+            {"lo_hz": 7000000, "hi_hz": 7080000, "use": "cw"}
+          ]
+        },
+        {
+          "name": "40 m Digital",
+          "chip": "Digital",
+          "lo_hz": 7080000,
+          "hi_hz": 7125000,
+          "home_hz": 7102500,
+          "mode": "RTTY",
+          "segments": [
+            {"lo_hz": 7080000, "hi_hz": 7125000, "use": "digital"}
+          ]
+        },
+        {
+          "name": "40 m Voice",
+          "chip": "Voice",
+          "lo_hz": 7125000,
+          "hi_hz": 7300000,
+          "home_hz": 7150000,
+          "mode": "LSB",
+          "segments": [
+            {"lo_hz": 7125000, "hi_hz": 7300000, "use": "voice"}
+          ]
+        }
+      ]
+    },
+    {
+      "name": "30 m",
+      "color": [92, 184, 120],
+      "bands": [
+        {
+          "name": "30 m CW",
+          "chip": "CW",
+          "lo_hz": 10100000,
+          "hi_hz": 10130000,
+          "home_hz": 10115000,
+          "mode": "CW",
+          "segments": [
+            {"lo_hz": 10100000, "hi_hz": 10130000, "use": "cw"}
+          ]
+        },
+        {
+          "name": "30 m Digital",
+          "chip": "Digital",
+          "lo_hz": 10130000,
+          "hi_hz": 10150000,
+          "home_hz": 10136000,
+          "mode": "CW",
+          "segments": [
+            {"lo_hz": 10130000, "hi_hz": 10150000, "use": "digital"}
+          ]
+        }
+      ]
+    },
+    {
+      "name": "20 m",
+      "color": [92, 184, 120],
+      "bands": [
+        {
+          "name": "20 m CW",
+          "chip": "CW",
+          "lo_hz": 14000000,
+          "hi_hz": 14070000,
+          "home_hz": 14035000,
+          "mode": "CW",
+          "segments": [
+            {"lo_hz": 14000000, "hi_hz": 14070000, "use": "cw"}
+          ]
+        },
+        {
+          "name": "20 m Digital",
+          "chip": "Digital",
+          "lo_hz": 14070000,
+          "hi_hz": 14150000,
+          "home_hz": 14110000,
+          "mode": "RTTY",
+          "segments": [
+            {"lo_hz": 14070000, "hi_hz": 14150000, "use": "digital"}
+          ]
+        },
+        {
+          "name": "20 m Voice",
+          "chip": "Voice",
+          "lo_hz": 14150000,
+          "hi_hz": 14350000,
+          "home_hz": 14153608,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 14150000, "hi_hz": 14350000, "use": "voice"}
+          ]
+        }
+      ]
+    },
+    {
+      "name": "17 m",
+      "color": [92, 184, 120],
+      "bands": [
+        {
+          "name": "17 m CW",
+          "chip": "CW",
+          "lo_hz": 18068000,
+          "hi_hz": 18100000,
+          "home_hz": 18084000,
+          "mode": "CW",
+          "segments": [
+            {"lo_hz": 18068000, "hi_hz": 18100000, "use": "cw"}
+          ]
+        },
+        {
+          "name": "17 m Digital",
+          "chip": "Digital",
+          "lo_hz": 18100000,
+          "hi_hz": 18110000,
+          "home_hz": 18105000,
+          "mode": "RTTY",
+          "segments": [
+            {"lo_hz": 18100000, "hi_hz": 18110000, "use": "digital"}
+          ]
+        },
+        {
+          "name": "17 m Voice",
+          "chip": "Voice",
+          "lo_hz": 18110000,
+          "hi_hz": 18168000,
+          "home_hz": 18110000,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 18110000, "hi_hz": 18168000, "use": "voice"}
+          ]
+        }
+      ]
+    },
+    {
+      "name": "15 m",
+      "color": [92, 184, 120],
+      "bands": [
+        {
+          "name": "15 m CW",
+          "chip": "CW",
+          "lo_hz": 21000000,
+          "hi_hz": 21070000,
+          "home_hz": 21035000,
+          "mode": "CW",
+          "segments": [
+            {"lo_hz": 21000000, "hi_hz": 21070000, "use": "cw"}
+          ]
+        },
+        {
+          "name": "15 m Digital",
+          "chip": "Digital",
+          "lo_hz": 21070000,
+          "hi_hz": 21200000,
+          "home_hz": 21135000,
+          "mode": "RTTY",
+          "segments": [
+            {"lo_hz": 21070000, "hi_hz": 21200000, "use": "digital"}
+          ]
+        },
+        {
+          "name": "15 m Voice",
+          "chip": "Voice",
+          "lo_hz": 21200000,
+          "hi_hz": 21450000,
+          "home_hz": 21300000,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 21200000, "hi_hz": 21450000, "use": "voice"}
+          ]
+        }
+      ]
+    },
+    {
+      "name": "12 m",
+      "color": [92, 184, 120],
+      "bands": [
+        {
+          "name": "12 m CW",
+          "chip": "CW",
+          "lo_hz": 24890000,
+          "hi_hz": 24920000,
+          "home_hz": 24905000,
+          "mode": "CW",
+          "segments": [
+            {"lo_hz": 24890000, "hi_hz": 24920000, "use": "cw"}
+          ]
+        },
+        {
+          "name": "12 m Digital",
+          "chip": "Digital",
+          "lo_hz": 24920000,
+          "hi_hz": 24930000,
+          "home_hz": 24925000,
+          "mode": "RTTY",
+          "segments": [
+            {"lo_hz": 24920000, "hi_hz": 24930000, "use": "digital"}
+          ]
+        },
+        {
+          "name": "12 m Voice",
+          "chip": "Voice",
+          "lo_hz": 24930000,
+          "hi_hz": 24990000,
+          "home_hz": 24940000,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 24930000, "hi_hz": 24990000, "use": "voice"}
+          ]
+        }
+      ]
+    },
+    {
+      "name": "10 m",
+      "color": [92, 184, 120],
+      "bands": [
+        {
+          "name": "10 m CW 1",
+          "chip": "CW 1",
+          "lo_hz": 28000000,
+          "hi_hz": 28070000,
+          "home_hz": 28035000,
+          "mode": "CW",
+          "segments": [
+            {"lo_hz": 28000000, "hi_hz": 28070000, "use": "cw"}
+          ]
+        },
+        {
+          "name": "10 m Digital",
+          "chip": "Digital",
+          "lo_hz": 28070000,
+          "hi_hz": 28150000,
+          "home_hz": 28110000,
+          "mode": "RTTY",
+          "segments": [
+            {"lo_hz": 28070000, "hi_hz": 28150000, "use": "digital"}
+          ]
+        },
+        {
+          "name": "10 m CW 2",
+          "chip": "CW 2",
+          "lo_hz": 28150000,
+          "hi_hz": 28300000,
+          "home_hz": 28225000,
+          "mode": "CW",
+          "segments": [
+            {"lo_hz": 28150000, "hi_hz": 28300000, "use": "cw"}
+          ]
+        },
+        {
+          "name": "10 m Voice 1",
+          "chip": "Voice 1",
+          "lo_hz": 28300000,
+          "hi_hz": 29300000,
+          "home_hz": 28400000,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 28300000, "hi_hz": 29300000, "use": "voice"}
+          ]
+        },
+        {
+          "name": "10 m Mixed",
+          "chip": "Mixed",
+          "lo_hz": 29300000,
+          "hi_hz": 29510000,
+          "home_hz": 29405000,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 29300000, "hi_hz": 29510000, "use": "mixed"}
+          ]
+        },
+        {
+          "name": "10 m Voice 2",
+          "chip": "Voice 2",
+          "lo_hz": 29510000,
+          "hi_hz": 29700000,
+          "home_hz": 29605000,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 29510000, "hi_hz": 29700000, "use": "voice"}
+          ]
+        }
+      ]
+    },
+    {
+      "name": "6 m",
+      "color": [92, 184, 120],
+      "bands": [
+        {
+          "name": "6 m CW",
+          "chip": "CW",
+          "lo_hz": 50000000,
+          "hi_hz": 50100000,
+          "home_hz": 50050000,
+          "mode": "CW",
+          "segments": [
+            {"lo_hz": 50000000, "hi_hz": 50100000, "use": "cw"}
+          ]
+        },
+        {
+          "name": "6 m Voice 1",
+          "chip": "Voice 1",
+          "lo_hz": 50100000,
+          "hi_hz": 50300000,
+          "home_hz": 50125000,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 50100000, "hi_hz": 50300000, "use": "voice"}
+          ]
+        },
+        {
+          "name": "6 m Mixed",
+          "chip": "Mixed",
+          "lo_hz": 50300000,
+          "hi_hz": 50600000,
+          "home_hz": 50450000,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 50300000, "hi_hz": 50600000, "use": "mixed"}
+          ]
+        },
+        {
+          "name": "6 m Digital",
+          "chip": "Digital",
+          "lo_hz": 50600000,
+          "hi_hz": 51000000,
+          "home_hz": 50800000,
+          "mode": "RTTY",
+          "segments": [
+            {"lo_hz": 50600000, "hi_hz": 51000000, "use": "digital"}
+          ]
+        },
+        {
+          "name": "6 m Voice 2",
+          "chip": "Voice 2",
+          "lo_hz": 51000000,
+          "hi_hz": 54000000,
+          "home_hz": 52500000,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 51000000, "hi_hz": 54000000, "use": "voice"}
+          ]
+        }
+      ]
+    },
+    {
+      "name": "2 m",
+      "color": [92, 184, 120],
+      "bands": [
+        {
+          "name": "2 m CW",
+          "chip": "CW",
+          "lo_hz": 144000000,
+          "hi_hz": 144100000,
+          "home_hz": 144050000,
+          "mode": "CW",
+          "segments": [
+            {"lo_hz": 144000000, "hi_hz": 144100000, "use": "cw"}
+          ]
+        },
+        {
+          "name": "2 m Voice 1",
+          "chip": "Voice 1",
+          "lo_hz": 144100000,
+          "hi_hz": 144900000,
+          "home_hz": 144500000,
+          "mode": "FM",
+          "segments": [
+            {"lo_hz": 144100000, "hi_hz": 144900000, "use": "voice"}
+          ]
+        },
+        {
+          "name": "2 m Digital",
+          "chip": "Digital",
+          "lo_hz": 144900000,
+          "hi_hz": 145100000,
+          "home_hz": 145000000,
+          "mode": "RTTY",
+          "segments": [
+            {"lo_hz": 144900000, "hi_hz": 145100000, "use": "digital"}
+          ]
+        },
+        {
+          "name": "2 m Voice 2",
+          "chip": "Voice 2",
+          "lo_hz": 145100000,
+          "hi_hz": 148000000,
+          "home_hz": 146520000,
+          "mode": "FM",
+          "segments": [
+            {"lo_hz": 145100000, "hi_hz": 148000000, "use": "voice"}
+          ]
+        }
+      ]
+    },
+    {
+      "name": "1.25 m",
+      "color": [92, 184, 120],
+      "bands": [
+        {
+          "name": "1.25 m CW",
+          "chip": "CW",
+          "lo_hz": 222000000,
+          "hi_hz": 222100000,
+          "home_hz": 222050000,
+          "mode": "CW",
+          "segments": [
+            {"lo_hz": 222000000, "hi_hz": 222100000, "use": "cw"}
+          ]
+        },
+        {
+          "name": "1.25 m Voice 1",
+          "chip": "Voice 1",
+          "lo_hz": 222100000,
+          "hi_hz": 222150000,
+          "home_hz": 222100000,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 222100000, "hi_hz": 222150000, "use": "voice"}
+          ]
+        },
+        {
+          "name": "1.25 m Mixed 1",
+          "chip": "Mixed 1",
+          "lo_hz": 222150000,
+          "hi_hz": 222250000,
+          "home_hz": 222200000,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 222150000, "hi_hz": 222250000, "use": "mixed"}
+          ]
+        },
+        {
+          "name": "1.25 m Voice 2",
+          "chip": "Voice 2",
+          "lo_hz": 222250000,
+          "hi_hz": 223520000,
+          "home_hz": 222885000,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 222250000, "hi_hz": 223520000, "use": "voice"}
+          ]
+        },
+        {
+          "name": "1.25 m Digital",
+          "chip": "Digital",
+          "lo_hz": 223520000,
+          "hi_hz": 223640000,
+          "home_hz": 223580000,
+          "mode": "RTTY",
+          "segments": [
+            {"lo_hz": 223520000, "hi_hz": 223640000, "use": "digital"}
+          ]
+        },
+        {
+          "name": "1.25 m Mixed 2",
+          "chip": "Mixed 2",
+          "lo_hz": 223640000,
+          "hi_hz": 223850000,
+          "home_hz": 223745000,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 223640000, "hi_hz": 223850000, "use": "mixed"}
+          ]
+        },
+        {
+          "name": "1.25 m Voice 3",
+          "chip": "Voice 3",
+          "lo_hz": 223850000,
+          "hi_hz": 224980000,
+          "home_hz": 224415000,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 223850000, "hi_hz": 224980000, "use": "voice"}
+          ]
+        }
+      ]
+    },
+    {
+      "name": "70 cm",
+      "color": [92, 184, 120],
+      "bands": [
+        {
+          "name": "70 cm CW",
+          "chip": "CW",
+          "lo_hz": 432000000,
+          "hi_hz": 432100000,
+          "home_hz": 432050000,
+          "mode": "CW",
+          "segments": [
+            {"lo_hz": 432000000, "hi_hz": 432100000, "use": "cw"}
+          ]
+        },
+        {
+          "name": "70 cm Voice 1",
+          "chip": "Voice 1",
+          "lo_hz": 432100000,
+          "hi_hz": 433000000,
+          "home_hz": 432550000,
+          "mode": "FM",
+          "segments": [
+            {"lo_hz": 432100000, "hi_hz": 433000000, "use": "voice"}
+          ]
+        },
+        {
+          "name": "70 cm Mixed 1",
+          "chip": "Mixed 1",
+          "lo_hz": 433000000,
+          "hi_hz": 435000000,
+          "home_hz": 434000000,
+          "mode": "FM",
+          "segments": [
+            {"lo_hz": 433000000, "hi_hz": 435000000, "use": "mixed"}
+          ]
+        },
+        {
+          "name": "70 cm Mixed 2",
+          "chip": "Mixed 2",
+          "lo_hz": 435000000,
+          "hi_hz": 438000000,
+          "home_hz": 436500000,
+          "mode": "FM",
+          "segments": [
+            {"lo_hz": 435000000, "hi_hz": 438000000, "use": "mixed"}
+          ]
+        },
+        {
+          "name": "70 cm Voice 2",
+          "chip": "Voice 2",
+          "lo_hz": 438000000,
+          "hi_hz": 450000000,
+          "home_hz": 446000000,
+          "mode": "FM",
+          "segments": [
+            {"lo_hz": 438000000, "hi_hz": 450000000, "use": "voice"}
+          ]
+        }
+      ]
+    },
+    {
+      "name": "33 cm",
+      "color": [92, 184, 120],
+      "bands": [
+        {
+          "name": "33 cm Voice 1",
+          "chip": "Voice 1",
+          "lo_hz": 902000000,
+          "hi_hz": 903400000,
+          "home_hz": 903100000,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 902000000, "hi_hz": 903400000, "use": "voice"}
+          ]
+        },
+        {
+          "name": "33 cm Mixed",
+          "chip": "Mixed",
+          "lo_hz": 903400000,
+          "hi_hz": 927000000,
+          "home_hz": 915200000,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 903400000, "hi_hz": 927000000, "use": "mixed"}
+          ]
+        },
+        {
+          "name": "33 cm Voice 2",
+          "chip": "Voice 2",
+          "lo_hz": 927000000,
+          "hi_hz": 928000000,
+          "home_hz": 927500000,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 927000000, "hi_hz": 928000000, "use": "voice"}
+          ]
+        }
+      ]
+    },
+    {
+      "name": "23 cm",
+      "color": [92, 184, 120],
+      "bands": [
+        {
+          "name": "23 cm Mixed 1",
+          "chip": "Mixed 1",
+          "lo_hz": 1240000000,
+          "hi_hz": 1248000000,
+          "home_hz": 1244000000,
+          "mode": "FM",
+          "segments": [
+            {"lo_hz": 1240000000, "hi_hz": 1248000000, "use": "mixed"}
+          ]
+        },
+        {
+          "name": "23 cm Digital 1",
+          "chip": "Digital 1",
+          "lo_hz": 1248000000,
+          "hi_hz": 1252000000,
+          "home_hz": 1250000000,
+          "mode": "RTTY",
+          "segments": [
+            {"lo_hz": 1248000000, "hi_hz": 1252000000, "use": "digital"}
+          ]
+        },
+        {
+          "name": "23 cm Mixed 2",
+          "chip": "Mixed 2",
+          "lo_hz": 1252000000,
+          "hi_hz": 1294000000,
+          "home_hz": 1273000000,
+          "mode": "FM",
+          "segments": [
+            {"lo_hz": 1252000000, "hi_hz": 1294000000, "use": "mixed"}
+          ]
+        },
+        {
+          "name": "23 cm Voice 1",
+          "chip": "Voice 1",
+          "lo_hz": 1294000000,
+          "hi_hz": 1295000000,
+          "home_hz": 1294500000,
+          "mode": "FM",
+          "segments": [
+            {"lo_hz": 1294000000, "hi_hz": 1295000000, "use": "voice"}
+          ]
+        },
+        {
+          "name": "23 cm Mixed 3",
+          "chip": "Mixed 3",
+          "lo_hz": 1295000000,
+          "hi_hz": 1296080000,
+          "home_hz": 1295540000,
+          "mode": "FM",
+          "segments": [
+            {"lo_hz": 1295000000, "hi_hz": 1296080000, "use": "mixed"}
+          ]
+        },
+        {
+          "name": "23 cm Voice 2",
+          "chip": "Voice 2",
+          "lo_hz": 1296080000,
+          "hi_hz": 1296200000,
+          "home_hz": 1296140000,
+          "mode": "FM",
+          "segments": [
+            {"lo_hz": 1296080000, "hi_hz": 1296200000, "use": "voice"}
+          ]
+        },
+        {
+          "name": "23 cm Digital 2",
+          "chip": "Digital 2",
+          "lo_hz": 1296200000,
+          "hi_hz": 1296400000,
+          "home_hz": 1296300000,
+          "mode": "RTTY",
+          "segments": [
+            {"lo_hz": 1296200000, "hi_hz": 1296400000, "use": "digital"}
+          ]
+        },
+        {
+          "name": "23 cm Mixed 4",
+          "chip": "Mixed 4",
+          "lo_hz": 1296400000,
+          "hi_hz": 1297000000,
+          "home_hz": 1296700000,
+          "mode": "FM",
+          "segments": [
+            {"lo_hz": 1296400000, "hi_hz": 1297000000, "use": "mixed"}
+          ]
+        },
+        {
+          "name": "23 cm Digital 3",
+          "chip": "Digital 3",
+          "lo_hz": 1297000000,
+          "hi_hz": 1300000000,
+          "home_hz": 1298500000,
+          "mode": "RTTY",
+          "segments": [
+            {"lo_hz": 1297000000, "hi_hz": 1300000000, "use": "digital"}
+          ]
+        }
+      ]
+    },
+    {
+      "name": "13 cm",
+      "color": [92, 184, 120],
+      "bands": [
+        {
+          "name": "13 cm Mixed 1",
+          "chip": "Mixed 1",
+          "lo_hz": 2300000000,
+          "hi_hz": 2303750000,
+          "home_hz": 2301875000,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 2300000000, "hi_hz": 2303750000, "use": "mixed"}
+          ]
+        },
+        {
+          "name": "13 cm Mixed 2",
+          "chip": "Mixed 2",
+          "lo_hz": 2303750000,
+          "hi_hz": 2304300000,
+          "home_hz": 2304100000,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 2303750000, "hi_hz": 2304300000, "use": "mixed"}
+          ]
+        },
+        {
+          "name": "13 cm CW",
+          "chip": "CW",
+          "lo_hz": 2304300000,
+          "hi_hz": 2304400000,
+          "home_hz": 2304350000,
+          "mode": "CW",
+          "segments": [
+            {"lo_hz": 2304300000, "hi_hz": 2304400000, "use": "cw"}
+          ]
+        },
+        {
+          "name": "13 cm Mixed 3",
+          "chip": "Mixed 3",
+          "lo_hz": 2304400000,
+          "hi_hz": 2310000000,
+          "home_hz": 2307200000,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 2304400000, "hi_hz": 2310000000, "use": "mixed"}
+          ]
+        }
+      ]
+    },
+    {
+      "name": "13 cm hi",
+      "color": [92, 184, 120],
+      "bands": [
+        {
+          "name": "13 cm hi Mixed",
+          "chip": "Mixed",
+          "lo_hz": 2390000000,
+          "hi_hz": 2450000000,
+          "home_hz": 2405000000,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 2390000000, "hi_hz": 2450000000, "use": "mixed"}
+          ]
+        }
+      ]
+    },
+    {
+      "name": "9 cm",
+      "color": [92, 184, 120],
+      "bands": [
+        {
+          "name": "9 cm Mixed 1",
+          "chip": "Mixed 1",
+          "lo_hz": 3300000000,
+          "hi_hz": 3332000000,
+          "home_hz": 3316000000,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 3300000000, "hi_hz": 3332000000, "use": "mixed"}
+          ]
+        },
+        {
+          "name": "9 cm Mixed 2",
+          "chip": "Mixed 2",
+          "lo_hz": 3339000000,
+          "hi_hz": 3345800000,
+          "home_hz": 3342400000,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 3339000000, "hi_hz": 3345800000, "use": "mixed"}
+          ]
+        },
+        {
+          "name": "9 cm Mixed 3",
+          "chip": "Mixed 3",
+          "lo_hz": 3352500000,
+          "hi_hz": 3450000000,
+          "home_hz": 3400100000,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 3352500000, "hi_hz": 3450000000, "use": "mixed"}
+          ]
+        }
+      ]
+    },
+    {
+      "name": "5 cm",
+      "color": [92, 184, 120],
+      "bands": [
+        {
+          "name": "5 cm Mixed 1",
+          "chip": "Mixed 1",
+          "lo_hz": 5650000000,
+          "hi_hz": 5759000000,
+          "home_hz": 5704500000,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 5650000000, "hi_hz": 5759000000, "use": "mixed"}
+          ]
+        },
+        {
+          "name": "5 cm Mixed 2",
+          "chip": "Mixed 2",
+          "lo_hz": 5759000000,
+          "hi_hz": 5760300000,
+          "home_hz": 5760100000,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 5759000000, "hi_hz": 5760300000, "use": "mixed"}
+          ]
+        },
+        {
+          "name": "5 cm CW",
+          "chip": "CW",
+          "lo_hz": 5760300000,
+          "hi_hz": 5760400000,
+          "home_hz": 5760350000,
+          "mode": "CW",
+          "segments": [
+            {"lo_hz": 5760300000, "hi_hz": 5760400000, "use": "cw"}
+          ]
+        },
+        {
+          "name": "5 cm Mixed 3",
+          "chip": "Mixed 3",
+          "lo_hz": 5760400000,
+          "hi_hz": 5925000000,
+          "home_hz": 5842700000,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 5760400000, "hi_hz": 5925000000, "use": "mixed"}
+          ]
+        }
+      ]
+    },
+    {
+      "name": "3 cm",
+      "color": [92, 184, 120],
+      "bands": [
+        {
+          "name": "3 cm Mixed 1",
+          "chip": "Mixed 1",
+          "lo_hz": 10000000000,
+          "hi_hz": 10367000000,
+          "home_hz": 10183500000,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 10000000000, "hi_hz": 10367000000, "use": "mixed"}
+          ]
+        },
+        {
+          "name": "3 cm Mixed 2",
+          "chip": "Mixed 2",
+          "lo_hz": 10367000000,
+          "hi_hz": 10368300000,
+          "home_hz": 10368100000,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 10367000000, "hi_hz": 10368300000, "use": "mixed"}
+          ]
+        },
+        {
+          "name": "3 cm CW",
+          "chip": "CW",
+          "lo_hz": 10368300000,
+          "hi_hz": 10368400000,
+          "home_hz": 10368350000,
+          "mode": "CW",
+          "segments": [
+            {"lo_hz": 10368300000, "hi_hz": 10368400000, "use": "cw"}
+          ]
+        },
+        {
+          "name": "3 cm Mixed 3",
+          "chip": "Mixed 3",
+          "lo_hz": 10368400000,
+          "hi_hz": 10500000000,
+          "home_hz": 10434200000,
+          "mode": "USB",
+          "segments": [
+            {"lo_hz": 10368400000, "hi_hz": 10500000000, "use": "mixed"}
+          ]
+        }
+      ]
+    }
+  ]
+}
