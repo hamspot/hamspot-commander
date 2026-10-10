@@ -1,0 +1,57 @@
+name: portable release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  portable:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: System libraries for the egui window
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libgtk-3-dev zip
+
+      - name: Release binary
+        run: cargo build --release -p commander
+
+      - name: Portable zip
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          stage="${RUNNER_TEMP}/HamSpotCommander"
+          scripts/portable-install.sh --no-build --stage "$stage"
+          archive="hamspot-commander-${version}-portable-linux-x86_64.zip"
+          ( cd "$RUNNER_TEMP" && zip -r "${GITHUB_WORKSPACE}/${archive}" HamSpotCommander )
+          echo "archive=${archive}" >> "$GITHUB_ENV"
+
+      - name: Attach the zip to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          notes=$(cat <<EOF
+Portable Linux build of Hamspot Commander ${version}.
+
+Unzip HamSpotCommander and start hamspot-commander.sh. Config, window state, and Gqrx files stay inside that folder. The machine still needs gqrx, rigctld (libhamlib-utils), and PipeWire.
+EOF
+          )
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" \
+              --title "$version" \
+              --notes "$notes" \
+              --verify-tag
+          fi
+          gh release upload "$GITHUB_REF_NAME" "$archive" --clobber

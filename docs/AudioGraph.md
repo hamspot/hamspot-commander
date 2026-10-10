@@ -4,6 +4,8 @@ This is the PipeWire graph Helvum shows for the Hamlib dummy, connection 1. Comm
 
 The number in each hamspot name is the connection id. The words before it are the make and the model.
 
+The Config tab draws the same wires in the Audio frame. The cartoon radio is the virtual card. The cartoon speaker is the receiver side. The cartoon microphone is the transmit side. Computer devices use the desktop's own icons. Dragging a wire there chooses the same microphone or speaker as the dropdown next to that radio.
+
 ## Hamlib Dummy 1 RX
 
 Hamlib Dummy 1 RX is the receiver card. Its PipeWire name is `hamspot_1_rx`. It is a sink: a program plays the receiver here, and the card then carries that audio toward the speakers.

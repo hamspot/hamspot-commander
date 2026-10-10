@@ -5,6 +5,7 @@
 //! face (frequency, meters, VFO, band scales, levels).
 
 mod audio;
+mod bay;
 mod cat;
 mod channels;
 mod config;
@@ -205,6 +206,12 @@ struct App {
     audio_saved: String,
     /// A loaded file is not written back until the cards it asked for have appeared.
     audio_hold: bool,
+    speaker_tex: Option<egui::TextureHandle>,
+    mic_tex: Option<egui::TextureHandle>,
+    radio_tex: Option<egui::TextureHandle>,
+    /// `None` means the theme had no icon, so the frame does not ask again.
+    xdg_tex: HashMap<String, Option<egui::TextureHandle>>,
+    bay_drag: Option<bay::Drag>,
 }
 
 /// True when `name` is a file on `PATH` with an execute bit. A missing
@@ -235,6 +242,74 @@ fn helvum_on_path() -> bool {
 /// Starts Helvum in its own process group. Hub shutdown only signals the
 /// radio and `pw-dump` process groups, so this editor stays up. The waiter
 /// reaps Helvum when it exits.
+fn paint_curve(
+    painter: &egui::Painter,
+    origin: egui::Pos2,
+    from: [f32; 2],
+    to: [f32; 2],
+    color: egui::Color32,
+) {
+    let points = bay::curve_points(from, to);
+    let shape = egui::epaint::CubicBezierShape::from_points_stroke(
+        [
+            origin + egui::vec2(points[0][0], points[0][1]),
+            origin + egui::vec2(points[1][0], points[1][1]),
+            origin + egui::vec2(points[2][0], points[2][1]),
+            origin + egui::vec2(points[3][0], points[3][1]),
+        ],
+        false,
+        egui::Color32::TRANSPARENT,
+        egui::Stroke::new(2.0, color),
+    );
+    painter.add(shape);
+}
+
+fn png_texture(ctx: &egui::Context, name: &str, bytes: &[u8]) -> Option<egui::TextureHandle> {
+    let image = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let size = [image.width() as usize, image.height() as usize];
+    let color = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
+    Some(ctx.load_texture(name, color, egui::TextureOptions::LINEAR))
+}
+
+/// Rasterize one XDG icon through the active GTK theme.
+///
+/// The microphone icon in the current theme is SVG only. GTK already knows
+/// the theme and how to color a symbolic icon. The process exit is the result.
+fn xdg_icon_png(name: &str) -> Option<Vec<u8>> {
+    let script = r#"
+import sys
+import gi
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk
+Gtk.init([])
+theme = Gtk.IconTheme.get_default()
+info = None
+for candidate in sys.argv[1:]:
+    info = theme.lookup_icon(candidate, 64, 0)
+    if info is not None:
+        break
+if info is None:
+    sys.exit(1)
+pixbuf = info.load_icon()
+ok, buf = pixbuf.save_to_bufferv("png", [], [])
+if not ok:
+    sys.exit(1)
+sys.stdout.buffer.write(buf)
+"#;
+    let symbolic = format!("{name}-symbolic");
+    let output = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(script)
+        .arg(name)
+        .arg(&symbolic)
+        .output()
+        .ok()?;
+    if !output.status.success() || output.stdout.is_empty() {
+        return None;
+    }
+    Some(output.stdout)
+}
+
 fn launch_helvum() {
     use std::os::unix::process::CommandExt;
     let mut cmd = std::process::Command::new("helvum");
@@ -570,6 +645,11 @@ impl App {
             config_note: String::new(),
             audio_saved: crate::audio::canonical(&crate::audio::AudioGraph::default()),
             audio_hold: false,
+            speaker_tex: None,
+            mic_tex: None,
+            radio_tex: None,
+            xdg_tex: HashMap::new(),
+            bay_drag: None,
         }
     }
 
@@ -1933,6 +2013,7 @@ impl App {
                 }
                 ui.add_space(4.0);
             }
+            self.paint_bay(ui, &view);
             let owned: Vec<String> = view
                 .rows
                 .iter()
@@ -1953,17 +2034,169 @@ impl App {
                     ));
                 }
             }
-            if !view.audio.links.is_empty() {
-                ui.add_space(4.0);
-                ui.label("Wires");
-                for link in &view.audio.links {
-                    ui.label(format!("{}    {}", link.output, link.input));
-                }
-            }
         });
         if let Some((id, input, output)) = endpoint {
             self.hub.set_endpoint(id, input, output);
         }
+    }
+
+    fn paint_bay(&mut self, ui: &mut egui::Ui, view: &cat::HubView) {
+        self.ensure_bay_art(ui.ctx());
+        let radios: Vec<bay::BayRadio> = view
+            .rows
+            .iter()
+            .map(|row| bay::BayRadio {
+                id: row.id,
+                title: format!("{} {} {}", row.id, row.make, row.model_label),
+                rx_title: crate::audio::describe(&row.make, &row.model_label, row.id, "RX"),
+                tx_title: crate::audio::describe(&row.make, &row.model_label, row.id, "TX"),
+                input: row.spec.audio.input.clone(),
+                output: row.spec.audio.output.clone(),
+            })
+            .collect();
+        let bindings: Vec<bay::RadioBinding> = radios
+            .iter()
+            .map(|radio| bay::RadioBinding {
+                id: radio.id,
+                input: radio.input.clone(),
+                output: radio.output.clone(),
+            })
+            .collect();
+        ui.add_space(8.0);
+        ui.label("Drag a wire from a microphone to the radio, or from the radio to a speaker.");
+        let input = bay::BayIn {
+            captures: &view.capture,
+            playbacks: &view.playback,
+            radios: &radios,
+            links: &view.audio.links,
+            ports: &view.connect_ports,
+        };
+        let width = ui.available_width().max(680.0);
+        let scene = bay::layout(width, &input);
+        for icon in &scene.icons {
+            if icon.kind == bay::IconKind::Xdg {
+                self.ensure_xdg(ui.ctx(), &icon.xdg);
+            }
+        }
+        let (rect, response) = ui.allocate_exact_size(
+            egui::vec2(scene.width, scene.height),
+            egui::Sense::click_and_drag(),
+        );
+        let origin = rect.min;
+        let pointer = response.interact_pointer_pos().map(|pos| pos - origin);
+        if response.drag_started() {
+            if let Some(pos) = pointer {
+                self.bay_drag = bay::grab_at(&scene, pos.x, pos.y);
+            }
+        }
+        let mut updates = Vec::new();
+        if response.drag_stopped() {
+            if let Some(drag) = self.bay_drag.take() {
+                if let Some(pos) = pointer {
+                    let inside = pos.x >= 0.0
+                        && pos.y >= 0.0
+                        && pos.x <= scene.width
+                        && pos.y <= scene.height;
+                    if inside {
+                        let target = bay::target_at(&scene, pos.x, pos.y);
+                        updates = bay::endpoint_updates(&bindings, &drag.grab, target.as_ref());
+                    }
+                }
+            }
+        }
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(22, 24, 28));
+        let wire_color = egui::Color32::from_rgb(70, 140, 220);
+        for wire in &scene.wires {
+            paint_curve(&painter, origin, wire.from, wire.to, wire_color);
+        }
+        if let Some(drag) = &self.bay_drag {
+            if let Some(pos) = pointer {
+                paint_curve(
+                    &painter,
+                    origin,
+                    drag.anchor,
+                    [pos.x, pos.y],
+                    egui::Color32::from_rgb(160, 200, 255),
+                );
+            }
+        }
+        for icon in &scene.icons {
+            let tex = match icon.kind {
+                bay::IconKind::Mic => self.mic_tex.as_ref(),
+                bay::IconKind::Speaker => self.speaker_tex.as_ref(),
+                bay::IconKind::Radio => self.radio_tex.as_ref(),
+                bay::IconKind::Xdg => self.xdg_tex.get(&icon.xdg).and_then(Option::as_ref),
+            };
+            let icon_rect = egui::Rect::from_min_size(
+                origin + egui::vec2(icon.x, icon.y),
+                egui::vec2(48.0, 48.0),
+            );
+            if let Some(tex) = tex {
+                painter.image(
+                    tex.id(),
+                    icon_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            }
+            painter.text(
+                icon_rect.center_bottom() + egui::vec2(0.0, 2.0),
+                egui::Align2::CENTER_TOP,
+                &icon.label,
+                egui::FontId::proportional(10.0),
+                egui::Color32::from_gray(210),
+            );
+        }
+        for port in &scene.ports {
+            let at = origin + egui::vec2(port.at[0], port.at[1]);
+            painter.circle_filled(at, 4.0, wire_color);
+            let anchor = if port.label_right {
+                (at + egui::vec2(8.0, 0.0), egui::Align2::LEFT_CENTER)
+            } else {
+                (at + egui::vec2(-8.0, 0.0), egui::Align2::RIGHT_CENTER)
+            };
+            painter.text(
+                anchor.0,
+                anchor.1,
+                &port.label,
+                egui::FontId::monospace(9.0),
+                egui::Color32::from_gray(170),
+            );
+        }
+        for update in updates {
+            self.hub
+                .set_endpoint(update.id, update.input, update.output);
+        }
+    }
+
+    fn ensure_bay_art(&mut self, ctx: &egui::Context) {
+        if self.speaker_tex.is_none() {
+            self.speaker_tex = png_texture(
+                ctx,
+                "hamspot-speaker",
+                include_bytes!("../assets/icon-speaker.png"),
+            );
+        }
+        if self.mic_tex.is_none() {
+            self.mic_tex =
+                png_texture(ctx, "hamspot-mic", include_bytes!("../assets/icon-mic.png"));
+        }
+        if self.radio_tex.is_none() {
+            self.radio_tex = png_texture(
+                ctx,
+                "hamspot-radio",
+                include_bytes!("../assets/icon-radio.png"),
+            );
+        }
+    }
+
+    fn ensure_xdg(&mut self, ctx: &egui::Context, name: &str) {
+        if self.xdg_tex.contains_key(name) {
+            return;
+        }
+        let tex = xdg_icon_png(name).and_then(|bytes| png_texture(ctx, name, &bytes));
+        self.xdg_tex.insert(name.to_string(), tex);
     }
 
     fn open_hamlib(&mut self, row: Option<&cat::RadioRow>) {
@@ -2066,6 +2299,13 @@ impl App {
                 ui.text_edit_singleline(&mut edit.name);
             });
             ui.label("Commander starts this GQRX and stops it on exit.");
+            if edit.id.is_none() {
+                ui.label("A new GQRX has no input device, so it opens the I/O chooser.");
+            }
+            ui.label(format!(
+                "Config  {}",
+                cat::gqrx_conf_for_name(&edit.name).display()
+            ));
             ui.label(format!("Listen  127.0.0.1:{}", edit.port_label));
             if !edit.error.is_empty() {
                 ui.label(
@@ -2217,11 +2457,26 @@ impl App {
                     self.hub
                         .view()
                         .rows
-                        .into_iter()
+                        .iter()
                         .find(|row| row.id == id)
-                        .map(|row| row.spec.audio)
+                        .map(|row| row.spec.audio.clone())
                 })
                 .unwrap_or_default(),
+            gqrx: match edit.driver {
+                cat::RadioDriver::Gqrx if edit.id.is_none() => cat::gqrx_chooser_config(),
+                cat::RadioDriver::Gqrx => edit
+                    .id
+                    .and_then(|id| {
+                        self.hub
+                            .view()
+                            .rows
+                            .iter()
+                            .find(|row| row.id == id)
+                            .map(|row| row.spec.gqrx.clone())
+                    })
+                    .unwrap_or_else(cat::gqrx_chooser_config),
+                cat::RadioDriver::Hamlib => cat::GqrxConfig::new(),
+            },
         };
         if let Err(err) = cat::validate_spec(&spec) {
             if let Some(edit) = &mut self.cat_edit {

@@ -284,6 +284,7 @@ mod tests {
             conf: String::new(),
             park: false,
             audio: crate::cat::RadioAudio::default(),
+            gqrx: crate::cat::GqrxConfig::new(),
         });
         let back = parse(&to_string(&file).unwrap()).unwrap();
         assert_eq!(back.radios.len(), 1);
@@ -312,6 +313,43 @@ mod tests {
         let back = parse(&to_string(&file).unwrap()).unwrap();
         assert_eq!(back.audio.devices[0].name, "hamspot_custom");
         assert_eq!(back.audio.links[0].output, "output.hamspot_1_rx:output_FL");
+        assert!(!to_string(&file).unwrap().contains("\"gqrx\""));
+    }
+
+    #[test]
+    fn gqrx_settings_round_trip_inside_the_station_file() {
+        let mut file = sample();
+        let mut spec = crate::cat::RadioSpec::dummy();
+        spec.driver = crate::cat::RadioDriver::Gqrx;
+        spec.name = "GQRX".into();
+        spec.model = 0;
+        spec.park = false;
+        spec.gqrx = crate::cat::gqrx_chooser_config();
+        file.radios.push(spec);
+        let text = to_string(&file).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let gqrx = &value["radios"][0]["gqrx"];
+        assert!(gqrx.get("General").is_some());
+        assert_eq!(gqrx["General"]["crashed"], "false");
+        assert!(gqrx
+            .get("input")
+            .and_then(|group| group.get("device"))
+            .is_none());
+        let back = parse(&text).unwrap();
+        assert!(crate::cat::gqrx_needs_chooser(&back.radios[0].gqrx));
+        assert_eq!(
+            back.radios[0]
+                .gqrx
+                .get("remote_control")
+                .unwrap()
+                .get("enabled")
+                .unwrap(),
+            "true"
+        );
+        let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        value["radios"][0].as_object_mut().unwrap().remove("gqrx");
+        let loaded = parse(&value.to_string()).unwrap();
+        assert!(loaded.radios[0].gqrx.is_empty());
     }
 
     #[test]

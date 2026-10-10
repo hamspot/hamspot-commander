@@ -6,7 +6,7 @@
 //! whole graph. Later lines list only the objects that changed, and `info:
 //! null` removes an id. Those lines are merged; a changed line is not a new graph.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
@@ -45,6 +45,8 @@ pub struct AudioLook {
     pub graph: AudioGraph,
     pub playback: Vec<AudioNode>,
     pub capture: Vec<AudioNode>,
+    /// Connectable port names keyed by `node.name`. Monitor taps are left out.
+    pub connect_ports: BTreeMap<String, Vec<String>>,
 }
 
 /// `{Make} {Model} {id} RX` or the TX form. This is the name a person sees.
@@ -194,6 +196,14 @@ pub fn look_key(look: &AudioLook) -> String {
         key.push_str(&node.class);
         key.push('\n');
     }
+    for (name, ports) in &look.connect_ports {
+        key.push_str(name);
+        key.push('\n');
+        for port in ports {
+            key.push_str(port);
+            key.push('\n');
+        }
+    }
     key
 }
 
@@ -226,6 +236,7 @@ pub fn graph_from_dump(text: &str) -> Option<AudioLook> {
         names.insert(id, (name.to_string(), description, class));
     }
     let mut ports = BTreeMap::<u64, String>::new();
+    let mut connect_ports: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for item in &items {
         if item.get("type").and_then(Value::as_str) != Some("PipeWire:Interface:Port") {
             continue;
@@ -246,6 +257,12 @@ pub fn graph_from_dump(text: &str) -> Option<AudioLook> {
             continue;
         };
         ports.insert(id, format!("{node_name}:{port_name}"));
+        if connectable_port(port_name) {
+            connect_ports
+                .entry(node_name.clone())
+                .or_default()
+                .insert(port_name.to_string());
+        }
     }
     let mut devices = Vec::new();
     let mut playback = Vec::new();
@@ -302,11 +319,23 @@ pub fn graph_from_dump(text: &str) -> Option<AudioLook> {
     let graph = serde_json::from_str(&canonical(&graph)).unwrap_or(graph);
     playback.sort_by(|a, b| a.name.cmp(&b.name));
     capture.sort_by(|a, b| a.name.cmp(&b.name));
+    let connect_ports = connect_ports
+        .into_iter()
+        .map(|(name, ports)| (name, ports.into_iter().collect()))
+        .collect();
     Some(AudioLook {
         graph,
         playback,
         capture,
+        connect_ports,
     })
+}
+
+fn connectable_port(name: &str) -> bool {
+    name.starts_with("playback_")
+        || name.starts_with("capture_")
+        || name.starts_with("output_")
+        || name.starts_with("input_")
 }
 
 fn menu_device(name: &str) -> bool {
@@ -558,6 +587,18 @@ mod tests {
             .playback
             .iter()
             .any(|node| node.name == "Radio-Playback"));
+        assert_eq!(
+            look.connect_ports
+                .get("alsa_output.speakers")
+                .map(Vec::as_slice),
+            Some(["playback_FL".to_string()].as_slice())
+        );
+        assert_eq!(
+            look.connect_ports
+                .get("output.hamspot_1_rx")
+                .map(Vec::as_slice),
+            Some(["output_FL".to_string()].as_slice())
+        );
         assert_eq!(
             peer_node(&look.graph, "output.hamspot_1_rx", true).as_deref(),
             Some("alsa_output.speakers")

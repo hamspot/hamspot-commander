@@ -687,10 +687,11 @@ dependencies = [
 
 [[package]]
 name = "commander"
-version = "0.3.0"
+version = "0.6.6"
 dependencies = [
  "eframe",
  "egui",
+ "image",
  "libc",
  "rfd",
  "rigctl",
@@ -2716,7 +2717,7 @@ dependencies = [
 
 [[package]]
 name = "rigctl"
-version = "0.3.0"
+version = "0.6.6"
 
 [[package]]
 name = "ron"
