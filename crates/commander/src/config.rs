@@ -28,6 +28,10 @@ pub struct ConfigFile {
     /// Absent in a file written before the Audio frame existed.
     #[serde(default)]
     pub audio: AudioGraph,
+    /// Rotators the Automation frame starts. Absent in a file written before
+    /// that frame existed, which still loads and starts no rotator.
+    #[serde(default)]
+    pub rotators: Vec<crate::rot::RotatorSpec>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -144,6 +148,9 @@ pub fn validate(file: &ConfigFile) -> Result<(), String> {
     for radio in &file.radios {
         crate::cat::validate_spec(radio)?;
     }
+    for rotator in &file.rotators {
+        crate::rot::validate_spec(rotator)?;
+    }
     Ok(())
 }
 
@@ -229,6 +236,7 @@ mod tests {
             levels: BTreeMap::from([("AF".into(), 0.25)]),
             radios: Vec::new(),
             audio: AudioGraph::default(),
+            rotators: Vec::new(),
         }
     }
 
@@ -283,6 +291,7 @@ mod tests {
             ptt_file: String::new(),
             conf: String::new(),
             park: false,
+            follow: false,
             audio: crate::cat::RadioAudio::default(),
             gqrx: crate::cat::GqrxConfig::new(),
         });
@@ -292,6 +301,7 @@ mod tests {
         assert_eq!(back.radios[0].model, 3073);
         assert_eq!(back.radios[0].device, "/dev/ttyUSB0");
         assert!(!back.radios[0].park);
+        assert!(!back.radios[0].follow);
         assert!(back.radios[0].audio.rx);
         assert!(back.radios[0].audio.input.is_empty());
         let mut value: serde_json::Value =
@@ -314,6 +324,30 @@ mod tests {
         assert_eq!(back.audio.devices[0].name, "hamspot_custom");
         assert_eq!(back.audio.links[0].output, "output.hamspot_1_rx:output_FL");
         assert!(!to_string(&file).unwrap().contains("\"gqrx\""));
+    }
+
+    #[test]
+    fn a_file_without_rotators_loads_and_one_rotator_round_trips() {
+        let text = to_string(&sample()).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        value.as_object_mut().unwrap().remove("rotators");
+        let loaded = parse(&value.to_string()).unwrap();
+        assert!(loaded.rotators.is_empty());
+        let mut file = sample();
+        file.rotators.push(crate::rot::RotatorSpec {
+            name: "Tower".into(),
+            model: 601,
+            device: "/dev/ttyUSB0".into(),
+            serial_speed: "9600".into(),
+            conf: String::new(),
+        });
+        let back = parse(&to_string(&file).unwrap()).unwrap();
+        assert_eq!(back.rotators.len(), 1);
+        assert_eq!(back.rotators[0].name, "Tower");
+        assert_eq!(back.rotators[0].model, 601);
+        assert_eq!(back.rotators[0].device, "/dev/ttyUSB0");
+        file.rotators[0].name.clear();
+        assert!(to_string(&file).is_err());
     }
 
     #[test]

@@ -28,6 +28,14 @@ const READ_LEVELS: &[&str] = &[
     "ALC",
     "SWR",
     "RFPOWER_METER",
+    // The rest of hamlib's read-only meter list (`RIG_LEVEL_READONLY_LIST`).
+    // A radio that does not list the name is not asked.
+    "RFPOWER_METER_WATTS",
+    "COMP_METER",
+    "VD_METER",
+    "ID_METER",
+    "TEMP_METER",
+    "RAWSTR",
 ];
 
 const READ_FUNCS: &[&str] = &[
@@ -44,12 +52,27 @@ pub struct LiveRig {
     message: String,
     /// Extended is hamlib `+\`. Classic is the short rigctl form GQRX speaks.
     dialect: Dialect,
+    /// While set, a poll reads both VFOs without `set_vfo`.
+    follow: bool,
+    /// The last follow poll named both VFOs. False means only the current
+    /// VFO was read, so the caller can keep the previous pair.
+    paired: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Dialect {
     Extended,
     Classic,
+}
+
+struct Followed {
+    vfo: String,
+    freq: f64,
+    mode: String,
+    passband: i32,
+    other: String,
+    other_freq: f64,
+    other_mode: String,
 }
 
 struct Reply {
@@ -73,7 +96,23 @@ impl LiveRig {
             ant: 1,
             message: String::new(),
             dialect: Dialect::Extended,
+            follow: false,
+            paired: true,
         })
+    }
+
+    /// Follow reads both VFOs with `\set_vfo_opt` on this socket only.
+    /// The daemon is still started without `-o`. A classic socket ignores it.
+    pub fn set_follow(&mut self, follow: bool) {
+        self.follow = follow;
+        if !follow {
+            self.paired = true;
+        }
+    }
+
+    /// True when Follow is on and this poll could not name the paired VFO.
+    pub fn follow_current_only(&self) -> bool {
+        self.follow && !self.paired
     }
 
     /// GQRX and any other short-command rigctl socket. The same [`Command`]
@@ -100,7 +139,110 @@ impl LiveRig {
             ant: 1,
             message: String::new(),
             dialect: Dialect::Classic,
+            follow: false,
+            paired: true,
         })
+    }
+
+    /// One frequency while vfo mode is on. The VFO name is required: a bare
+    /// `get_freq` does not answer, and the next command would read that reply.
+    fn named_freq(&mut self, vfo: &str) -> Result<Option<f64>, RigError> {
+        let reply = self.exchange(&format!("get_freq {vfo}"))?;
+        if reply.rprt != 0 {
+            return Ok(None);
+        }
+        match labeled(&reply.lines, "Frequency") {
+            Some(text) => text
+                .parse::<f64>()
+                .map(Some)
+                .map_err(|_| RigError::Remote(format!("bad frequency {text}"))),
+            None => Ok(None),
+        }
+    }
+
+    fn named_mode(&mut self, vfo: &str) -> Result<Option<(String, i32)>, RigError> {
+        let reply = self.exchange(&format!("get_mode {vfo}"))?;
+        if reply.rprt != 0 {
+            return Ok(None);
+        }
+        let mode = labeled(&reply.lines, "Mode").unwrap_or("USB").to_string();
+        let passband = labeled(&reply.lines, "Passband")
+            .and_then(|text| text.parse().ok())
+            .unwrap_or(2400);
+        Ok(Some((mode, passband)))
+    }
+
+    /// Turn vfo mode off before any ordinary command. One retry. A second
+    /// failure drops the socket: a new connection starts with vfo mode off.
+    /// `chk_vfo` is not sent. On hamlib 4.6 it answers with no `RPRT`, and a
+    /// reader waiting for `RPRT` would stall this socket.
+    fn vfo_opt_off(&mut self) -> Result<(), RigError> {
+        let off = self.exchange("set_vfo_opt 0");
+        if matches!(&off, Err(RigError::Io(_))) {
+            return Err(RigError::Io(off.err().unwrap().to_string()));
+        }
+        if matches!(off, Ok(reply) if reply.rprt == 0) {
+            return Ok(());
+        }
+        let again = self.exchange("set_vfo_opt 0")?;
+        if again.rprt != 0 {
+            return Err(RigError::Io(
+                "set_vfo_opt 0 failed; a new socket starts with vfo mode off".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Read the current VFO and its pair without `set_vfo`.
+    ///
+    /// `\set_vfo_opt 1` is per connection. It is not the daemon `-o` switch.
+    /// The bracket ends with `\set_vfo_opt 0` so a later `set_freq` or
+    /// `set_mode` keeps the command shape this client already sends.
+    fn read_followed(&mut self) -> Result<Option<Followed>, RigError> {
+        let on = self.exchange("set_vfo_opt 1")?;
+        if on.rprt != 0 {
+            return Ok(None);
+        }
+        let read = self.read_named_vfos();
+        self.vfo_opt_off()?;
+        read
+    }
+
+    fn read_named_vfos(&mut self) -> Result<Option<Followed>, RigError> {
+        let vfo_reply = self.exchange("get_vfo")?;
+        if vfo_reply.rprt != 0 {
+            return Ok(None);
+        }
+        let vfo = labeled(&vfo_reply.lines, "VFO")
+            .unwrap_or("VFOA")
+            .to_string();
+        let Some(freq) = self.named_freq(&vfo)? else {
+            return Ok(None);
+        };
+        let (mode, passband) = self
+            .named_mode(&vfo)?
+            .unwrap_or_else(|| ("USB".into(), 2400));
+        let other_name = crate::other_vfo_name(&vfo, &self.caps.vfos).unwrap_or_default();
+        let (other, other_freq, other_mode) = if other_name.is_empty() {
+            (String::new(), 0.0, String::new())
+        } else if let Some(hz) = self.named_freq(&other_name)? {
+            let mode = self
+                .named_mode(&other_name)?
+                .map(|(mode, _)| mode)
+                .unwrap_or_default();
+            (other_name, hz, mode)
+        } else {
+            (String::new(), 0.0, String::new())
+        };
+        Ok(Some(Followed {
+            vfo,
+            freq,
+            mode,
+            passband,
+            other,
+            other_freq,
+            other_mode,
+        }))
     }
 
     fn exchange(&mut self, body: &str) -> Result<Reply, RigError> {
@@ -198,24 +340,40 @@ impl Rig for LiveRig {
     }
 
     fn poll(&mut self) -> Result<Snapshot, RigError> {
-        let freq = match labeled(&self.exchange("get_freq")?.lines, "Frequency") {
-            Some(text) => text
-                .parse::<f64>()
-                .map_err(|_| RigError::Remote(format!("bad frequency {text}")))?,
-            None => return Err(RigError::Remote("get_freq had no Frequency line".into())),
+        let followed = if self.follow && self.dialect == Dialect::Extended {
+            self.read_followed()?
+        } else {
+            None
         };
-        let mode_reply = self.exchange("get_mode")?;
-        let mode = labeled(&mode_reply.lines, "Mode")
-            .unwrap_or("USB")
-            .to_string();
-        let passband_hz = labeled(&mode_reply.lines, "Passband")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(2400);
-        let vfo = self
-            .exchange("get_vfo")
-            .ok()
-            .and_then(|r| labeled(&r.lines, "VFO").map(str::to_string))
-            .unwrap_or_else(|| "VFOA".into());
+        self.paired = !self.follow || followed.is_some();
+        let (freq, mode, passband_hz, vfo) = if let Some(pair) = &followed {
+            (
+                pair.freq,
+                pair.mode.clone(),
+                pair.passband,
+                pair.vfo.clone(),
+            )
+        } else {
+            let freq = match labeled(&self.exchange("get_freq")?.lines, "Frequency") {
+                Some(text) => text
+                    .parse::<f64>()
+                    .map_err(|_| RigError::Remote(format!("bad frequency {text}")))?,
+                None => return Err(RigError::Remote("get_freq had no Frequency line".into())),
+            };
+            let mode_reply = self.exchange("get_mode")?;
+            let mode = labeled(&mode_reply.lines, "Mode")
+                .unwrap_or("USB")
+                .to_string();
+            let passband_hz = labeled(&mode_reply.lines, "Passband")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(2400);
+            let vfo = self
+                .exchange("get_vfo")
+                .ok()
+                .and_then(|r| labeled(&r.lines, "VFO").map(str::to_string))
+                .unwrap_or_else(|| "VFOA".into());
+            (freq, mode, passband_hz, vfo)
+        };
         let rit_hz = self
             .exchange("get_rit")
             .ok()
@@ -280,7 +438,14 @@ impl Rig for LiveRig {
             .and_then(|r| labeled(&r.lines, "Power Status").map(|s| s.trim() != "0"))
             .unwrap_or(true);
 
-        let (sub_vfo, sub_freq_hz, sub_mode) = self.read_other_vfo(&vfo)?;
+        let (sub_vfo, sub_freq_hz, sub_mode) = if self.follow {
+            match &followed {
+                Some(pair) => (pair.other.clone(), pair.other_freq, pair.other_mode.clone()),
+                None => (String::new(), 0.0, String::new()),
+            }
+        } else {
+            self.read_other_vfo(&vfo)?
+        };
         let (sub_mode, sub_freq_hz, sub_vfo, tx_vfo) = if self.caps.can_set_split {
             let split_freq = self
                 .exchange("get_split_freq")

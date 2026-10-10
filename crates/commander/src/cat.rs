@@ -5,7 +5,7 @@
 //! did not spawn. The listen address is always 127.0.0.1, and the argv never
 //! includes `-o`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::net::{TcpListener, TcpStream};
@@ -42,6 +42,9 @@ pub struct FaceGate {
     /// The handed port speaks GQRX short commands.
     pub connect_classic: bool,
     pub connect_failed: bool,
+    /// The selected radio is under Gpredict. The drive loop reads both VFOs
+    /// and does not call `set_vfo` on each poll.
+    pub follow: bool,
 }
 
 impl FaceGate {
@@ -53,6 +56,7 @@ impl FaceGate {
             connect: None,
             connect_classic: false,
             connect_failed: false,
+            follow: false,
         }
     }
 }
@@ -130,6 +134,9 @@ pub struct RadioSpec {
     /// Park the hamlib dummy dials the first time this process answers.
     #[serde(default)]
     pub park: bool,
+    /// Tune stops sending frequency commands and the poll follows Gpredict.
+    #[serde(default)]
+    pub follow: bool,
     /// Speaker and mic this radio's card is wired to.
     #[serde(default)]
     pub audio: RadioAudio,
@@ -153,6 +160,7 @@ impl RadioSpec {
             ptt_file: String::new(),
             conf: String::new(),
             park: true,
+            follow: false,
             audio: RadioAudio::default(),
             gqrx: GqrxConfig::new(),
         }
@@ -201,6 +209,8 @@ enum HubCmd {
     SetEndpoint(u64, String, String),
     /// Stop every child this program started and leave the supervisor loop.
     Shutdown,
+    /// Gpredict follow for one radio. Does not restart `rigctld`.
+    SetFollow(u64, bool),
 }
 
 pub struct Hub {
@@ -241,6 +251,8 @@ struct Slot {
     make: String,
     model_label: String,
     audio_status: String,
+    /// TCP port reserved in [`CLAIMED`] for this slot's daemon.
+    held: Option<u16>,
 }
 
 pub fn validate_spec(spec: &RadioSpec) -> Result<(), String> {
@@ -287,16 +299,40 @@ fn push_opt(args: &mut Vec<String>, flag: &str, value: &str) {
     args.push(value.into());
 }
 
+/// Ports a radio or a rotator has reserved. The listener is dropped so the
+/// daemon can bind, and the set keeps the other supervisor from taking it
+/// during that gap.
+static CLAIMED: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
+
 /// First port at or above `start` that this process can bind, up to 64 tries.
-/// The listener is dropped before the function returns so `rigctld` can bind it.
-pub fn free_port(start: u16) -> Result<u16, String> {
+/// The port stays reserved until [`release_port`].
+pub fn claim_port(start: u16) -> Result<u16, String> {
+    let mut claimed = CLAIMED.lock().expect("ports");
     let last = start.saturating_add(PORT_TRIES - 1);
     for port in start..=last {
+        if claimed.contains(&port) {
+            continue;
+        }
         if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            claimed.insert(port);
             return Ok(port);
         }
     }
     Err(format!("no free TCP port from {start} through {last}"))
+}
+
+pub fn release_port(port: u16) {
+    CLAIMED.lock().expect("ports").remove(&port);
+}
+
+/// First port at or above `start` that this process can bind, up to 64 tries.
+/// The listener is dropped before the function returns so `rigctld` can bind it.
+/// The reservation is released too. A daemon that keeps the port uses [`claim_port`].
+#[cfg(test)]
+pub fn free_port(start: u16) -> Result<u16, String> {
+    let port = claim_port(start)?;
+    release_port(port);
+    Ok(port)
 }
 
 /// USB serial names under `root`. `root/serial/by-id` wins when it has entries.
@@ -830,6 +866,11 @@ impl Hub {
         self.send(HubCmd::SetEndpoint(id, input, output));
     }
 
+    /// Record Gpredict follow. The running `rigctld` stays up.
+    pub fn set_follow(&self, id: u64, follow: bool) {
+        self.send(HubCmd::SetFollow(id, follow));
+    }
+
     /// Wake the supervisor without a command. Leaving Demo uses this so the
     /// selected radio is handed back without waiting out the idle read.
     pub fn wake(&self) {
@@ -926,6 +967,12 @@ fn supervise(
             changed = true;
             match cmd {
                 HubCmd::Shutdown => stop = true,
+                HubCmd::SetFollow(id, follow) => {
+                    if let Some(slot) = slots.iter_mut().find(|slot| slot.id == id) {
+                        slot.spec.follow = follow;
+                        slot.status_dirty = true;
+                    }
+                }
                 HubCmd::Add(spec) => {
                     if validate_spec(&spec).is_err() {
                         continue;
@@ -1124,6 +1171,13 @@ fn new_slot(id: u64, spec: RadioSpec) -> Slot {
         make: String::new(),
         model_label: String::new(),
         audio_status: String::new(),
+        held: None,
+    }
+}
+
+fn release_held(slot: &mut Slot) {
+    if let Some(port) = slot.held.take() {
+        release_port(port);
     }
 }
 
@@ -1146,6 +1200,7 @@ fn tick_slot(
                 let connected = slot.port.is_some();
                 slot.child = None;
                 slot.idle = None;
+                release_held(slot);
                 slot.port = None;
                 slot.assigned = None;
                 slot.probe_at = None;
@@ -1163,6 +1218,7 @@ fn tick_slot(
             Err(_) => {
                 slot.child = None;
                 slot.idle = None;
+                release_held(slot);
                 slot.port = None;
                 slot.assigned = None;
                 slot.probe_at = None;
@@ -1176,6 +1232,7 @@ fn tick_slot(
         }
         slot.child = None;
         slot.idle = None;
+        release_held(slot);
         slot.port = None;
         slot.assigned = None;
         slot.probe_at = None;
@@ -1191,10 +1248,16 @@ fn tick_slot(
         if slot.retry_at.is_some_and(|at| now < at) {
             return;
         }
-        match free_port(PORT_START)
-            .and_then(|port| spawn_radio(&mut slot.spec, port, slot.id).map(|child| (port, child)))
-        {
+        match claim_port(PORT_START).and_then(|port| {
+            spawn_radio(&mut slot.spec, port, slot.id)
+                .map(|child| (port, child))
+                .map_err(|err| {
+                    release_port(port);
+                    err
+                })
+        }) {
             Ok((port, child)) if slot.spec.driver == RadioDriver::Gqrx => {
+                slot.held = Some(port);
                 // Leave the process up while the I/O chooser is open. Remote
                 // control listens only after that dialog is accepted.
                 slot.child = Some(child);
@@ -1211,6 +1274,7 @@ fn tick_slot(
             }
             Ok((port, mut child)) => match wait_ready(port, &mut child) {
                 Ok(()) => {
+                    slot.held = Some(port);
                     if slot.park_pending && slot.spec.driver == RadioDriver::Hamlib {
                         if let Ok(mut rig) = LiveRig::connect("127.0.0.1", port) {
                             if park_dummy(&mut rig).is_ok() {
@@ -1226,6 +1290,7 @@ fn tick_slot(
                     slot.status_dirty = true;
                 }
                 Err(err) => {
+                    release_port(port);
                     stop_child(&mut child);
                     slot.status = err;
                     slot.status_dirty = true;
@@ -1426,6 +1491,7 @@ fn stop_slot(slot: &mut Slot) {
         stop_child(child);
     }
     slot.child = None;
+    release_held(slot);
     slot.port = None;
     slot.assigned = None;
     slot.probe_at = None;
@@ -1937,6 +2003,7 @@ mod tests {
             ptt_file: "/dev/ttyUSB1".into(),
             conf: "rts_state=ON".into(),
             park: false,
+            follow: false,
             audio: RadioAudio::default(),
             gqrx: GqrxConfig::new(),
         };
@@ -2028,17 +2095,21 @@ mod tests {
     #[test]
     fn dummy_parks_vfo_a_and_the_process_ends() {
         let spec = RadioSpec::dummy();
-        let port = match free_port(PORT_START) {
+        let port = match claim_port(PORT_START) {
             Ok(port) => port,
             Err(_) => return,
         };
         let mut child = match spawn_rigctld(&spec, port) {
             Ok(child) => child,
-            Err(_) => return,
+            Err(_) => {
+                release_port(port);
+                return;
+            }
         };
         let ready = wait_ready(port, &mut child);
         if ready.is_err() {
             stop_child(&mut child);
+            release_port(port);
             return;
         }
         {
@@ -2050,8 +2121,63 @@ mod tests {
         assert!((snap.freq_hz - 14_153_608.0).abs() < 1.0);
         drop(rig);
         stop_child(&mut child);
+        release_port(port);
         let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
         assert!(TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_err());
+    }
+
+    #[test]
+    fn follow_reads_vfo_b_without_leaving_vfo_a() {
+        let spec = RadioSpec::dummy();
+        let port = match claim_port(PORT_START) {
+            Ok(port) => port,
+            Err(_) => return,
+        };
+        let mut child = match spawn_rigctld(&spec, port) {
+            Ok(child) => child,
+            Err(_) => {
+                release_port(port);
+                return;
+            }
+        };
+        let ready = wait_ready(port, &mut child);
+        if ready.is_err() {
+            stop_child(&mut child);
+            release_port(port);
+            return;
+        }
+        let mut rig = LiveRig::connect("127.0.0.1", port).expect("client");
+        rig.apply(&CatCommand::SetVfo("VFOB".into())).unwrap();
+        rig.apply(&CatCommand::SetFreq(145_800_000.0)).unwrap();
+        rig.apply(&CatCommand::SetMode {
+            mode: "FM".into(),
+            passband_hz: 15000,
+        })
+        .unwrap();
+        rig.apply(&CatCommand::SetVfo("VFOA".into())).unwrap();
+        rig.apply(&CatCommand::SetFreq(14_153_608.0)).unwrap();
+        rig.apply(&CatCommand::SetMode {
+            mode: "USB".into(),
+            passband_hz: 2400,
+        })
+        .unwrap();
+        rig.set_follow(true);
+        let snap = rig.poll().expect("follow poll");
+        assert_eq!(snap.vfo, "VFOA");
+        assert!((snap.freq_hz - 14_153_608.0).abs() < 1.0);
+        assert_eq!(snap.mode, "USB");
+        assert_eq!(snap.sub_vfo, "VFOB");
+        assert!((snap.sub_freq_hz - 145_800_000.0).abs() < 1.0);
+        assert_eq!(snap.sub_mode, "FM");
+        assert!(!rig.follow_current_only());
+        rig.set_follow(false);
+        let snap = rig.poll().expect("plain poll");
+        assert_eq!(snap.vfo, "VFOA");
+        assert!((snap.freq_hz - 14_153_608.0).abs() < 1.0);
+        assert_eq!(snap.sub_vfo, "VFOB");
+        drop(rig);
+        stop_child(&mut child);
+        release_port(port);
     }
 
     #[test]
@@ -2067,6 +2193,7 @@ mod tests {
             ptt_file: String::new(),
             conf: String::new(),
             park: false,
+            follow: false,
             audio: RadioAudio::default(),
             gqrx: gqrx_chooser_config(),
         };
@@ -2163,6 +2290,7 @@ mod tests {
             ptt_file: String::new(),
             conf: String::new(),
             park: false,
+            follow: false,
             audio: RadioAudio::default(),
             gqrx: GqrxConfig::new(),
         };
