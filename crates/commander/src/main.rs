@@ -4,11 +4,13 @@
 //! grouped frames in the body, and a status line. The controls are the rig
 //! face (frequency, meters, VFO, band scales, levels).
 
+mod cat;
 mod channels;
+mod config;
 mod dial;
 mod plan;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -97,24 +99,56 @@ struct Favorite {
     passband_hz: i32,
 }
 
+struct PendingTune {
+    tune: config::Tune,
+    levels: BTreeMap<String, f64>,
+    after_gen: u64,
+}
+
+#[derive(Clone)]
+struct CatDraft {
+    id: Option<u64>,
+    name: String,
+    model: i32,
+    device: String,
+    serial_speed: String,
+    civ: String,
+    ptt_type: String,
+    ptt_file: String,
+    conf: String,
+    /// Kept from the row being edited. New radios are not parked.
+    park: bool,
+    port_label: String,
+    error: String,
+    driver: cat::RadioDriver,
+}
+
 struct Shared {
     snap: Snapshot,
     cmds: Vec<Command>,
     switch: Option<Switch>,
+    /// Bumps once each time the drive loop has published a snapshot for a
+    /// `rigctld` it just opened. A loaded config waits for a newer value so
+    /// it is not applied to the radio that was already on the screen.
+    live_gen: u64,
 }
 
 enum Switch {
     Demo,
-    Connect { host: String, port: u16 },
-    Disconnect,
 }
 
 struct App {
     shared: Arc<Mutex<Shared>>,
     wake: Arc<Condvar>,
+    face: Arc<Mutex<cat::FaceGate>>,
+    hub: Arc<cat::Hub>,
     host: String,
     port: String,
-    connect_open: bool,
+    /// Tune settings from an opened config. Applied after the selected radio
+    /// this open started is the one the drive loop is polling.
+    pending_tune: Option<PendingTune>,
+    models: Vec<cat::HamlibModel>,
+    cat_edit: Option<CatDraft>,
     favorite: Option<Favorite>,
     fav_open: bool,
     show_spread: bool,
@@ -162,6 +196,10 @@ struct App {
     /// Last folder chosen in the channel browser. Absent means the working directory.
     channel_dir: Option<PathBuf>,
     channel_note: String,
+    config_path: String,
+    /// Last folder chosen in the config browser. Absent means the working directory.
+    config_dir: Option<PathBuf>,
+    config_note: String,
 }
 
 fn rx_pairs(snap: &Snapshot) -> Vec<(f64, f64)> {
@@ -330,6 +368,7 @@ enum Page {
     Channels,
     Meters,
     Levels,
+    Config,
 }
 
 const PAGES: &[(Page, &str)] = &[
@@ -338,27 +377,36 @@ const PAGES: &[(Page, &str)] = &[
     (Page::Channels, "Channels"),
     (Page::Meters, "Meters"),
     (Page::Levels, "Levels"),
+    (Page::Config, "Config"),
 ];
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
-        // The face talks to hamlib. The in-process demo is only the Demo button.
+        // The face talks to the hamlib dummy this window starts. Demo does not.
         let mut snap = empty_snap();
-        snap.message = "connecting to 127.0.0.1:4532".into();
+        snap.message = "starting dummy".into();
         let shared = Arc::new(Mutex::new(Shared {
             snap,
             cmds: Vec::new(),
-            switch: Some(Switch::Connect {
-                host: "127.0.0.1".into(),
-                port: 4532,
-            }),
+            switch: None,
+            live_gen: 0,
         }));
         let wake = Arc::new(Condvar::new());
+        let face = Arc::new(Mutex::new(cat::FaceGate::new()));
         let ctx = cc.egui_ctx.clone();
+        let kick_shared = Arc::clone(&shared);
+        let kick_wake = Arc::clone(&wake);
+        let kick: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            let _guard = kick_shared.lock().expect("ui");
+            kick_wake.notify_one();
+        });
+        let hub = cat::Hub::spawn(Arc::clone(&face), kick, ctx.clone());
         let shared_thread = Arc::clone(&shared);
         let wake_thread = Arc::clone(&wake);
-        thread::spawn(move || drive(shared_thread, wake_thread, ctx));
+        let face_thread = Arc::clone(&face);
+        let hub_thread = Arc::clone(&hub);
+        thread::spawn(move || drive(shared_thread, wake_thread, face_thread, hub_thread, ctx));
         let plan_path = plan::default_path();
         let plan = plan::load_file(&plan_path).unwrap_or_else(|_| plan::embedded());
         let plan_dir = cc
@@ -372,6 +420,11 @@ impl App {
             .and_then(|storage| storage.get_string("channel_dir"))
             .map(PathBuf::from)
             .filter(|dir| dir.is_dir());
+        let config_dir = cc
+            .storage
+            .and_then(|storage| storage.get_string("config_dir"))
+            .map(PathBuf::from)
+            .filter(|dir| dir.is_dir());
         let band_sel = plan
             .zones
             .first()
@@ -380,9 +433,13 @@ impl App {
         Self {
             shared,
             wake,
+            face,
+            hub,
             host: "127.0.0.1".into(),
             port: "4532".into(),
-            connect_open: false,
+            pending_tune: None,
+            models: Vec::new(),
+            cat_edit: None,
             favorite: None,
             fav_open: false,
             show_spread: true,
@@ -417,11 +474,15 @@ impl App {
             channel_path: String::new(),
             channel_dir,
             channel_note: String::new(),
+            config_path: String::new(),
+            config_dir,
+            config_note: String::new(),
         }
     }
 
-    fn snap(&self) -> Snapshot {
-        self.shared.lock().expect("rig thread").snap.clone()
+    fn snap_gen(&self) -> (Snapshot, u64) {
+        let guard = self.shared.lock().expect("rig thread");
+        (guard.snap.clone(), guard.live_gen)
     }
 
     fn send(&self, cmd: Command) {
@@ -627,6 +688,10 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.hub.shutdown();
+    }
+
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         if let Some(dir) = &self.plan_dir {
             storage.set_string("plan_dir", dir.display().to_string());
@@ -634,10 +699,20 @@ impl eframe::App for App {
         if let Some(dir) = &self.channel_dir {
             storage.set_string("channel_dir", dir.display().to_string());
         }
+        if let Some(dir) = &self.config_dir {
+            storage.set_string("config_dir", dir.display().to_string());
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let mut snap = self.snap();
+        let (mut snap, live_gen) = self.snap_gen();
+        self.maybe_push_loaded(&snap, live_gen);
+        if let Some(row) = self.hub.view().rows.iter().find(|row| row.selected) {
+            self.host = "127.0.0.1".into();
+            if let Some(port) = row.port {
+                self.port = port.to_string();
+            }
+        }
         // Tune follows the frequency the readout is showing, including a
         // set_freq that the radio has not confirmed yet. The Plan editor
         // keeps its own zone tab.
@@ -695,7 +770,7 @@ impl eframe::App for App {
         }
 
         egui::Panel::top("bar").show_inside(ui, |ui| {
-            self.bar(ui);
+            self.bar(ui, &snap);
         });
         // One row. A later tab scrolls sideways instead of wrapping onto
         // a second line and pushing the page body down.
@@ -735,8 +810,11 @@ impl eframe::App for App {
             }
         });
 
-        if self.connect_open {
-            self.connect_window(&ctx);
+        let cat_driver = self.cat_edit.as_ref().map(|edit| edit.driver.clone());
+        match cat_driver {
+            Some(cat::RadioDriver::Hamlib) => self.hamlib_window(&ctx),
+            Some(cat::RadioDriver::Gqrx) => self.gqrx_window(&ctx),
+            None => {}
         }
         if self.fav_open {
             self.favorite_window(&ctx, &snap);
@@ -745,16 +823,31 @@ impl eframe::App for App {
 }
 
 impl App {
-    fn bar(&mut self, ui: &mut egui::Ui) {
+    fn bar(&mut self, ui: &mut egui::Ui, snap: &Snapshot) {
         ui.horizontal(|ui| {
-            if ui.button("Connect").clicked() {
-                self.connect_open = true;
-            }
-            if ui.button("Demo").clicked() {
+            let demo = snap.kind == LinkKind::Demo;
+            if ui.selectable_label(demo, "Demo").clicked() {
                 self.hold_freq = None;
                 self.hold_levels.clear();
                 self.hold_pass = None;
-                self.switch(Switch::Demo);
+                if demo {
+                    // Back to the selected radio. The hub hands its port.
+                    let mut gate = self.face.lock().expect("face");
+                    gate.demo = false;
+                    gate.face_down = true;
+                    gate.connect = None;
+                    gate.connect_failed = true;
+                    drop(gate);
+                    self.hub.wake();
+                } else {
+                    let mut gate = self.face.lock().expect("face");
+                    gate.demo = true;
+                    gate.face_down = true;
+                    gate.connect = None;
+                    drop(gate);
+                    self.hub.wake();
+                    self.switch(Switch::Demo);
+                }
             }
             if ui.button("Favorite").clicked() {
                 self.fav_open = true;
@@ -817,6 +910,7 @@ impl App {
             Page::Channels => self.page_channels(ui, snap),
             Page::Meters => self.page_meters(ui, snap),
             Page::Levels => self.page_levels(ui, snap),
+            Page::Config => self.page_config(ui, snap),
         }
     }
 
@@ -1546,6 +1640,667 @@ impl App {
         match channels::save_file(Path::new(&self.channel_path), &self.channels) {
             Ok(()) => self.channel_note.clear(),
             Err(err) => self.channel_note = err,
+        }
+    }
+
+    fn page_config(&mut self, ui: &mut egui::Ui, snap: &mut Snapshot) {
+        ui.horizontal(|ui| {
+            if ui.button("Load").clicked() {
+                self.browse_config(false, snap);
+            }
+            if ui.button("Save").clicked() {
+                self.browse_config(true, snap);
+            }
+            let label = if self.config_path.is_empty() {
+                "No file".to_string()
+            } else {
+                file_label(&self.config_path)
+            };
+            ui.label(label).on_hover_text(&self.config_path);
+        });
+        if !self.config_note.is_empty() {
+            ui.label(
+                egui::RichText::new(&self.config_note).color(egui::Color32::from_rgb(220, 160, 80)),
+            );
+        }
+        ui.add_space(8.0);
+        ui.label(format!("Band plan: {}", file_label(&self.plan_path)));
+        ui.label(format!("Channels: {} zones", self.channels.zones.len()));
+        ui.add_space(8.0);
+        self.cat_frame(ui);
+    }
+
+    fn cat_frame(&mut self, ui: &mut egui::Ui) {
+        let view = self.hub.view();
+        let mut select = None;
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.label("CAT Control");
+            ui.add_space(4.0);
+            egui::Grid::new("cat-radios")
+                .striped(true)
+                .min_col_width(72.0)
+                .show(ui, |ui| {
+                    ui.label("Name");
+                    ui.label("Driver");
+                    ui.label("Device");
+                    ui.label("Listen");
+                    ui.label("Status");
+                    ui.end_row();
+                    for row in &view.rows {
+                        let listen = match row.port {
+                            Some(port) => format!("127.0.0.1:{port}"),
+                            None => "127.0.0.1".to_string(),
+                        };
+                        let device = if row.spec.device.trim().is_empty() {
+                            "—".to_string()
+                        } else {
+                            row.spec.device.clone()
+                        };
+                        if cat_cell(ui, &row.spec.name, row.selected) {
+                            select = Some(row.id);
+                        }
+                        if cat_cell(ui, cat::driver_name(row.spec.driver), row.selected) {
+                            select = Some(row.id);
+                        }
+                        if cat_cell(ui, &device, row.selected) {
+                            select = Some(row.id);
+                        }
+                        if cat_cell(ui, &listen, row.selected) {
+                            select = Some(row.id);
+                        }
+                        if cat_cell(ui, &row.status, row.selected) {
+                            select = Some(row.id);
+                        }
+                        ui.end_row();
+                    }
+                });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("Add hamlib").clicked() {
+                    self.open_hamlib(None);
+                }
+                if ui.button("Add GQRX").clicked() {
+                    self.open_gqrx(None);
+                }
+                let selected = view.rows.iter().find(|row| row.selected).map(|row| row.id);
+                if ui
+                    .add_enabled(selected.is_some(), egui::Button::new("Edit"))
+                    .clicked()
+                {
+                    if let Some(id) = selected {
+                        if let Some(row) = view.rows.iter().find(|row| row.id == id) {
+                            match row.spec.driver {
+                                cat::RadioDriver::Hamlib => self.open_hamlib(Some(row)),
+                                cat::RadioDriver::Gqrx => self.open_gqrx(Some(row)),
+                            }
+                        }
+                    }
+                }
+                if ui
+                    .add_enabled(selected.is_some(), egui::Button::new("Remove"))
+                    .clicked()
+                {
+                    if let Some(id) = selected {
+                        self.hub.remove(id);
+                    }
+                }
+            });
+            ui.add_space(6.0);
+            ui.label("USB ports");
+            if view.serial.is_empty() {
+                ui.label("none");
+            } else {
+                for path in &view.serial {
+                    ui.label(path);
+                }
+            }
+        });
+        if let Some(id) = select {
+            self.hub.select(id);
+        }
+    }
+
+    fn open_hamlib(&mut self, row: Option<&cat::RadioRow>) {
+        self.models = cat::model_list().unwrap_or_default();
+        let draft = if let Some(row) = row {
+            CatDraft {
+                id: Some(row.id),
+                name: row.spec.name.clone(),
+                model: row.spec.model,
+                device: row.spec.device.clone(),
+                serial_speed: row.spec.serial_speed.clone(),
+                civ: row.spec.civ.clone(),
+                ptt_type: row.spec.ptt_type.clone(),
+                ptt_file: row.spec.ptt_file.clone(),
+                conf: row.spec.conf.clone(),
+                park: row.spec.park,
+                port_label: row
+                    .port
+                    .map(|port| port.to_string())
+                    .unwrap_or_else(|| "assigning".into()),
+                error: String::new(),
+                driver: cat::RadioDriver::Hamlib,
+            }
+        } else {
+            CatDraft {
+                id: None,
+                name: "Radio".into(),
+                model: 1,
+                device: String::new(),
+                serial_speed: String::new(),
+                civ: String::new(),
+                ptt_type: String::new(),
+                ptt_file: String::new(),
+                conf: String::new(),
+                park: false,
+                port_label: "assigning".into(),
+                error: String::new(),
+                driver: cat::RadioDriver::Hamlib,
+            }
+        };
+        if self.models.is_empty() {
+            let mut draft = draft;
+            draft.error =
+                "rigctld -l did not return a model list. The model number is still saved.".into();
+            self.cat_edit = Some(draft);
+        } else {
+            self.cat_edit = Some(draft);
+        }
+    }
+
+    fn open_gqrx(&mut self, row: Option<&cat::RadioRow>) {
+        let draft = if let Some(row) = row {
+            CatDraft {
+                id: Some(row.id),
+                name: row.spec.name.clone(),
+                model: 0,
+                device: String::new(),
+                serial_speed: String::new(),
+                civ: String::new(),
+                ptt_type: String::new(),
+                ptt_file: String::new(),
+                conf: String::new(),
+                park: false,
+                port_label: row
+                    .port
+                    .map(|port| port.to_string())
+                    .unwrap_or_else(|| "assigning".into()),
+                error: String::new(),
+                driver: cat::RadioDriver::Gqrx,
+            }
+        } else {
+            CatDraft {
+                id: None,
+                name: "GQRX".into(),
+                model: 0,
+                device: String::new(),
+                serial_speed: String::new(),
+                civ: String::new(),
+                ptt_type: String::new(),
+                ptt_file: String::new(),
+                conf: String::new(),
+                park: false,
+                port_label: "assigning".into(),
+                error: String::new(),
+                driver: cat::RadioDriver::Gqrx,
+            }
+        };
+        self.cat_edit = Some(draft);
+    }
+
+    fn gqrx_window(&mut self, ctx: &egui::Context) {
+        let mut open = true;
+        let mut commit = false;
+        egui::Window::new("GQRX").open(&mut open).show(ctx, |ui| {
+            let Some(edit) = &mut self.cat_edit else {
+                return;
+            };
+            ui.horizontal(|ui| {
+                ui.label("Name");
+                ui.text_edit_singleline(&mut edit.name);
+            });
+            ui.label("Commander starts this GQRX and stops it on exit.");
+            ui.label(format!("Listen  127.0.0.1:{}", edit.port_label));
+            if !edit.error.is_empty() {
+                ui.label(
+                    egui::RichText::new(&edit.error).color(egui::Color32::from_rgb(220, 160, 80)),
+                );
+            }
+            if ui.button("Save").clicked() {
+                commit = true;
+            }
+        });
+        if !open {
+            self.cat_edit = None;
+            return;
+        }
+        if commit {
+            self.commit_hamlib();
+        }
+    }
+
+    fn hamlib_window(&mut self, ctx: &egui::Context) {
+        let mut open = true;
+        let mut commit = false;
+        let serial = self.hub.view().serial;
+        egui::Window::new("Hamlib radio")
+            .open(&mut open)
+            .show(ctx, |ui| {
+                let models = self.models.clone();
+                let Some(edit) = &mut self.cat_edit else {
+                    return;
+                };
+                ui.horizontal(|ui| {
+                    ui.label("Name");
+                    ui.text_edit_singleline(&mut edit.name);
+                });
+                let current = models
+                    .iter()
+                    .find(|row| row.id == edit.model)
+                    .map(cat::model_button_label)
+                    .unwrap_or_else(|| edit.model.to_string());
+                egui::ComboBox::from_id_salt("hamlib-model")
+                    .selected_text(current)
+                    .show_ui(ui, |ui| {
+                        // The header uses the same selectable as the rows so
+                        // its left inset matches and the columns stay even.
+                        let _ = ui.selectable_label(
+                            false,
+                            egui::RichText::new(cat::model_menu_header())
+                                .monospace()
+                                .strong(),
+                        );
+                        for row in &models {
+                            let text = egui::RichText::new(cat::format_model_row(row)).monospace();
+                            if ui.selectable_label(edit.model == row.id, text).clicked() {
+                                edit.model = row.id;
+                            }
+                        }
+                    });
+                ui.horizontal(|ui| {
+                    ui.label("Model");
+                    let mut text = edit.model.to_string();
+                    if ui.text_edit_singleline(&mut text).changed() {
+                        if let Ok(model) = text.trim().parse::<i32>() {
+                            edit.model = model;
+                        }
+                    }
+                });
+                let device_label = if edit.device.trim().is_empty() {
+                    "none".to_string()
+                } else {
+                    edit.device.clone()
+                };
+                egui::ComboBox::from_id_salt("hamlib-device")
+                    .selected_text(device_label)
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(edit.device.trim().is_empty(), "none")
+                            .clicked()
+                        {
+                            edit.device.clear();
+                        }
+                        for path in &serial {
+                            if ui.selectable_label(edit.device == *path, path).clicked() {
+                                edit.device.clone_from(path);
+                            }
+                        }
+                    });
+                ui.horizontal(|ui| {
+                    ui.label("Device");
+                    ui.text_edit_singleline(&mut edit.device);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Serial speed");
+                    ui.text_edit_singleline(&mut edit.serial_speed);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("CI-V");
+                    ui.text_edit_singleline(&mut edit.civ);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("PTT type");
+                    ui.text_edit_singleline(&mut edit.ptt_type);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("PTT device");
+                    ui.text_edit_singleline(&mut edit.ptt_file);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Extra -C");
+                    ui.text_edit_singleline(&mut edit.conf);
+                });
+                ui.label(format!("Listen  127.0.0.1:{}", edit.port_label));
+                if !edit.error.is_empty() {
+                    ui.label(
+                        egui::RichText::new(&edit.error)
+                            .color(egui::Color32::from_rgb(220, 160, 80)),
+                    );
+                }
+                if ui.button("Save").clicked() {
+                    commit = true;
+                }
+            });
+        if !open {
+            self.cat_edit = None;
+            return;
+        }
+        if commit {
+            self.commit_hamlib();
+        }
+    }
+
+    fn commit_hamlib(&mut self) {
+        let Some(edit) = self.cat_edit.clone() else {
+            return;
+        };
+        let spec = cat::RadioSpec {
+            driver: edit.driver.clone(),
+            name: edit.name.trim().to_string(),
+            model: edit.model,
+            device: edit.device.trim().to_string(),
+            serial_speed: edit.serial_speed.trim().to_string(),
+            civ: edit.civ.trim().to_string(),
+            ptt_type: edit.ptt_type.trim().to_string(),
+            ptt_file: edit.ptt_file.trim().to_string(),
+            conf: edit.conf.trim().to_string(),
+            park: edit.park,
+        };
+        if let Err(err) = cat::validate_spec(&spec) {
+            if let Some(edit) = &mut self.cat_edit {
+                edit.error = err;
+            }
+            return;
+        }
+        match edit.id {
+            Some(id) => self.hub.update(id, spec),
+            None => self.hub.add(spec),
+        }
+        self.cat_edit = None;
+    }
+
+    /// Send a loaded Tune face only after the drive loop has connected to the
+    /// radio this open started. The previous session can still be answering
+    /// on the same port number until that happens.
+    fn maybe_push_loaded(&mut self, snap: &Snapshot, live_gen: u64) {
+        let Some(pending) = &self.pending_tune else {
+            return;
+        };
+        if live_gen <= pending.after_gen {
+            return;
+        }
+        let view = self.hub.view();
+        let Some(row) = view.rows.iter().find(|row| row.selected) else {
+            return;
+        };
+        let Some(port) = row.port else {
+            return;
+        };
+        let marker = format!(":{port}");
+        if snap.kind != LinkKind::Live || !snap.endpoint.ends_with(&marker) {
+            return;
+        }
+        let tune = pending.tune.clone();
+        let levels = pending.levels.clone();
+        self.pending_tune = None;
+        self.push_radio(snap, &tune, &levels);
+    }
+
+    fn browse_config(&mut self, save: bool, snap: &Snapshot) {
+        let dir = remembered_dir(&self.config_dir);
+        let dialog = rfd::FileDialog::new()
+            .set_title(if save { "Save config" } else { "Load config" })
+            .add_filter("Config", &["json"])
+            .set_directory(&dir);
+        let picked = if save {
+            let name = if self.config_path.is_empty() {
+                "config.json".to_string()
+            } else {
+                file_label(&self.config_path)
+            };
+            dialog.set_file_name(name).save_file()
+        } else {
+            dialog.pick_file()
+        };
+        let Some(path) = picked else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            if parent.is_dir() {
+                self.config_dir = Some(parent.to_path_buf());
+            }
+        }
+        self.config_path = path.display().to_string();
+        if save {
+            self.save_config(snap);
+        } else {
+            self.load_config(snap);
+        }
+    }
+
+    fn load_config(&mut self, snap: &Snapshot) {
+        match config::load_file(Path::new(&self.config_path)) {
+            Ok(file) => self.apply_config(snap, file),
+            Err(err) => self.config_note = err,
+        }
+    }
+
+    fn save_config(&mut self, snap: &Snapshot) {
+        let file = match self.capture_config(snap) {
+            Ok(file) => file,
+            Err(err) => {
+                self.config_note = err;
+                return;
+            }
+        };
+        match config::save_file(Path::new(&self.config_path), &file) {
+            Ok(()) => self.config_note.clear(),
+            Err(err) => self.config_note = err,
+        }
+    }
+
+    /// The open plan, channel file, Tune face, and settable levels.
+    /// PTT is not included. This does not write `bsp/` and does not send CAT.
+    fn capture_config(&mut self, snap: &Snapshot) -> Result<config::ConfigFile, String> {
+        let bsp_name = config::bsp_name_from_path(&self.plan_path)?;
+        let names: Vec<String> = snap.caps.set_levels.keys().cloned().collect();
+        let mut levels = BTreeMap::new();
+        for name in names {
+            if snap.caps.level_range(&name).is_none() {
+                continue;
+            }
+            levels.insert(name.clone(), self.shown_level(&name, snap));
+        }
+        let split = !snap.tx_vfo.is_empty() && !snap.tx_vfo.eq_ignore_ascii_case(&snap.vfo);
+        Ok(config::ConfigFile {
+            version: 1,
+            bsp_name,
+            bsp: self.plan.clone(),
+            channels: self.channels.clone(),
+            tune: config::Tune {
+                show_spread: self.show_spread,
+                step_hz: self.step_hz,
+                zone_sel: self.zone_sel,
+                band_sel: self.band_sel,
+                band_mem: self
+                    .band_mem
+                    .iter()
+                    .map(|(name, hz)| (name.clone(), *hz))
+                    .collect(),
+                favorite: self.favorite.as_ref().map(|fav| config::FavoriteSlot {
+                    hz: fav.hz,
+                    mode: fav.mode.clone(),
+                    passband_hz: fav.passband_hz,
+                }),
+                host: self.host.clone(),
+                port: self.port.clone(),
+                freq_hz: self.shown_freq(snap),
+                mode: self.mode_hold.clone().unwrap_or_else(|| snap.mode.clone()),
+                passband_hz: self.hold_pass.unwrap_or(snap.passband_hz),
+                sub_freq_hz: self.shown_sub_freq(snap),
+                sub_mode: self
+                    .sub_mode_hold
+                    .clone()
+                    .unwrap_or_else(|| snap.sub_mode.clone()),
+                rit_hz: snap.rit_hz,
+                split,
+            },
+            levels,
+            radios: self
+                .hub
+                .view()
+                .rows
+                .into_iter()
+                .map(|row| row.spec)
+                .collect(),
+        })
+    }
+
+    fn apply_config(&mut self, _snap: &Snapshot, file: config::ConfigFile) {
+        let config::ConfigFile {
+            bsp_name,
+            bsp,
+            channels,
+            tune,
+            levels,
+            radios,
+            ..
+        } = file;
+        self.plan = bsp;
+        self.channels = channels;
+        // The channel file on disk is a different document. Leave its path
+        // empty so a later Channels Save does not overwrite that file.
+        self.channel_path.clear();
+        self.channel_zone = 0;
+        self.channel_sel = 0;
+        self.channel_note.clear();
+        self.zone_rename = None;
+        // The manager stops the radios it started and brings this list up.
+        // An empty list is the hamlib dummy. The face fields are sent once
+        // that new session is the one on screen.
+        let after_gen = self.shared.lock().expect("rig thread").live_gen;
+        self.pending_tune = Some(PendingTune {
+            tune: tune.clone(),
+            levels: levels.clone(),
+            after_gen,
+        });
+        self.hub.replace(radios);
+        self.show_spread = tune.show_spread;
+        self.step_hz = tune.step_hz;
+        self.zone_sel = tune.zone_sel;
+        self.band_sel = tune.band_sel;
+        self.clamp_plan_selection();
+        self.band_mem = tune.band_mem.into_iter().collect();
+        self.favorite = tune.favorite.map(|fav| Favorite {
+            hz: fav.hz,
+            mode: fav.mode,
+            passband_hz: fav.passband_hz,
+        });
+        self.host = tune.host;
+        self.port = tune.port;
+        match config::install_new_bsp(plan::bsp_dir().as_deref(), &bsp_name, &self.plan) {
+            Ok(config::BspInstall::Written(path)) => {
+                self.plan_path = path.display().to_string();
+                self.config_note = format!("Wrote {bsp_name} into the band-plan folder.");
+            }
+            Ok(config::BspInstall::Kept(path)) => {
+                self.plan_path = path.display().to_string();
+                self.config_note.clear();
+            }
+            Ok(config::BspInstall::NoFolder) => {
+                self.plan_path = bsp_name.clone();
+                self.config_note =
+                    format!("Band-plan folder was not found, so {bsp_name} was not written.");
+            }
+            Err(err) => self.config_note = err,
+        }
+    }
+
+    fn clamp_plan_selection(&mut self) {
+        if self.plan.zones.is_empty() {
+            self.zone_sel = 0;
+            self.band_sel = 0;
+            return;
+        }
+        if self.zone_sel >= self.plan.zones.len() {
+            self.zone_sel = 0;
+        }
+        let count = self.plan.zones[self.zone_sel].bands.len();
+        if count == 0 || self.band_sel >= count {
+            self.band_sel = 0;
+        }
+    }
+
+    /// Send the radio fields from a loaded config. A refused frequency does
+    /// not stop the mode, split, RIT, or level commands. PTT is not keyed.
+    fn push_radio(&mut self, snap: &Snapshot, tune: &config::Tune, levels: &BTreeMap<String, f64>) {
+        if !snap.online() {
+            return;
+        }
+        self.tune(snap, tune.freq_hz);
+        if snap.caps.can_set_mode && !tune.mode.is_empty() {
+            let allowed = snap.caps.modes.is_empty()
+                || snap
+                    .caps
+                    .modes
+                    .iter()
+                    .any(|mode| mode.eq_ignore_ascii_case(&tune.mode));
+            if allowed {
+                self.mode_hold = Some(tune.mode.clone());
+                self.hold_pass = Some(tune.passband_hz);
+                self.send(Command::SetMode {
+                    mode: tune.mode.clone(),
+                    passband_hz: tune.passband_hz,
+                });
+            }
+        }
+        if tune.sub_freq_hz > 0.0 {
+            let wanted = (!tune.sub_mode.is_empty()).then_some(tune.sub_mode.as_str());
+            self.tune_sub(snap, tune.sub_freq_hz, wanted);
+        } else if snap.caps.can_set_mode && !tune.sub_mode.is_empty() {
+            let allowed = snap.caps.modes.is_empty()
+                || snap
+                    .caps
+                    .modes
+                    .iter()
+                    .any(|mode| mode.eq_ignore_ascii_case(&tune.sub_mode));
+            if allowed {
+                self.sub_mode_hold = Some(tune.sub_mode.clone());
+                self.send(Command::SetSubMode {
+                    mode: tune.sub_mode.clone(),
+                    passband_hz: tune.passband_hz,
+                });
+            }
+        }
+        if snap.caps.can_set_rit {
+            self.send(Command::SetRit(tune.rit_hz));
+        }
+        if snap.caps.can_set_split {
+            let tx_vfo = if tune.split {
+                if snap.sub_vfo.is_empty() {
+                    "VFOB".to_string()
+                } else {
+                    snap.sub_vfo.clone()
+                }
+            } else if snap.vfo.is_empty() {
+                "VFOA".to_string()
+            } else {
+                snap.vfo.clone()
+            };
+            self.send(Command::SetSplit {
+                on: tune.split,
+                tx_vfo,
+            });
+        }
+        for (name, value) in levels {
+            if snap.caps.level_range(name).is_none() {
+                continue;
+            }
+            self.hold_levels.insert(name.clone(), *value);
+            self.send(Command::SetLevel {
+                name: name.clone(),
+                value: *value,
+            });
         }
     }
 
@@ -2553,45 +3308,6 @@ impl App {
         });
     }
 
-    fn connect_window(&mut self, ctx: &egui::Context) {
-        let mut open = self.connect_open;
-        egui::Window::new("Connect to rigctld")
-            .open(&mut open)
-            .show(ctx, |ui| {
-                ui.label("Hamlib rigctld is already running. This does not start it.");
-                ui.horizontal(|ui| {
-                    ui.label("Host");
-                    ui.text_edit_singleline(&mut self.host);
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Port");
-                    ui.text_edit_singleline(&mut self.port);
-                });
-                ui.horizontal(|ui| {
-                    if ui.button("Connect").clicked() {
-                        match self.port.trim().parse::<u16>() {
-                            Ok(port) if port > 0 => {
-                                self.switch(Switch::Connect {
-                                    host: self.host.trim().to_string(),
-                                    port,
-                                });
-                                self.connect_open = false;
-                            }
-                            _ => {
-                                self.port = "4532".into();
-                            }
-                        }
-                    }
-                    if ui.button("Disconnect").clicked() {
-                        self.switch(Switch::Disconnect);
-                        self.connect_open = false;
-                    }
-                });
-                ui.label("The hamlib dummy is scripts/dummy-rig.sh, which is rigctld -m 1 on 127.0.0.1:4532.");
-            });
-        self.connect_open = open;
-    }
-
     fn favorite_window(&mut self, ctx: &egui::Context, snap: &Snapshot) {
         let mut open = self.fav_open;
         egui::Window::new("Favorite")
@@ -2634,46 +3350,99 @@ impl App {
     }
 }
 
-fn drive(shared: Arc<Mutex<Shared>>, wake: Arc<Condvar>, ctx: egui::Context) {
+fn drive(
+    shared: Arc<Mutex<Shared>>,
+    wake: Arc<Condvar>,
+    face: Arc<Mutex<cat::FaceGate>>,
+    hub: Arc<cat::Hub>,
+    ctx: egui::Context,
+) {
     let mut session = Session::Down {
-        message: "connecting to 127.0.0.1:4532".into(),
+        message: "starting dummy".into(),
     };
     let mut last = shared.lock().expect("ui").snap.clone();
     loop {
-        let (cmds, switch) = {
-            let guard = shared.lock().expect("ui");
-            let pending = !guard.cmds.is_empty() || guard.switch.is_some();
-            let mut guard = if pending {
-                guard
-            } else if session.is_down() {
-                wake.wait(guard).expect("ui")
-            } else {
-                // The radio's own dial can move. Hamlib's default protocol does
-                // not push, so the listen socket is polled on this timeout and
-                // woken at once when the window queues a command.
-                let (guard, _) = wake
-                    .wait_timeout(guard, Duration::from_millis(200))
-                    .expect("ui");
-                guard
-            };
+        // The condvar is waited on `shared`. The hub's kick holds that same
+        // mutex before it notifies, and this loop reads `face.connect` while
+        // holding it, so a handed port is not missed.
+        let (cmds, switch, connect, classic) = {
+            let mut guard = shared.lock().expect("ui");
+            loop {
+                let demo = face.lock().expect("face").demo;
+                let connect_ready = !demo && face.lock().expect("face").connect.is_some();
+                let pending = !guard.cmds.is_empty() || guard.switch.is_some() || connect_ready;
+                if pending {
+                    break;
+                }
+                if session.is_down() {
+                    guard = wake.wait(guard).expect("ui");
+                } else {
+                    // The radio's own dial can move. Hamlib's default protocol
+                    // does not push, so the listen socket is polled on this
+                    // timeout and woken at once when the window queues a command.
+                    let (next, _) = wake
+                        .wait_timeout(guard, Duration::from_millis(200))
+                        .expect("ui");
+                    guard = next;
+                    break;
+                }
+            }
             let cmds = std::mem::take(&mut guard.cmds);
             let switch = guard.switch.take();
-            (cmds, switch)
+            drop(guard);
+            let demo = face.lock().expect("face").demo;
+            let (connect, classic) = if demo {
+                (None, false)
+            } else {
+                let mut gate = face.lock().expect("face");
+                (gate.connect.take(), gate.connect_classic)
+            };
+            (cmds, switch, connect, classic)
         };
 
-        if let Some(switch) = switch {
-            session = match switch {
-                Switch::Demo => Session::Demo(DemoRig::new()),
-                Switch::Disconnect => Session::Down {
-                    message: "disconnected".into(),
-                },
-                Switch::Connect { host, port } => match LiveRig::connect(&host, port) {
-                    Ok(rig) => Session::Live(rig),
-                    Err(err) => Session::Down {
-                        message: err.to_string(),
-                    },
-                },
-            };
+        if let Some(Switch::Demo) = switch {
+            session = Session::Demo(DemoRig::new());
+            let mut gate = face.lock().expect("face");
+            gate.demo = true;
+            gate.face_down = true;
+            gate.face_port = None;
+            gate.connect = None;
+        }
+
+        let mut armed = false;
+        let demo = face.lock().expect("face").demo;
+        if !demo {
+            if let Some(port) = connect {
+                let opened = if classic {
+                    LiveRig::connect_classic("127.0.0.1", port)
+                } else {
+                    LiveRig::connect("127.0.0.1", port)
+                };
+                match opened {
+                    Ok(rig) => {
+                        // Drop the previous session before publishing the new
+                        // port, so the hub does not open a second client on
+                        // the radio the drive loop still holds.
+                        session = Session::Live(rig);
+                        let mut gate = face.lock().expect("face");
+                        gate.face_port = Some(port);
+                        gate.face_down = false;
+                        gate.connect_failed = false;
+                        armed = true;
+                    }
+                    Err(err) => {
+                        let mut gate = face.lock().expect("face");
+                        gate.face_port = None;
+                        gate.face_down = true;
+                        gate.connect_failed = true;
+                        drop(gate);
+                        hub.wake();
+                        session = Session::Down {
+                            message: err.to_string(),
+                        };
+                    }
+                }
+            }
         }
 
         let mut sent = None;
@@ -2684,7 +3453,12 @@ fn drive(shared: Arc<Mutex<Shared>>, wake: Arc<Condvar>, ctx: egui::Context) {
                 Ok(()) => {}
                 Err(RigError::Remote(msg)) => remote = Some(msg),
                 Err(RigError::Io(msg)) => {
+                    let was_live = matches!(session, Session::Live(_));
                     session = Session::Down { message: msg };
+                    if was_live {
+                        note_face_down(&face, &hub);
+                    }
+                    armed = false;
                     break;
                 }
             }
@@ -2693,9 +3467,14 @@ fn drive(shared: Arc<Mutex<Shared>>, wake: Arc<Condvar>, ctx: egui::Context) {
         let mut snap = match session.poll() {
             Ok(snap) => snap,
             Err(RigError::Io(msg)) => {
+                let was_live = matches!(session, Session::Live(_));
                 session = Session::Down {
                     message: msg.clone(),
                 };
+                if was_live {
+                    note_face_down(&face, &hub);
+                }
+                armed = false;
                 offline(&last, &msg)
             }
             Err(RigError::Remote(msg)) => {
@@ -2723,10 +3502,31 @@ fn drive(shared: Arc<Mutex<Shared>>, wake: Arc<Condvar>, ctx: egui::Context) {
         }
         {
             let mut guard = shared.lock().expect("ui");
+            if armed && snap.kind == LinkKind::Live {
+                guard.live_gen = guard.live_gen.wrapping_add(1);
+            }
             guard.snap = snap;
         }
         ctx.request_repaint();
     }
+}
+
+fn note_face_down(face: &Mutex<cat::FaceGate>, hub: &cat::Hub) {
+    let mut gate = face.lock().expect("face");
+    gate.face_down = true;
+    gate.face_port = None;
+    gate.connect_failed = true;
+    drop(gate);
+    hub.wake();
+}
+
+fn cat_cell(ui: &mut egui::Ui, text: &str, selected: bool) -> bool {
+    let mut text = egui::RichText::new(text);
+    if selected {
+        text = text.color(HAM);
+    }
+    ui.add(egui::Label::new(text).sense(egui::Sense::click()))
+        .clicked()
 }
 
 enum Session {

@@ -1306,6 +1306,8 @@ mod tests {
             hz = tuned;
         }
         assert_eq!(seen.len(), bands.len());
-        assert!(seen.windows(2).any(|pair| pair == ["17 m Voice", "15 m CW"]));
+        assert!(seen
+            .windows(2)
+            .any(|pair| pair == ["17 m Voice", "15 m CW"]));
     }
 }

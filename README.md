@@ -4,7 +4,7 @@ A station console for amateur radio. Phase 1 is the rig-control face: frequency,
 
 The layout follows the rig screen in the Ham Radio Deluxe 5.21 preliminary user guide (11 May 2012). That guide is the behavior reference for this screen. Logbook, Digital Master, satellites, and rotator control are later work and are not in this tree. Ham Radio Deluxe is a trademark of its owner. This project does not copy its icons, bitmaps, or manual text.
 
-The window is a Rust [`egui`](https://github.com/emilk/egui) app in the same spirit as the RT-950 CPS: dark groups, a large frequency, and a click-to-tune bandspread. Radio I/O goes through Hamlib's `rigctld` extended response protocol (`+\` commands, `RPRT` replies). The program does not link `libhamlib`.
+The window is a Rust [`egui`](https://github.com/emilk/egui) app in the same spirit as the RT-950 CPS: dark groups, a large frequency, and a click-to-tune bandspread. Radio I/O goes through Hamlib's `rigctld` extended response protocol (`+\` commands, `RPRT` replies). GQRX uses the short rigctl commands on the same client. The program does not link `libhamlib`.
 
 ## Run
 
@@ -12,13 +12,9 @@ The window is a Rust [`egui`](https://github.com/emilk/egui) app in the same spi
 cargo run -p commander
 ```
 
-The window connects to a `rigctld` that is already listening on `127.0.0.1:4532`. **Demo** switches to a small in-process stand-in. **Connect** picks another host or port. This program does not start `rigctld`.
+The window starts Hamlib's dummy itself: `rigctld -m 1` on `127.0.0.1`, port 4532 when that port is free. VFO A is 14.153608 MHz USB, VFO B is 146.520 MHz FM, and VFO C is 446.000 MHz FM. **Demo** switches to a small in-process stand-in and does not spawn `rigctld`. The Config tab saves the station to one JSON file and adds radios. A hamlib row starts `rigctld`. A GQRX row starts GQRX. The program does not attach to a `rigctld` or GQRX it did not start.
 
-```bash
-scripts/dummy-rig.sh
-```
-
-That starts Hamlib's dummy rig (`rigctld -m 1`) on `127.0.0.1:4532` and parks 20 m on VFO A, 2 m on VFO B, and 70 cm on VFO C. The dummy's range is 150 kHz–1.5 GHz, so those HF, VHF, and UHF frequencies are all in band. Use your radio's model number and serial port when you connect a real rig. Levels the backend lists with an empty range stay disabled.
+`scripts/dummy-rig.sh` still starts that dummy by hand for a manual run. Levels the backend lists with an empty range stay disabled.
 
 ## Layout
 

@@ -1,15 +1,16 @@
 //! TCP client for a running `rigctld`.
 //!
-//! Commands use Hamlib's extended response prefix `+\`. The read timeout is
-//! the completion signal: `rigctld` answers with `RPRT`, and a peer that
-//! accepts the socket and then stays silent never closes it.
+//! Hamlib's extended form prefixes each command with `+\` and ends every
+//! reply with `RPRT`. GQRX uses the short commands (`f`, `F`) and a get ends
+//! on its line count. Either way a peer that accepts and stays silent never
+//! closes, so the read timeout is the completion signal.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
-use crate::caps::{parse_caps, Caps};
+use crate::caps::{parse_caps, Caps, Range};
 use crate::{Command, LinkKind, Rig, RigError, Snapshot};
 
 const READ_LEVELS: &[&str] = &[
@@ -41,6 +42,14 @@ pub struct LiveRig {
     skip: BTreeSet<String>,
     ant: i32,
     message: String,
+    /// Extended is hamlib `+\`. Classic is the short rigctl form GQRX speaks.
+    dialect: Dialect,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Dialect {
+    Extended,
+    Classic,
 }
 
 struct Reply {
@@ -50,26 +59,7 @@ struct Reply {
 
 impl LiveRig {
     pub fn connect(host: &str, port: u16) -> Result<Self, RigError> {
-        let endpoint = format!("{host}:{port}");
-        let addr = endpoint
-            .to_socket_addrs()
-            .map_err(|e| RigError::Io(format!("{endpoint}: {e}")))?
-            .next()
-            .ok_or_else(|| RigError::Io(format!("{endpoint}: no address")))?;
-        let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
-            .map_err(|e| RigError::Io(format!("{endpoint}: {e}")))?;
-        // `rigctld` finishes a command with `RPRT`. A dead session that keeps
-        // the TCP connection open has no other completion signal.
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .map_err(|e| RigError::Io(e.to_string()))?;
-        stream
-            .set_write_timeout(Some(Duration::from_secs(2)))
-            .map_err(|e| RigError::Io(e.to_string()))?;
-        stream
-            .set_nodelay(true)
-            .map_err(|e| RigError::Io(e.to_string()))?;
-
+        let (mut stream, endpoint) = open_stream(host, port)?;
         let dump = transact(&mut stream, "dump_caps")?;
         if dump.rprt != 0 {
             return Err(RigError::Remote(format!("dump_caps RPRT {}", dump.rprt)));
@@ -82,11 +72,62 @@ impl LiveRig {
             skip: BTreeSet::new(),
             ant: 1,
             message: String::new(),
+            dialect: Dialect::Extended,
+        })
+    }
+
+    /// GQRX and any other short-command rigctl socket. The same [`Command`]
+    /// bodies are used; the wire form is `f` / `F` rather than `+\get_freq`.
+    pub fn connect_classic(host: &str, port: u16) -> Result<Self, RigError> {
+        let (mut stream, endpoint) = open_stream(host, port)?;
+        let freq = classic_transact(&mut stream, "f", 1)?;
+        if freq.rprt != 0 || freq.lines.is_empty() {
+            return Err(RigError::Remote("gqrx get frequency failed".into()));
+        }
+        let modes = classic_transact(&mut stream, "M ?", 1)?;
+        let get_levels = classic_transact(&mut stream, "l ?", 1)?;
+        let set_levels = classic_transact(&mut stream, "L ?", 1)?;
+        let caps = gqrx_caps(
+            modes.lines.first().map(String::as_str).unwrap_or(""),
+            get_levels.lines.first().map(String::as_str).unwrap_or(""),
+            set_levels.lines.first().map(String::as_str).unwrap_or(""),
+        );
+        Ok(Self {
+            stream,
+            endpoint,
+            caps,
+            skip: BTreeSet::new(),
+            ant: 1,
+            message: String::new(),
+            dialect: Dialect::Classic,
         })
     }
 
     fn exchange(&mut self, body: &str) -> Result<Reply, RigError> {
-        transact(&mut self.stream, body)
+        match self.dialect {
+            Dialect::Extended => transact(&mut self.stream, body),
+            Dialect::Classic => {
+                let Some((wire, lines)) = classic_wire(body) else {
+                    return Ok(Reply {
+                        rprt: 1,
+                        lines: Vec::new(),
+                    });
+                };
+                let mut reply = classic_transact(&mut self.stream, &wire, lines)?;
+                reply.lines = present_classic(body, reply.lines);
+                Ok(reply)
+            }
+        }
+    }
+
+    /// One `get_freq`. Idle radios use this so a dead daemon is noticed
+    /// without the full poll the selected radio already runs.
+    pub fn ping(&mut self) -> Result<(), RigError> {
+        let reply = self.exchange("get_freq")?;
+        if reply.rprt != 0 {
+            return Err(RigError::Remote(format!("get_freq RPRT {}", reply.rprt)));
+        }
+        Ok(())
     }
 
     /// Read the paired VFO without leaving the rig on it.
@@ -318,15 +359,163 @@ impl Rig for LiveRig {
     }
 }
 
+fn open_stream(host: &str, port: u16) -> Result<(TcpStream, String), RigError> {
+    let endpoint = format!("{host}:{port}");
+    let addr = endpoint
+        .to_socket_addrs()
+        .map_err(|e| RigError::Io(format!("{endpoint}: {e}")))?
+        .next()
+        .ok_or_else(|| RigError::Io(format!("{endpoint}: no address")))?;
+    let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+        .map_err(|e| RigError::Io(format!("{endpoint}: {e}")))?;
+    // A command finishes with `RPRT`, or with the line count the short form
+    // promises. A peer that accepts and then stays silent never closes.
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|e| RigError::Io(e.to_string()))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .map_err(|e| RigError::Io(e.to_string()))?;
+    stream
+        .set_nodelay(true)
+        .map_err(|e| RigError::Io(e.to_string()))?;
+    Ok((stream, endpoint))
+}
+
 fn transact(stream: &mut TcpStream, body: &str) -> Result<Reply, RigError> {
     let line = format!("+\\{body}\n");
     stream
         .write_all(line.as_bytes())
         .map_err(|e| RigError::Io(e.to_string()))?;
-    read_reply(stream)
+    read_reply(stream, None)
 }
 
-fn read_reply(stream: &mut TcpStream) -> Result<Reply, RigError> {
+fn classic_transact(
+    stream: &mut TcpStream,
+    wire: &str,
+    content_lines: usize,
+) -> Result<Reply, RigError> {
+    stream
+        .write_all(format!("{wire}\n").as_bytes())
+        .map_err(|e| RigError::Io(e.to_string()))?;
+    read_reply(stream, Some(content_lines))
+}
+
+/// Short-command form of a long rigctl body. `None` is a command GQRX does
+/// not implement; the caller reports `RPRT 1` without writing to the socket.
+fn classic_wire(body: &str) -> Option<(String, usize)> {
+    let mut parts = body.split_whitespace();
+    let cmd = parts.next().unwrap_or("");
+    let rest: Vec<&str> = parts.collect();
+    let wire = match cmd {
+        "get_freq" => ("f".to_string(), 1),
+        "set_freq" => (format!("F {}", rest.first().copied().unwrap_or("0")), 0),
+        "get_mode" => ("m".to_string(), 2),
+        "set_mode" => {
+            let mode = rest.first().copied().unwrap_or("USB");
+            let bw = rest.get(1).copied().unwrap_or("0");
+            (format!("M {mode} {bw}"), 0)
+        }
+        "get_vfo" => ("v".to_string(), 1),
+        "set_vfo" => (format!("V {}", rest.first().copied().unwrap_or("VFOA")), 0),
+        "get_level" => (format!("l {}", rest.first().copied().unwrap_or("")), 1),
+        "set_level" => (
+            format!(
+                "L {} {}",
+                rest.first().copied().unwrap_or(""),
+                rest.get(1).copied().unwrap_or("0")
+            ),
+            0,
+        ),
+        "get_func" => (format!("u {}", rest.first().copied().unwrap_or("")), 1),
+        "set_func" => (
+            format!(
+                "U {} {}",
+                rest.first().copied().unwrap_or(""),
+                rest.get(1).copied().unwrap_or("0")
+            ),
+            0,
+        ),
+        _ => return None,
+    };
+    Some(wire)
+}
+
+fn present_classic(body: &str, lines: Vec<String>) -> Vec<String> {
+    let cmd = body.split_whitespace().next().unwrap_or("");
+    match cmd {
+        "get_freq" => lines
+            .into_iter()
+            .take(1)
+            .map(|hz| format!("Frequency: {hz}"))
+            .collect(),
+        "get_mode" => {
+            let mode = lines.first().cloned().unwrap_or_default();
+            let pass = lines.get(1).cloned().unwrap_or_else(|| "0".into());
+            vec![format!("Mode: {mode}"), format!("Passband: {pass}")]
+        }
+        "get_vfo" => lines
+            .into_iter()
+            .take(1)
+            .map(|name| format!("VFO: {name}"))
+            .collect(),
+        _ => lines,
+    }
+}
+
+/// Receive window for the GQRX face. This is not the dongle's hardware span.
+const GQRX_RX_HZ: f64 = 6_000_000_000.0;
+
+fn gqrx_caps(modes: &str, get_levels: &str, set_levels: &str) -> Caps {
+    let mut caps = Caps::empty();
+    caps.model = "GQRX".into();
+    caps.can_set_freq = true;
+    caps.can_set_mode = true;
+    caps.modes = modes.split_whitespace().map(str::to_string).collect();
+    if caps.modes.is_empty() {
+        caps.modes = ["USB", "LSB", "CW", "FM", "AM"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+    }
+    caps.vfos = vec!["VFOA".into()];
+    caps.rx_ranges = vec![Range {
+        min: 0.0,
+        max: GQRX_RX_HZ,
+        step: 1.0,
+    }];
+    for name in get_levels.split_whitespace() {
+        caps.get_levels.insert(name.to_string(), gqrx_level(name));
+    }
+    for name in set_levels.split_whitespace() {
+        if matches!(name, "SQL" | "AF") {
+            caps.set_levels.insert(name.to_string(), gqrx_level(name));
+        }
+    }
+    caps
+}
+
+fn gqrx_level(name: &str) -> Range {
+    match name {
+        "SQL" => Range {
+            min: -150.0,
+            max: 0.0,
+            step: 1.0,
+        },
+        "AF" => Range {
+            min: -80.0,
+            max: 50.0,
+            step: 1.0,
+        },
+        _ => Range {
+            min: 0.0,
+            max: 0.0,
+            step: 0.0,
+        },
+    }
+}
+
+fn read_reply(stream: &mut TcpStream, content_lines: Option<usize>) -> Result<Reply, RigError> {
     let mut acc = Vec::new();
     let mut lines = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -340,6 +529,11 @@ fn read_reply(stream: &mut TcpStream) -> Result<Reply, RigError> {
             }
             if !line.is_empty() {
                 lines.push(line);
+            }
+            // A short-form get ends on its line count. `Some(0)` is a set,
+            // which ends only on `RPRT`.
+            if content_lines.is_some_and(|n| n > 0 && lines.len() >= n) {
+                return Ok(Reply { rprt: 0, lines });
             }
         }
         if Instant::now() >= deadline {
@@ -571,5 +765,70 @@ RPRT 0
         assert_eq!(snap.caps.rx_ranges.len(), 1);
         assert!((snap.caps.rx_ranges[0].min - 150_000.0).abs() < 0.5);
         assert!((snap.caps.rx_ranges[0].max - 1_500_000_000.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn classic_freq_uses_short_commands() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = std::sync::Arc::clone(&seen);
+        thread::spawn(move || {
+            let mut freq = 14_153_608_i64;
+            let (mut sock, _) = listener.accept().unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut acc = Vec::new();
+            loop {
+                let mut buf = [0u8; 1024];
+                let n = match sock.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => n,
+                };
+                acc.extend_from_slice(&buf[..n]);
+                while let Some(pos) = acc.iter().position(|b| *b == b'\n') {
+                    let line = String::from_utf8_lossy(&acc[..pos]).trim().to_string();
+                    acc.drain(..=pos);
+                    log.lock().unwrap().push(line.clone());
+                    let reply = match line.as_str() {
+                        "f" => format!("{freq}\n"),
+                        "m" => "USB\n2400\n".to_string(),
+                        "v" => "VFOA\n".to_string(),
+                        "M ?" => "USB LSB CW FM AM\n".to_string(),
+                        "l ?" => "STRENGTH SQL AF\n".to_string(),
+                        "L ?" => "SQL AF\n".to_string(),
+                        "l STRENGTH" => "-40.0\n".to_string(),
+                        "l AF" => "-6.0\n".to_string(),
+                        other if other.starts_with("F ") => {
+                            freq = other[2..].trim().parse().unwrap_or(freq);
+                            "RPRT 0\n".to_string()
+                        }
+                        other if other.starts_with("M ") || other.starts_with("L ") => {
+                            "RPRT 0\n".to_string()
+                        }
+                        _ => "RPRT 1\n".to_string(),
+                    };
+                    let _ = sock.write_all(reply.as_bytes());
+                }
+            }
+        });
+        let mut rig = LiveRig::connect_classic("127.0.0.1", port).unwrap();
+        let snap = rig.poll().unwrap();
+        assert!((snap.freq_hz - 14_153_608.0).abs() < 1.0);
+        assert_eq!(snap.mode, "USB");
+        assert_eq!(snap.passband_hz, 2400);
+        assert_eq!(snap.vfo, "VFOA");
+        assert!(!snap.caps.can_set_ptt);
+        assert!(!snap.caps.can_set_split);
+        assert!(snap.caps.level_range("AF").is_some());
+        assert!(snap.caps.level_range("SQL").is_some());
+        assert!(snap.caps.allow_freq(14_153_608.0).is_some());
+        assert!((snap.strength_db - -40.0).abs() < 0.1);
+        rig.apply(&Command::SetFreq(146_520_000.0)).unwrap();
+        let snap = rig.poll().unwrap();
+        assert!((snap.freq_hz - 146_520_000.0).abs() < 1.0);
+        let log = seen.lock().unwrap().clone();
+        assert!(log.iter().any(|line| line == "f"));
+        assert!(log.iter().any(|line| line == "F 146520000"));
+        assert!(log.iter().all(|line| !line.contains('+')));
     }
 }
