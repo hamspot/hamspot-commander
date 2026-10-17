@@ -78,10 +78,12 @@ A serial radio needs the user in the `dialout` group. A USB device node that Ubu
 | `gqrx` | `gqrx-sdr` | A GQRX row on the Config page |
 | `pw-loopback`, `pw-dump` | `pipewire-bin` | The receive and transmit audio cards |
 | `helvum` | `helvum` | The Helvum button on the Audio frame |
+| `dsd-fme` | built from lwvmobile/dsd-fme | Digital voice, including P25, on an RX pipe |
+| `sox`, `socat` | `sox`, `socat` | Resample dsd-fme's 8 kHz voice to the RX pipe's 48 kHz stream |
 
 PipeWire itself is part of the Ubuntu desktop session. Commander does not start it.
 
-The source-tree installer also installs `rustc`, `cargo`, `pkg-config`, and `libgtk-3-dev` so it can compile the window. The portable zip is already compiled. A live USB does not need the compiler.
+The source-tree installer also installs `rustc`, `cargo`, `pkg-config`, and `libgtk-3-dev` so it can compile the window. It installs `build-essential`, `cmake`, `git`, `libcodec2-dev`, `libncurses-dev`, `libpulse-dev`, `librtlsdr-dev`, `libsndfile1-dev`, and `libusb-1.0-0-dev`, then builds `mbelib` and `dsd-fme` into `~/.local/bin`. It does not install GNU Radio or the Ubuntu `dsdcc` package. The portable zip is already compiled and does not include `dsd-fme`. A live USB does not need the compiler.
 
 ## 1.6 Radios
 
@@ -687,11 +689,12 @@ scripts/install.sh
 
 The script asks for sudo without a password prompt. On a machine where sudo requires a password in the terminal, run it from a terminal that can authenticate, or arrange passwordless sudo for the duration of the install. If sudo cannot run, the script stops before it changes packages.
 
-It installs the packages in section 1.5, including the compiler, then builds the release binary. It copies:
+It installs the packages in section 1.5, including the compiler, then builds the release binary and `dsd-fme`. It copies:
 
 | Installed path | What it is |
 | --- | --- |
 | `~/.local/bin/commander` | The window |
+| `~/.local/bin/dsd-fme` | The digital voice decoder |
 | `~/.local/share/applications/hamspotcommander.desktop` | The desktop entry |
 | `~/.local/share/icons/hicolor/128x128/apps/hamspot-commander.png` | The icon |
 | `~/.local/share/hamspot-commander/installed.manifest` | What this install added |
@@ -708,7 +711,7 @@ The script does not start Commander or GQRX.
 scripts/uninstall.sh
 ```
 
-Removal deletes the binary, the desktop file, and the icon recorded in the manifest, when those paths are under your home directory. It removes you from `dialout` or `plugdev` only if the manifest says this install added you. It does not remove apt packages. GQRX, Hamlib, PipeWire, and the compiler stay installed.
+Removal deletes the binary, the desktop file, and the icon recorded in the manifest, when those paths are under your home directory. It also deletes the `dsd-fme` and `mbelib` files listed in the manifest. It removes you from `dialout` or `plugdev` only if the manifest says this install added you. It does not remove apt packages. GQRX, Hamlib, PipeWire, and the compiler stay installed. The decoder source cache under `~/.cache/hamspot-commander` stays as well.
 
 A second install leaves `added_dialout` and `added_plugdev` as they were, so a later uninstall does not drop a group you already belonged to.
 

@@ -77,6 +77,40 @@ remove_path "$binary"
 remove_path "$desktop"
 remove_path "$icon"
 
+dsd_files="$(grep -E '^dsd_fme_files=' "$manifest" | head -n 1 | cut -d= -f2-)"
+if [[ -n "$dsd_files" ]]; then
+    under_home "$dsd_files"
+    if [[ -f "$dsd_files" ]]; then
+        while IFS= read -r path || [[ -n "$path" ]]; do
+            [[ -z "$path" || "$path" == \#* ]] && continue
+            remove_path "$path"
+        done <"$dsd_files"
+    fi
+    remove_path "$dsd_files"
+    remove_path "${state_dir}/dsd-fme-rev"
+fi
+
+modems_dir="$(grep -E '^modems_dir=' "$manifest" | head -n 1 | cut -d= -f2-)"
+if [[ -n "$modems_dir" ]]; then
+    under_home "$modems_dir"
+    if [[ -d "$modems_dir" ]]; then
+        modem=""
+        for modem in "$modems_dir"/*; do
+            [[ -e "$modem" || -L "$modem" ]] || continue
+            link="${home_dir}/.local/bin/$(basename "$modem")"
+            if [[ -L "$link" ]]; then
+                target="$(readlink -f "$link" 2>/dev/null || true)"
+                modem_real="$(readlink -f "$modem" 2>/dev/null || true)"
+                if [[ -n "$target" && "$target" == "$modem_real" ]]; then
+                    remove_path "$link"
+                fi
+            fi
+            remove_path "$modem"
+        done
+        rmdir "$modems_dir" 2>/dev/null || true
+    fi
+fi
+
 if [[ "$added_dialout" == yes || "$added_plugdev" == yes ]]; then
     command -v sudo >/dev/null 2>&1 || die "sudo is required to undo group membership"
     sudo -n true || die "sudo needs a password. Run this script in a terminal."

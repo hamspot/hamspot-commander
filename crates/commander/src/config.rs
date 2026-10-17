@@ -294,6 +294,7 @@ mod tests {
             follow: false,
             audio: crate::cat::RadioAudio::default(),
             gqrx: crate::cat::GqrxConfig::new(),
+            rx_pipe: String::new(),
         });
         let back = parse(&to_string(&file).unwrap()).unwrap();
         assert_eq!(back.radios.len(), 1);
@@ -323,6 +324,19 @@ mod tests {
         let back = parse(&to_string(&file).unwrap()).unwrap();
         assert_eq!(back.audio.devices[0].name, "hamspot_custom");
         assert_eq!(back.audio.links[0].output, "output.hamspot_1_rx:output_FL");
+        assert!(!to_string(&file).unwrap().contains("rx_pipe"));
+        file.radios[0].rx_pipe = "dsdccx -i - -o -".into();
+        let text = to_string(&file).unwrap();
+        assert!(text.contains("dsdccx -i - -o -"));
+        let back = parse(&text).unwrap();
+        assert_eq!(back.radios[0].rx_pipe, "dsdccx -i - -o -");
+        let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        value["radios"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("rx_pipe");
+        let loaded = parse(&value.to_string()).unwrap();
+        assert!(loaded.radios[0].rx_pipe.is_empty());
         assert!(!to_string(&file).unwrap().contains("\"gqrx\""));
     }
 

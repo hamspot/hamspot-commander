@@ -15,6 +15,7 @@ mod exit_watch;
 mod gpredict_hw;
 mod plan;
 mod rot;
+mod rx_pipe;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -179,6 +180,8 @@ struct App {
     rotators: Arc<rot::Hub>,
     rot_models: Vec<rot::RotModel>,
     rot_edit: Option<RotDraft>,
+    /// Apply was sent. The station file is written once the hub has that command.
+    rx_pipe_pending: Option<(u64, String)>,
     favorite: Option<Favorite>,
     fav_open: bool,
     show_spread: bool,
@@ -237,6 +240,7 @@ struct App {
     speaker_tex: Option<egui::TextureHandle>,
     mic_tex: Option<egui::TextureHandle>,
     radio_tex: Option<egui::TextureHandle>,
+    scope_tex: Option<egui::TextureHandle>,
     /// `None` means the theme had no icon, so the frame does not ask again.
     xdg_tex: HashMap<String, Option<egui::TextureHandle>>,
     bay_drag: Option<bay::Drag>,
@@ -774,6 +778,7 @@ impl App {
             rotators,
             rot_models: Vec::new(),
             rot_edit: None,
+            rx_pipe_pending: None,
             favorite: None,
             fav_open: false,
             show_spread: true,
@@ -816,6 +821,7 @@ impl App {
             speaker_tex: None,
             mic_tex: None,
             radio_tex: None,
+            scope_tex: None,
             xdg_tex: HashMap::new(),
             bay_drag: None,
             gpredict_sig: String::new(),
@@ -1155,6 +1161,7 @@ impl eframe::App for App {
         let (mut snap, live_gen) = self.snap_gen();
         self.maybe_push_loaded(&snap, live_gen);
         self.autosave_audio(&snap);
+        self.flush_rx_pipe(&snap);
         self.sync_gpredict();
         let follow = self.following();
         self.face.lock().expect("face").follow = follow;
@@ -2532,6 +2539,7 @@ impl App {
     fn audio_frame(&mut self, ui: &mut egui::Ui) {
         let view = self.hub.view();
         let mut endpoint = None;
+        let mut pipe_apply = None;
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label("Audio");
@@ -2604,6 +2612,37 @@ impl App {
                             .color(egui::Color32::from_rgb(220, 160, 80)),
                     );
                 }
+                ui.horizontal(|ui| {
+                    ui.label("RX pipe");
+                    let scripts = crate::rx_pipe::modem_scripts();
+                    let current = row.spec.rx_pipe.as_str();
+                    egui::ComboBox::from_id_salt(("rx-pipe", row.id))
+                        .selected_text(crate::rx_pipe::choice_text(current, &scripts))
+                        .width(280.0)
+                        .show_ui(ui, |ui| {
+                            if ui.selectable_label(current.is_empty(), "none").clicked()
+                                && !current.is_empty()
+                            {
+                                pipe_apply = Some((row.id, String::new()));
+                            }
+                            for script in &scripts {
+                                let on = crate::rx_pipe::script_matches(current, script);
+                                if ui
+                                    .selectable_label(on, crate::rx_pipe::modem_label(&script.name))
+                                    .clicked()
+                                    && !on
+                                {
+                                    pipe_apply = Some((row.id, script.command.clone()));
+                                }
+                            }
+                        });
+                });
+                if !row.rx_pipe_status.is_empty() {
+                    ui.label(
+                        egui::RichText::new(&row.rx_pipe_status)
+                            .color(egui::Color32::from_rgb(220, 160, 80)),
+                    );
+                }
                 ui.add_space(4.0);
             }
             self.paint_bay(ui, &view);
@@ -2631,6 +2670,32 @@ impl App {
         if let Some((id, input, output)) = endpoint {
             self.hub.set_endpoint(id, input, output);
         }
+        if let Some((id, command)) = pipe_apply {
+            self.hub.set_rx_pipe(id, command.clone());
+            if !self.config_path.is_empty() {
+                self.rx_pipe_pending = Some((id, command));
+            }
+        }
+    }
+
+    /// The hub applies the command on its own thread. Write the station file
+    /// only after that row shows the same text, so the save cannot race ahead.
+    fn flush_rx_pipe(&mut self, snap: &Snapshot) {
+        let Some((id, command)) = self.rx_pipe_pending.clone() else {
+            return;
+        };
+        let view = self.hub.view();
+        let Some(row) = view.rows.iter().find(|row| row.id == id) else {
+            self.rx_pipe_pending = None;
+            return;
+        };
+        if row.spec.rx_pipe != command {
+            return;
+        }
+        self.rx_pipe_pending = None;
+        if !self.config_path.is_empty() {
+            self.save_config(snap);
+        }
     }
 
     fn paint_bay(&mut self, ui: &mut egui::Ui, view: &cat::HubView) {
@@ -2645,6 +2710,16 @@ impl App {
                 tx_title: crate::audio::describe(&row.make, &row.model_label, row.id, "TX"),
                 input: row.spec.audio.input.clone(),
                 output: row.spec.audio.output.clone(),
+                rx_pipe_live: row.rx_pipe_diverted,
+                rx_pipe_label: crate::rx_pipe::modem_label(
+                    std::path::Path::new(
+                        crate::rx_pipe::program_name(&row.spec.rx_pipe).unwrap_or("RX pipe"),
+                    )
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("RX pipe"),
+                )
+                .to_string(),
             })
             .collect();
         let bindings: Vec<bay::RadioBinding> = radios
@@ -2690,7 +2765,7 @@ impl App {
                         && pos.y >= 0.0
                         && pos.x <= scene.width
                         && pos.y <= scene.height;
-                    if inside {
+                    if inside && !bay::over_rx_pipe(&scene, pos.x, pos.y) {
                         let target = bay::target_at(&scene, pos.x, pos.y);
                         updates = bay::endpoint_updates(&bindings, &drag.grab, target.as_ref());
                     }
@@ -2715,22 +2790,42 @@ impl App {
             }
         }
         for icon in &scene.icons {
+            let icon_rect = egui::Rect::from_min_size(
+                origin + egui::vec2(icon.x, icon.y),
+                egui::vec2(
+                    if icon.kind == bay::IconKind::Pipe {
+                        bay::PIPE_W
+                    } else {
+                        48.0
+                    },
+                    48.0,
+                ),
+            );
             let tex = match icon.kind {
                 bay::IconKind::Mic => self.mic_tex.as_ref(),
                 bay::IconKind::Speaker => self.speaker_tex.as_ref(),
                 bay::IconKind::Radio => self.radio_tex.as_ref(),
                 bay::IconKind::Xdg => self.xdg_tex.get(&icon.xdg).and_then(Option::as_ref),
+                bay::IconKind::Pipe => self.scope_tex.as_ref(),
             };
-            let icon_rect = egui::Rect::from_min_size(
-                origin + egui::vec2(icon.x, icon.y),
-                egui::vec2(48.0, 48.0),
-            );
             if let Some(tex) = tex {
                 painter.image(
                     tex.id(),
                     icon_rect,
                     egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                     egui::Color32::WHITE,
+                );
+            } else if icon.kind == bay::IconKind::Pipe {
+                painter.rect_filled(
+                    icon_rect,
+                    egui::CornerRadius::same(6),
+                    egui::Color32::from_rgb(28, 32, 38),
+                );
+                painter.rect_stroke(
+                    icon_rect,
+                    egui::CornerRadius::same(6),
+                    egui::Stroke::new(1.5, egui::Color32::from_rgb(220, 160, 80)),
+                    egui::StrokeKind::Inside,
                 );
             }
             painter.text(
@@ -2780,6 +2875,13 @@ impl App {
                 ctx,
                 "hamspot-radio",
                 include_bytes!("../assets/icon-radio.png"),
+            );
+        }
+        if self.scope_tex.is_none() {
+            self.scope_tex = png_texture(
+                ctx,
+                "hamspot-scope",
+                include_bytes!("../assets/icon-scope.png"),
             );
         }
     }
@@ -3241,6 +3343,17 @@ impl App {
                     .unwrap_or_else(cat::gqrx_chooser_config),
                 cat::RadioDriver::Hamlib => cat::GqrxConfig::new(),
             },
+            rx_pipe: edit
+                .id
+                .and_then(|id| {
+                    self.hub
+                        .view()
+                        .rows
+                        .iter()
+                        .find(|row| row.id == id)
+                        .map(|row| row.spec.rx_pipe.clone())
+                })
+                .unwrap_or_default(),
         };
         if let Err(err) = cat::validate_spec(&spec) {
             if let Some(edit) = &mut self.cat_edit {

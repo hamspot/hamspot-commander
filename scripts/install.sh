@@ -28,6 +28,18 @@ packages=(
     cargo
     pkg-config
     libgtk-3-dev
+    # dsd-fme and mbelib. Not GNU Radio, and not the Ubuntu dsdcc package.
+    build-essential
+    cmake
+    git
+    libcodec2-dev
+    libncurses-dev
+    libpulse-dev
+    librtlsdr-dev
+    libsndfile1-dev
+    libusb-1.0-0-dev
+    socat
+    sox
 )
 
 die() {
@@ -70,6 +82,21 @@ refresh_caches() {
     fi
 }
 
+# Copy repo modems/ into the install directory and link each script onto PATH.
+install_modems() {
+    local src_dir="${root}/modems"
+    local dest_dir="${state_dir}/modems"
+    [[ -d "$src_dir" ]] || die "missing ${src_dir}"
+    install -d -m 755 "$dest_dir" "${home_dir}/.local/bin"
+    local src name
+    for src in "$src_dir"/*; do
+        [[ -f "$src" ]] || continue
+        name="$(basename "$src")"
+        install -m 755 "$src" "${dest_dir}/${name}"
+        ln -sfn "${dest_dir}/${name}" "${home_dir}/.local/bin/${name}"
+    done
+}
+
 write_desktop() {
     cat >"$desktop_path" <<EOF
 ${marker}
@@ -105,6 +132,8 @@ desktop=${desktop_path}
 icon=${icon_path}
 added_dialout=${added_dialout}
 added_plugdev=${added_plugdev}
+dsd_fme_files=${state_dir}/dsd-fme-files.txt
+modems_dir=${state_dir}/modems
 EOF
 }
 
@@ -129,6 +158,8 @@ command -v rustc >/dev/null 2>&1 || die "rustc is not on PATH after apt install"
 
 install -d -m 755 "${home_dir}/.local/bin"
 install -m 755 "${root}/target/release/commander" "$bin_path"
+"${root}/scripts/build-dsd-fme.sh"
+install_modems
 install -d -m 755 "$(dirname "$icon_path")"
 install -m 644 "$icon_src" "$icon_path"
 write_desktop

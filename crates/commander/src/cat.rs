@@ -145,6 +145,10 @@ pub struct RadioSpec {
     /// Absent on a hamlib row and on a station file from before this field.
     #[serde(default, skip_serializing_if = "gqrx_config_is_empty")]
     pub gqrx: GqrxConfig,
+    /// External demodulator. Empty leaves the RX stream on the speaker.
+    /// Stdin and stdout are 48 kHz mono s16le. Absent in an older file.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub rx_pipe: String,
 }
 
 impl RadioSpec {
@@ -163,6 +167,7 @@ impl RadioSpec {
             follow: false,
             audio: RadioAudio::default(),
             gqrx: GqrxConfig::new(),
+            rx_pipe: String::new(),
         }
     }
 }
@@ -177,6 +182,10 @@ pub struct RadioRow {
     pub make: String,
     pub model_label: String,
     pub audio_status: String,
+    /// Empty when the RX pipe is off. A failure stays here until the command changes.
+    pub rx_pipe_status: String,
+    /// The pipe process is in the speaker path, so the bay draws it as a block.
+    pub rx_pipe_diverted: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -211,6 +220,8 @@ enum HubCmd {
     Shutdown,
     /// Gpredict follow for one radio. Does not restart `rigctld`.
     SetFollow(u64, bool),
+    /// Receiver stdin/stdout command. Does not restart `rigctld`.
+    SetRxPipe(u64, String),
 }
 
 pub struct Hub {
@@ -253,6 +264,16 @@ struct Slot {
     audio_status: String,
     /// TCP port reserved in [`CLAIMED`] for this slot's daemon.
     held: Option<u16>,
+    rx_pipe: Option<crate::rx_pipe::Running>,
+    /// Command that cannot be started. A crash does not set this. The
+    /// command has to change before service tries that program again.
+    rx_pipe_failed: Option<String>,
+    /// Speaker whose direct wire this pipe removed. Restored when the pipe
+    /// is finished, and kept across a crash so the restart stays in that path.
+    rx_pipe_owned: Option<String>,
+    /// Next start after a component exited. Same gap as a radio daemon.
+    rx_pipe_retry_at: Option<Instant>,
+    rx_pipe_status: String,
 }
 
 pub fn validate_spec(spec: &RadioSpec) -> Result<(), String> {
@@ -871,6 +892,11 @@ impl Hub {
         self.send(HubCmd::SetFollow(id, follow));
     }
 
+    /// Receiver pipe command. The running `rigctld` stays up.
+    pub fn set_rx_pipe(&self, id: u64, command: String) {
+        self.send(HubCmd::SetRxPipe(id, command));
+    }
+
     /// Wake the supervisor without a command. Leaving Demo uses this so the
     /// selected radio is handed back without waiting out the idle read.
     pub fn wake(&self) {
@@ -970,6 +996,22 @@ fn supervise(
                 HubCmd::SetFollow(id, follow) => {
                     if let Some(slot) = slots.iter_mut().find(|slot| slot.id == id) {
                         slot.spec.follow = follow;
+                        slot.status_dirty = true;
+                    }
+                }
+                HubCmd::SetRxPipe(id, command) => {
+                    if let Some(slot) = slots.iter_mut().find(|slot| slot.id == id) {
+                        let command = command.trim().to_string();
+                        slot.spec.rx_pipe = command;
+                        slot.rx_pipe_failed = None;
+                        slot.rx_pipe_retry_at = None;
+                        if slot
+                            .rx_pipe
+                            .as_ref()
+                            .is_some_and(|pipe| pipe.command != slot.spec.rx_pipe)
+                        {
+                            release_rx_pipe(slot);
+                        }
                         slot.status_dirty = true;
                     }
                 }
@@ -1116,6 +1158,7 @@ fn supervise(
         }
         for slot in &mut slots {
             service_audio(slot, &models, &wanted, &look.graph);
+            service_rx_pipe(slot, &look.graph, now);
             tick_slot(
                 slot,
                 slot.id == selected,
@@ -1172,6 +1215,11 @@ fn new_slot(id: u64, spec: RadioSpec) -> Slot {
         model_label: String::new(),
         audio_status: String::new(),
         held: None,
+        rx_pipe: None,
+        rx_pipe_failed: None,
+        rx_pipe_owned: None,
+        rx_pipe_retry_at: None,
+        rx_pipe_status: String::new(),
     }
 }
 
@@ -1424,7 +1472,12 @@ fn adopt_gqrx_file(slot: &mut Slot) {
 fn next_wait(slots: &[Slot], now: Instant) -> Duration {
     let mut wait = IDLE_READ;
     for slot in slots {
-        for at in [slot.retry_at, slot.next_idle, slot.probe_at]
+        for at in [
+            slot.retry_at,
+            slot.next_idle,
+            slot.probe_at,
+            slot.rx_pipe_retry_at,
+        ]
             .into_iter()
             .flatten()
         {
@@ -1457,6 +1510,8 @@ fn publish(
             make: slot.make.clone(),
             model_label: slot.model_label.clone(),
             audio_status: slot.audio_status.clone(),
+            rx_pipe_status: slot.rx_pipe_status.clone(),
+            rx_pipe_diverted: slot.rx_pipe.as_ref().is_some_and(|pipe| pipe.diverted),
         })
         .collect();
     let mut pids = Vec::new();
@@ -1469,6 +1524,9 @@ fn publish(
         }
         if let Some(child) = &slot.tx_audio {
             pids.push(child.id() as i32);
+        }
+        if let Some(pipe) = &slot.rx_pipe {
+            pids.push(pipe.leader_id() as i32);
         }
     }
     *hub.pids.lock().expect("cat pids") = pids;
@@ -1501,6 +1559,7 @@ fn stop_slot(slot: &mut Slot) {
         adopt_gqrx_file(slot);
     }
     stop_audio(slot);
+    release_rx_pipe(slot);
 }
 
 fn park_until(hub: &Hub, watch: &Option<DevWatch>, wait: Duration) {
@@ -1654,9 +1713,13 @@ fn note_audio(slots: &mut [Slot], graph: &crate::audio::AudioGraph) {
         } else if slot.saw_tx {
             slot.spec.audio.tx = false;
         }
-        if let Some(node) = crate::audio::peer_node(graph, &crate::audio::rx_stream(slot.id), true)
-        {
-            slot.spec.audio.output = node;
+        let pipe_holds_speaker = slot.rx_pipe.as_ref().is_some_and(|pipe| pipe.diverted);
+        if !pipe_holds_speaker {
+            if let Some(node) =
+                crate::audio::peer_node(graph, &crate::audio::rx_stream(slot.id), true)
+            {
+                slot.spec.audio.output = node;
+            }
         }
         if let Some(node) = crate::audio::peer_node(graph, &crate::audio::tx_stream(slot.id), false)
         {
@@ -1897,6 +1960,149 @@ fn retarget(slot: &mut Slot, input: &str, output: &str, live: &crate::audio::Aud
     }
 }
 
+fn service_rx_pipe(slot: &mut Slot, graph: &crate::audio::AudioGraph, now: Instant) {
+    let command = slot.spec.rx_pipe.trim().to_string();
+    if command.is_empty() {
+        release_rx_pipe(slot);
+        set_rx_pipe_status(slot, "");
+        return;
+    }
+    let restart = slot
+        .rx_pipe
+        .as_ref()
+        .is_some_and(|pipe| pipe.command != command || pipe.output != slot.spec.audio.output);
+    if restart {
+        release_rx_pipe(slot);
+    }
+    if let Some(note) = slot.rx_pipe.as_mut().and_then(crate::rx_pipe::poll) {
+        // One dead component ends the group. The speaker wire stays taken
+        // so the next start does not play the undecoded signal in between.
+        halt_rx_pipe(slot, false);
+        slot.rx_pipe_retry_at = Some(now + RETRY_AFTER);
+        set_rx_pipe_status(slot, &format!("rx pipe restarting ({note})"));
+        return;
+    }
+    if slot.rx_pipe.is_some() {
+        divert_rx_pipe(slot, graph);
+        return;
+    }
+    if slot.rx_pipe_failed.as_deref() == Some(command.as_str()) {
+        return;
+    }
+    if slot.rx_pipe_owned.as_deref() != Some(slot.spec.audio.output.trim()) {
+        // The speaker moved. The old wire is no longer this pipe's to put back.
+        slot.rx_pipe_owned = None;
+    }
+    if slot.rx_pipe_retry_at.is_some_and(|at| now < at) {
+        return;
+    }
+    let output = slot.spec.audio.output.trim();
+    if !slot.audio_wired || output.is_empty() {
+        set_rx_pipe_status(slot, "rx pipe waiting for the speaker link");
+        return;
+    }
+    let Some(program) = crate::rx_pipe::program_name(&command).map(str::to_string) else {
+        slot.rx_pipe_failed = Some(command);
+        set_rx_pipe_status(slot, "rx pipe command is empty");
+        return;
+    };
+    if !crate::rx_pipe::on_path(&program) {
+        slot.rx_pipe_failed = Some(command);
+        slot.rx_pipe_retry_at = None;
+        set_rx_pipe_status(slot, &format!("rx pipe: {program} is not on PATH"));
+        return;
+    }
+    match crate::rx_pipe::spawn(slot.id, output, &command) {
+        Ok(mut pipe) => {
+            if slot.rx_pipe_owned.as_deref() == Some(output) {
+                pipe.diverted = true;
+            }
+            slot.rx_pipe = Some(pipe);
+            slot.rx_pipe_retry_at = None;
+            if slot.rx_pipe_owned.is_some() {
+                set_rx_pipe_status(slot, &format!("rx pipe {}", crate::rx_pipe::FORMAT));
+            } else {
+                set_rx_pipe_status(slot, "rx pipe starting");
+            }
+        }
+        Err(err) => {
+            slot.rx_pipe_retry_at = Some(now + RETRY_AFTER);
+            set_rx_pipe_status(slot, &format!("rx pipe restarting ({err})"));
+        }
+    }
+}
+
+fn divert_rx_pipe(slot: &mut Slot, graph: &crate::audio::AudioGraph) {
+    let alive = slot
+        .rx_pipe
+        .as_mut()
+        .is_some_and(|pipe| crate::rx_pipe::poll(pipe).is_none());
+    if !alive {
+        return;
+    }
+    let stream = crate::audio::rx_stream(slot.id);
+    let linked = graph
+        .links
+        .iter()
+        .any(|link| crate::audio::port_node(&link.output) == stream);
+    // No link in this snapshot means the speaker wire is not there to move.
+    // Leave it, and leave `diverted` clear, so a dead pipe cannot restore a
+    // wire this snapshot never saw.
+    if !linked {
+        return;
+    }
+    unlink_stream(&stream, true, graph);
+    let owned = slot.rx_pipe.as_ref().map(|pipe| pipe.output.clone());
+    if let Some(pipe) = slot.rx_pipe.as_mut() {
+        pipe.diverted = true;
+    }
+    if let Some(output) = owned {
+        slot.rx_pipe_owned = Some(output);
+    }
+    set_rx_pipe_status(slot, &format!("rx pipe {}", crate::rx_pipe::FORMAT));
+}
+
+fn release_rx_pipe(slot: &mut Slot) {
+    halt_rx_pipe(slot, true);
+    slot.rx_pipe_retry_at = None;
+}
+
+/// Stop the process group. `restore` puts the speaker wire back when this
+/// pipe still owns it. A crash passes false and leaves the wire taken.
+fn halt_rx_pipe(slot: &mut Slot, restore: bool) {
+    if let Some(pipe) = slot.rx_pipe.take() {
+        if pipe.diverted {
+            slot.rx_pipe_owned = Some(pipe.output.clone());
+        }
+        crate::rx_pipe::shutdown(pipe);
+    }
+    if !restore {
+        return;
+    }
+    if let Some(output) = slot.rx_pipe_owned.take() {
+        if slot.spec.audio.output == output {
+            restore_rx_link(slot.id, &output);
+        }
+    }
+}
+
+fn restore_rx_link(id: u64, output: &str) {
+    let outputs = crate::audio::pw_ports(true).unwrap_or_default();
+    let inputs = crate::audio::pw_ports(false).unwrap_or_default();
+    let from = crate::audio::ports_of(&outputs, &crate::audio::rx_stream(id));
+    let to = crate::audio::ports_of(&inputs, output);
+    for (left, right) in crate::audio::pair_ports(&from, &to) {
+        let _ = crate::audio::pw_link(&left, &right);
+    }
+}
+
+fn set_rx_pipe_status(slot: &mut Slot, text: &str) {
+    if slot.rx_pipe_status != text {
+        slot.rx_pipe_status = text.to_string();
+        slot.status_dirty = true;
+    }
+}
+
 fn unlink_stream(stream: &str, stream_is_output: bool, graph: &crate::audio::AudioGraph) {
     for link in &graph.links {
         let ours = if stream_is_output {
@@ -2006,6 +2212,7 @@ mod tests {
             follow: false,
             audio: RadioAudio::default(),
             gqrx: GqrxConfig::new(),
+            rx_pipe: String::new(),
         };
         let args = hamlib_argv(&spec, 4534);
         assert_eq!(
@@ -2196,6 +2403,7 @@ mod tests {
             follow: false,
             audio: RadioAudio::default(),
             gqrx: gqrx_chooser_config(),
+            rx_pipe: String::new(),
         };
         assert!(validate_spec(&spec).is_ok());
         assert_eq!(driver_name(RadioDriver::Gqrx), "gqrx");
@@ -2293,6 +2501,7 @@ mod tests {
             follow: false,
             audio: RadioAudio::default(),
             gqrx: GqrxConfig::new(),
+            rx_pipe: String::new(),
         };
         let path = prepare_gqrx_document_in(&home, &mut spec).unwrap();
         assert!(gqrx_needs_chooser(&spec.gqrx));

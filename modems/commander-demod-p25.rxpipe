@@ -1,0 +1,67 @@
+#!/bin/bash
+# P25 Phase 1 for a Hamspot Commander RX pipe.
+#
+# stdin and stdout are 48 kHz mono signed 16-bit little-endian. dsd-fme
+# reads that stream and sends 8 kHz mono voice to UDP. socat and sox turn
+# the voice back into the format the pipe plays. An optional first argument
+# is the UDP port (default 23469). A second radio needs its own port.
+#
+# If the decoder or the voice pipeline exits, this script exits too. The
+# supervisor then stops the whole pipe group and starts it again.
+
+set -euo pipefail
+
+port="${1:-23469}"
+case "$port" in
+    ''|*[!0-9]*)
+        echo "commander-demod-p25: port must be a number" >&2
+        exit 1
+        ;;
+esac
+
+for program in dsd-fme socat sox; do
+    if ! command -v "$program" >/dev/null 2>&1; then
+        echo "commander-demod-p25: ${program} is not on PATH" >&2
+        exit 1
+    fi
+done
+
+decoder=""
+listener=""
+player=""
+voice=""
+cleanup() {
+    if [[ -n "$decoder" ]]; then
+        kill "$decoder" 2>/dev/null || true
+    fi
+    if [[ -n "$listener" ]]; then
+        kill "$listener" 2>/dev/null || true
+    fi
+    if [[ -n "$player" ]]; then
+        kill "$player" 2>/dev/null || true
+    fi
+    if [[ -n "$voice" ]]; then
+        rm -f "$voice"
+    fi
+}
+trap cleanup EXIT
+
+voice="$(mktemp -u /tmp/hamspot-rxpipe.XXXXXX)"
+mkfifo -m 600 "$voice"
+
+# Without job control, bash connects a bare background command's stdin
+# to /dev/null. dsd-fme would see EOF, exit, and the recorder would die
+# with SIGPIPE. <&0 keeps this script's stdin, which is the RX audio.
+dsd-fme -f1 -i - -o "udp:127.0.0.1:${port}" <&0 >/dev/null 2>&1 &
+decoder=$!
+socat -u "udp-listen:${port}" - </dev/null >"$voice" &
+listener=$!
+sox -q -t raw -r 8000 -e signed -b 16 -c 1 "$voice" -t raw -r 48000 -e signed -b 16 -c 1 - </dev/null &
+player=$!
+
+# One exit is the crash. The trap stops the other two on the way out.
+set +e
+wait -n
+status=$?
+set -e
+exit "$status"

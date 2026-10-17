@@ -20,6 +20,10 @@ pub enum End {
     Playback { device: String },
     RadioTx { id: u64 },
     RadioRx { id: u64 },
+    /// Left jack of the receive-pipe block.
+    RxPipeIn { id: u64 },
+    /// Right jack of the receive-pipe block.
+    RxPipeOut { id: u64 },
 }
 
 /// What the pointer picked up.
@@ -58,6 +62,10 @@ pub struct BayRadio {
     pub tx_title: String,
     pub input: String,
     pub output: String,
+    /// The receive pipe is in the speaker path. The block replaces that wire.
+    pub rx_pipe_live: bool,
+    /// Program name drawn in the pipe block.
+    pub rx_pipe_label: String,
 }
 
 pub struct BayIn<'a> {
@@ -74,6 +82,8 @@ pub enum IconKind {
     Speaker,
     Radio,
     Xdg,
+    /// Receive-pipe block drawn between the radio and the speaker.
+    Pipe,
 }
 
 #[derive(Clone, Debug)]
@@ -121,6 +131,9 @@ pub struct Drag {
 
 const ICON: f32 = 48.0;
 const DOT: f32 = 12.0;
+/// The receive-pipe icon matches the other device icons. The demodulator
+/// name is painted under it, the same way the radio and speaker names are.
+pub const PIPE_W: f32 = ICON;
 
 /// Icon name for a PipeWire node that Commander did not create.
 pub fn xdg_icon_name(class: &str, name: &str, description: &str) -> &'static str {
@@ -393,6 +406,23 @@ pub fn layout(width: f32, input: &BayIn<'_>) -> Scene {
             &rx_ports,
             false,
         );
+        if radio.rx_pipe_live && !radio.output.is_empty() {
+            let speaker_ports = shown_ports(
+                input.ports,
+                &radio.output,
+                &["playback_FL", "playback_FR"],
+            );
+            place_rx_pipe(
+                &mut icons,
+                &mut ports,
+                radio,
+                &rx_ports,
+                &speaker_ports,
+                y_mid,
+                rx_port_x(x0, col),
+                playback_port_x(8.0 + 2.0 * col, col),
+            );
+        }
         y_mid += row;
     }
     let height = y_left.max(y_right).max(y_mid).max(88.0);
@@ -466,6 +496,94 @@ fn place_radio_side(
     place_ports(ports, end, names, port_x, y + ICON * 0.5, !ports_on_left);
 }
 
+fn rx_port_x(x0: f32, col: f32) -> f32 {
+    let icon_x = x0 + col - ICON - 28.0;
+    icon_x + ICON + 16.0
+}
+
+fn playback_port_x(x0: f32, col: f32) -> f32 {
+    let icon_x = x0 + col - ICON - 8.0;
+    icon_x - 16.0
+}
+
+/// Block between the radio's receive ports and the speaker ports.
+/// Each receive channel gets a left jack and a right jack.
+fn place_rx_pipe(
+    icons: &mut Vec<IconSpot>,
+    ports: &mut Vec<PortSpot>,
+    radio: &BayRadio,
+    rx_ports: &[&str],
+    speaker_ports: &[&str],
+    y: f32,
+    rx_x: f32,
+    speaker_x: f32,
+) {
+    let pairs = pipe_pairs(rx_ports, speaker_ports);
+    if pairs.is_empty() {
+        return;
+    }
+    let ys: Vec<f32> = pairs
+        .iter()
+        .filter_map(|(rx_leaf, _)| port_at(ports, &End::RadioRx { id: radio.id }, rx_leaf))
+        .map(|at| at[1])
+        .collect();
+    let center_y = if ys.is_empty() {
+        y + ICON * 0.5
+    } else {
+        ys.iter().sum::<f32>() / ys.len() as f32
+    };
+    let pipe_x = (rx_x + speaker_x) * 0.5 - PIPE_W * 0.5;
+    icons.push(IconSpot {
+        x: pipe_x,
+        y: center_y - ICON * 0.5,
+        kind: IconKind::Pipe,
+        xdg: String::new(),
+        label: short(if radio.rx_pipe_label.is_empty() {
+            "RX pipe"
+        } else {
+            &radio.rx_pipe_label
+        }),
+        hit: None,
+    });
+    let left = pipe_x - 10.0;
+    let right = pipe_x + PIPE_W + 10.0;
+    for (rx_leaf, speaker_leaf) in &pairs {
+        let Some(at) = port_at(ports, &End::RadioRx { id: radio.id }, rx_leaf) else {
+            continue;
+        };
+        push_port(
+            ports,
+            PortSpot {
+                end: End::RxPipeIn { id: radio.id },
+                port: format!("in:{rx_leaf}"),
+                at: [left, at[1]],
+                label: channel_label(rx_leaf).to_string(),
+                label_right: false,
+            },
+        );
+        push_port(
+            ports,
+            PortSpot {
+                end: End::RxPipeOut { id: radio.id },
+                port: format!("out:{speaker_leaf}"),
+                at: [right, at[1]],
+                label: channel_label(speaker_leaf).to_string(),
+                label_right: true,
+            },
+        );
+    }
+}
+
+fn push_port(ports: &mut Vec<PortSpot>, spot: PortSpot) {
+    if ports
+        .iter()
+        .any(|have| have.end == spot.end && have.port == spot.port)
+    {
+        return;
+    }
+    ports.push(spot);
+}
+
 fn place_ports(
     ports: &mut Vec<PortSpot>,
     end: End,
@@ -497,6 +615,10 @@ fn wires_of(input: &BayIn<'_>, ports: &[PortSpot]) -> Vec<WireSpot> {
                 continue;
             };
             if radio.output != in_node {
+                continue;
+            }
+            // The pipe block owns this path. The direct wire is not drawn.
+            if radio.rx_pipe_live {
                 continue;
             }
             let from = port_at(ports, &End::RadioRx { id }, port_leaf(&link.output));
@@ -548,7 +670,123 @@ fn wires_of(input: &BayIn<'_>, ports: &[PortSpot]) -> Vec<WireSpot> {
             });
         }
     }
+    for radio in input.radios {
+        if !radio.rx_pipe_live || radio.output.is_empty() {
+            continue;
+        }
+        let rx_ports = shown_ports(
+            input.ports,
+            &audio::rx_stream(radio.id),
+            &["output_FL", "output_FR"],
+        );
+        let speaker_ports = shown_ports(
+            input.ports,
+            &radio.output,
+            &["playback_FL", "playback_FR"],
+        );
+        for (rx_leaf, speaker_leaf) in pipe_pairs(&rx_ports, &speaker_ports) {
+            let from = port_at(ports, &End::RadioRx { id: radio.id }, &rx_leaf);
+            let into = port_at(
+                ports,
+                &End::RxPipeIn { id: radio.id },
+                &format!("in:{rx_leaf}"),
+            );
+            let out_of = port_at(
+                ports,
+                &End::RxPipeOut { id: radio.id },
+                &format!("out:{speaker_leaf}"),
+            );
+            let to = port_at(
+                ports,
+                &End::Playback {
+                    device: radio.output.clone(),
+                },
+                &speaker_leaf,
+            );
+            let (Some(from), Some(into), Some(out_of), Some(to)) = (from, into, out_of, to) else {
+                continue;
+            };
+            wires.push(WireSpot {
+                from,
+                to: into,
+                from_grab: Grab::RadioRx { id: radio.id },
+                to_grab: Grab::RadioRx { id: radio.id },
+            });
+            wires.push(WireSpot {
+                from: out_of,
+                to,
+                from_grab: Grab::Playback {
+                    device: radio.output.clone(),
+                    radio: Some(radio.id),
+                },
+                to_grab: Grab::Playback {
+                    device: radio.output.clone(),
+                    radio: Some(radio.id),
+                },
+            });
+        }
+    }
     wires
+}
+
+/// Left and right channels, in order. A mono side fans out to every channel
+/// on the other side, the same way `audio::pair_ports` does.
+fn pipe_pairs(rx: &[&str], speaker: &[&str]) -> Vec<(String, String)> {
+    if rx.is_empty() || speaker.is_empty() {
+        return Vec::new();
+    }
+    if rx.len() == 1 {
+        return speaker
+            .iter()
+            .map(|port| (rx[0].to_string(), (*port).to_string()))
+            .collect();
+    }
+    if speaker.len() == 1 {
+        return rx
+            .iter()
+            .map(|port| ((*port).to_string(), speaker[0].to_string()))
+            .collect();
+    }
+    rx.iter()
+        .zip(speaker.iter())
+        .map(|(left, right)| ((*left).to_string(), (*right).to_string()))
+        .collect()
+}
+
+fn channel_label(port: &str) -> &str {
+    if port.ends_with("_FL") || port == "FL" {
+        "FL"
+    } else if port.ends_with("_FR") || port == "FR" {
+        "FR"
+    } else if port.ends_with("MONO") {
+        "MONO"
+    } else {
+        port
+    }
+}
+
+pub fn over_rx_pipe(scene: &Scene, x: f32, y: f32) -> bool {
+    if scene.icons.iter().any(|icon| {
+        icon.kind == IconKind::Pipe
+            && x >= icon.x
+            && x <= icon.x + PIPE_W
+            && y >= icon.y
+            && y <= icon.y + ICON
+    }) {
+        return true;
+    }
+    scene.ports.iter().any(|port| {
+        pipe_end(&port.end)
+            && {
+                let dx = port.at[0] - x;
+                let dy = port.at[1] - y;
+                dx * dx + dy * dy <= DOT * DOT
+            }
+    })
+}
+
+fn pipe_end(end: &End) -> bool {
+    matches!(end, End::RxPipeIn { .. } | End::RxPipeOut { .. })
 }
 
 fn port_at(ports: &[PortSpot], end: &End, port: &str) -> Option<[f32; 2]> {
@@ -566,6 +804,10 @@ fn port_at(ports: &[PortSpot], end: &End, port: &str) -> Option<[f32; 2]> {
 
 pub fn grab_at(scene: &Scene, x: f32, y: f32) -> Option<Drag> {
     if let Some(port) = nearest_port(scene, x, y, DOT) {
+        // The pipe jacks stay put. The wires on either side are the handles.
+        if pipe_end(&port.end) {
+            return None;
+        }
         let grab = scene
             .wires
             .iter()
@@ -622,7 +864,9 @@ pub fn grab_at(scene: &Scene, x: f32, y: f32) -> Option<Drag> {
 
 pub fn target_at(scene: &Scene, x: f32, y: f32) -> Option<End> {
     if let Some(port) = nearest_port(scene, x, y, DOT) {
-        return Some(port.end.clone());
+        if !pipe_end(&port.end) {
+            return Some(port.end.clone());
+        }
     }
     scene
         .icons
@@ -643,6 +887,8 @@ fn grab_from_end(end: &End) -> Grab {
         },
         End::RadioTx { id } => Grab::RadioTx { id: *id },
         End::RadioRx { id } => Grab::RadioRx { id: *id },
+        // Pipe jacks are not handles. `grab_at` returns before this arm.
+        End::RxPipeIn { id } | End::RxPipeOut { id } => Grab::RadioRx { id: *id },
     }
 }
 
@@ -765,6 +1011,7 @@ fn port_leaf(port: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::{AudioLink, AudioNode};
 
     fn bound() -> Vec<RadioBinding> {
         vec![RadioBinding {
@@ -848,6 +1095,109 @@ mod tests {
         );
         assert_eq!(updates[0].input, "mic");
         assert_eq!(updates[0].output, "phones");
+    }
+
+    fn sample_radio(live: bool) -> BayRadio {
+        BayRadio {
+            id: 1,
+            title: "1 Hamlib Dummy".into(),
+            rx_title: "Hamlib Dummy 1 RX".into(),
+            tx_title: "Hamlib Dummy 1 TX".into(),
+            input: String::new(),
+            output: "spk".into(),
+            rx_pipe_live: live,
+            rx_pipe_label: "dsd-fme".into(),
+        }
+    }
+
+    fn sample_scene(live: bool, links: &[AudioLink]) -> Scene {
+        let playback = [AudioNode {
+            name: "spk".into(),
+            description: "RCA".into(),
+            class: "Audio/Sink".into(),
+        }];
+        let radios = [sample_radio(live)];
+        let ports = std::collections::BTreeMap::new();
+        layout(
+            900.0,
+            &BayIn {
+                captures: &[],
+                playbacks: &playback,
+                radios: &radios,
+                links,
+                ports: &ports,
+            },
+        )
+    }
+
+    #[test]
+    fn a_live_rx_pipe_is_a_block_between_the_radio_and_the_speaker() {
+        let scene = sample_scene(true, &[]);
+        let pipe = scene
+            .icons
+            .iter()
+            .find(|icon| icon.kind == IconKind::Pipe)
+            .expect("pipe block");
+        assert_eq!(pipe.label, "dsd-fme");
+        let inputs: Vec<_> = scene
+            .ports
+            .iter()
+            .filter(|port| matches!(port.end, End::RxPipeIn { id: 1 }))
+            .collect();
+        let outputs: Vec<_> = scene
+            .ports
+            .iter()
+            .filter(|port| matches!(port.end, End::RxPipeOut { id: 1 }))
+            .collect();
+        assert_eq!(
+            inputs.iter().map(|port| port.label.as_str()).collect::<Vec<_>>(),
+            vec!["FL", "FR"]
+        );
+        assert_eq!(
+            outputs.iter().map(|port| port.label.as_str()).collect::<Vec<_>>(),
+            vec!["FL", "FR"]
+        );
+        assert!(inputs.iter().all(|port| port.at[0] < pipe.x));
+        assert!(outputs.iter().all(|port| port.at[0] > pipe.x + PIPE_W));
+        assert_eq!(scene.wires.len(), 4);
+        assert!(scene.wires.iter().all(|wire| wire.from[0] < wire.to[0]));
+        let rx = scene
+            .ports
+            .iter()
+            .find(|port| matches!(port.end, End::RadioRx { id: 1 }) && port.port == "output_FL")
+            .expect("rx fl");
+        let speaker = scene
+            .ports
+            .iter()
+            .find(|port| {
+                matches!(port.end, End::Playback { ref device } if device == "spk")
+                    && port.port == "playback_FL"
+            })
+            .expect("speaker fl");
+        assert!(rx.at[0] < pipe.x && pipe.x + PIPE_W < speaker.at[0]);
+        assert!(over_rx_pipe(
+            &scene,
+            pipe.x + PIPE_W * 0.5,
+            pipe.y + ICON * 0.5
+        ));
+        assert!(grab_at(&scene, inputs[0].at[0], inputs[0].at[1]).is_none());
+    }
+
+    #[test]
+    fn a_quiet_radio_keeps_the_direct_speaker_wire() {
+        let links = [
+            AudioLink {
+                output: "output.hamspot_1_rx:output_FL".into(),
+                input: "spk:playback_FL".into(),
+            },
+            AudioLink {
+                output: "output.hamspot_1_rx:output_FR".into(),
+                input: "spk:playback_FR".into(),
+            },
+        ];
+        let scene = sample_scene(false, &links);
+        assert!(scene.icons.iter().all(|icon| icon.kind != IconKind::Pipe));
+        assert_eq!(scene.wires.len(), 2);
     }
 
     #[test]
