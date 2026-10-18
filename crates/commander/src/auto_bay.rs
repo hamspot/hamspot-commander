@@ -20,6 +20,8 @@ pub struct Device {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HwFile {
     pub stem: String,
+    /// Text on the port. Empty draws `stem`.
+    pub label: String,
     pub owned: bool,
 }
 
@@ -35,6 +37,7 @@ pub struct Card {
 #[derive(Clone, Debug)]
 pub struct FilePort {
     pub stem: String,
+    pub label: String,
     pub at: [f32; 2],
     pub owned: bool,
 }
@@ -74,8 +77,14 @@ pub fn layout(width: f32, devices: &[Device], files: &[HwFile]) -> Scene {
     let mut ports = Vec::new();
     let mut file_y = file_top;
     for file in files {
+        let label = if file.label.is_empty() {
+            file.stem.clone()
+        } else {
+            file.label.clone()
+        };
         ports.push(FilePort {
             stem: file.stem.clone(),
+            label,
             at: [panel_x + 16.0, file_y],
             owned: file.owned,
         });
@@ -123,10 +132,12 @@ mod tests {
         let files = vec![
             HwFile {
                 stem: "hamspot_FT-450D".into(),
+                label: String::new(),
                 owned: true,
             },
             HwFile {
                 stem: "MyRig".into(),
+                label: String::new(),
                 owned: false,
             },
         ];

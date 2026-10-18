@@ -9,11 +9,15 @@ mod auto_bay;
 mod bay;
 mod cat;
 mod channels;
+mod clock;
 mod config;
 mod dial;
 mod exit_watch;
+mod follow;
 mod gpredict_hw;
 mod plan;
+mod talkgroups;
+mod units;
 mod rot;
 mod rx_pipe;
 
@@ -27,8 +31,9 @@ use eframe::egui;
 use rigctl::{Command, DemoRig, LinkKind, LiveRig, Rig, RigError, Snapshot};
 
 use dial::{
-    arrange_meter_ids, channel_dial, channel_window, digit_steps, format_hz, lock_toggle,
+    channel_dial, channel_window, digit_steps, format_hz, lock_toggle,
     merge_meter_order, meter, meter_columns, meter_faces, meter_hit, meter_origin, move_meter,
+    order_with_clock, SYSTEM_CLOCK,
     needle_settled, paint_analog_meter, parse_freq, scale, step_needle, strength_frac,
     strength_label, swatch, vfo_label, wheel_notches, zone_scale, MeterFace, Needle, PaintSpan,
     SubBand, HAM, METER_GAP, METER_H, METER_W,
@@ -182,6 +187,7 @@ struct App {
     rot_edit: Option<RotDraft>,
     /// Apply was sent. The station file is written once the hub has that command.
     rx_pipe_pending: Option<(u64, String)>,
+    tx_pipe_pending: Option<(u64, String)>,
     favorite: Option<Favorite>,
     fav_open: bool,
     show_spread: bool,
@@ -224,11 +230,40 @@ struct App {
     sub_mode_hold: Option<String>,
     channels: channels::ChannelFile,
     channel_zone: usize,
+    /// Scroll the zone list to the selected row once after a station load.
+    /// A later manual scroll is left alone.
+    zone_list_follow: bool,
     channel_sel: usize,
     channel_path: String,
     /// Last folder chosen in the channel browser. Absent means the working directory.
     channel_dir: Option<PathBuf>,
     channel_note: String,
+    talkgroups: talkgroups::TalkgroupFile,
+    talkgroup_zone: usize,
+    talkgroup_sel: usize,
+    talkgroup_path: String,
+    talkgroup_dir: Option<PathBuf>,
+    talkgroup_note: String,
+    /// Radios named on a control channel. The description is the operator's text.
+    units: Vec<units::Unit>,
+    unit_sel: usize,
+    /// A description edit is held until the field is left, then written.
+    /// Exit does not save, and rewriting the station on every key is the whole file.
+    unit_desc_dirty: bool,
+    /// Control follower enabled per radio. Off leaves the P25 pipe as voice only.
+    cc_on: HashMap<u64, bool>,
+    /// Last events flag sent to the hub, so a frame does not restart the pipe.
+    cc_sent: HashMap<u64, bool>,
+    cc_voice_sent: HashMap<u64, bool>,
+    /// Last control-channel mode sent, so a parked radio is not told again.
+    cc_mode_sent: HashMap<u64, String>,
+    followers: HashMap<u64, follow::Follower>,
+    feeds: HashMap<u64, follow::DsdFeed>,
+    /// Last decoder stderr lines per radio. The hub queue is drained for
+    /// the follower, so this is what the Automation frame shows.
+    cc_tail: HashMap<u64, Vec<String>>,
+    /// Trunking-system time as a skew from this machine's clock.
+    system_clock: clock::SystemClock,
     config_path: String,
     /// Last folder chosen in the config browser. Absent means the working directory.
     config_dir: Option<PathBuf>,
@@ -275,11 +310,16 @@ struct MeterState {
     /// Last known outer position and inner size. Absent on Wayland.
     saved_pos: Option<egui::Pos2>,
     saved_size: Option<egui::Vec2>,
+    /// Monitor size in points, when the window system reports it.
+    saved_monitor: Option<egui::Vec2>,
+    /// OS pixels per point, when the window system reports it.
+    saved_ppp: Option<f32>,
 }
 
 struct MeterFeed {
     snap: Snapshot,
     radio: Option<String>,
+    clock: clock::SystemClock,
 }
 
 fn meter_viewport() -> egui::ViewportId {
@@ -575,6 +615,92 @@ mod helvum_tests {
 }
 
 #[cfg(test)]
+mod talkgroup_tab_tests {
+    use super::{directory_has_talkgroups, talkgroup_radio_ids, Page};
+
+    fn row(
+        id: u64,
+        driver: crate::cat::RadioDriver,
+        name: &str,
+        rx_pipe: &str,
+        selected: bool,
+    ) -> crate::cat::RadioRow {
+        let mut spec = crate::cat::RadioSpec::dummy();
+        spec.driver = driver;
+        spec.name = name.into();
+        spec.model = 0;
+        spec.park = false;
+        spec.rx_pipe = rx_pipe.into();
+        crate::cat::RadioRow {
+            id,
+            spec,
+            port: None,
+            status: String::new(),
+            selected,
+            make: String::new(),
+            model_label: String::new(),
+            audio_status: String::new(),
+            rx_pipe_status: String::new(),
+            rx_pipe_diverted: false,
+            tx_pipe_status: String::new(),
+            tx_pipe_diverted: false,
+        }
+    }
+
+    #[test]
+    fn a_saved_directory_keeps_the_tab_when_the_p25_pipe_is_off() {
+        let rows = [
+            row(1, crate::cat::RadioDriver::Hamlib, "Dummy", "", true),
+            row(3, crate::cat::RadioDriver::Gqrx, "HackRF", "", false),
+        ];
+        let mut file = crate::talkgroups::empty();
+        assert!(!directory_has_talkgroups(&file));
+        assert!(talkgroup_radio_ids(&rows, false).is_empty());
+        file.zones[0].talkgroups.push(crate::talkgroups::Talkgroup {
+            name: "ISP".into(),
+            tg: 10006,
+            encrypted: false,
+        });
+        assert_eq!(talkgroup_radio_ids(&rows, true), vec![3]);
+        let tabs = super::page_tabs(&rows, &file, &[]);
+        assert!(tabs.iter().any(|(page, label)| {
+            *page == Page::Talkgroups(3) && label == "HackRF Talkgroups"
+        }));
+        assert!(tabs.iter().all(|(page, _)| !matches!(page, Page::RadioIds(_))));
+        let units = vec![crate::units::Unit::named(42)];
+        let empty = crate::talkgroups::empty();
+        let radio_tabs = super::page_tabs(&rows, &empty, &units);
+        assert!(radio_tabs.iter().any(|(page, label)| {
+            *page == Page::RadioIds(3) && label == "HackRF Radio IDs"
+        }));
+        assert!(radio_tabs
+            .iter()
+            .all(|(page, _)| !matches!(page, Page::Talkgroups(_))));
+        let both = super::page_tabs(&rows, &file, &units);
+        let talk_at = both
+            .iter()
+            .position(|(page, _)| *page == Page::Talkgroups(3))
+            .expect("talkgroups");
+        let radio_at = both
+            .iter()
+            .position(|(page, _)| *page == Page::RadioIds(3))
+            .expect("radio ids");
+        assert!(talk_at < radio_at);
+        let piped = [
+            row(1, crate::cat::RadioDriver::Hamlib, "Dummy", "", false),
+            row(
+                3,
+                crate::cat::RadioDriver::Gqrx,
+                "HackRF",
+                "/opt/modems/commander-demod-p25.rxpipe",
+                true,
+            ),
+        ];
+        assert_eq!(talkgroup_radio_ids(&piped, true), vec![3]);
+    }
+}
+
+#[cfg(test)]
 mod icon_tests {
     #[test]
     fn favicon_becomes_a_square_window_icon() {
@@ -700,6 +826,10 @@ enum Page {
     Tune,
     Plan,
     Channels,
+    /// Talkgroup directory for one radio's control-channel follower.
+    Talkgroups(u64),
+    /// Radios named on that control channel.
+    RadioIds(u64),
     Meters,
     Levels,
     Config,
@@ -713,6 +843,131 @@ const PAGES: &[(Page, &str)] = &[
     (Page::Levels, "Levels"),
     (Page::Config, "Config"),
 ];
+
+fn page_name(page: Page) -> String {
+    match page {
+        Page::Talkgroups(id) => return format!("Talkgroups:{id}"),
+        Page::RadioIds(id) => return format!("RadioIds:{id}"),
+        _ => {}
+    }
+    PAGES
+        .iter()
+        .find(|(id, _)| *id == page)
+        .map(|(_, name)| (*name).to_string())
+        .unwrap_or_else(|| "Tune".to_string())
+}
+
+fn page_from_name(name: &str) -> Page {
+    if let Some(id) = name.strip_prefix("Talkgroups:") {
+        if let Ok(id) = id.parse() {
+            return Page::Talkgroups(id);
+        }
+    }
+    if let Some(id) = name.strip_prefix("RadioIds:") {
+        if let Ok(id) = id.parse() {
+            return Page::RadioIds(id);
+        }
+    }
+    PAGES
+        .iter()
+        .find(|(_, label)| *label == name)
+        .map(|(page, _)| *page)
+        .unwrap_or(Page::Tune)
+}
+
+fn directory_has_talkgroups(file: &talkgroups::TalkgroupFile) -> bool {
+    file.zones.iter().any(|zone| !zone.talkgroups.is_empty())
+}
+
+/// Radios that get a Talkgroups tab. A live P25 receive pipe wins. With the
+/// pipe off, a saved directory still keeps a tab on each GQRX radio so the
+/// list does not disappear when the decoder is stopped.
+fn talkgroup_radio_ids(rows: &[cat::RadioRow], directory: bool) -> Vec<u64> {
+    let piped: Vec<u64> = rows
+        .iter()
+        .filter(|row| crate::rx_pipe::is_p25_rx(&row.spec.rx_pipe))
+        .map(|row| row.id)
+        .collect();
+    if !piped.is_empty() {
+        return piped;
+    }
+    if !directory {
+        return Vec::new();
+    }
+    let gqrx: Vec<u64> = rows
+        .iter()
+        .filter(|row| row.spec.driver == cat::RadioDriver::Gqrx)
+        .map(|row| row.id)
+        .collect();
+    if !gqrx.is_empty() {
+        return gqrx;
+    }
+    rows.iter()
+        .filter(|row| row.selected)
+        .map(|row| row.id)
+        .collect()
+}
+
+fn page_tabs(
+    rows: &[cat::RadioRow],
+    talkgroups: &talkgroups::TalkgroupFile,
+    units: &[units::Unit],
+) -> Vec<(Page, String)> {
+    let mut tabs: Vec<(Page, String)> = PAGES
+        .iter()
+        .map(|(page, name)| (*page, (*name).to_string()))
+        .collect();
+    let talk = radio_page_tabs(
+        rows,
+        talkgroup_radio_ids(rows, directory_has_talkgroups(talkgroups)),
+        "Talkgroups",
+        Page::Talkgroups,
+    );
+    let radios = radio_page_tabs(
+        rows,
+        talkgroup_radio_ids(rows, !units.is_empty()),
+        "Radio IDs",
+        Page::RadioIds,
+    );
+    let mut at = tabs
+        .iter()
+        .position(|(page, _)| *page == Page::Channels)
+        .map(|idx| idx + 1)
+        .unwrap_or(tabs.len());
+    for item in talk.into_iter().chain(radios) {
+        tabs.insert(at, item);
+        at += 1;
+    }
+    tabs
+}
+
+fn radio_page_tabs(
+    rows: &[cat::RadioRow],
+    shown: Vec<u64>,
+    title: &str,
+    page_of: fn(u64) -> Page,
+) -> Vec<(Page, String)> {
+    let mut tabs = Vec::new();
+    for row in rows {
+        if shown.contains(&row.id) {
+            tabs.push((page_of(row.id), format!("{} {title}", row.spec.name)));
+        }
+    }
+    let mut seen = std::collections::BTreeMap::<String, usize>::new();
+    for (_, label) in &tabs {
+        *seen.entry(label.clone()).or_insert(0) += 1;
+    }
+    for (page, label) in &mut tabs {
+        if seen.get(label.as_str()).copied().unwrap_or(0) > 1 {
+            let id = match *page {
+                Page::Talkgroups(id) | Page::RadioIds(id) => id,
+                _ => continue,
+            };
+            label.push_str(&format!(" {id}"));
+        }
+    }
+    tabs
+}
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
@@ -765,7 +1020,7 @@ impl App {
             .first()
             .and_then(|zone| zone.bands.iter().position(|band| band.chip == "20m"))
             .unwrap_or(0);
-        Self {
+        let mut app = Self {
             shared,
             wake,
             face,
@@ -779,6 +1034,7 @@ impl App {
             rot_models: Vec::new(),
             rot_edit: None,
             rx_pipe_pending: None,
+            tx_pipe_pending: None,
             favorite: None,
             fav_open: false,
             show_spread: true,
@@ -809,10 +1065,28 @@ impl App {
             sub_vfo_height: 0.0,
             channels: channels::empty(),
             channel_zone: 0,
+            zone_list_follow: true,
             channel_sel: 0,
             channel_path: String::new(),
             channel_dir,
             channel_note: String::new(),
+            talkgroups: talkgroups::empty(),
+            talkgroup_zone: 0,
+            talkgroup_sel: 0,
+            talkgroup_path: String::new(),
+            talkgroup_dir: None,
+            talkgroup_note: String::new(),
+            units: Vec::new(),
+            unit_sel: 0,
+            unit_desc_dirty: false,
+            cc_on: HashMap::new(),
+            cc_sent: HashMap::new(),
+            cc_voice_sent: HashMap::new(),
+            cc_mode_sent: HashMap::new(),
+            followers: HashMap::new(),
+            feeds: HashMap::new(),
+            cc_tail: HashMap::new(),
+            system_clock: clock::SystemClock::default(),
             config_path: String::new(),
             config_dir,
             config_note: String::new(),
@@ -862,15 +1136,41 @@ impl App {
                     .and_then(|storage| storage.get_string("meter_win_size"))
                     .as_deref()
                     .and_then(parse_size),
+                saved_monitor: None,
+                saved_ppp: None,
             })),
             meter_feed: Arc::new(Mutex::new(MeterFeed {
                 snap: empty_snap(),
                 radio: None,
+                clock: clock::SystemClock::default(),
             })),
             icon: Arc::new(hamspot_icon()),
             meter_place: None,
             meter_size: None,
             meter_placed: false,
+        };
+        app.open_startup_station();
+        app
+    }
+
+    /// A clicked station file wins. With no argument, open Default.HSCommander
+    /// when it already exists. A missing default stays the save target and is
+    /// written the next time the station changes.
+    fn open_startup_station(&mut self) {
+        let path = config::station_from_args(std::env::args().skip(1));
+        let clicked = path != config::default_station_path();
+        if clicked && !path.is_file() {
+            self.config_note = format!("{}: no such station file", path.display());
+            return;
+        }
+        self.config_path = path.display().to_string();
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                self.config_dir = Some(parent.to_path_buf());
+            }
+        }
+        if path.is_file() {
+            self.load_config(&empty_snap());
         }
     }
 
@@ -941,8 +1241,27 @@ impl App {
             .any(|row| row.selected && row.spec.follow)
     }
 
+    /// The selected radio's control follower is the one writing the dial.
+    fn following_control(&self) -> bool {
+        if self.face.lock().expect("face").demo {
+            return false;
+        }
+        let rows = self.hub.view().rows;
+        let Some(row) = rows.iter().find(|row| row.selected) else {
+            return false;
+        };
+        if row.spec.follow || !crate::rx_pipe::is_p25_rx(&row.spec.rx_pipe) {
+            return false;
+        }
+        self.cc_on.get(&row.id).copied().unwrap_or(false)
+    }
+
+    fn dial_held(&self) -> bool {
+        self.following() || self.following_control()
+    }
+
     fn can_tune_freq(&self, snap: &Snapshot, main: bool) -> bool {
-        if !frequency_writes_allowed(self.following()) {
+        if !frequency_writes_allowed(self.dial_held()) {
             return false;
         }
         snap.online()
@@ -984,7 +1303,7 @@ impl App {
     /// Right-click path. Same frequency and plan mode as the main VFO, sent
     /// to the other VFO. The main frequency and mode are left alone.
     fn tune_sub(&mut self, snap: &Snapshot, hz: f64, wanted: Option<&str>) {
-        if !frequency_writes_allowed(self.following()) {
+        if !frequency_writes_allowed(self.dial_held()) {
             return;
         }
         let Some(hz) = snap.caps.allow_freq(hz) else {
@@ -1068,7 +1387,7 @@ impl App {
     }
 
     fn hold_and_send(&mut self, hz: f64) {
-        if !frequency_writes_allowed(self.following()) {
+        if !frequency_writes_allowed(self.dial_held()) {
             return;
         }
         self.hold_freq = Some(hz);
@@ -1108,6 +1427,16 @@ impl App {
             live
         }
     }
+}
+
+fn pipe_block_label(command: &str, fallback: &str) -> String {
+    crate::rx_pipe::modem_label(
+        std::path::Path::new(crate::rx_pipe::program_name(command).unwrap_or(fallback))
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(fallback),
+    )
+    .to_string()
 }
 
 impl eframe::App for App {
@@ -1162,6 +1491,8 @@ impl eframe::App for App {
         self.maybe_push_loaded(&snap, live_gen);
         self.autosave_audio(&snap);
         self.flush_rx_pipe(&snap);
+        self.flush_tx_pipe(&snap);
+        self.service_cc(&snap);
         self.sync_gpredict();
         let follow = self.following();
         self.face.lock().expect("face").follow = follow;
@@ -1241,13 +1572,30 @@ impl eframe::App for App {
                 .id_salt("page-tabs")
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        for (page, label) in PAGES {
+                        let rows = self.hub.view().rows;
+                        let tabs = page_tabs(&rows, &self.talkgroups, &self.units);
+                        let still_here = match self.page {
+                            Page::Talkgroups(id) => tabs
+                                .iter()
+                                .any(|(page, _)| *page == Page::Talkgroups(id)),
+                            Page::RadioIds(id) => {
+                                tabs.iter().any(|(page, _)| *page == Page::RadioIds(id))
+                            }
+                            _ => true,
+                        };
+                        if !still_here {
+                            self.page = Page::Channels;
+                        }
+                        for (page, label) in tabs {
                             if ui
-                                .add(egui::Button::selectable(self.page == *page, *label))
+                                .add(egui::Button::selectable(self.page == page, label))
                                 .clicked()
                             {
-                                self.page = *page;
+                                self.page = page;
                             }
+                        }
+                        if self.unit_desc_dirty && !matches!(self.page, Page::RadioIds(_)) {
+                            self.save_unit_description(&snap);
                         }
                     });
                 });
@@ -1264,6 +1612,10 @@ impl eframe::App for App {
                 self.page_plan(ui, &mut snap);
             } else if self.page == Page::Channels {
                 self.page_channels(ui, &mut snap);
+            } else if let Page::Talkgroups(id) = self.page {
+                self.page_talkgroups(ui, id);
+            } else if let Page::RadioIds(id) = self.page {
+                self.page_radio_ids(ui, id, &snap);
             } else {
                 egui::ScrollArea::vertical()
                     .id_salt("body")
@@ -1374,6 +1726,8 @@ impl App {
             Page::Tune => self.page_tune(ui, snap),
             Page::Plan => self.page_plan(ui, snap),
             Page::Channels => self.page_channels(ui, snap),
+            Page::Talkgroups(id) => self.page_talkgroups(ui, id),
+            Page::RadioIds(id) => self.page_radio_ids(ui, id, snap),
             Page::Meters => self.page_meters(ui, snap),
             Page::Levels => self.page_levels(ui, snap),
             Page::Config => self.page_config(ui, snap),
@@ -1388,6 +1742,8 @@ impl App {
             ui.take_available_width();
             if self.following() {
                 ui.label("Following Gpredict");
+            } else if self.following_control() {
+                ui.label("Following control");
             }
             ui.horizontal(|ui| {
                 let known_main = self.main_cluster_height;
@@ -1849,138 +2205,150 @@ impl App {
             self.channel_sel = count - 1;
         }
         ui.add_space(6.0);
-        let names: Vec<String> = self
-            .channels
-            .zones
-            .iter()
-            .map(|zone| zone.name.clone())
-            .collect();
-        ui.horizontal(|ui| {
-            for (idx, name) in names.iter().enumerate() {
-                if ui
-                    .add(egui::Button::selectable(self.channel_zone == idx, name))
-                    .clicked()
-                {
-                    self.channel_zone = idx;
-                    self.channel_sel = 0;
-                }
-            }
-        });
-        let selected = self.channels.zones[self.channel_zone]
-            .channels
-            .get(self.channel_sel)
-            .map(|channel| (channel.hz, channel.name.clone(), channel.mode.clone()));
-        let freqs: Vec<f64> = self.channels.zones[self.channel_zone]
-            .channels
-            .iter()
-            .map(|channel| channel.hz)
-            .collect();
-        let (win_lo, win_hi) = channel_window(&freqs, rx_fallback(snap));
-        let marks = plan::marks_for_window(&self.plan, win_lo, win_hi);
-        let spans: Vec<PaintSpan> = marks
-            .iter()
-            .map(|mark| {
-                let [r, g, b] = mark.rgb;
-                PaintSpan {
-                    lo: mark.lo_hz,
-                    hi: mark.hi_hz,
-                    color: egui::Color32::from_rgb(r, g, b),
-                }
-            })
-            .collect();
-        let needle = selected.as_ref().map(|(hz, _, _)| *hz);
-        let plan_title =
-            needle.and_then(|hz| plan::label_for_window(&self.plan, win_lo, win_hi, hz));
-
-        let mut clicked = None;
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let shown = match needle {
-                    Some(hz) => format!("{:.3}", hz / 1_000_000.0),
-                    None => "—".to_string(),
-                };
-                ui.label(egui::RichText::new(shown).size(40.0).strong());
-                ui.vertical(|ui| {
-                    ui.label(egui::RichText::new("MHz").size(16.0));
-                    if let Some(hz) = needle {
-                        ui.label(egui::RichText::new(format_hz(hz)).weak());
-                    }
-                });
-                ui.add_space(18.0);
-                match plan_title {
-                    Some(title) => {
-                        ui.label(egui::RichText::new(title).size(22.0).color(HAM).strong());
-                    }
-                    None => {
-                        ui.label(egui::RichText::new("—").size(22.0).weak());
-                    }
-                }
-                if let Some((_, name, mode)) = &selected {
-                    if !name.is_empty() {
-                        ui.add_space(12.0);
-                        ui.label(egui::RichText::new(name).size(22.0));
-                    }
-                    if !mode.is_empty() {
-                        ui.add_space(12.0);
-                        ui.label(egui::RichText::new(mode).size(22.0));
-                    }
-                }
-            });
-            ui.add_space(6.0);
-            clicked = channel_dial(ui, needle, win_lo, win_hi, &spans);
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.set_min_height(18.0);
-                let mut seen = Vec::new();
-                for mark in &marks {
-                    if seen.contains(&mark.legend) {
-                        continue;
-                    }
-                    seen.push(mark.legend.clone());
-                    let [r, g, b] = mark.rgb;
-                    swatch(ui, egui::Color32::from_rgb(r, g, b), &mark.legend);
-                    ui.add_space(10.0);
-                }
-            });
-        });
-        if let Some(hz) = clicked {
-            self.set_channel_hz(snap, hz);
-        }
-
-        ui.add_space(8.0);
         let gap = ui.spacing().item_spacing.x;
+        let zone_w = 280.0;
         let editor_w = 320.0;
         let total_w = ui.available_width();
-        let left_w = (total_w - gap - editor_w).max(280.0);
-        let right_w = (total_w - gap - left_w).max(0.0);
-        let height = ui.available_height();
+        let channel_w = (total_w - gap * 2.0 - zone_w - editor_w).max(220.0);
+        let editor_w = (total_w - gap * 2.0 - zone_w - channel_w).max(0.0);
+        let height = ui.available_height().max(80.0);
         ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
-                ui.set_width(left_w);
+                ui.set_width(zone_w);
                 egui::ScrollArea::vertical()
-                    .id_salt("channel-list")
-                    .max_height(height.max(80.0))
+                    .id_salt("zone-list")
+                    .auto_shrink([false, false])
+                    .max_height(height)
                     .show(ui, |ui| {
-                        let count = self
-                            .channels
-                            .zones
-                            .get(self.channel_zone)
-                            .map(|zone| zone.channels.len())
-                            .unwrap_or(0);
+                        let jump = self.zone_list_follow;
+                        let count = self.channels.zones.len();
                         for idx in 0..count {
-                            if self.channel_row(ui, idx) {
-                                self.recall_channel(snap, idx);
+                            let (clicked, response) = self.zone_row(ui, idx);
+                            if jump && idx == self.channel_zone {
+                                response.scroll_to_me(Some(egui::Align::Center));
+                            }
+                            if clicked {
+                                self.channel_zone = idx;
+                                self.channel_sel = 0;
                             }
                         }
+                        self.zone_list_follow = false;
                     });
             });
             ui.vertical(|ui| {
-                ui.set_width(right_w);
-                egui::ScrollArea::vertical()
-                    .id_salt("channel-editor")
-                    .auto_shrink([false, true])
-                    .max_height(height.max(80.0))
-                    .show(ui, |ui| self.channel_editor(ui, snap, right_w));
+                ui.set_width(channel_w + gap + editor_w);
+                let selected = self.channels.zones[self.channel_zone]
+                    .channels
+                    .get(self.channel_sel)
+                    .map(|channel| (channel.hz, channel.name.clone(), channel.mode.clone()));
+                let freqs: Vec<f64> = self.channels.zones[self.channel_zone]
+                    .channels
+                    .iter()
+                    .map(|channel| channel.hz)
+                    .collect();
+                let (win_lo, win_hi) = channel_window(&freqs, rx_fallback(snap));
+                let marks = plan::marks_for_window(&self.plan, win_lo, win_hi);
+                let spans: Vec<PaintSpan> = marks
+                    .iter()
+                    .map(|mark| {
+                        let [r, g, b] = mark.rgb;
+                        PaintSpan {
+                            lo: mark.lo_hz,
+                            hi: mark.hi_hz,
+                            color: egui::Color32::from_rgb(r, g, b),
+                        }
+                    })
+                    .collect();
+                let needle = selected.as_ref().map(|(hz, _, _)| *hz);
+                let plan_title =
+                    needle.and_then(|hz| plan::label_for_window(&self.plan, win_lo, win_hi, hz));
+
+                let mut clicked = None;
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let shown = match needle {
+                            Some(hz) => format!("{:.3}", hz / 1_000_000.0),
+                            None => "—".to_string(),
+                        };
+                        ui.label(egui::RichText::new(shown).size(40.0).strong());
+                        ui.vertical(|ui| {
+                            ui.label(egui::RichText::new("MHz").size(16.0));
+                            if let Some(hz) = needle {
+                                ui.label(egui::RichText::new(format_hz(hz)).weak());
+                            }
+                        });
+                        ui.add_space(18.0);
+                        match plan_title {
+                            Some(title) => {
+                                ui.label(egui::RichText::new(title).size(22.0).color(HAM).strong());
+                            }
+                            None => {
+                                ui.label(egui::RichText::new("—").size(22.0).weak());
+                            }
+                        }
+                        if let Some((_, name, mode)) = &selected {
+                            if !name.is_empty() {
+                                ui.add_space(12.0);
+                                ui.label(egui::RichText::new(name).size(22.0));
+                            }
+                            if !mode.is_empty() {
+                                ui.add_space(12.0);
+                                ui.label(egui::RichText::new(mode).size(22.0));
+                            }
+                        }
+                    });
+                    ui.add_space(6.0);
+                    clicked = channel_dial(ui, needle, win_lo, win_hi, &spans);
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.set_min_height(18.0);
+                        let mut seen = Vec::new();
+                        for mark in &marks {
+                            if seen.contains(&mark.legend) {
+                                continue;
+                            }
+                            seen.push(mark.legend.clone());
+                            let [r, g, b] = mark.rgb;
+                            swatch(ui, egui::Color32::from_rgb(r, g, b), &mark.legend);
+                            ui.add_space(10.0);
+                        }
+                    });
+                });
+                if let Some(hz) = clicked {
+                    self.set_channel_hz(snap, hz);
+                }
+
+                ui.add_space(8.0);
+                let list_h = ui.available_height().max(80.0);
+                ui.horizontal_top(|ui| {
+                    ui.vertical(|ui| {
+                        ui.set_width(channel_w);
+                        egui::ScrollArea::vertical()
+                            .id_salt("channel-list")
+                            .max_height(list_h)
+                            .show(ui, |ui| {
+                                let count = self
+                                    .channels
+                                    .zones
+                                    .get(self.channel_zone)
+                                    .map(|zone| zone.channels.len())
+                                    .unwrap_or(0);
+                                for idx in 0..count {
+                                    if self.channel_row(ui, idx) {
+                                        self.recall_channel(snap, idx);
+                                    }
+                                }
+                            });
+                    });
+                    ui.vertical(|ui| {
+                        ui.set_width(editor_w);
+                        egui::ScrollArea::vertical()
+                            .id_salt("channel-editor")
+                            .auto_shrink([false, true])
+                            .max_height(list_h)
+                            .show(ui, |ui| self.channel_editor(ui, snap, editor_w));
+                    });
+                });
             });
         });
     }
@@ -2135,6 +2503,7 @@ impl App {
         ui.add_space(8.0);
         ui.label(format!("Band plan: {}", file_label(&self.plan_path)));
         ui.label(format!("Channels: {} zones", self.channels.zones.len()));
+        ui.label(format!("Talkgroups: {} zones", self.talkgroups.zones.len()));
         ui.add_space(8.0);
         self.cat_frame(ui);
         ui.add_space(8.0);
@@ -2235,10 +2604,21 @@ impl App {
             .iter()
             .map(|file| auto_bay::HwFile {
                 stem: file.stem.clone(),
+                label: String::new(),
                 owned: file.owned,
             })
             .collect();
-        let scene = auto_bay::layout(ui.available_width(), &devices, &files);
+        self.paint_auto_scene(ui, "Gpredict", &devices, &files);
+    }
+
+    fn paint_auto_scene(
+        &mut self,
+        ui: &mut egui::Ui,
+        title: &str,
+        devices: &[auto_bay::Device],
+        files: &[auto_bay::HwFile],
+    ) {
+        let scene = auto_bay::layout(ui.available_width(), devices, files);
         let (rect, _) =
             ui.allocate_exact_size(egui::vec2(scene.width, scene.height), egui::Sense::hover());
         let origin = rect.min;
@@ -2252,7 +2632,7 @@ impl App {
         painter.text(
             panel.left_top() + egui::vec2(12.0, 6.0),
             egui::Align2::LEFT_TOP,
-            "Gpredict",
+            title,
             egui::FontId::proportional(13.0),
             egui::Color32::from_gray(220),
         );
@@ -2306,10 +2686,69 @@ impl App {
             painter.text(
                 at + egui::vec2(10.0, 0.0),
                 egui::Align2::LEFT_CENTER,
-                &file.stem,
+                &file.label,
                 egui::FontId::monospace(10.0),
                 color,
             );
+        }
+    }
+
+    /// P25 radios on the left, the control channel they are hunting on the
+    /// right. A blue wire means that channel is moving the dial.
+    fn paint_control(&mut self, ui: &mut egui::Ui, radios: &cat::HubView) {
+        let zone_name = self
+            .channels
+            .zones
+            .get(self.channel_zone)
+            .map(|zone| zone.name.as_str())
+            .unwrap_or("");
+        ui.label(format!("Control · {zone_name}"));
+        let p25: Vec<_> = radios
+            .rows
+            .iter()
+            .filter(|row| crate::rx_pipe::is_p25_rx(&row.spec.rx_pipe))
+            .collect();
+        if p25.is_empty() {
+            ui.label("No P25 receive pipe is on.");
+            return;
+        }
+        let mut devices = Vec::new();
+        let mut files = Vec::new();
+        for row in p25 {
+            let driving = self.cc_on.get(&row.id).copied().unwrap_or(false) && !row.spec.follow;
+            let stem = format!("cc-{}", row.id);
+            devices.push(auto_bay::Device {
+                title: row.spec.name.clone(),
+                stem: if driving { stem.clone() } else { String::new() },
+                kind: auto_bay::Kind::Radio,
+            });
+            files.push(auto_bay::HwFile {
+                stem,
+                label: self.control_port_label(row.id),
+                owned: driving,
+            });
+        }
+        self.paint_auto_scene(ui, "Control", &devices, &files);
+        for row in radios
+            .rows
+            .iter()
+            .filter(|row| crate::rx_pipe::is_p25_rx(&row.spec.rx_pipe))
+        {
+            let mut follow = self.cc_on.get(&row.id).copied().unwrap_or(false);
+            let toggle = ui.add_enabled(
+                !row.spec.follow,
+                egui::Checkbox::new(&mut follow, format!("Follow control ({})", row.spec.name)),
+            );
+            if row.spec.follow {
+                toggle.on_hover_text("Gpredict is moving this radio.");
+            }
+            if self.cc_on.get(&row.id).copied().unwrap_or(false) != follow {
+                self.cc_on.insert(row.id, follow);
+            }
+            if let Some(status) = self.followers.get(&row.id).map(|follower| follower.status()) {
+                ui.label(format!("{} · {status}", row.spec.name));
+            }
+            self.decoder_log(ui, row.id, &row.spec.name);
         }
     }
 
@@ -2330,6 +2769,8 @@ impl App {
             });
             ui.add_space(4.0);
             self.paint_gpredict(ui, &radios, &rots);
+            ui.add_space(8.0);
+            self.paint_control(ui, &radios);
             if !self.gpredict_note.is_empty() {
                 ui.label(
                     egui::RichText::new(&self.gpredict_note)
@@ -2540,6 +2981,7 @@ impl App {
         let view = self.hub.view();
         let mut endpoint = None;
         let mut pipe_apply = None;
+        let mut tx_apply = None;
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label("Audio");
@@ -2628,7 +3070,10 @@ impl App {
                             for script in &scripts {
                                 let on = crate::rx_pipe::script_matches(current, script);
                                 if ui
-                                    .selectable_label(on, crate::rx_pipe::modem_label(&script.name))
+                                    .selectable_label(
+                                        on,
+                                        crate::rx_pipe::pipeline_label(&script.name),
+                                    )
                                     .clicked()
                                     && !on
                                 {
@@ -2640,6 +3085,40 @@ impl App {
                 if !row.rx_pipe_status.is_empty() {
                     ui.label(
                         egui::RichText::new(&row.rx_pipe_status)
+                            .color(egui::Color32::from_rgb(220, 160, 80)),
+                    );
+                }
+                ui.horizontal(|ui| {
+                    ui.label("TX pipe");
+                    let scripts = crate::rx_pipe::tx_scripts();
+                    let current = row.spec.tx_pipe.as_str();
+                    egui::ComboBox::from_id_salt(("tx-pipe", row.id))
+                        .selected_text(crate::rx_pipe::choice_text(current, &scripts))
+                        .width(280.0)
+                        .show_ui(ui, |ui| {
+                            if ui.selectable_label(current.is_empty(), "none").clicked()
+                                && !current.is_empty()
+                            {
+                                tx_apply = Some((row.id, String::new()));
+                            }
+                            for script in &scripts {
+                                let on = crate::rx_pipe::script_matches(current, script);
+                                if ui
+                                    .selectable_label(
+                                        on,
+                                        crate::rx_pipe::pipeline_label(&script.name),
+                                    )
+                                    .clicked()
+                                    && !on
+                                {
+                                    tx_apply = Some((row.id, script.command.clone()));
+                                }
+                            }
+                        });
+                });
+                if !row.tx_pipe_status.is_empty() {
+                    ui.label(
+                        egui::RichText::new(&row.tx_pipe_status)
                             .color(egui::Color32::from_rgb(220, 160, 80)),
                     );
                 }
@@ -2676,6 +3155,12 @@ impl App {
                 self.rx_pipe_pending = Some((id, command));
             }
         }
+        if let Some((id, command)) = tx_apply {
+            self.hub.set_tx_pipe(id, command.clone());
+            if !self.config_path.is_empty() {
+                self.tx_pipe_pending = Some((id, command));
+            }
+        }
     }
 
     /// The hub applies the command on its own thread. Write the station file
@@ -2698,6 +3183,24 @@ impl App {
         }
     }
 
+    fn flush_tx_pipe(&mut self, snap: &Snapshot) {
+        let Some((id, command)) = self.tx_pipe_pending.clone() else {
+            return;
+        };
+        let view = self.hub.view();
+        let Some(row) = view.rows.iter().find(|row| row.id == id) else {
+            self.tx_pipe_pending = None;
+            return;
+        };
+        if row.spec.tx_pipe != command {
+            return;
+        }
+        self.tx_pipe_pending = None;
+        if !self.config_path.is_empty() {
+            self.save_config(snap);
+        }
+    }
+
     fn paint_bay(&mut self, ui: &mut egui::Ui, view: &cat::HubView) {
         self.ensure_bay_art(ui.ctx());
         let radios: Vec<bay::BayRadio> = view
@@ -2711,15 +3214,9 @@ impl App {
                 input: row.spec.audio.input.clone(),
                 output: row.spec.audio.output.clone(),
                 rx_pipe_live: row.rx_pipe_diverted,
-                rx_pipe_label: crate::rx_pipe::modem_label(
-                    std::path::Path::new(
-                        crate::rx_pipe::program_name(&row.spec.rx_pipe).unwrap_or("RX pipe"),
-                    )
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("RX pipe"),
-                )
-                .to_string(),
+                rx_pipe_label: pipe_block_label(&row.spec.rx_pipe, "RX pipe"),
+                tx_pipe_live: row.tx_pipe_diverted,
+                tx_pipe_label: pipe_block_label(&row.spec.tx_pipe, "TX pipe"),
             })
             .collect();
         let bindings: Vec<bay::RadioBinding> = radios
@@ -2765,7 +3262,10 @@ impl App {
                         && pos.y >= 0.0
                         && pos.x <= scene.width
                         && pos.y <= scene.height;
-                    if inside && !bay::over_rx_pipe(&scene, pos.x, pos.y) {
+                    if inside
+                        && !bay::over_rx_pipe(&scene, pos.x, pos.y)
+                        && !bay::over_tx_pipe(&scene, pos.x, pos.y)
+                    {
                         let target = bay::target_at(&scene, pos.x, pos.y);
                         updates = bay::endpoint_updates(&bindings, &drag.grab, target.as_ref());
                     }
@@ -2776,6 +3276,9 @@ impl App {
         painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(22, 24, 28));
         let wire_color = egui::Color32::from_rgb(70, 140, 220);
         for wire in &scene.wires {
+            paint_curve(&painter, origin, wire.from, wire.to, wire_color);
+        }
+        for wire in &scene.fixed {
             paint_curve(&painter, origin, wire.from, wire.to, wire_color);
         }
         if let Some(drag) = &self.bay_drag {
@@ -2793,7 +3296,7 @@ impl App {
             let icon_rect = egui::Rect::from_min_size(
                 origin + egui::vec2(icon.x, icon.y),
                 egui::vec2(
-                    if icon.kind == bay::IconKind::Pipe {
+                    if icon.kind == bay::IconKind::Pipe || icon.kind == bay::IconKind::TxPipe {
                         bay::PIPE_W
                     } else {
                         48.0
@@ -2806,7 +3309,7 @@ impl App {
                 bay::IconKind::Speaker => self.speaker_tex.as_ref(),
                 bay::IconKind::Radio => self.radio_tex.as_ref(),
                 bay::IconKind::Xdg => self.xdg_tex.get(&icon.xdg).and_then(Option::as_ref),
-                bay::IconKind::Pipe => self.scope_tex.as_ref(),
+                bay::IconKind::Pipe | bay::IconKind::TxPipe => self.scope_tex.as_ref(),
             };
             if let Some(tex) = tex {
                 painter.image(
@@ -2815,7 +3318,7 @@ impl App {
                     egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                     egui::Color32::WHITE,
                 );
-            } else if icon.kind == bay::IconKind::Pipe {
+            } else if icon.kind == bay::IconKind::Pipe || icon.kind == bay::IconKind::TxPipe {
                 painter.rect_filled(
                     icon_rect,
                     egui::CornerRadius::same(6),
@@ -2838,7 +3341,8 @@ impl App {
         }
         for port in &scene.ports {
             let at = origin + egui::vec2(port.at[0], port.at[1]);
-            painter.circle_filled(at, 4.0, wire_color);
+            painter.circle_filled(at, bay::JACK + 3.0, egui::Color32::from_rgb(18, 36, 58));
+            painter.circle_filled(at, bay::JACK, wire_color);
             let anchor = if port.label_right {
                 (at + egui::vec2(8.0, 0.0), egui::Align2::LEFT_CENTER)
             } else {
@@ -3354,6 +3858,17 @@ impl App {
                         .map(|row| row.spec.rx_pipe.clone())
                 })
                 .unwrap_or_default(),
+            tx_pipe: edit
+                .id
+                .and_then(|id| {
+                    self.hub
+                        .view()
+                        .rows
+                        .iter()
+                        .find(|row| row.id == id)
+                        .map(|row| row.spec.tx_pipe.clone())
+                })
+                .unwrap_or_default(),
         };
         if let Err(err) = cat::validate_spec(&spec) {
             if let Some(edit) = &mut self.cat_edit {
@@ -3399,11 +3914,11 @@ impl App {
         let dir = remembered_dir(&self.config_dir);
         let dialog = rfd::FileDialog::new()
             .set_title(if save { "Save config" } else { "Load config" })
-            .add_filter("Config", &["json"])
+            .add_filter("Hamspot Commander", &["HSCommander", "hscommander", "json"])
             .set_directory(&dir);
         let picked = if save {
             let name = if self.config_path.is_empty() {
-                "config.json".to_string()
+                config::DEFAULT_STATION_NAME.to_string()
             } else {
                 file_label(&self.config_path)
             };
@@ -3413,6 +3928,11 @@ impl App {
         };
         let Some(path) = picked else {
             return;
+        };
+        let path = if save {
+            config::with_station_extension(&path)
+        } else {
+            path
         };
         if let Some(parent) = path.parent() {
             if parent.is_dir() {
@@ -3489,6 +4009,8 @@ impl App {
             bsp_name,
             bsp: self.plan.clone(),
             channels: self.channels.clone(),
+            talkgroups: self.talkgroups.clone(),
+            units: self.units.clone(),
             tune: config::Tune {
                 show_spread: self.show_spread,
                 step_hz: self.step_hz,
@@ -3516,6 +4038,7 @@ impl App {
                     .unwrap_or_else(|| snap.sub_mode.clone()),
                 rit_hz: snap.rit_hz,
                 split,
+                mem_hz: self.local_mem,
             },
             levels,
             radios: self
@@ -3533,7 +4056,50 @@ impl App {
                 .into_iter()
                 .map(|row| row.spec)
                 .collect(),
+            selected: self
+                .hub
+                .view()
+                .rows
+                .iter()
+                .position(|row| row.selected)
+                .unwrap_or(0),
+            page: page_name(self.page),
+            channel_zone: self.channel_zone,
+            channel_sel: self.channel_sel,
+            talkgroup_zone: self.talkgroup_zone,
+            talkgroup_sel: self.talkgroup_sel,
+            meters: self.meters_face(),
         })
+    }
+
+    fn meters_face(&self) -> config::MetersFace {
+        let meters = self.meters.lock().expect("meters");
+        let (x, y) = match meters.saved_pos {
+            Some(pos) => (Some(pos.x), Some(pos.y)),
+            None => (None, None),
+        };
+        let (width, height) = match meters.saved_size {
+            Some(size) => (Some(size.x), Some(size.y)),
+            None => (None, None),
+        };
+        let (monitor_width, monitor_height) = match meters.saved_monitor {
+            Some(size) => (Some(size.x), Some(size.y)),
+            None => (None, None),
+        };
+        config::MetersFace {
+            locked: meters.locked,
+            detached: meters.detached,
+            order: meters.order.clone(),
+            window: config::WindowPlace {
+                x,
+                y,
+                width,
+                height,
+                monitor_width,
+                monitor_height,
+                pixels_per_point: meters.saved_ppp,
+            },
+        }
     }
 
     fn apply_config(&mut self, _snap: &Snapshot, file: config::ConfigFile) {
@@ -3541,15 +4107,31 @@ impl App {
             bsp_name,
             bsp,
             channels,
+            talkgroups,
+            units,
             tune,
             levels,
             radios,
             audio,
             rotators,
+            selected,
+            page,
+            channel_zone,
+            channel_sel,
+            talkgroup_zone,
+            talkgroup_sel,
+            meters,
             ..
         } = file;
         self.plan = bsp;
         self.channels = channels;
+        self.talkgroups = talkgroups;
+        self.units = units;
+        self.unit_sel = 0;
+        self.unit_desc_dirty = false;
+        self.talkgroup_zone = 0;
+        self.talkgroup_sel = 0;
+        self.talkgroup_note.clear();
         // The channel file on disk is a different document. Leave its path
         // empty so a later Channels Save does not overwrite that file.
         self.channel_path.clear();
@@ -3568,9 +4150,18 @@ impl App {
         });
         self.audio_saved = crate::audio::canonical(&audio);
         self.audio_hold = true;
-        self.hub.replace(radios);
+        self.hub.replace(radios, selected);
         self.hub.apply_audio(audio);
         self.rotators.replace(rotators);
+        self.page = page_from_name(&page);
+        self.channel_zone = channel_zone;
+        self.channel_sel = channel_sel;
+        self.talkgroup_zone = talkgroup_zone;
+        self.talkgroup_sel = talkgroup_sel;
+        self.zone_list_follow = true;
+        self.clamp_channel_selection();
+        self.apply_meters(&meters);
+        self.local_mem = tune.mem_hz;
         self.show_spread = tune.show_spread;
         self.step_hz = tune.step_hz;
         self.zone_sel = tune.zone_sel;
@@ -3600,6 +4191,51 @@ impl App {
             }
             Err(err) => self.config_note = err,
         }
+    }
+
+    fn clamp_channel_selection(&mut self) {
+        if self.channels.zones.is_empty() {
+            self.channel_zone = 0;
+            self.channel_sel = 0;
+            return;
+        }
+        if self.channel_zone >= self.channels.zones.len() {
+            self.channel_zone = 0;
+        }
+        let count = self.channels.zones[self.channel_zone].channels.len();
+        if count == 0 || self.channel_sel >= count {
+            self.channel_sel = 0;
+        }
+    }
+
+    fn apply_meters(&mut self, face: &config::MetersFace) {
+        let pos = match (face.window.x, face.window.y) {
+            (Some(x), Some(y)) => Some(egui::pos2(x, y)),
+            _ => None,
+        };
+        let size = match (face.window.width, face.window.height) {
+            (Some(width), Some(height)) => Some(egui::vec2(width, height)),
+            _ => None,
+        };
+        let monitor = match (face.window.monitor_width, face.window.monitor_height) {
+            (Some(width), Some(height)) => Some(egui::vec2(width, height)),
+            _ => None,
+        };
+        {
+            let mut meters = self.meters.lock().expect("meters");
+            meters.locked = face.locked;
+            meters.detached = face.detached;
+            meters.order = face.order.clone();
+            meters.drag = None;
+            meters.dock = false;
+            meters.saved_pos = pos;
+            meters.saved_size = size;
+            meters.saved_monitor = monitor;
+            meters.saved_ppp = face.window.pixels_per_point;
+        }
+        self.meter_place = pos;
+        self.meter_size = size;
+        self.meter_placed = false;
     }
 
     fn clamp_plan_selection(&mut self) {
@@ -3690,6 +4326,31 @@ impl App {
         }
     }
 
+    fn zone_row(&self, ui: &mut egui::Ui, idx: usize) -> (bool, egui::Response) {
+        let name = self
+            .channels
+            .zones
+            .get(idx)
+            .map(|zone| zone.name.clone())
+            .unwrap_or_default();
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 26.0), egui::Sense::click());
+        let painter = ui.painter();
+        if self.channel_zone == idx {
+            painter.rect_filled(rect, egui::CornerRadius::same(4), HAM.gamma_multiply(0.28));
+        } else if idx % 2 == 1 {
+            painter.rect_filled(rect, egui::CornerRadius::ZERO, ui.visuals().faint_bg_color);
+        }
+        painter.text(
+            rect.left_center() + egui::vec2(8.0, 0.0),
+            egui::Align2::LEFT_CENTER,
+            &name,
+            egui::FontId::proportional(14.0),
+            ui.visuals().text_color(),
+        );
+        (response.clicked(), response.on_hover_text(name))
+    }
+
     fn channel_row(&self, ui: &mut egui::Ui, idx: usize) -> bool {
         let Some(channel) = self
             .channels
@@ -3710,7 +4371,13 @@ impl App {
         } else if idx % 2 == 1 {
             painter.rect_filled(rect, egui::CornerRadius::ZERO, ui.visuals().faint_bg_color);
         }
-        let text = format!("{slot}   {freq}   {name}");
+        let mut text = format!("{slot}   {freq}   {name}");
+        if channel.control {
+            text.push_str("  ctrl");
+        }
+        if channel.encrypted {
+            text.push_str("  enc");
+        }
         painter.text(
             rect.left_center() + egui::vec2(8.0, 0.0),
             egui::Align2::LEFT_CENTER,
@@ -3755,6 +4422,8 @@ impl App {
         let modes = mode_choices(snap);
         let mut name_changed = false;
         let mut freq_changed = false;
+        let mut control = channel.control;
+        let mut encrypted = channel.encrypted;
         let mut picked = None;
         let mut add = false;
         let mut delete = false;
@@ -3790,6 +4459,8 @@ impl App {
                         }
                     });
             });
+            ui.checkbox(&mut control, "Control");
+            ui.checkbox(&mut encrypted, "Encrypted");
             ui.horizontal(|ui| {
                 if ui.button("Add").clicked() {
                     add = true;
@@ -3831,6 +4502,23 @@ impl App {
                 });
             }
         }
+        let flags_changed = self
+            .channels
+            .zones
+            .get(zone_idx)
+            .and_then(|zone| zone.channels.get(sel))
+            .is_some_and(|channel| channel.control != control || channel.encrypted != encrypted);
+        if flags_changed {
+            if let Some(channel) = self
+                .channels
+                .zones
+                .get_mut(zone_idx)
+                .and_then(|zone| zone.channels.get_mut(sel))
+            {
+                channel.control = control;
+                channel.encrypted = encrypted;
+            }
+        }
         if delete {
             self.delete_channel();
         } else if add {
@@ -3852,6 +4540,8 @@ impl App {
             name: String::new(),
             hz,
             mode,
+            control: false,
+            encrypted: false,
         });
         self.channel_sel = zone.channels.len() - 1;
         self.channel_note.clear();
@@ -3901,6 +4591,10 @@ impl App {
         };
         let hz = channel.hz;
         let mode = channel.mode.clone();
+        let control = channel.control;
+        if control {
+            self.hold_control(hz);
+        }
         if hz.is_finite() && hz > 0.0 && snap.caps.allow_freq(hz).is_some() {
             self.tune(snap, hz);
             if snap.online() && snap.caps.can_set_mode && !mode.is_empty() {
@@ -4136,7 +4830,14 @@ impl App {
             });
             return;
         }
-        paint_meter_page(ui, snap, radio.as_deref(), &mut meters, false);
+        paint_meter_page(
+            ui,
+            snap,
+            radio.as_deref(),
+            &mut meters,
+            &self.system_clock,
+            false,
+        );
     }
 
     /// Open the meters as a native window when they are detached.
@@ -4150,6 +4851,7 @@ impl App {
         {
             let mut feed = self.meter_feed.lock().expect("meters");
             feed.snap = snap.clone();
+            feed.clock = self.system_clock.clone();
             feed.radio = self
                 .hub
                 .view()
@@ -4182,6 +4884,803 @@ impl App {
         // The radio poll wakes the main window. The meter window needs its own.
         ctx.request_repaint_of(viewport);
     }
+
+    /// Point every follower at a control the operator just picked. The radio
+    /// was being pulled back to the first memory in the zone.
+    fn hold_control(&mut self, hz: f64) {
+        let now = std::time::Instant::now();
+        for follower in self.followers.values_mut() {
+            follower.hold(hz, now);
+        }
+    }
+
+    fn control_port_label(&self, id: u64) -> String {
+        let controls = channels::zone_controls(&self.channels, self.channel_zone);
+        let hz = self
+            .followers
+            .get(&id)
+            .and_then(|follower| follower.shown_control_hz())
+            .or_else(|| controls.first().map(|(hz, _, _)| *hz));
+        let Some(hz) = hz else {
+            return "no control channel".into();
+        };
+        let name = controls
+            .iter()
+            .find(|(item, _, _)| (*item - hz).abs() < 1.0)
+            .map(|(_, _, name)| name.as_str())
+            .unwrap_or("");
+        let mhz = format!("{:.4}", hz / 1_000_000.0);
+        let text = if name.is_empty() {
+            mhz
+        } else {
+            format!("{mhz}  {name}")
+        };
+        if text.chars().count() > 32 {
+            let mut short: String = text.chars().take(31).collect();
+            short.push('…');
+            short
+        } else {
+            text
+        }
+    }
+
+    fn note_decoder(&mut self, id: u64, lines: &[String]) {
+        if lines.is_empty() {
+            return;
+        }
+        let mut plains = Vec::new();
+        {
+            let tail = self.cc_tail.entry(id).or_default();
+            for line in lines {
+                let plain = follow::plain_line(line);
+                let plain = plain.trim();
+                if plain.is_empty() {
+                    continue;
+                }
+                plains.push(plain.to_string());
+                tail.push(plain.to_string());
+            }
+            const CAP: usize = 80;
+            if tail.len() > CAP {
+                let extra = tail.len() - CAP;
+                tail.drain(0..extra);
+            }
+        }
+        let now = clock::unix_now_ms();
+        for plain in plains {
+            self.system_clock.note_line(&plain, now);
+        }
+    }
+
+    /// Rolling stderr from the P25 decoder. Empty means the pipe has not
+    /// written a line yet, not that the log was discarded.
+    fn decoder_log(&self, ui: &mut egui::Ui, id: u64, radio: &str) {
+        ui.label(format!("{radio} decoder"));
+        let lines = self.cc_tail.get(&id).cloned().unwrap_or_default();
+        egui::ScrollArea::vertical()
+            .id_salt(("cc-log", id))
+            .max_height(140.0)
+            .auto_shrink([false, true])
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                if lines.is_empty() {
+                    ui.label(
+                        "No decoder lines yet. This is dsd-fme stderr from the P25 receive pipe.",
+                    );
+                } else {
+                    for line in &lines {
+                        ui.label(egui::RichText::new(line).monospace().size(11.0));
+                    }
+                }
+            });
+    }
+
+    /// Park a P25 radio on a control memory and hop to the newest clear grant.
+    /// Gpredict follow keeps the radio. The decoder process stays up across hops.
+    fn service_cc(&mut self, snap: &Snapshot) {
+        let rows = self.hub.view().rows;
+        let p25: Vec<(u64, bool, bool)> = rows
+            .iter()
+            .filter(|row| crate::rx_pipe::is_p25_rx(&row.spec.rx_pipe))
+            .map(|row| (row.id, row.selected, row.spec.follow))
+            .collect();
+        let ids: Vec<u64> = p25.iter().map(|row| row.0).collect();
+        self.cc_on.retain(|id, _| ids.contains(id));
+        self.cc_sent.retain(|id, _| ids.contains(id));
+        self.cc_voice_sent.retain(|id, _| ids.contains(id));
+        self.cc_mode_sent.retain(|id, _| ids.contains(id));
+        self.followers.retain(|id, _| ids.contains(id));
+        self.feeds.retain(|id, _| ids.contains(id));
+        self.cc_tail.retain(|id, _| ids.contains(id));
+
+        // The selected channel zone. Other sites stay out of the hunt.
+        let controls = channels::zone_controls(&self.channels, self.channel_zone);
+        let control_hz: Vec<f64> = controls.iter().map(|(hz, _, _)| *hz).collect();
+
+        for (id, selected, gpredict) in p25 {
+            let on = self.cc_on.get(&id).copied().unwrap_or(false);
+            let events = on && !gpredict;
+            if self.cc_sent.get(&id).copied() != Some(events) {
+                self.hub.set_cc(id, events);
+                self.cc_sent.insert(id, events);
+            }
+            let lines = self.hub.take_cc_events(id);
+            self.note_decoder(id, &lines);
+            // The advertisement is useful with Follow off. The feed has to
+            // see every line or a header and its frequency can land on
+            // different wakes.
+            let mut parsed = Vec::new();
+            {
+                let feed = self.feeds.entry(id).or_default();
+                for line in &lines {
+                    parsed.extend(feed.push_line(line));
+                }
+            }
+            let mut added = false;
+            if let Some(zone) = self.channels.zones.get_mut(self.channel_zone) {
+                for event in &parsed {
+                    if let follow::CcEvent::Adjacent { hz, rfss, site } = event {
+                        if channels::add_control(zone, *hz, *rfss, *site) {
+                            added = true;
+                        }
+                    }
+                }
+            }
+            for event in &parsed {
+                match event {
+                    follow::CcEvent::Grant { tg, alg, .. } => {
+                        let encrypted = *alg != follow::CLEAR_ALG;
+                        if talkgroups::note_seen(&mut self.talkgroups, *tg, encrypted) {
+                            added = true;
+                        }
+                    }
+                    follow::CcEvent::Unit(sight) => {
+                        if units::note(&mut self.units, sight) {
+                            added = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // Exit does not save. A new memory has to be written when it is
+            // inserted, or the next launch loses it.
+            if added && !self.config_path.is_empty() {
+                self.save_config(snap);
+            }
+            if !events {
+                if self.cc_voice_sent.get(&id).copied() != Some(true) {
+                    self.hub.set_cc_voice(id, true);
+                    self.cc_voice_sent.insert(id, true);
+                }
+                continue;
+            }
+            if !self.followers.contains_key(&id) {
+                self.followers
+                    .insert(id, follow::Follower::new(control_hz.clone()));
+            }
+            if let Some(follower) = self.followers.get_mut(&id) {
+                if !follower.controls_match(&control_hz) {
+                    follower.set_controls(control_hz.clone());
+                }
+            }
+            if let Some(follower) = self.followers.get_mut(&id) {
+                for event in parsed {
+                    follower.push(event);
+                }
+            }
+            // The S-meter on the snapshot is the selected radio only.
+            // A scan of any other radio would rank channels it is not hearing.
+            if selected {
+                let on_frequency = self
+                    .followers
+                    .get(&id)
+                    .and_then(|follower| follower.target_hz())
+                    .is_some_and(|hz| (snap.freq_hz - hz).abs() < 500.0);
+                if let Some(follower) = self.followers.get_mut(&id) {
+                    follower.observe(std::time::Instant::now(), snap.strength_db, on_frequency);
+                }
+            }
+            let Some(target) = self.followers.get(&id).and_then(|follower| follower.target_hz())
+            else {
+                continue;
+            };
+            let sent = self.followers.get(&id).and_then(|follower| follower.sent());
+            let already = sent.is_some_and(|hz| (hz - target).abs() < 1.0);
+            if !already {
+                let close = selected && (snap.freq_hz - target).abs() < 500.0;
+                let landed = if close {
+                    true
+                } else if selected {
+                    let allowed = snap.online() && snap.caps.allow_freq(target).is_some();
+                    if allowed {
+                        self.send(Command::SetFreq(target));
+                    }
+                    allowed
+                } else {
+                    self.hub.tune(id, target);
+                    true
+                };
+                if landed {
+                    if let Some(follower) = self.followers.get_mut(&id) {
+                        follower.note_sent(target);
+                    }
+                }
+            }
+            let watching = self
+                .followers
+                .get(&id)
+                .is_some_and(|follower| follower.voice_hz().is_none());
+            if selected && watching {
+                if let Some((_, mode, _)) = controls
+                    .iter()
+                    .find(|(hz, _, _)| (*hz - target).abs() < 1.0)
+                    .filter(|(_, mode, _)| !mode.is_empty())
+                {
+                    self.send_control_mode(snap, id, mode);
+                }
+            }
+            let play = self
+                .followers
+                .get(&id)
+                .is_some_and(|follower| follower.play_voice());
+            if self.cc_voice_sent.get(&id).copied() != Some(play) {
+                self.hub.set_cc_voice(id, play);
+                self.cc_voice_sent.insert(id, play);
+            }
+        }
+    }
+
+    /// One mode command for the control memory. A later frame does not repeat it.
+    fn send_control_mode(&mut self, snap: &Snapshot, id: u64, mode: &str) {
+        if !snap.online() || !snap.caps.can_set_mode {
+            return;
+        }
+        if snap.mode.eq_ignore_ascii_case(mode) {
+            self.cc_mode_sent.insert(id, mode.to_string());
+            return;
+        }
+        if self.cc_mode_sent.get(&id).is_some_and(|sent| sent == mode) {
+            return;
+        }
+        self.cc_mode_sent.insert(id, mode.to_string());
+        self.send(Command::SetMode {
+            mode: mode.to_string(),
+            passband_hz: snap.passband_hz,
+        });
+    }
+
+    /// Write a radio-id description when the field is left. Exit does not save.
+    fn save_unit_description(&mut self, snap: &Snapshot) {
+        if !self.unit_desc_dirty {
+            return;
+        }
+        self.unit_desc_dirty = false;
+        if self.config_path.is_empty() {
+            return;
+        }
+        self.save_config(snap);
+    }
+
+    fn page_radio_ids(&mut self, ui: &mut egui::Ui, id: u64, snap: &Snapshot) {
+        let rows = self.hub.view().rows;
+        let Some(row) = rows.iter().find(|row| row.id == id) else {
+            ui.label("This radio is gone.");
+            return;
+        };
+        ui.label(format!(
+            "{} radio IDs are stored in the station file.",
+            row.spec.name
+        ));
+        if self.units.is_empty() {
+            ui.label("No radio IDs yet. A unit named on this control channel is added here.");
+            return;
+        }
+        if self.unit_sel >= self.units.len() {
+            self.unit_sel = self.units.len() - 1;
+        }
+        ui.add_space(6.0);
+        let gap = ui.spacing().item_spacing.x;
+        let editor_w = 320.0;
+        let list_w = (ui.available_width() - gap - editor_w).max(220.0);
+        let height = ui.available_height().max(80.0);
+        let mut picked = None;
+        ui.horizontal_top(|ui| {
+            ui.vertical(|ui| {
+                ui.set_width(list_w);
+                egui::ScrollArea::vertical()
+                    .id_salt(("radio-ids", id))
+                    .auto_shrink([false, false])
+                    .max_height(height)
+                    .show(ui, |ui| {
+                        let count = self.units.len();
+                        for idx in 0..count {
+                            if self.unit_row(ui, idx) {
+                                picked = Some(idx);
+                            }
+                        }
+                    });
+            });
+            ui.vertical(|ui| {
+                ui.set_width(editor_w);
+                self.unit_editor(ui, snap);
+            });
+        });
+        if let Some(idx) = picked {
+            if self.unit_sel != idx {
+                self.save_unit_description(snap);
+                self.unit_sel = idx;
+            }
+        }
+    }
+
+    /// Selecting a row does not tune. The facts are what the control channel printed.
+    fn unit_row(&self, ui: &mut egui::Ui, idx: usize) -> bool {
+        let Some(row) = self.units.get(idx) else {
+            return false;
+        };
+        let facts = units::facts(row);
+        let text = if facts.is_empty() {
+            format!("{:>8}   {}", row.id, row.description)
+        } else {
+            format!("{:>8}   {}   {facts}", row.id, row.description)
+        };
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 26.0), egui::Sense::click());
+        if self.unit_sel == idx {
+            ui.painter().rect_filled(
+                rect,
+                egui::CornerRadius::same(4),
+                HAM.gamma_multiply(0.28),
+            );
+        } else if idx % 2 == 1 {
+            ui.painter().rect_filled(
+                rect,
+                egui::CornerRadius::ZERO,
+                ui.visuals().faint_bg_color,
+            );
+        }
+        ui.painter().text(
+            rect.left_center() + egui::vec2(8.0, 0.0),
+            egui::Align2::LEFT_CENTER,
+            &text,
+            egui::FontId::monospace(14.0),
+            ui.visuals().text_color(),
+        );
+        response.on_hover_text(&text).clicked()
+    }
+
+    fn unit_editor(&mut self, ui: &mut egui::Ui, snap: &Snapshot) {
+        let sel = self.unit_sel;
+        let Some(row) = self.units.get(sel) else {
+            ui.label("No radio ID.");
+            return;
+        };
+        let unit_id = row.id;
+        let mut description = row.description.clone();
+        let fact_line = units::facts(row);
+        let response = ui
+            .horizontal(|ui| {
+                ui.label("Description");
+                ui.add(
+                    egui::TextEdit::singleline(&mut description)
+                        .id_salt(("unit-desc", unit_id))
+                        .desired_width(180.0),
+                )
+            })
+            .inner;
+        if response.changed() {
+            if let Some(row) = self.units.get_mut(sel) {
+                row.description = description;
+                self.unit_desc_dirty = true;
+            }
+        }
+        let enter = response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+        if response.lost_focus() || enter {
+            self.save_unit_description(snap);
+        }
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new(format!("Radio {unit_id}")).strong());
+        if fact_line.is_empty() {
+            ui.label("No extra detail yet.");
+            return;
+        }
+        for part in fact_line.split("  ") {
+            ui.label(part);
+        }
+    }
+
+    fn page_talkgroups(&mut self, ui: &mut egui::Ui, id: u64) {
+        let rows = self.hub.view().rows;
+        let Some(row) = rows.iter().find(|row| row.id == id) else {
+            ui.label("This radio is gone.");
+            return;
+        };
+        let p25 = crate::rx_pipe::is_p25_rx(&row.spec.rx_pipe);
+        let gpredict = row.spec.follow;
+        let mut follow = p25 && self.cc_on.get(&id).copied().unwrap_or(false);
+        ui.horizontal(|ui| {
+            if ui.button("Load").clicked() {
+                self.browse_talkgroups(false);
+            }
+            if ui.button("Save").clicked() {
+                self.browse_talkgroups(true);
+            }
+            let label = if self.talkgroup_path.is_empty() {
+                "No file".to_string()
+            } else {
+                file_label(&self.talkgroup_path)
+            };
+            ui.label(label).on_hover_text(&self.talkgroup_path);
+            let toggle = ui.add_enabled(p25, egui::Checkbox::new(&mut follow, "Follow"));
+            if !p25 {
+                toggle.on_hover_text("The P25 receive pipe is off.");
+            } else if gpredict {
+                toggle.on_hover_text("Gpredict is moving this radio.");
+            }
+        });
+        if self.cc_on.get(&id).copied().unwrap_or(false) != follow {
+            self.cc_on.insert(id, follow);
+        }
+        if !self.talkgroup_note.is_empty() {
+            ui.label(
+                egui::RichText::new(&self.talkgroup_note)
+                    .color(egui::Color32::from_rgb(220, 160, 80)),
+            );
+        }
+        let status = self
+            .followers
+            .get(&id)
+            .map(|follower| follower.status().to_string())
+            .unwrap_or_else(|| {
+                if follow {
+                    "watching".to_string()
+                } else {
+                    "follow is off".to_string()
+                }
+            });
+        let heard = self.followers.get(&id).and_then(|follower| {
+            follower.active_tg().map(|tg| (tg, follower.voice_hz())).or_else(|| {
+                follower.heard().map(|heard| (heard.tg, Some(heard.hz)))
+            })
+        });
+        let control_hz = self
+            .followers
+            .get(&id)
+            .and_then(|follower| follower.shown_control_hz());
+        let active = self.followers.get(&id).and_then(|follower| follower.active_tg());
+        ui.add_space(6.0);
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let figure = match heard {
+                    Some((tg, _)) => tg.to_string(),
+                    None => "—".to_string(),
+                };
+                ui.label(egui::RichText::new(figure).size(40.0).strong());
+                ui.vertical(|ui| {
+                    if let Some((tg, _)) = heard {
+                        let name = talkgroups::name_of(&self.talkgroups, tg)
+                            .unwrap_or_else(|| "not in this directory".to_string());
+                        ui.label(name);
+                    }
+                    let voice = heard.and_then(|(_, hz)| hz);
+                    let voice_label = match voice {
+                        Some(hz) => format!("voice {}", format_hz(hz)),
+                        None => "voice —".to_string(),
+                    };
+                    ui.label(egui::RichText::new(voice_label).weak());
+                    let control_label = match control_hz {
+                        Some(hz) => format!("control {}", format_hz(hz)),
+                        None => "control —".to_string(),
+                    };
+                    ui.label(egui::RichText::new(control_label).weak());
+                });
+                ui.add_space(18.0);
+                ui.label(status);
+            });
+        });
+        if p25 {
+            self.decoder_log(ui, id, &row.spec.name);
+        }
+        if self.talkgroups.zones.is_empty() {
+            ui.label("No zones in this talkgroup file.");
+            return;
+        }
+        if self.talkgroup_zone >= self.talkgroups.zones.len() {
+            self.talkgroup_zone = 0;
+            self.talkgroup_sel = 0;
+        }
+        let count = self.talkgroups.zones[self.talkgroup_zone].talkgroups.len();
+        if count == 0 {
+            self.talkgroup_sel = 0;
+        } else if self.talkgroup_sel >= count {
+            self.talkgroup_sel = count - 1;
+        }
+        ui.add_space(6.0);
+        let gap = ui.spacing().item_spacing.x;
+        let zone_w = 280.0;
+        let editor_w = 320.0;
+        let total_w = ui.available_width();
+        let list_w = (total_w - gap * 2.0 - zone_w - editor_w).max(220.0);
+        let editor_w = (total_w - gap * 2.0 - zone_w - list_w).max(0.0);
+        let height = ui.available_height().max(80.0);
+        ui.horizontal_top(|ui| {
+            ui.vertical(|ui| {
+                ui.set_width(zone_w);
+                egui::ScrollArea::vertical()
+                    .id_salt("tg-zone-list")
+                    .auto_shrink([false, false])
+                    .max_height(height)
+                    .show(ui, |ui| {
+                        let count = self.talkgroups.zones.len();
+                        for idx in 0..count {
+                            let name = self.talkgroups.zones[idx].name.clone();
+                            let selected = self.talkgroup_zone == idx;
+                            let (rect, response) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), 26.0),
+                                egui::Sense::click(),
+                            );
+                            if selected {
+                                ui.painter().rect_filled(
+                                    rect,
+                                    egui::CornerRadius::same(4),
+                                    HAM.gamma_multiply(0.28),
+                                );
+                            } else if idx % 2 == 1 {
+                                ui.painter().rect_filled(
+                                    rect,
+                                    egui::CornerRadius::ZERO,
+                                    ui.visuals().faint_bg_color,
+                                );
+                            }
+                            ui.painter().text(
+                                rect.left_center() + egui::vec2(8.0, 0.0),
+                                egui::Align2::LEFT_CENTER,
+                                &name,
+                                egui::FontId::proportional(14.0),
+                                ui.visuals().text_color(),
+                            );
+                            if response.clicked() {
+                                self.talkgroup_zone = idx;
+                                self.talkgroup_sel = 0;
+                            }
+                            response.on_hover_text(&name);
+                        }
+                    });
+            });
+            ui.vertical(|ui| {
+                ui.set_width(list_w + gap + editor_w);
+                let list_h = ui.available_height().max(80.0);
+                ui.horizontal_top(|ui| {
+                    ui.vertical(|ui| {
+                        ui.set_width(list_w);
+                        egui::ScrollArea::vertical()
+                            .id_salt("tg-list")
+                            .max_height(list_h)
+                            .show(ui, |ui| {
+                                let count = self
+                                    .talkgroups
+                                    .zones
+                                    .get(self.talkgroup_zone)
+                                    .map(|zone| zone.talkgroups.len())
+                                    .unwrap_or(0);
+                                for idx in 0..count {
+                                    if self.talkgroup_row(ui, idx, active) {
+                                        self.talkgroup_sel = idx;
+                                    }
+                                }
+                            });
+                    });
+                    ui.vertical(|ui| {
+                        ui.set_width(editor_w);
+                        egui::ScrollArea::vertical()
+                            .id_salt("tg-editor")
+                            .auto_shrink([false, true])
+                            .max_height(list_h)
+                            .show(ui, |ui| self.talkgroup_editor(ui, editor_w));
+                    });
+                });
+            });
+        });
+    }
+
+    fn talkgroup_row(&self, ui: &mut egui::Ui, idx: usize, active: Option<u32>) -> bool {
+        let Some(row) = self
+            .talkgroups
+            .zones
+            .get(self.talkgroup_zone)
+            .and_then(|zone| zone.talkgroups.get(idx))
+        else {
+            return false;
+        };
+        let slot = format!("{:>4}", idx + 1);
+        let mut text = format!("{slot}   {:>8}   {}", row.tg, row.name);
+        if row.encrypted {
+            text.push_str("  enc");
+        }
+        let followed = active == Some(row.tg);
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 26.0), egui::Sense::click());
+        if followed {
+            // Same dark red as the meter needle. The row is decoding this grant.
+            ui.painter().rect_filled(
+                rect,
+                egui::CornerRadius::same(4),
+                egui::Color32::from_rgb(146, 24, 18),
+            );
+        } else if self.talkgroup_sel == idx {
+            ui.painter().rect_filled(
+                rect,
+                egui::CornerRadius::same(4),
+                HAM.gamma_multiply(0.28),
+            );
+        } else if idx % 2 == 1 {
+            ui.painter().rect_filled(
+                rect,
+                egui::CornerRadius::ZERO,
+                ui.visuals().faint_bg_color,
+            );
+        }
+        ui.painter().text(
+            rect.left_center() + egui::vec2(8.0, 0.0),
+            egui::Align2::LEFT_CENTER,
+            text,
+            egui::FontId::monospace(14.0),
+            ui.visuals().text_color(),
+        );
+        response.clicked()
+    }
+
+    fn talkgroup_editor(&mut self, ui: &mut egui::Ui, width: f32) {
+        let frame = egui::Frame::group(ui.style());
+        let chrome =
+            frame.inner_margin.sum().x + frame.stroke.width * 2.0 + frame.outer_margin.sum().x;
+        let inner = (width - chrome).max(0.0);
+        let zone_idx = self.talkgroup_zone;
+        let sel = self.talkgroup_sel;
+        let Some(row) = self
+            .talkgroups
+            .zones
+            .get(zone_idx)
+            .and_then(|zone| zone.talkgroups.get(sel))
+        else {
+            let mut add = false;
+            frame.show(ui, |ui| {
+                ui.set_min_width(inner);
+                ui.label("No talkgroup.");
+                if ui.button("Add").clicked() {
+                    add = true;
+                }
+            });
+            if add {
+                self.add_talkgroup();
+            }
+            return;
+        };
+        let mut name = row.name.clone();
+        let mut tg = row.tg;
+        let mut encrypted = row.encrypted;
+        let mut name_changed = false;
+        let mut add = false;
+        let mut delete = false;
+        frame.show(ui, |ui| {
+            ui.set_min_width(inner);
+            ui.label(egui::RichText::new(format!("Talkgroup {}", sel + 1)).strong());
+            name_changed = ui
+                .horizontal(|ui| {
+                    ui.label("Name");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut name)
+                            .id_salt(("tg-name", zone_idx, sel))
+                            .desired_width(180.0),
+                    )
+                })
+                .inner
+                .changed();
+            ui.horizontal(|ui| {
+                ui.label("Number");
+                ui.add(egui::DragValue::new(&mut tg).range(0..=16_777_215u32));
+            });
+            ui.checkbox(&mut encrypted, "Encrypted");
+            ui.horizontal(|ui| {
+                if ui.button("Add").clicked() {
+                    add = true;
+                }
+                if ui.button("Delete").clicked() {
+                    delete = true;
+                }
+            });
+        });
+        if let Some(row) = self
+            .talkgroups
+            .zones
+            .get_mut(zone_idx)
+            .and_then(|zone| zone.talkgroups.get_mut(sel))
+        {
+            if name_changed {
+                row.name = name;
+            }
+            row.tg = tg;
+            row.encrypted = encrypted;
+        }
+        if delete {
+            self.delete_talkgroup();
+        } else if add {
+            self.add_talkgroup();
+        }
+    }
+
+    fn add_talkgroup(&mut self) {
+        let Some(zone) = self.talkgroups.zones.get_mut(self.talkgroup_zone) else {
+            return;
+        };
+        let next = zone.talkgroups.iter().map(|row| row.tg).max().unwrap_or(0).saturating_add(1);
+        zone.talkgroups.push(talkgroups::Talkgroup {
+            name: String::new(),
+            tg: next,
+            encrypted: false,
+        });
+        self.talkgroup_sel = zone.talkgroups.len() - 1;
+        self.talkgroup_note.clear();
+    }
+
+    fn delete_talkgroup(&mut self) {
+        let Some(zone) = self.talkgroups.zones.get_mut(self.talkgroup_zone) else {
+            return;
+        };
+        if self.talkgroup_sel < zone.talkgroups.len() {
+            zone.talkgroups.remove(self.talkgroup_sel);
+            if self.talkgroup_sel >= zone.talkgroups.len() && self.talkgroup_sel > 0 {
+                self.talkgroup_sel -= 1;
+            }
+        }
+    }
+
+    fn browse_talkgroups(&mut self, save: bool) {
+        let dir = remembered_dir(&self.talkgroup_dir);
+        let dialog = rfd::FileDialog::new()
+            .set_title(if save {
+                "Save talkgroups"
+            } else {
+                "Load talkgroups"
+            })
+            .add_filter("Talkgroups", &["json"])
+            .set_directory(&dir);
+        let picked = if save {
+            let name = if self.talkgroup_path.is_empty() {
+                "talkgroups.json".to_string()
+            } else {
+                file_label(&self.talkgroup_path)
+            };
+            dialog.set_file_name(name).save_file()
+        } else {
+            dialog.pick_file()
+        };
+        let Some(path) = picked else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            if parent.is_dir() {
+                self.talkgroup_dir = Some(parent.to_path_buf());
+            }
+        }
+        self.talkgroup_path = path.display().to_string();
+        if save {
+            match talkgroups::save_file(Path::new(&self.talkgroup_path), &self.talkgroups) {
+                Ok(()) => self.talkgroup_note.clear(),
+                Err(err) => self.talkgroup_note = err,
+            }
+        } else {
+            match talkgroups::load_file(Path::new(&self.talkgroup_path)) {
+                Ok(file) => {
+                    self.talkgroups = file;
+                    self.talkgroup_zone = 0;
+                    self.talkgroup_sel = 0;
+                    self.talkgroup_note.clear();
+                }
+                Err(err) => self.talkgroup_note = err,
+            }
+        }
+    }
 }
 
 fn paint_meter_page(
@@ -4189,6 +5688,7 @@ fn paint_meter_page(
     snap: &Snapshot,
     radio: Option<&str>,
     meters: &mut MeterState,
+    clock: &clock::SystemClock,
     own_window: bool,
 ) {
     let offers: Vec<(&str, f64, f64)> = snap
@@ -4203,7 +5703,9 @@ fn paint_meter_page(
         .map(|(name, value)| (name.as_str(), *value))
         .collect();
     let faces = meter_faces(&offers, &values, snap.strength_db, snap.ptt);
-    let mut order = arrange_meter_ids(&meters.order, &faces);
+    let now_ms = clock::unix_now_ms();
+    let readout = clock.face_at(now_ms);
+    let mut order = order_with_clock(&meters.order, &faces, readout.is_some());
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Meters").strong());
@@ -4230,10 +5732,16 @@ fn paint_meter_page(
             });
         });
         status_column(ui, snap);
-        if faces.is_empty() {
+        if readout.is_some() {
+            // The shown minute changes on the local clock. Nothing else
+            // signals that moment.
+            ui.ctx()
+                .request_repaint_after(clock.next_paint_delay(now_ms));
+        }
+        if faces.is_empty() && readout.is_none() {
             ui.label("This radio lists no meter levels.");
         } else {
-            order = paint_meter_grid(ui, &faces, order, meters);
+            order = paint_meter_grid(ui, &faces, order, meters, readout.as_ref());
             meters.order = merge_meter_order(&meters.order, &order);
         }
     });
@@ -4244,9 +5752,9 @@ fn meter_window_ui(
     state: &Arc<Mutex<MeterState>>,
     feed: &Arc<Mutex<MeterFeed>>,
 ) {
-    let (snap, radio) = {
+    let (snap, radio, clock) = {
         let feed = feed.lock().expect("meters");
-        (feed.snap.clone(), feed.radio.clone())
+        (feed.snap.clone(), feed.radio.clone(), feed.clock.clone())
     };
     let mut meters = state.lock().expect("meters");
     if ui.input(|input| input.viewport().close_requested()) {
@@ -4254,13 +5762,24 @@ fn meter_window_ui(
         meters.detached = false;
         meters.drag = None;
     }
-    if let Some(outer) = ui.input(|input| input.viewport().outer_rect) {
+    let info = ui.input(|input| input.viewport().clone());
+    if let Some(outer) = info.outer_rect {
         meters.saved_pos = Some(outer.min);
     }
-    if let Some(inner) = ui.input(|input| input.viewport().inner_rect) {
+    if let Some(inner) = info.inner_rect {
         let size = inner.size();
         if size.x >= 64.0 && size.y >= 64.0 {
             meters.saved_size = Some(size);
+        }
+    }
+    if let Some(monitor) = info.monitor_size {
+        if monitor.x > 1.0 && monitor.y > 1.0 {
+            meters.saved_monitor = Some(monitor);
+        }
+    }
+    if let Some(ppp) = info.native_pixels_per_point {
+        if ppp.is_finite() && ppp > 0.0 {
+            meters.saved_ppp = Some(ppp);
         }
     }
     egui::CentralPanel::default().show_inside(ui, |ui| {
@@ -4268,7 +5787,7 @@ fn meter_window_ui(
             .id_salt("meter-window")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                paint_meter_page(ui, &snap, radio.as_deref(), &mut meters, true);
+                paint_meter_page(ui, &snap, radio.as_deref(), &mut meters, &clock, true);
             });
     });
 }
@@ -4280,6 +5799,7 @@ fn paint_meter_grid(
     faces: &[MeterFace],
     mut order: Vec<String>,
     meters: &mut MeterState,
+    clock: Option<&clock::Readout>,
 ) -> Vec<String> {
     let width = ui.available_width();
     let cols = meter_columns(width);
@@ -4341,29 +5861,14 @@ fn paint_meter_grid(
         if floating.as_ref().is_some_and(|drag| &drag.id == id) {
             continue;
         }
-        let Some(face) = faces.iter().find(|face| &face.id == id) else {
-            continue;
-        };
         let (x, y) = meter_origin(area.min.x, area.min.y, index, cols);
         let rect = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(METER_W, METER_H));
-        let frac = meters
-            .needles
-            .get(id)
-            .map(|needle| needle.frac)
-            .unwrap_or(face.frac);
-        paint_analog_meter(painter.clone(), rect, frac, &face.scale, face.lamp);
+        paint_meter_cell(&painter, rect, id, faces, meters, clock);
     }
     if let Some(drag) = &floating {
         if let Some(pos) = response.interact_pointer_pos() {
-            if let Some(face) = faces.iter().find(|face| face.id == drag.id) {
-                let rect = egui::Rect::from_min_size(pos - drag.grab, egui::vec2(METER_W, METER_H));
-                let frac = meters
-                    .needles
-                    .get(&face.id)
-                    .map(|needle| needle.frac)
-                    .unwrap_or(face.frac);
-                paint_analog_meter(painter.clone(), rect, frac, &face.scale, face.lamp);
-            }
+            let rect = egui::Rect::from_min_size(pos - drag.grab, egui::vec2(METER_W, METER_H));
+            paint_meter_cell(&painter, rect, &drag.id, faces, meters, clock);
         }
     }
     if !meters.locked {
@@ -4383,6 +5888,31 @@ fn paint_meter_grid(
         ui.ctx().request_repaint();
     }
     order
+}
+
+fn paint_meter_cell(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    id: &str,
+    faces: &[MeterFace],
+    meters: &MeterState,
+    clock: Option<&clock::Readout>,
+) {
+    if id == SYSTEM_CLOCK {
+        if let Some(readout) = clock {
+            clock::paint(painter, rect, readout);
+        }
+        return;
+    }
+    let Some(face) = faces.iter().find(|face| face.id == id) else {
+        return;
+    };
+    let frac = meters
+        .needles
+        .get(id)
+        .map(|needle| needle.frac)
+        .unwrap_or(face.frac);
+    paint_analog_meter(painter.clone(), rect, frac, &face.scale, face.lamp);
 }
 
 fn settle_needles(meters: &mut MeterState, faces: &[MeterFace], dt: f32) -> bool {

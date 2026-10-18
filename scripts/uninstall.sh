@@ -40,6 +40,9 @@ refresh_caches() {
     if command -v gtk-update-icon-cache >/dev/null 2>&1; then
         gtk-update-icon-cache -f -t "${home_dir}/.local/share/icons/hicolor" || true
     fi
+    if command -v update-mime-database >/dev/null 2>&1; then
+        update-mime-database "${home_dir}/.local/share/mime" || true
+    fi
 }
 
 drop_group() {
@@ -57,6 +60,7 @@ if [[ ! -f "$manifest" ]]; then
         remove_path "$default_bin"
         remove_path "$default_desktop"
         remove_path "$default_icon"
+        remove_path "${home_dir}/.local/share/mime/packages/hamspot-commander.xml"
         refresh_caches
         echo "No manifest, so group membership was left as it is."
         exit 0
@@ -76,6 +80,7 @@ added_plugdev="$(grep -E '^added_plugdev=' "$manifest" | head -n 1 | cut -d= -f2
 remove_path "$binary"
 remove_path "$desktop"
 remove_path "$icon"
+remove_path "${home_dir}/.local/share/mime/packages/hamspot-commander.xml"
 
 dsd_files="$(grep -E '^dsd_fme_files=' "$manifest" | head -n 1 | cut -d= -f2-)"
 if [[ -n "$dsd_files" ]]; then
@@ -109,6 +114,18 @@ if [[ -n "$modems_dir" ]]; then
         done
         rmdir "$modems_dir" 2>/dev/null || true
     fi
+fi
+
+p25_files="$(grep -E '^p25voice_files=' "$manifest" | head -n 1 | cut -d= -f2-)"
+if [[ -n "$p25_files" ]]; then
+    under_home "$p25_files"
+    if [[ -f "$p25_files" ]]; then
+        while IFS= read -r path || [[ -n "$path" ]]; do
+            [[ -z "$path" || "$path" == \#* ]] && continue
+            remove_path "$path"
+        done <"$p25_files"
+    fi
+    remove_path "$p25_files"
 fi
 
 if [[ "$added_dialout" == yes || "$added_plugdev" == yes ]]; then

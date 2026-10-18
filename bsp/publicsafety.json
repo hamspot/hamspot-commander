@@ -1,0 +1,315 @@
+{
+  "version": 1,
+  "zones": [
+    {
+      "name": "HF",
+      "color": [
+        130,
+        136,
+        150
+      ],
+      "bands": [
+        {
+          "name": "HF Disaster",
+          "chip": "hf",
+          "lo_hz": 2000000,
+          "hi_hz": 10000000,
+          "home_hz": 5000000,
+          "mode": "USB",
+          "segments": [
+            {
+              "lo_hz": 2000000,
+              "hi_hz": 10000000,
+              "use": "voice",
+              "service": "government"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "VHF",
+      "color": [
+        72,
+        140,
+        168
+      ],
+      "bands": [
+        {
+          "name": "VHF Low",
+          "chip": "vlo",
+          "lo_hz": 25000000,
+          "hi_hz": 50000000,
+          "home_hz": 39000000,
+          "mode": "FM",
+          "segments": [
+            {
+              "lo_hz": 25000000,
+              "hi_hz": 50000000,
+              "use": "mixed",
+              "service": "government"
+            }
+          ]
+        },
+        {
+          "name": "VHF High",
+          "chip": "vhi",
+          "lo_hz": 150800000,
+          "hi_hz": 174000000,
+          "home_hz": 155752500,
+          "mode": "FM",
+          "segments": [
+            {
+              "lo_hz": 150800000,
+              "hi_hz": 162012500,
+              "use": "mixed",
+              "service": "government"
+            },
+            {
+              "lo_hz": 162012500,
+              "hi_hz": 173200000,
+              "use": "mixed",
+              "service": "military"
+            },
+            {
+              "lo_hz": 173200000,
+              "hi_hz": 173400000,
+              "use": "mixed",
+              "service": "government"
+            },
+            {
+              "lo_hz": 173400000,
+              "hi_hz": 174000000,
+              "use": "mixed",
+              "service": "military"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "UHF",
+      "color": [
+        92,
+        120,
+        96
+      ],
+      "bands": [
+        {
+          "name": "Federal UHF",
+          "chip": "ufed",
+          "lo_hz": 406100000,
+          "hi_hz": 420000000,
+          "home_hz": 413000000,
+          "mode": "FM",
+          "segments": [
+            {
+              "lo_hz": 406100000,
+              "hi_hz": 420000000,
+              "use": "mixed",
+              "service": "military"
+            }
+          ]
+        },
+        {
+          "name": "UHF",
+          "chip": "uhf",
+          "lo_hz": 450000000,
+          "hi_hz": 470000000,
+          "home_hz": 460000000,
+          "mode": "FM",
+          "segments": [
+            {
+              "lo_hz": 450000000,
+              "hi_hz": 470000000,
+              "use": "mixed",
+              "service": "government"
+            }
+          ]
+        },
+        {
+          "name": "T-band",
+          "chip": "tband",
+          "lo_hz": 470000000,
+          "hi_hz": 512000000,
+          "home_hz": 491000000,
+          "mode": "FM",
+          "segments": [
+            {
+              "lo_hz": 470000000,
+              "hi_hz": 512000000,
+              "use": "mixed",
+              "service": "government"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "700",
+      "color": [
+        90,
+        150,
+        210
+      ],
+      "bands": [
+        {
+          "name": "FirstNet",
+          "chip": "lte",
+          "lo_hz": 758000000,
+          "hi_hz": 768000000,
+          "home_hz": 763000000,
+          "mode": "FM",
+          "segments": [
+            {
+              "lo_hz": 758000000,
+              "hi_hz": 768000000,
+              "use": "mixed",
+              "service": "government"
+            }
+          ]
+        },
+        {
+          "name": "700 NB",
+          "chip": "n700",
+          "lo_hz": 769000000,
+          "hi_hz": 775000000,
+          "home_hz": 769243750,
+          "mode": "FM",
+          "segments": [
+            {
+              "lo_hz": 769000000,
+              "hi_hz": 775000000,
+              "use": "mixed",
+              "service": "government"
+            }
+          ]
+        },
+        {
+          "name": "FirstNet UL",
+          "chip": "lteu",
+          "lo_hz": 788000000,
+          "hi_hz": 798000000,
+          "home_hz": 793000000,
+          "mode": "FM",
+          "segments": [
+            {
+              "lo_hz": 788000000,
+              "hi_hz": 798000000,
+              "use": "mixed",
+              "service": "government"
+            }
+          ]
+        },
+        {
+          "name": "700 NB UL",
+          "chip": "n700u",
+          "lo_hz": 799000000,
+          "hi_hz": 805000000,
+          "home_hz": 799243750,
+          "mode": "FM",
+          "segments": [
+            {
+              "lo_hz": 799000000,
+              "hi_hz": 805000000,
+              "use": "mixed",
+              "service": "government"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "800",
+      "color": [
+        196,
+        112,
+        72
+      ],
+      "bands": [
+        {
+          "name": "NPSPAC",
+          "chip": "nps",
+          "lo_hz": 851000000,
+          "hi_hz": 854000000,
+          "home_hz": 851012500,
+          "mode": "FM",
+          "segments": [
+            {
+              "lo_hz": 851000000,
+              "hi_hz": 854000000,
+              "use": "mixed",
+              "service": "government"
+            }
+          ]
+        },
+        {
+          "name": "800",
+          "chip": "p800",
+          "lo_hz": 854000000,
+          "hi_hz": 860000000,
+          "home_hz": 857000000,
+          "mode": "FM",
+          "segments": [
+            {
+              "lo_hz": 854000000,
+              "hi_hz": 860000000,
+              "use": "mixed",
+              "service": "government"
+            }
+          ]
+        },
+        {
+          "name": "800 edge",
+          "chip": "edge",
+          "lo_hz": 860000000,
+          "hi_hz": 862000000,
+          "home_hz": 860500000,
+          "mode": "FM",
+          "segments": [
+            {
+              "lo_hz": 860000000,
+              "hi_hz": 861000000,
+              "use": "mixed",
+              "service": "utility"
+            },
+            {
+              "lo_hz": 861000000,
+              "hi_hz": 862000000,
+              "use": "mixed",
+              "service": "utility"
+            }
+          ]
+        },
+        {
+          "name": "800 UL",
+          "chip": "p800u",
+          "lo_hz": 806000000,
+          "hi_hz": 817000000,
+          "home_hz": 806012500,
+          "mode": "FM",
+          "segments": [
+            {
+              "lo_hz": 806000000,
+              "hi_hz": 809000000,
+              "use": "mixed",
+              "service": "government"
+            },
+            {
+              "lo_hz": 809000000,
+              "hi_hz": 815000000,
+              "use": "mixed",
+              "service": "government"
+            },
+            {
+              "lo_hz": 815000000,
+              "hi_hz": 817000000,
+              "use": "mixed",
+              "service": "utility"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

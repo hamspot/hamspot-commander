@@ -3,11 +3,12 @@ Version=1.0
 Type=Application
 Name=Hamspot Commander
 Comment=Hamlib rig face
-Exec=commander
+Exec=commander %f
 Icon=hamspot-commander
 StartupWMClass=hamspotcommander
 Terminal=false
 Categories=HamRadio;Network;
+MimeType=application/x-hamspot-commander;
 StartupNotify=true
 Actions=new-window;
 

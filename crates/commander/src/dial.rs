@@ -867,6 +867,9 @@ pub const RADIO_METERS: &[&str] = &[
     "RAWSTR",
 ];
 
+/// Meter-grid id for the trunking system clock. It is not a hamlib level.
+pub const SYSTEM_CLOCK: &str = "SYSTEM_CLOCK";
+
 pub struct MeterFace {
     pub id: String,
     pub frac: f32,
@@ -1016,6 +1019,27 @@ pub fn arrange_meter_ids(saved: &[String], faces: &[MeterFace]) -> Vec<String> {
     out
 }
 
+/// `SYSTEM_CLOCK` shares the meter grid. A saved place is kept. A new clock
+/// takes the first cell. Hidden clocks stay out of the visible order.
+pub fn order_with_clock(saved: &[String], faces: &[MeterFace], show_clock: bool) -> Vec<String> {
+    let mut order = arrange_meter_ids(saved, faces);
+    if !show_clock {
+        return order;
+    }
+    let at = saved
+        .iter()
+        .position(|id| id == SYSTEM_CLOCK)
+        .map(|index| {
+            saved[..index]
+                .iter()
+                .filter(|id| order.iter().any(|kept| kept == *id))
+                .count()
+        })
+        .unwrap_or(0);
+    order.insert(at.min(order.len()), SYSTEM_CLOCK.to_string());
+    order
+}
+
 pub fn move_meter(order: &[String], from: usize, to: usize) -> Vec<String> {
     if from >= order.len() || to >= order.len() || from == to {
         return order.to_vec();
@@ -1029,7 +1053,7 @@ pub fn move_meter(order: &[String], from: usize, to: usize) -> Vec<String> {
 /// Write `visible` back into `saved`. Meters this radio is not showing keep
 /// their places. A name that is not a meter is dropped. A new meter appends.
 pub fn merge_meter_order(saved: &[String], visible: &[String]) -> Vec<String> {
-    let known = |id: &str| RADIO_METERS.contains(&id) || id == "RFPOWER";
+    let known = |id: &str| RADIO_METERS.contains(&id) || id == "RFPOWER" || id == SYSTEM_CLOCK;
     let mut base: Vec<String> = saved.iter().filter(|id| known(id)).cloned().collect();
     let visible: Vec<String> = visible.iter().filter(|id| known(id)).cloned().collect();
     let showing: std::collections::BTreeSet<&str> = visible.iter().map(String::as_str).collect();
@@ -1519,6 +1543,37 @@ mod tests {
         assert_eq!(
             merge_meter_order(&stored, &visible),
             ["STRENGTH", "VD_METER", "SWR", "ALC"]
+        );
+    }
+
+    #[test]
+    fn the_system_clock_keeps_its_place_among_the_meters() {
+        let faces = meter_faces(
+            &[("STRENGTH", -54.0, 60.0), ("SWR", 1.0, 5.0)],
+            &[],
+            -54.0,
+            false,
+        );
+        let saved = ["SWR".into(), "STRENGTH".into()];
+        assert_eq!(
+            order_with_clock(&saved, &faces, true),
+            ["SYSTEM_CLOCK", "SWR", "STRENGTH"]
+        );
+        let placed = ["SWR".into(), "SYSTEM_CLOCK".into(), "STRENGTH".into()];
+        assert_eq!(
+            order_with_clock(&placed, &faces, true),
+            ["SWR", "SYSTEM_CLOCK", "STRENGTH"]
+        );
+        assert_eq!(order_with_clock(&placed, &faces, false), ["SWR", "STRENGTH"]);
+        let visible = ["STRENGTH".into(), "SYSTEM_CLOCK".into(), "SWR".into()];
+        assert_eq!(
+            merge_meter_order(&placed, &visible),
+            ["STRENGTH", "SYSTEM_CLOCK", "SWR"]
+        );
+        let hidden = ["STRENGTH".into(), "SWR".into()];
+        assert_eq!(
+            merge_meter_order(&placed, &hidden),
+            ["STRENGTH", "SYSTEM_CLOCK", "SWR"]
         );
     }
 

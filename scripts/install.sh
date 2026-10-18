@@ -16,6 +16,9 @@ desktop_path="${home_dir}/.local/share/applications/hamspotcommander.desktop"
 icon_path="${home_dir}/.local/share/icons/hicolor/128x128/apps/hamspot-commander.png"
 state_dir="${home_dir}/.local/share/hamspot-commander"
 manifest="${state_dir}/installed.manifest"
+config_home="${XDG_CONFIG_HOME:-${home_dir}/.config}"
+# empty follows HAMSPOT_WITH_P25VOICE, then the marker file. Default is off.
+with_p25=""
 icon_src="${root}/crates/commander/assets/hamspot-commander.png"
 marker="# hamspot-commander-install"
 
@@ -45,6 +48,35 @@ packages=(
 die() {
     echo "install: $*" >&2
     exit 1
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --with-p25voice) with_p25=yes ;;
+        --without-p25voice) with_p25=no ;;
+        *) die "unknown argument: $1" ;;
+    esac
+    shift
+done
+
+# Last flag wins. An explicit flag beats the environment and the marker.
+p25voice_wanted() {
+    if [[ "$with_p25" == yes ]]; then
+        return 0
+    fi
+    if [[ "$with_p25" == no ]]; then
+        return 1
+    fi
+    if [[ -n "${HAMSPOT_WITH_P25VOICE+x}" ]]; then
+        local want
+        want="$(printf '%s' "$HAMSPOT_WITH_P25VOICE" | tr '[:upper:]' '[:lower:]')"
+        case "$want" in
+            1|yes|true) return 0 ;;
+            0|no|false|"") return 1 ;;
+            *) die "HAMSPOT_WITH_P25VOICE must be 1, yes, 0, or no" ;;
+        esac
+    fi
+    [[ -f "${config_home}/hamspot-commander/with-p25voice" ]]
 }
 
 require_ubuntu_2604() {
@@ -105,12 +137,13 @@ Version=1.0
 Type=Application
 Name=Hamspot Commander
 Comment=Hamlib rig face
-Exec=${bin_path}
+Exec=${bin_path} %f
 Path=${root}
 Icon=${icon_path}
 StartupWMClass=hamspotcommander
 Terminal=false
 Categories=HamRadio;Network;
+MimeType=application/x-hamspot-commander;
 StartupNotify=true
 Actions=new-window;
 
@@ -118,6 +151,23 @@ Actions=new-window;
 Name=New Window
 Exec=${bin_path}
 EOF
+}
+
+install_mime() {
+    local mime_dir="${home_dir}/.local/share/mime/packages"
+    local mime_src="${root}/share/mime/packages/hamspot-commander.xml"
+    [[ -f "$mime_src" ]] || die "missing ${mime_src}"
+    install -d -m 755 "$mime_dir"
+    install -m 644 "$mime_src" "${mime_dir}/hamspot-commander.xml"
+    if command -v update-mime-database >/dev/null 2>&1; then
+        update-mime-database "${home_dir}/.local/share/mime" || true
+    fi
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database "${home_dir}/.local/share/applications" || true
+    fi
+    if command -v xdg-mime >/dev/null 2>&1; then
+        xdg-mime default hamspotcommander.desktop application/x-hamspot-commander || true
+    fi
 }
 
 write_manifest() {
@@ -134,6 +184,7 @@ added_dialout=${added_dialout}
 added_plugdev=${added_plugdev}
 dsd_fme_files=${state_dir}/dsd-fme-files.txt
 modems_dir=${state_dir}/modems
+p25voice_files=${state_dir}/p25voice-files.txt
 EOF
 }
 
@@ -160,9 +211,13 @@ install -d -m 755 "${home_dir}/.local/bin"
 install -m 755 "${root}/target/release/commander" "$bin_path"
 "${root}/scripts/build-dsd-fme.sh"
 install_modems
+if p25voice_wanted; then
+    "${root}/scripts/install-p25voice.sh"
+fi
 install -d -m 755 "$(dirname "$icon_path")"
 install -m 644 "$icon_src" "$icon_path"
 write_desktop
+install_mime
 
 added_dialout=no
 added_plugdev=no

@@ -68,12 +68,13 @@ Version=1.0
 Type=Application
 Name=Hamspot Commander
 Comment=Portable hamlib rig face
-Exec=sh -c 'exec "\$(dirname "\$(readlink -f "\$1")")/${relative_launcher}"' sh %k
+Exec=sh -c 'exec "\$(dirname "\$(readlink -f "\$1")")/${relative_launcher}" \${2:+"\$2"}' sh %k %f
 ${path_line}
 Icon=${icon}
 StartupWMClass=hamspotcommander
 Terminal=false
 Categories=HamRadio;Network;
+MimeType=application/x-hamspot-commander;
 StartupNotify=true
 Actions=new-window;
 
@@ -117,6 +118,12 @@ install -m 755 "${root}/target/release/commander" "${prefix}/bin/commander"
 install -m 755 "${root}/scripts/hamspot-commander.sh" "${prefix}/hamspot-commander.sh"
 install -m 644 "$icon_src" "${prefix}/hamspot-commander.png"
 install -m 644 "$icon_src" "${prefix}/share/icons/hicolor/128x128/apps/hamspot-commander.png"
+install -d -m 755 "${prefix}/share/mime/packages"
+install -m 644 "${root}/share/mime/packages/hamspot-commander.xml" \
+    "${prefix}/share/mime/packages/hamspot-commander.xml"
+if command -v update-mime-database >/dev/null 2>&1; then
+    update-mime-database "${prefix}/share/mime" || true
+fi
 cp -a "${root}/bsp/." "${prefix}/bsp/"
 
 # Keep the directories when the tree is packed into a squashfs.

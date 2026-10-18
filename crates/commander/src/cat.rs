@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::RawFd;
 use std::os::unix::process::CommandExt;
@@ -30,6 +30,9 @@ const RETRY_AFTER: Duration = Duration::from_secs(2);
 /// Idle TCP sessions get no push from hamlib. The light read is how a dead
 /// daemon is noticed. The selected radio is polled by the drive loop instead.
 const IDLE_READ: Duration = Duration::from_secs(2);
+/// Failed Start DSP commands before the radio is marked up anyway.
+/// The control port is already open, so a refusal must not block the face.
+const DSP_TRIES: u8 = 4;
 
 /// What the drive loop is doing with the selected radio. The hub writes
 /// `connect`. The drive loop writes the port it actually holds.
@@ -141,14 +144,20 @@ pub struct RadioSpec {
     #[serde(default)]
     pub audio: RadioAudio,
     /// Gqrx settings for this radio. Written again as a native INI file
-    /// under `~/.config/hamspot-commander/gqrx/` when the process starts.
-    /// Absent on a hamlib row and on a station file from before this field.
+    /// under the Commander data directory (`…/hamspot-commander/gqrx/`)
+    /// when the process starts. Absent on a hamlib row and on a station
+    /// file from before this field.
     #[serde(default, skip_serializing_if = "gqrx_config_is_empty")]
     pub gqrx: GqrxConfig,
     /// External demodulator. Empty leaves the RX stream on the speaker.
     /// Stdin and stdout are 48 kHz mono s16le. Absent in an older file.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub rx_pipe: String,
+    /// External modulator. Empty leaves the microphone on the transmit input.
+    /// Stdin and stdout are 48 kHz mono s16le. Absent in an older file.
+    /// The pipe does not key the radio.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tx_pipe: String,
 }
 
 impl RadioSpec {
@@ -168,6 +177,7 @@ impl RadioSpec {
             audio: RadioAudio::default(),
             gqrx: GqrxConfig::new(),
             rx_pipe: String::new(),
+            tx_pipe: String::new(),
         }
     }
 }
@@ -186,6 +196,10 @@ pub struct RadioRow {
     pub rx_pipe_status: String,
     /// The pipe process is in the speaker path, so the bay draws it as a block.
     pub rx_pipe_diverted: bool,
+    /// Empty when the TX pipe is off.
+    pub tx_pipe_status: String,
+    /// The pipe process is in the microphone path, so the bay draws it as a block.
+    pub tx_pipe_diverted: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -209,7 +223,10 @@ enum HubCmd {
     Update(u64, RadioSpec),
     Remove(u64),
     Select(u64),
-    Replace(Vec<RadioSpec>),
+    Replace {
+        specs: Vec<RadioSpec>,
+        selected: usize,
+    },
     /// The station file's saved graph. Missing radio cards are created from it.
     ApplyAudio(crate::audio::AudioGraph),
     /// One `pw-dump` snapshot whose hamspot slice changed.
@@ -222,6 +239,15 @@ enum HubCmd {
     SetFollow(u64, bool),
     /// Receiver stdin/stdout command. Does not restart `rigctld`.
     SetRxPipe(u64, String),
+    /// Transmitter stdin/stdout command. Does not key the radio and does not
+    /// restart `rigctld`.
+    SetTxPipe(u64, String),
+    /// P25 control-channel events on this radio's receive pipe.
+    SetCc(u64, bool),
+    /// Speaker gate for that pipe. Does not restart the decoder.
+    SetCcVoice(u64, bool),
+    /// Tune one radio the face is not driving. Does not key it.
+    Tune(u64, f64),
 }
 
 pub struct Hub {
@@ -235,6 +261,8 @@ pub struct Hub {
     wake: RawFd,
     done: Mutex<bool>,
     done_wake: Condvar,
+    /// Decoder lines waiting for the control follower, keyed by radio id.
+    cc_log: Mutex<BTreeMap<u64, Vec<String>>>,
 }
 
 struct Slot {
@@ -254,6 +282,8 @@ struct Slot {
     assigned: Option<u16>,
     /// Next TCP probe. Gqrx does not signal that remote control is listening.
     probe_at: Option<Instant>,
+    /// Failed `U DSP 1` attempts for this process. Cleared when it exits.
+    dsp_tries: u8,
     rx_audio: Option<Child>,
     tx_audio: Option<Child>,
     audio_wired: bool,
@@ -274,6 +304,20 @@ struct Slot {
     /// Next start after a component exited. Same gap as a radio daemon.
     rx_pipe_retry_at: Option<Instant>,
     rx_pipe_status: String,
+    tx_pipe: Option<crate::rx_pipe::Running>,
+    tx_pipe_failed: Option<String>,
+    /// Microphone whose direct wire this pipe removed. Restored when the
+    /// pipe stops, including when the modulator exits on its own.
+    tx_pipe_owned: Option<String>,
+    tx_pipe_retry_at: Option<Instant>,
+    tx_pipe_status: String,
+    /// Control follow is on. The receive pipe does not look at this to
+    /// decide whether to restart. Stderr stays on for every P25 pipe.
+    cc_events: bool,
+    /// Play decoder audio. Clear while the follower is on a control channel.
+    cc_voice: bool,
+    /// Frequency for a radio the drive loop is not polling.
+    pending_tune: Option<f64>,
 }
 
 pub fn validate_spec(spec: &RadioSpec) -> Result<(), String> {
@@ -497,6 +541,22 @@ fn config_home() -> PathBuf {
     PathBuf::from(home).join(".config")
 }
 
+fn data_home() -> PathBuf {
+    if let Ok(dir) = std::env::var("XDG_DATA_HOME") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    PathBuf::from(home).join(".local/share")
+}
+
+/// Directory passed to Gqrx as `XDG_CONFIG_HOME`. Gqrx appends `gqrx/` itself
+/// for bookmarks and the recent list. The radio file is written there too.
+pub fn gqrx_data_home() -> PathBuf {
+    data_home().join("hamspot-commander")
+}
+
 fn sanitize_radio_name(name: &str) -> String {
     let mut out = String::new();
     for ch in name.chars() {
@@ -513,15 +573,22 @@ fn sanitize_radio_name(name: &str) -> String {
     }
 }
 
-pub fn gqrx_conf_path(config_home: &Path, name: &str) -> PathBuf {
-    config_home
-        .join("hamspot-commander")
+pub fn gqrx_conf_path(data_dir: &Path, name: &str) -> PathBuf {
+    data_dir
         .join("gqrx")
         .join(format!("{}.conf", sanitize_radio_name(name)))
 }
 
 pub fn gqrx_conf_for_name(name: &str) -> PathBuf {
-    gqrx_conf_path(&config_home(), name)
+    gqrx_conf_path(&gqrx_data_home(), name)
+}
+
+/// Where a radio's Gqrx file lived before it moved into the data directory.
+fn legacy_gqrx_conf(config_home: &Path, name: &str) -> PathBuf {
+    config_home
+        .join("hamspot-commander")
+        .join("gqrx")
+        .join(format!("{}.conf", sanitize_radio_name(name)))
 }
 
 /// Settings for a Gqrx that has never had an input device. `loadConfig`
@@ -655,19 +722,52 @@ pub fn write_gqrx_native(path: &Path, config: &GqrxConfig, port: u16) -> Result<
 /// Use the embedded document. A radio saved before that field existed keeps
 /// the native file already on disk when there is one.
 fn prepare_gqrx_document(spec: &mut RadioSpec) -> Result<PathBuf, String> {
-    prepare_gqrx_document_in(&config_home(), spec)
+    prepare_gqrx_document_in(&gqrx_data_home(), Some(&config_home()), spec)
 }
 
-fn prepare_gqrx_document_in(config_home: &Path, spec: &mut RadioSpec) -> Result<PathBuf, String> {
-    let path = gqrx_conf_path(config_home, &spec.name);
+fn prepare_gqrx_document_in(
+    data_dir: &Path,
+    legacy_config_home: Option<&Path>,
+    spec: &mut RadioSpec,
+) -> Result<PathBuf, String> {
+    let path = gqrx_conf_path(data_dir, &spec.name);
     if spec.gqrx.is_empty() {
         match read_gqrx_file(&path)? {
             Some(found) => spec.gqrx = found,
-            None => spec.gqrx = gqrx_chooser_config(),
+            None => {
+                let legacy = legacy_config_home
+                    .map(|home| legacy_gqrx_conf(home, &spec.name))
+                    .filter(|path| path.is_file());
+                match legacy {
+                    Some(legacy) => match read_gqrx_file(&legacy)? {
+                        Some(found) => spec.gqrx = found,
+                        None => spec.gqrx = gqrx_chooser_config(),
+                    },
+                    None => spec.gqrx = gqrx_chooser_config(),
+                }
+            }
         }
     }
     normalize_gqrx(&mut spec.gqrx);
     Ok(path)
+}
+
+/// This Gqrx plays into the radio's RX card. That card is the input of the
+/// receive pipe. The speaker is downstream of the pipe, so this is not the
+/// USB device. An empty device would follow the desktop default instead.
+fn pin_gqrx_output(config: &mut GqrxConfig, id: u64) {
+    config
+        .entry("output".into())
+        .or_default()
+        .insert("device".into(), crate::audio::rx_name(id));
+}
+
+/// Gqrx reads the output device once, at start. The RX card has to be in
+/// the graph already or Pulse ignores the name and the radio plays elsewhere.
+fn gqrx_rx_card_ready(slot: &Slot, graph: &crate::audio::AudioGraph) -> bool {
+    slot.spec.driver != RadioDriver::Gqrx
+        || !slot.spec.audio.rx
+        || crate::audio::has_device(graph, &crate::audio::rx_name(slot.id))
 }
 
 /// Rewrite only the `remote_control` group. Every other group stays.
@@ -734,10 +834,14 @@ pub fn patch_remote_control(text: &str, port: u16) -> String {
 pub fn spawn_gqrx(spec: &mut RadioSpec, port: u16, id: u64) -> Result<Child, String> {
     validate_spec(spec)?;
     let path = prepare_gqrx_document(spec)?;
+    pin_gqrx_output(&mut spec.gqrx, id);
     write_gqrx_native(&path, &spec.gqrx, port)?;
     let mut cmd = Command::new("gqrx");
-    // The card's node names are the Pulse devices this process should open.
-    cmd.env("PULSE_SINK", crate::audio::rx_name(id))
+    // Gqrx resolves its config directory from XDG_CONFIG_HOME and appends
+    // `gqrx/`. The absolute `-c` file is the radio document in that same tree.
+    // The card names are the Pulse devices this process should open.
+    cmd.env("XDG_CONFIG_HOME", gqrx_data_home())
+        .env("PULSE_SINK", crate::audio::rx_name(id))
         .env("PULSE_SOURCE", crate::audio::tx_name(id))
         .arg("-c")
         .arg(&path)
@@ -849,6 +953,7 @@ impl Hub {
             wake,
             done: Mutex::new(false),
             done_wake: Condvar::new(),
+            cc_log: Mutex::new(BTreeMap::new()),
         });
         let thread_hub = Arc::clone(&hub);
         thread::spawn(move || supervise(thread_hub, face, kick, ctx));
@@ -875,8 +980,8 @@ impl Hub {
         self.send(HubCmd::Select(id));
     }
 
-    pub fn replace(&self, specs: Vec<RadioSpec>) {
-        self.send(HubCmd::Replace(specs));
+    pub fn replace(&self, specs: Vec<RadioSpec>, selected: usize) {
+        self.send(HubCmd::Replace { specs, selected });
     }
 
     pub fn apply_audio(&self, graph: crate::audio::AudioGraph) {
@@ -895,6 +1000,41 @@ impl Hub {
     /// Receiver pipe command. The running `rigctld` stays up.
     pub fn set_rx_pipe(&self, id: u64, command: String) {
         self.send(HubCmd::SetRxPipe(id, command));
+    }
+
+    /// Transmitter pipe command. The running `rigctld` stays up. PTT is unchanged.
+    pub fn set_tx_pipe(&self, id: u64, command: String) {
+        self.send(HubCmd::SetTxPipe(id, command));
+    }
+
+    /// Record that this radio is following a control channel.
+    ///
+    /// The P25 pipe keeps decoder stderr whether or not this is set, so
+    /// turning follow on does not restart `dsd-fme`. A restart would drop
+    /// the identifier table the next grant needs.
+    pub fn set_cc(&self, id: u64, on: bool) {
+        self.send(HubCmd::SetCc(id, on));
+    }
+
+    /// Play or silence the P25 decoder. The process is left running.
+    pub fn set_cc_voice(&self, id: u64, on: bool) {
+        self.send(HubCmd::SetCcVoice(id, on));
+    }
+
+    /// Tune a radio the drive loop is not polling. The selected radio is
+    /// tuned with `Command::SetFreq` instead, so this does not open a second
+    /// client on that session.
+    pub fn tune(&self, id: u64, hz: f64) {
+        self.send(HubCmd::Tune(id, hz));
+    }
+
+    /// Decoder lines collected for `id` since the last take.
+    pub fn take_cc_events(&self, id: u64) -> Vec<String> {
+        self.cc_log
+            .lock()
+            .expect("cc log")
+            .remove(&id)
+            .unwrap_or_default()
     }
 
     /// Wake the supervisor without a command. Leaving Demo uses this so the
@@ -1015,6 +1155,22 @@ fn supervise(
                         slot.status_dirty = true;
                     }
                 }
+                HubCmd::SetTxPipe(id, command) => {
+                    if let Some(slot) = slots.iter_mut().find(|slot| slot.id == id) {
+                        let command = command.trim().to_string();
+                        slot.spec.tx_pipe = command;
+                        slot.tx_pipe_failed = None;
+                        slot.tx_pipe_retry_at = None;
+                        if slot
+                            .tx_pipe
+                            .as_ref()
+                            .is_some_and(|pipe| pipe.command != slot.spec.tx_pipe)
+                        {
+                            release_tx_pipe(slot);
+                        }
+                        slot.status_dirty = true;
+                    }
+                }
                 HubCmd::Add(spec) => {
                     if validate_spec(&spec).is_err() {
                         continue;
@@ -1051,7 +1207,30 @@ fn supervise(
                         slot.status_dirty = true;
                     }
                 }
+                HubCmd::SetCc(id, on) => {
+                    if let Some(slot) = slots.iter_mut().find(|slot| slot.id == id) {
+                        slot.cc_events = on;
+                    }
+                }
+                HubCmd::SetCcVoice(id, on) => {
+                    if let Some(slot) = slots.iter_mut().find(|slot| slot.id == id) {
+                        slot.cc_voice = on;
+                        if let Some(pipe) = &slot.rx_pipe {
+                            crate::rx_pipe::set_voice(pipe, on);
+                        }
+                    }
+                }
+                HubCmd::Tune(id, hz) => {
+                    if id != selected {
+                        if let Some(slot) = slots.iter_mut().find(|slot| slot.id == id) {
+                            if hz.is_finite() && hz > 0.0 {
+                                slot.pending_tune = Some(hz);
+                            }
+                        }
+                    }
+                }
                 HubCmd::Remove(id) => {
+                    hub.cc_log.lock().expect("cc log").remove(&id);
                     if let Some(pos) = slots.iter().position(|slot| slot.id == id) {
                         let mut slot = slots.remove(pos);
                         stop_slot(&mut slot);
@@ -1089,33 +1268,36 @@ fn supervise(
                         slot.status_dirty = true;
                     }
                 }
-                HubCmd::Replace(specs) => {
+                HubCmd::Replace {
+                    specs,
+                    selected: wanted,
+                } => {
                     for slot in &mut slots {
                         stop_slot(slot);
                     }
                     slots.clear();
-                    selected = 0;
                     let specs = if specs.is_empty() {
                         vec![RadioSpec::dummy()]
                     } else {
                         specs
                     };
+                    let mut ids = Vec::new();
                     for spec in specs {
                         if validate_spec(&spec).is_err() {
                             continue;
                         }
                         let id = next_id;
                         next_id += 1;
-                        if selected == 0 {
-                            selected = id;
-                        }
+                        ids.push(id);
                         slots.push(new_slot(id, spec));
                     }
                     if slots.is_empty() {
-                        selected = next_id;
+                        let id = next_id;
                         next_id += 1;
-                        slots.push(new_slot(selected, RadioSpec::dummy()));
+                        ids.push(id);
+                        slots.push(new_slot(id, RadioSpec::dummy()));
                     }
+                    selected = ids.get(wanted).copied().unwrap_or(ids[0]);
                     {
                         let mut gate = face.lock().expect("face");
                         gate.face_port = None;
@@ -1158,7 +1340,25 @@ fn supervise(
         }
         for slot in &mut slots {
             service_audio(slot, &models, &wanted, &look.graph);
-            service_rx_pipe(slot, &look.graph, now);
+            service_rx_pipe(slot, &look.graph, now, &hub);
+            service_tx_pipe(slot, &look.graph, now);
+            if let Some(pipe) = &slot.rx_pipe {
+                let lines = crate::rx_pipe::drain_events(pipe);
+                if !lines.is_empty() {
+                    let mut log = hub.cc_log.lock().expect("cc log");
+                    let entry = log.entry(slot.id).or_default();
+                    entry.extend(lines);
+                    // The window takes these for the follower and the log.
+                    // A stalled frame must not grow the queue without a bound.
+                    const CC_LOG_CAP: usize = 400;
+                    if entry.len() > CC_LOG_CAP {
+                        let extra = entry.len() - CC_LOG_CAP;
+                        entry.drain(0..extra);
+                    }
+                    drop(log);
+                    ctx.request_repaint();
+                }
+            }
             tick_slot(
                 slot,
                 slot.id == selected,
@@ -1168,6 +1368,7 @@ fn supervise(
                 &face,
                 kick.as_ref(),
                 now,
+                &look.graph,
             );
         }
         let ready = audio_settled(&slots, &look.graph);
@@ -1206,6 +1407,7 @@ fn new_slot(id: u64, spec: RadioSpec) -> Slot {
         handed: None,
         assigned: None,
         probe_at: None,
+        dsp_tries: 0,
         rx_audio: None,
         tx_audio: None,
         audio_wired: false,
@@ -1220,6 +1422,14 @@ fn new_slot(id: u64, spec: RadioSpec) -> Slot {
         rx_pipe_owned: None,
         rx_pipe_retry_at: None,
         rx_pipe_status: String::new(),
+        tx_pipe: None,
+        tx_pipe_failed: None,
+        tx_pipe_owned: None,
+        tx_pipe_retry_at: None,
+        tx_pipe_status: String::new(),
+        cc_events: false,
+        cc_voice: false,
+        pending_tune: None,
     }
 }
 
@@ -1238,6 +1448,7 @@ fn tick_slot(
     face: &Mutex<FaceGate>,
     kick: &dyn Fn(),
     now: Instant,
+    graph: &crate::audio::AudioGraph,
 ) {
     if let Some(child) = slot.child.as_mut() {
         match child.try_wait() {
@@ -1252,6 +1463,7 @@ fn tick_slot(
                 slot.port = None;
                 slot.assigned = None;
                 slot.probe_at = None;
+                slot.dsp_tries = 0;
                 slot.handed = None;
                 if connected {
                     adopt_gqrx_file(slot);
@@ -1270,6 +1482,7 @@ fn tick_slot(
                 slot.port = None;
                 slot.assigned = None;
                 slot.probe_at = None;
+                slot.dsp_tries = 0;
             }
         }
     }
@@ -1284,6 +1497,7 @@ fn tick_slot(
         slot.port = None;
         slot.assigned = None;
         slot.probe_at = None;
+        slot.dsp_tries = 0;
         slot.handed = None;
         if slot.status != "device missing" {
             slot.status = "device missing".into();
@@ -1294,6 +1508,14 @@ fn tick_slot(
     }
     if slot.child.is_none() {
         if slot.retry_at.is_some_and(|at| now < at) {
+            return;
+        }
+        if !gqrx_rx_card_ready(slot, graph) {
+            let status = format!("waiting for {}", crate::audio::rx_name(slot.id));
+            if slot.status != status {
+                slot.status = status;
+                slot.status_dirty = true;
+            }
             return;
         }
         match claim_port(PORT_START).and_then(|port| {
@@ -1359,6 +1581,7 @@ fn tick_slot(
         return;
     };
     if selected && !demo {
+        slot.pending_tune = None;
         slot.idle = None;
         let need = face_down || face_port != Some(port);
         let cooling = slot.retry_at.is_some_and(|at| now < at);
@@ -1403,6 +1626,16 @@ fn tick_slot(
         }
         return;
     }
+    if let Some(hz) = slot.pending_tune.take() {
+        if let Some(rig) = slot.idle.as_mut() {
+            // One attempt. The follower sends again on the next terminator
+            // or sync loss if the radio is still elsewhere. Retrying here
+            // on every pass would hammer a radio that refused the frequency.
+            let _ = rig.apply(&CatCommand::SetFreq(hz));
+        } else {
+            slot.pending_tune = Some(hz);
+        }
+    }
     if slot.next_idle.is_some_and(|at| now < at) {
         return;
     }
@@ -1417,8 +1650,50 @@ fn tick_slot(
     }
 }
 
+/// `U DSP 1` on the socket that just connected. The reply line is the
+/// completion signal. The read timeout covers a peer that accepts and then
+/// never answers; GQRX publishes nothing else for this command.
+fn gqrx_start_dsp_on(stream: &mut TcpStream) -> Result<(), String> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|err| err.to_string())?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .map_err(|err| err.to_string())?;
+    stream
+        .write_all(b"U DSP 1\n")
+        .map_err(|err| err.to_string())?;
+    let mut line = String::new();
+    BufReader::new(stream.by_ref())
+        .read_line(&mut line)
+        .map_err(|err| err.to_string())?;
+    let line = line.trim();
+    if line == "RPRT 0" {
+        Ok(())
+    } else if line.is_empty() {
+        Err("gqrx DSP start: no reply".into())
+    } else {
+        Err(format!("gqrx DSP start: {line}"))
+    }
+}
+
+fn mark_gqrx_up(slot: &mut Slot, port: u16, detail: Option<&str>) {
+    slot.dsp_tries = 0;
+    slot.port = Some(port);
+    slot.probe_at = None;
+    slot.retry_at = None;
+    adopt_gqrx_file(slot);
+    slot.status = match detail {
+        Some(detail) => format!("up  127.0.0.1:{port}  ({detail})"),
+        None => format!("up  127.0.0.1:{port}"),
+    };
+    slot.status_dirty = true;
+}
+
 /// One connect attempt. Gqrx publishes no listen event, so the accept is
 /// the completion signal and this probe is only how soon it is noticed.
+/// The same socket asks GQRX to start DSP, then closes so the face can
+/// take the only remote client.
 fn probe_gqrx(slot: &mut Slot, now: Instant) {
     if slot.probe_at.is_some_and(|at| now < at) {
         return;
@@ -1428,15 +1703,22 @@ fn probe_gqrx(slot: &mut Slot, now: Instant) {
     };
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     match TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
-        Ok(stream) => {
-            drop(stream);
-            slot.port = Some(port);
-            slot.probe_at = None;
-            slot.retry_at = None;
-            adopt_gqrx_file(slot);
-            slot.status = format!("up  127.0.0.1:{port}");
-            slot.status_dirty = true;
-        }
+        Ok(mut stream) => match gqrx_start_dsp_on(&mut stream) {
+            Ok(()) => mark_gqrx_up(slot, port, None),
+            Err(err) => {
+                drop(stream);
+                slot.dsp_tries = slot.dsp_tries.saturating_add(1);
+                if slot.dsp_tries >= DSP_TRIES {
+                    mark_gqrx_up(slot, port, Some(&err));
+                } else {
+                    slot.probe_at = Some(now + Duration::from_millis(250));
+                    if slot.status != err {
+                        slot.status = err;
+                        slot.status_dirty = true;
+                    }
+                }
+            }
+        },
         Err(_) => {
             slot.probe_at = Some(now + Duration::from_millis(250));
             let status = if gqrx_needs_chooser(&slot.spec.gqrx) {
@@ -1477,9 +1759,10 @@ fn next_wait(slots: &[Slot], now: Instant) -> Duration {
             slot.next_idle,
             slot.probe_at,
             slot.rx_pipe_retry_at,
+            slot.tx_pipe_retry_at,
         ]
-            .into_iter()
-            .flatten()
+        .into_iter()
+        .flatten()
         {
             if at <= now {
                 return Duration::from_millis(1);
@@ -1512,6 +1795,8 @@ fn publish(
             audio_status: slot.audio_status.clone(),
             rx_pipe_status: slot.rx_pipe_status.clone(),
             rx_pipe_diverted: slot.rx_pipe.as_ref().is_some_and(|pipe| pipe.diverted),
+            tx_pipe_status: slot.tx_pipe_status.clone(),
+            tx_pipe_diverted: slot.tx_pipe.as_ref().is_some_and(|pipe| pipe.diverted),
         })
         .collect();
     let mut pids = Vec::new();
@@ -1526,6 +1811,9 @@ fn publish(
             pids.push(child.id() as i32);
         }
         if let Some(pipe) = &slot.rx_pipe {
+            pids.push(pipe.leader_id() as i32);
+        }
+        if let Some(pipe) = &slot.tx_pipe {
             pids.push(pipe.leader_id() as i32);
         }
     }
@@ -1553,6 +1841,7 @@ fn stop_slot(slot: &mut Slot) {
     slot.port = None;
     slot.assigned = None;
     slot.probe_at = None;
+    slot.dsp_tries = 0;
     slot.handed = None;
     if adopt {
         // The process has exited, so its destructor has flushed QSettings.
@@ -1560,6 +1849,7 @@ fn stop_slot(slot: &mut Slot) {
     }
     stop_audio(slot);
     release_rx_pipe(slot);
+    release_tx_pipe(slot);
 }
 
 fn park_until(hub: &Hub, watch: &Option<DevWatch>, wait: Duration) {
@@ -1721,9 +2011,13 @@ fn note_audio(slots: &mut [Slot], graph: &crate::audio::AudioGraph) {
                 slot.spec.audio.output = node;
             }
         }
-        if let Some(node) = crate::audio::peer_node(graph, &crate::audio::tx_stream(slot.id), false)
-        {
-            slot.spec.audio.input = node;
+        let pipe_holds_mic = slot.tx_pipe.as_ref().is_some_and(|pipe| pipe.diverted);
+        if !pipe_holds_mic {
+            if let Some(node) =
+                crate::audio::peer_node(graph, &crate::audio::tx_stream(slot.id), false)
+            {
+                slot.spec.audio.input = node;
+            }
         }
         slot.status_dirty = true;
     }
@@ -1805,6 +2099,45 @@ fn service_audio(
     if !slot.audio_wired {
         wire_slot(slot, wanted);
     }
+    // The dropdown can name a speaker before the loopback stream exists.
+    // A later pass puts that wire in. A configured receive pipe owns the
+    // speaker, including the moment before its process is up. Linking the
+    // raw stream in that gap is the digital audio on the speakers.
+    if slot.rx_pipe.is_none() && slot.spec.rx_pipe.trim().is_empty() {
+        ensure_rx_link(slot, live);
+    }
+}
+
+fn ensure_rx_link(slot: &mut Slot, live: &crate::audio::AudioGraph) {
+    let output = slot.spec.audio.output.trim();
+    if output.is_empty() {
+        return;
+    }
+    let stream = crate::audio::rx_stream(slot.id);
+    match crate::audio::peer_node(live, &stream, true).as_deref() {
+        Some(peer) if peer == output => return,
+        Some(_) => unlink_stream(&stream, true, live),
+        None => {}
+    }
+    let outputs = crate::audio::pw_ports(true).unwrap_or_default();
+    let inputs = crate::audio::pw_ports(false).unwrap_or_default();
+    let from = crate::audio::ports_of(&outputs, &stream);
+    let to = crate::audio::ports_of(&inputs, output);
+    if from.is_empty() || to.is_empty() {
+        return;
+    }
+    let mut error = None;
+    for (left, right) in crate::audio::pair_ports(&from, &to) {
+        if let Err(err) = crate::audio::pw_link(&left, &right) {
+            error = Some(err);
+        }
+    }
+    if let Some(err) = error {
+        if slot.audio_status != err {
+            slot.audio_status = err;
+            slot.status_dirty = true;
+        }
+    }
 }
 
 fn reap_audio(child: &mut Option<Child>) {
@@ -1858,16 +2191,47 @@ fn wire_slot(slot: &mut Slot, wanted: &crate::audio::AudioGraph) {
     let saved = wanted_links(slot.id, wanted);
     if saved.is_empty() {
         wire_default(slot, &outputs, &inputs);
-    } else {
-        for link in saved {
-            if let Err(err) = crate::audio::pw_link(&link.output, &link.input) {
-                slot.audio_status = err;
-                slot.status_dirty = true;
+        slot.audio_wired = true;
+        slot.status_dirty = true;
+        return;
+    }
+    let own = [
+        crate::audio::rx_name(slot.id),
+        crate::audio::tx_name(slot.id),
+        crate::audio::rx_stream(slot.id),
+        crate::audio::tx_stream(slot.id),
+    ];
+    let pass = crate::audio::classify_saved(&saved, &outputs, &inputs, &own);
+    // A port of this card is not in pw-link's list yet. Calling pw-link
+    // anyway stores "No such file or directory" and audio_wired stops the retry.
+    if pass.waiting_on_own {
+        clear_link_status(slot);
+        return;
+    }
+    let mut error = None;
+    for link in pass.ready {
+        if let Err(err) = crate::audio::pw_link(&link.output, &link.input) {
+            if crate::audio::missing_port(&err) {
+                clear_link_status(slot);
+                return;
             }
+            error = Some(err);
         }
     }
     slot.audio_wired = true;
+    match error {
+        Some(err) => slot.audio_status = err,
+        None if slot.audio_status.starts_with("pw-link:") => slot.audio_status.clear(),
+        None => {}
+    }
     slot.status_dirty = true;
+}
+
+fn clear_link_status(slot: &mut Slot) {
+    if slot.audio_status.starts_with("pw-link:") {
+        slot.audio_status.clear();
+        slot.status_dirty = true;
+    }
 }
 
 fn wanted_links(id: u64, graph: &crate::audio::AudioGraph) -> Vec<crate::audio::AudioLink> {
@@ -1934,7 +2298,10 @@ fn retarget(slot: &mut Slot, input: &str, output: &str, live: &crate::audio::Aud
     if output != slot.spec.audio.output {
         unlink_stream(&crate::audio::rx_stream(slot.id), true, live);
         // An empty name is the bay dropping a wire on bare canvas.
-        if !output.is_empty() {
+        // A receive pipe plays the decoder to this speaker. The raw stream
+        // stays unlinked so the undecoded signal is not mixed in.
+        let piped = slot.rx_pipe.is_some() || !slot.spec.rx_pipe.trim().is_empty();
+        if !output.is_empty() && !piped {
             let from = crate::audio::ports_of(&outputs, &crate::audio::rx_stream(slot.id));
             let to = crate::audio::ports_of(&inputs, output);
             for (left, right) in crate::audio::pair_ports(&from, &to) {
@@ -1960,17 +2327,27 @@ fn retarget(slot: &mut Slot, input: &str, output: &str, live: &crate::audio::Aud
     }
 }
 
-fn service_rx_pipe(slot: &mut Slot, graph: &crate::audio::AudioGraph, now: Instant) {
+fn service_rx_pipe(
+    slot: &mut Slot,
+    graph: &crate::audio::AudioGraph,
+    now: Instant,
+    hub: &Arc<Hub>,
+) {
     let command = slot.spec.rx_pipe.trim().to_string();
     if command.is_empty() {
         release_rx_pipe(slot);
         set_rx_pipe_status(slot, "");
         return;
     }
-    let restart = slot
-        .rx_pipe
-        .as_ref()
-        .is_some_and(|pipe| pipe.command != command || pipe.output != slot.spec.audio.output);
+    // Every P25 pipe keeps stderr and installs the speaker gate. Follow
+    // only changes the gate, through `cc_voice`. Tying the log to follow
+    // restarted dsd-fme and dropped the identifier table.
+    let capture = crate::rx_pipe::is_p25_rx(&command);
+    let restart = slot.rx_pipe.as_ref().is_some_and(|pipe| {
+        pipe.command != command
+            || pipe.output != slot.spec.audio.output
+            || pipe.events != capture
+    });
     if restart {
         release_rx_pipe(slot);
     }
@@ -1983,6 +2360,10 @@ fn service_rx_pipe(slot: &mut Slot, graph: &crate::audio::AudioGraph, now: Insta
         return;
     }
     if slot.rx_pipe.is_some() {
+        if let Some(pipe) = &slot.rx_pipe {
+            crate::rx_pipe::set_voice(pipe, slot.cc_voice);
+        }
+        ensure_rx_tap(slot);
         divert_rx_pipe(slot, graph);
         return;
     }
@@ -2012,15 +2393,24 @@ fn service_rx_pipe(slot: &mut Slot, graph: &crate::audio::AudioGraph, now: Insta
         set_rx_pipe_status(slot, &format!("rx pipe: {program} is not on PATH"));
         return;
     }
-    match crate::rx_pipe::spawn(slot.id, output, &command) {
+    let on_line = if capture {
+        let hub = Arc::clone(hub);
+        Some(Arc::new(move || hub.wake()) as Arc<dyn Fn() + Send + Sync>)
+    } else {
+        None
+    };
+    match crate::rx_pipe::spawn(slot.id, output, &command, capture, on_line) {
         Ok(mut pipe) => {
             if slot.rx_pipe_owned.as_deref() == Some(output) {
                 pipe.diverted = true;
             }
+            let status = rx_pipe_live_status(&pipe);
             slot.rx_pipe = Some(pipe);
             slot.rx_pipe_retry_at = None;
             if slot.rx_pipe_owned.is_some() {
-                set_rx_pipe_status(slot, &format!("rx pipe {}", crate::rx_pipe::FORMAT));
+                set_rx_pipe_status(slot, &status);
+            } else if let Some(port) = slot.rx_pipe.as_ref().and_then(|pipe| pipe.port) {
+                set_rx_pipe_status(slot, &format!("rx pipe starting · udp {port}"));
             } else {
                 set_rx_pipe_status(slot, "rx pipe starting");
             }
@@ -2029,6 +2419,18 @@ fn service_rx_pipe(slot: &mut Slot, graph: &crate::audio::AudioGraph, now: Insta
             slot.rx_pipe_retry_at = Some(now + RETRY_AFTER);
             set_rx_pipe_status(slot, &format!("rx pipe restarting ({err})"));
         }
+    }
+}
+
+fn ensure_rx_tap(slot: &mut Slot) {
+    let mut hard = None;
+    if let Some(pipe) = slot.rx_pipe.as_mut() {
+        if let Err(err) = crate::rx_pipe::ensure_tap(pipe) {
+            hard = Some(err);
+        }
+    }
+    if let Some(err) = hard {
+        set_rx_pipe_status(slot, &err);
     }
 }
 
@@ -2045,21 +2447,47 @@ fn divert_rx_pipe(slot: &mut Slot, graph: &crate::audio::AudioGraph) {
         .links
         .iter()
         .any(|link| crate::audio::port_node(&link.output) == stream);
-    // No link in this snapshot means the speaker wire is not there to move.
-    // Leave it, and leave `diverted` clear, so a dead pipe cannot restore a
-    // wire this snapshot never saw.
-    if !linked {
+    let named = !slot.spec.audio.output.trim().is_empty();
+    // A chosen speaker is enough. The player is already aimed at that node.
+    // Waiting for a direct wire left the pipe on "starting" and the bay blank.
+    if !linked && !named {
         return;
     }
-    unlink_stream(&stream, true, graph);
-    let owned = slot.rx_pipe.as_ref().map(|pipe| pipe.output.clone());
+    if linked {
+        unlink_stream(&stream, true, graph);
+    }
+    // The snapshot often does not contain the wire `ensure_rx_link` just
+    // made. Marking the pipe diverted from that snapshot left the raw
+    // digital audio on the speaker. A live listing is the check.
+    let mut mute_error = None;
     if let Some(pipe) = slot.rx_pipe.as_mut() {
+        if !pipe.raw_muted {
+            match crate::audio::unlink_node_outputs(&stream) {
+                Ok(0) => pipe.raw_muted = true,
+                Ok(_) => {}
+                Err(err) => mute_error = Some(err),
+            }
+        }
         pipe.diverted = true;
     }
+    if let Some(err) = mute_error {
+        set_rx_pipe_status(slot, &err);
+        return;
+    }
+    let owned = slot.rx_pipe.as_ref().map(|pipe| pipe.output.clone());
     if let Some(output) = owned {
         slot.rx_pipe_owned = Some(output);
     }
-    set_rx_pipe_status(slot, &format!("rx pipe {}", crate::rx_pipe::FORMAT));
+    if let Some(pipe) = slot.rx_pipe.as_ref() {
+        set_rx_pipe_status(slot, &rx_pipe_live_status(pipe));
+    }
+}
+
+fn rx_pipe_live_status(pipe: &crate::rx_pipe::Running) -> String {
+    match pipe.port {
+        Some(port) => format!("rx pipe {} · udp {port}", crate::rx_pipe::FORMAT),
+        None => format!("rx pipe {}", crate::rx_pipe::FORMAT),
+    }
 }
 
 fn release_rx_pipe(slot: &mut Slot) {
@@ -2071,10 +2499,14 @@ fn release_rx_pipe(slot: &mut Slot) {
 /// pipe still owns it. A crash passes false and leaves the wire taken.
 fn halt_rx_pipe(slot: &mut Slot, restore: bool) {
     if let Some(pipe) = slot.rx_pipe.take() {
+        let port = pipe.port;
         if pipe.diverted {
             slot.rx_pipe_owned = Some(pipe.output.clone());
         }
         crate::rx_pipe::shutdown(pipe);
+        if let Some(port) = port {
+            crate::rx_pipe::release_voice_port(port);
+        }
     }
     if !restore {
         return;
@@ -2099,6 +2531,210 @@ fn restore_rx_link(id: u64, output: &str) {
 fn set_rx_pipe_status(slot: &mut Slot, text: &str) {
     if slot.rx_pipe_status != text {
         slot.rx_pipe_status = text.to_string();
+        slot.status_dirty = true;
+    }
+}
+
+fn service_tx_pipe(slot: &mut Slot, graph: &crate::audio::AudioGraph, now: Instant) {
+    let command = slot.spec.tx_pipe.trim().to_string();
+    if command.is_empty() {
+        release_tx_pipe(slot);
+        set_tx_pipe_status(slot, "");
+        return;
+    }
+    let restart = slot
+        .tx_pipe
+        .as_ref()
+        .is_some_and(|pipe| pipe.command != command || pipe.source != slot.spec.audio.input);
+    if restart {
+        release_tx_pipe(slot);
+    }
+    if let Some(note) = slot.tx_pipe.as_mut().and_then(crate::rx_pipe::poll) {
+        // A dead modulator puts the microphone back. It does not leave the
+        // transmitter on silence, and it does not leave the mic unhooked.
+        halt_tx_pipe(slot, true);
+        slot.tx_pipe_retry_at = Some(now + RETRY_AFTER);
+        set_tx_pipe_status(slot, &format!("tx pipe restarting ({note})"));
+        return;
+    }
+    if slot.tx_pipe.is_some() {
+        ensure_tx_tap(slot);
+        divert_tx_pipe(slot, graph);
+        return;
+    }
+    if slot.tx_pipe_failed.as_deref() == Some(command.as_str()) {
+        return;
+    }
+    if slot.tx_pipe_owned.as_deref() != Some(slot.spec.audio.input.trim()) {
+        slot.tx_pipe_owned = None;
+    }
+    if slot.tx_pipe_retry_at.is_some_and(|at| now < at) {
+        return;
+    }
+    let input = slot.spec.audio.input.trim();
+    if !slot.audio_wired || input.is_empty() || !slot.spec.audio.tx {
+        set_tx_pipe_status(slot, "tx pipe waiting for the microphone link");
+        return;
+    }
+    let Some(program) = crate::rx_pipe::program_name(&command).map(str::to_string) else {
+        slot.tx_pipe_failed = Some(command);
+        set_tx_pipe_status(slot, "tx pipe command is empty");
+        return;
+    };
+    if !crate::rx_pipe::on_path(&program) {
+        slot.tx_pipe_failed = Some(command);
+        slot.tx_pipe_retry_at = None;
+        set_tx_pipe_status(slot, &format!("tx pipe: {program} is not on PATH"));
+        return;
+    }
+    let outputs = crate::audio::pw_ports(true).unwrap_or_default();
+    let inputs = crate::audio::pw_ports(false).unwrap_or_default();
+    let Some((capture, channel_map)) = crate::audio::capture_record_port(&outputs, input) else {
+        set_tx_pipe_status(slot, "tx pipe waiting for the microphone link");
+        return;
+    };
+    let play_ports = crate::audio::stream_input_ports(&inputs, &crate::audio::tx_stream(slot.id));
+    if play_ports.is_empty() {
+        set_tx_pipe_status(slot, "tx pipe waiting for the microphone link");
+        return;
+    }
+    match crate::rx_pipe::spawn_tx(slot.id, input, &capture, channel_map, &play_ports, &command) {
+        Ok(mut pipe) => {
+            if slot.tx_pipe_owned.as_deref() == Some(input) {
+                pipe.diverted = true;
+            }
+            let status = tx_pipe_live_status(&pipe);
+            slot.tx_pipe = Some(pipe);
+            slot.tx_pipe_retry_at = None;
+            if slot.tx_pipe_owned.is_some() {
+                set_tx_pipe_status(slot, &status);
+            } else if let Some(port) = slot.tx_pipe.as_ref().and_then(|pipe| pipe.port) {
+                set_tx_pipe_status(slot, &format!("tx pipe starting · udp {port}"));
+            } else {
+                set_tx_pipe_status(slot, "tx pipe starting");
+            }
+        }
+        Err(err) => {
+            slot.tx_pipe_retry_at = Some(now + RETRY_AFTER);
+            set_tx_pipe_status(slot, &format!("tx pipe restarting ({err})"));
+        }
+    }
+}
+
+fn ensure_tx_tap(slot: &mut Slot) {
+    let mut hard = None;
+    if let Some(pipe) = slot.tx_pipe.as_mut() {
+        if let Err(err) = crate::rx_pipe::ensure_tap(pipe) {
+            hard = Some(err);
+        }
+    }
+    if let Some(err) = hard {
+        set_tx_pipe_status(slot, &err);
+    }
+}
+
+fn divert_tx_pipe(slot: &mut Slot, graph: &crate::audio::AudioGraph) {
+    let ready = slot
+        .tx_pipe
+        .as_mut()
+        .is_some_and(|pipe| pipe.tapped && crate::rx_pipe::poll(pipe).is_none());
+    if !ready {
+        return;
+    }
+    if slot.tx_pipe.as_ref().is_some_and(|pipe| pipe.diverted) {
+        if let Some(pipe) = slot.tx_pipe.as_ref() {
+            set_tx_pipe_status(slot, &tx_pipe_live_status(pipe));
+        }
+        return;
+    }
+    let input = slot.spec.audio.input.clone();
+    let stream = crate::audio::tx_stream(slot.id);
+    let linked = graph.links.iter().any(|link| {
+        crate::audio::port_node(&link.output) == input
+            && crate::audio::port_node(&link.input) == stream
+    });
+    // No microphone wire in this snapshot means there is nothing to move.
+    // Leave `diverted` clear so a dead pipe cannot restore a path it never took.
+    if !linked {
+        return;
+    }
+    unlink_mic(&input, &stream, graph);
+    if let Some(pipe) = slot.tx_pipe.as_mut() {
+        pipe.diverted = true;
+    }
+    slot.tx_pipe_owned = Some(input);
+    if let Some(pipe) = slot.tx_pipe.as_ref() {
+        set_tx_pipe_status(slot, &tx_pipe_live_status(pipe));
+    }
+}
+
+fn tx_pipe_live_status(pipe: &crate::rx_pipe::Running) -> String {
+    match pipe.port {
+        Some(port) => format!("tx pipe {} · udp {port}", crate::rx_pipe::FORMAT),
+        None => format!("tx pipe {}", crate::rx_pipe::FORMAT),
+    }
+}
+
+fn release_tx_pipe(slot: &mut Slot) {
+    halt_tx_pipe(slot, true);
+    slot.tx_pipe_retry_at = None;
+}
+
+/// Stop the modulator and put the microphone back on the transmit input.
+/// Unlike the receive pipe, a crash also restores that wire. A dead
+/// modulator does not silence the microphone or feed silence to the radio.
+fn halt_tx_pipe(slot: &mut Slot, restore: bool) {
+    let owned = slot
+        .tx_pipe
+        .as_ref()
+        .filter(|pipe| pipe.diverted)
+        .map(|pipe| pipe.source.clone())
+        .or_else(|| slot.tx_pipe_owned.clone());
+    if restore {
+        if let Some(input) = owned {
+            if slot.spec.audio.input == input {
+                restore_tx_link(slot.id, &input);
+            }
+        }
+        slot.tx_pipe_owned = None;
+    }
+    if let Some(pipe) = slot.tx_pipe.take() {
+        let port = pipe.port;
+        if pipe.diverted && !restore {
+            slot.tx_pipe_owned = Some(pipe.source.clone());
+        }
+        crate::rx_pipe::shutdown(pipe);
+        if let Some(port) = port {
+            crate::rx_pipe::release_voice_port(port);
+        }
+    }
+}
+
+fn restore_tx_link(id: u64, source: &str) {
+    let outputs = crate::audio::pw_ports(true).unwrap_or_default();
+    let inputs = crate::audio::pw_ports(false).unwrap_or_default();
+    let from = crate::audio::ports_of(&outputs, source);
+    let to = crate::audio::ports_of(&inputs, &crate::audio::tx_stream(id));
+    for (left, right) in crate::audio::pair_ports(&from, &to) {
+        let _ = crate::audio::pw_link(&left, &right);
+    }
+}
+
+fn unlink_mic(source: &str, stream: &str, graph: &crate::audio::AudioGraph) {
+    for link in &graph.links {
+        if crate::audio::port_node(&link.output) != source {
+            continue;
+        }
+        if crate::audio::port_node(&link.input) != stream {
+            continue;
+        }
+        let _ = crate::audio::pw_unlink(&link.output, &link.input);
+    }
+}
+
+fn set_tx_pipe_status(slot: &mut Slot, text: &str) {
+    if slot.tx_pipe_status != text {
+        slot.tx_pipe_status = text.to_string();
         slot.status_dirty = true;
     }
 }
@@ -2143,12 +2779,17 @@ fn restore_links(wanted: &crate::audio::AudioGraph, slots: &[Slot], note: &mut S
         }
     };
     let mut complete = true;
+    let mut hard: Option<String> = None;
     for link in &wanted.links {
         let output_ready = outputs.iter().any(|port| port == &link.output);
         let input_ready = inputs.iter().any(|port| port == &link.input);
         if output_ready && input_ready {
             if let Err(err) = crate::audio::pw_link(&link.output, &link.input) {
-                *note = err;
+                if crate::audio::missing_port(&err) {
+                    complete = false;
+                } else {
+                    hard = Some(err);
+                }
             }
             continue;
         }
@@ -2161,6 +2802,11 @@ fn restore_links(wanted: &crate::audio::AudioGraph, slots: &[Slot], note: &mut S
         if waiting_on_radio {
             complete = false;
         }
+    }
+    if let Some(err) = hard {
+        *note = err;
+    } else if note.starts_with("pw-link:") {
+        note.clear();
     }
     complete
 }
@@ -2195,6 +2841,7 @@ fn restore_extra_devices(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::BufRead;
 
     #[test]
     fn argv_carries_the_dialog_fields_and_not_vfo_mode() {
@@ -2213,6 +2860,7 @@ mod tests {
             audio: RadioAudio::default(),
             gqrx: GqrxConfig::new(),
             rx_pipe: String::new(),
+            tx_pipe: String::new(),
         };
         let args = hamlib_argv(&spec, 4534);
         assert_eq!(
@@ -2404,6 +3052,7 @@ mod tests {
             audio: RadioAudio::default(),
             gqrx: gqrx_chooser_config(),
             rx_pipe: String::new(),
+            tx_pipe: String::new(),
         };
         assert!(validate_spec(&spec).is_ok());
         assert_eq!(driver_name(RadioDriver::Gqrx), "gqrx");
@@ -2472,21 +3121,18 @@ mod tests {
     fn an_empty_gqrx_document_adopts_the_native_file_without_copying_default() {
         let root = std::env::temp_dir().join(format!("hamspot-gqrx-adopt-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
-        let home = root.join("config");
-        let dir = home.join("hamspot-commander").join("gqrx");
+        let data = root.join("share").join("hamspot-commander");
+        let dir = data.join("gqrx");
         fs::create_dir_all(&dir).unwrap();
         fs::write(
             dir.join("SDR.conf"),
             "[General]\nconfigversion=4\ncrashed=true\n\n[input]\nfrequency=14236000\n\n[receiver]\ndemod=AM\n",
         )
         .unwrap();
-        // A poisoned default.conf must not be copied into a new instance.
-        fs::create_dir_all(home.join("gqrx")).unwrap();
-        fs::write(
-            home.join("gqrx").join("default.conf"),
-            "[input]\ndevice=hackrf\n",
-        )
-        .unwrap();
+        // A personal default.conf must not be copied into a new instance.
+        let personal = root.join("config").join("gqrx");
+        fs::create_dir_all(&personal).unwrap();
+        fs::write(personal.join("default.conf"), "[input]\ndevice=hackrf\n").unwrap();
         let mut spec = RadioSpec {
             driver: RadioDriver::Gqrx,
             name: "SDR".into(),
@@ -2502,8 +3148,9 @@ mod tests {
             audio: RadioAudio::default(),
             gqrx: GqrxConfig::new(),
             rx_pipe: String::new(),
+            tx_pipe: String::new(),
         };
-        let path = prepare_gqrx_document_in(&home, &mut spec).unwrap();
+        let path = prepare_gqrx_document_in(&data, Some(&root.join("config")), &mut spec).unwrap();
         assert!(gqrx_needs_chooser(&spec.gqrx));
         assert_eq!(
             spec.gqrx.get("input").unwrap().get("frequency").unwrap(),
@@ -2524,5 +3171,151 @@ mod tests {
         assert!(text.contains("frequency=14236000"));
         assert!(text.contains("port=4538"));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_older_config_file_moves_into_the_data_directory() {
+        let root = std::env::temp_dir().join(format!("hamspot-gqrx-legacy-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let legacy = root.join("config").join("hamspot-commander").join("gqrx");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(
+            legacy.join("HackRF.conf"),
+            "[input]\ndevice=hackrf\nfrequency=146520000\n",
+        )
+        .unwrap();
+        let data = root.join("share").join("hamspot-commander");
+        let mut spec = RadioSpec {
+            driver: RadioDriver::Gqrx,
+            name: "HackRF".into(),
+            model: 0,
+            device: String::new(),
+            serial_speed: String::new(),
+            civ: String::new(),
+            ptt_type: String::new(),
+            ptt_file: String::new(),
+            conf: String::new(),
+            park: false,
+            follow: false,
+            audio: RadioAudio::default(),
+            gqrx: GqrxConfig::new(),
+            rx_pipe: String::new(),
+            tx_pipe: String::new(),
+        };
+        let path = prepare_gqrx_document_in(&data, Some(&root.join("config")), &mut spec).unwrap();
+        assert_eq!(path, data.join("gqrx").join("HackRF.conf"));
+        assert_eq!(
+            spec.gqrx.get("input").unwrap().get("device").unwrap(),
+            "hackrf"
+        );
+        pin_gqrx_output(&mut spec.gqrx, 3);
+        write_gqrx_native(&path, &spec.gqrx, 4537).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("device=hackrf\n"));
+        assert!(text.contains("[output]\n"));
+        assert!(text.contains("device=hamspot_3_rx\n"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn gqrx_waits_until_its_rx_card_exists() {
+        let mut spec = RadioSpec::dummy();
+        spec.driver = RadioDriver::Gqrx;
+        spec.name = "HackRF".into();
+        spec.audio.rx = true;
+        let waiting = new_slot(3, spec);
+        assert!(!gqrx_rx_card_ready(
+            &waiting,
+            &crate::audio::AudioGraph::default()
+        ));
+        let mut graph = crate::audio::AudioGraph::default();
+        graph.devices.push(crate::audio::AudioNode {
+            name: "hamspot_3_rx".into(),
+            description: "GQRX HackRF 3 RX".into(),
+            class: "Audio/Sink".into(),
+        });
+        assert!(gqrx_rx_card_ready(&waiting, &graph));
+        let other = crate::audio::AudioGraph {
+            devices: vec![crate::audio::AudioNode {
+                name: "hamspot_1_rx".into(),
+                description: "other".into(),
+                class: "Audio/Sink".into(),
+            }],
+            links: Vec::new(),
+        };
+        assert!(!gqrx_rx_card_ready(&waiting, &other));
+        let hamlib = new_slot(1, RadioSpec::dummy());
+        assert!(gqrx_rx_card_ready(
+            &hamlib,
+            &crate::audio::AudioGraph::default()
+        ));
+    }
+
+    fn port_outside_the_radio_range() -> (TcpListener, u16) {
+        for _ in 0..32 {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            if !(PORT_START..PORT_START + PORT_TRIES).contains(&port) {
+                return (listener, port);
+            }
+        }
+        panic!("no port outside the radio range");
+    }
+
+    fn gqrx_probe_slot(port: u16) -> Slot {
+        let mut spec = RadioSpec::dummy();
+        spec.driver = RadioDriver::Gqrx;
+        spec.name = "dsp-probe-absent".into();
+        let mut slot = new_slot(9, spec);
+        slot.assigned = Some(port);
+        slot.probe_at = None;
+        slot
+    }
+
+    #[test]
+    fn gqrx_dsp_start_sends_the_remote_command() {
+        let (listener, port) = port_outside_the_radio_range();
+        let server = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(sock.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            assert_eq!(line, "U DSP 1\n");
+            std::io::Write::write_all(&mut sock, b"RPRT 0\n").unwrap();
+        });
+        let mut slot = gqrx_probe_slot(port);
+        probe_gqrx(&mut slot, Instant::now());
+        server.join().unwrap();
+        assert_eq!(slot.port, Some(port));
+        assert_eq!(slot.status, format!("up  127.0.0.1:{port}"));
+        assert_eq!(slot.dsp_tries, 0);
+    }
+
+    #[test]
+    fn gqrx_dsp_start_gives_up_after_a_refusal_and_stays_up() {
+        let (listener, port) = port_outside_the_radio_range();
+        let server = thread::spawn(move || {
+            for _ in 0..DSP_TRIES {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(sock.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                assert_eq!(line, "U DSP 1\n");
+                std::io::Write::write_all(&mut sock, b"RPRT 1\n").unwrap();
+            }
+        });
+        let mut slot = gqrx_probe_slot(port);
+        let start = Instant::now();
+        for step in 0..DSP_TRIES {
+            probe_gqrx(
+                &mut slot,
+                start + Duration::from_millis(250 * u64::from(step)),
+            );
+        }
+        server.join().unwrap();
+        assert_eq!(slot.port, Some(port));
+        assert!(slot.status.contains("gqrx DSP start: RPRT 1"), "{}", slot.status);
     }
 }

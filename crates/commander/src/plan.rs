@@ -1170,6 +1170,7 @@ mod tests {
         assert!(dir.join("default.json").is_file(), "{}", dir.display());
         assert!(dir.join("arrl.json").is_file(), "{}", dir.display());
         assert!(dir.join("shortwave.json").is_file(), "{}", dir.display());
+        assert!(dir.join("publicsafety.json").is_file(), "{}", dir.display());
         let plan = load_file(&dir.join("shortwave.json")).unwrap();
         let government = plan
             .zones
@@ -1309,5 +1310,33 @@ mod tests {
         assert!(seen
             .windows(2)
             .any(|pair| pair == ["17 m Voice", "15 m CW"]));
+    }
+
+    #[test]
+    fn publicsafety_plan_covers_the_listen_bands() {
+        let plan = parse(include_str!("../../../bsp/publicsafety.json")).unwrap();
+        let band = |chip: &str| {
+            plan.zones
+                .iter()
+                .flat_map(|zone| zone.bands.iter())
+                .find(|band| band.chip == chip)
+                .unwrap_or_else(|| panic!("missing {chip}"))
+        };
+        let nb = band("n700");
+        assert!((nb.lo_hz - 769_000_000.0).abs() < 0.5);
+        assert!((nb.hi_hz - 775_000_000.0).abs() < 0.5);
+        assert!((nb.home_hz - 769_243_750.0).abs() < 0.5);
+        assert_eq!(nb.mode, "FM");
+        let p800 = band("p800");
+        assert!((p800.lo_hz - 854_000_000.0).abs() < 0.5);
+        assert!((p800.hi_hz - 860_000_000.0).abs() < 0.5);
+        let nps = band("nps");
+        assert!((nps.home_hz - 851_012_500.0).abs() < 0.5);
+        let vhi = band("vhi");
+        assert!((vhi.home_hz - 155_752_500.0).abs() < 0.5);
+        assert!(vhi
+            .segments
+            .iter()
+            .any(|seg| seg.service.as_deref() == Some("military")));
     }
 }

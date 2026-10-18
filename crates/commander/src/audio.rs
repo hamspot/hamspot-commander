@@ -422,6 +422,86 @@ pub fn ports_of(ports: &[String], node: &str) -> Vec<String> {
         .collect()
 }
 
+/// Capture port a transmit pipe records, and the `pw-cat` channel map that
+/// matches it. A mono capture is one channel. A stereo source uses the left
+/// channel. Both stay 48 kHz mono s16le on the script's stdin.
+pub fn capture_record_port(ports: &[String], source: &str) -> Option<(String, &'static str)> {
+    let list = ports_of(ports, source);
+    if let Some(port) = list.iter().find(|port| port.ends_with(":capture_MONO")) {
+        return Some((port.clone(), "MONO"));
+    }
+    if let Some(port) = list.iter().find(|port| port.ends_with(":capture_FL")) {
+        return Some((port.clone(), "FL"));
+    }
+    None
+}
+
+/// Input ports of a transmit stream. `input_FL` / `input_FR` / `input_MONO`
+/// are the wires the microphone uses. Anything else on that node is left out
+/// when one of those is present.
+pub fn stream_input_ports(ports: &[String], stream: &str) -> Vec<String> {
+    let list = ports_of(ports, stream);
+    let preferred: Vec<String> = list
+        .iter()
+        .filter(|port| {
+            let leaf = port.rsplit(':').next().unwrap_or("");
+            leaf == "input_FL" || leaf == "input_FR" || leaf == "input_MONO"
+        })
+        .cloned()
+        .collect();
+    if preferred.is_empty() {
+        list
+    } else {
+        preferred
+    }
+}
+
+/// Saved wires split into the ones both ends can accept, and a flag when one
+/// of this radio's own ports is not in the list yet. An outside name that is
+/// absent (GQRX is not running) is neither ready nor this radio's wait.
+/// `pw-link` on that name returns "No such file or directory".
+pub struct SavedPass<'a> {
+    pub ready: Vec<&'a AudioLink>,
+    pub waiting_on_own: bool,
+}
+
+pub fn classify_saved<'a>(
+    links: &'a [AudioLink],
+    outputs: &[String],
+    inputs: &[String],
+    own_nodes: &[String],
+) -> SavedPass<'a> {
+    let listed = |port: &str| {
+        outputs.iter().any(|item| item == port) || inputs.iter().any(|item| item == port)
+    };
+    let mut ready = Vec::new();
+    let mut waiting_on_own = false;
+    for link in links {
+        let output_listed = listed(&link.output);
+        let input_listed = listed(&link.input);
+        if output_listed && input_listed {
+            ready.push(link);
+            continue;
+        }
+        let missing_own = |port: &str, is_listed: bool| {
+            !is_listed && own_nodes.iter().any(|node| port_node(port) == node)
+        };
+        if missing_own(&link.output, output_listed) || missing_own(&link.input, input_listed) {
+            waiting_on_own = true;
+        }
+    }
+    SavedPass {
+        ready,
+        waiting_on_own,
+    }
+}
+
+/// `pw-link` could not see one of the names. The port list was already stale,
+/// or the other program has not created it. The caller keeps trying.
+pub fn missing_port(err: &str) -> bool {
+    err.to_ascii_lowercase().contains("no such file")
+}
+
 fn command_output(program: &str, args: &[String]) -> Result<std::process::Output, String> {
     Command::new(program)
         .args(args)
@@ -457,6 +537,57 @@ pub fn pw_link(output_port: &str, input_port: &str) -> Result<(), String> {
         return Ok(());
     }
     Err(format!("pw-link: {}", err.trim()))
+}
+
+/// Output-port links for `node` in `pw-link -l` text.
+///
+/// The listing names a port, then `|->` for a link that leaves it and
+/// `|<-` for a link that arrives. Both directions describe one wire, so
+/// each pair is returned once.
+pub fn output_links_from_list(text: &str, node: &str) -> Vec<(String, String)> {
+    let mut found = BTreeSet::new();
+    let mut current = String::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(peer) = trimmed.strip_prefix("|->") {
+            let peer = peer.trim();
+            if port_node(&current) == node && !peer.is_empty() {
+                found.insert((current.clone(), peer.to_string()));
+            }
+            continue;
+        }
+        if let Some(peer) = trimmed.strip_prefix("|<-") {
+            let peer = peer.trim();
+            if port_node(peer) == node && !current.is_empty() {
+                found.insert((peer.to_string(), current.clone()));
+            }
+            continue;
+        }
+        current = trimmed.to_string();
+    }
+    found.into_iter().collect()
+}
+
+/// Remove every wire leaving `node`. The count is how many were listed
+/// before the removal. Zero means the node is already quiet.
+pub fn unlink_node_outputs(node: &str) -> Result<usize, String> {
+    let output = command_output("pw-link", &["-l".into()])?;
+    if !output.status.success() {
+        return Err(format!(
+            "pw-link -l: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let links = output_links_from_list(&text, node);
+    let count = links.len();
+    for (from, to) in links {
+        pw_unlink(&from, &to)?;
+    }
+    Ok(count)
 }
 
 pub fn pw_unlink(output_port: &str, input_port: &str) -> Result<(), String> {
@@ -660,5 +791,124 @@ mod tests {
         let removed = r#"[{"id": 1, "info": null}]"#;
         let third = merge.apply(removed).expect("remove");
         assert!(!has_device(&third.graph, "hamspot_1_rx"));
+    }
+
+    #[test]
+    fn a_mono_capture_is_the_transmit_record_port() {
+        let ports = vec![
+            "mic:capture_FL".into(),
+            "mic:capture_MONO".into(),
+            "other:capture_FL".into(),
+        ];
+        assert_eq!(
+            capture_record_port(&ports, "mic"),
+            Some(("mic:capture_MONO".into(), "MONO"))
+        );
+        let stereo = vec!["mic:capture_FR".into(), "mic:capture_FL".into()];
+        assert_eq!(
+            capture_record_port(&stereo, "mic"),
+            Some(("mic:capture_FL".into(), "FL"))
+        );
+        assert!(capture_record_port(&stereo, "gone").is_none());
+        assert_eq!(
+            stream_input_ports(
+                &[
+                    "input.hamspot_2_tx:monitor_FL".into(),
+                    "input.hamspot_2_tx:input_FR".into(),
+                    "input.hamspot_2_tx:input_FL".into(),
+                ],
+                "input.hamspot_2_tx"
+            ),
+            vec![
+                "input.hamspot_2_tx:input_FR".to_string(),
+                "input.hamspot_2_tx:input_FL".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_missing_outside_port_is_not_a_radio_wait() {
+        let links = vec![
+            AudioLink {
+                output: "GQRX:output_FL".into(),
+                input: "hamspot_3_rx:playback_FL".into(),
+            },
+            AudioLink {
+                output: "mic:capture_MONO".into(),
+                input: "input.hamspot_3_tx:input_FL".into(),
+            },
+        ];
+        let outputs = vec![
+            "mic:capture_MONO".into(),
+            "output.hamspot_3_rx:output_FL".into(),
+        ];
+        let inputs = vec![
+            "hamspot_3_rx:playback_FL".into(),
+            "input.hamspot_3_tx:input_FL".into(),
+        ];
+        let own = vec![
+            "hamspot_3_rx".into(),
+            "hamspot_3_tx".into(),
+            "output.hamspot_3_rx".into(),
+            "input.hamspot_3_tx".into(),
+        ];
+        let pass = classify_saved(&links, &outputs, &inputs, &own);
+        assert!(!pass.waiting_on_own);
+        assert_eq!(pass.ready.len(), 1);
+        assert_eq!(pass.ready[0].output, "mic:capture_MONO");
+        assert!(missing_port(
+            "pw-link: failed to link ports: No such file or directory"
+        ));
+    }
+
+    #[test]
+    fn a_pipewire_listing_names_each_output_link_once() {
+        let text = "\
+output.hamspot_3_rx:output_FL
+  |-> alsa_output.speakers:playback_FL
+output.hamspot_3_rx:output_FR
+  |-> alsa_output.speakers:playback_FR
+alsa_output.speakers:playback_FL
+  |<- output.hamspot_3_rx:output_FL
+  |<- pw-cat:output_FL
+hamspot_3_rx:monitor_FL
+  |-> commander-rx-3:input_FL
+";
+        let links = output_links_from_list(text, "output.hamspot_3_rx");
+        assert_eq!(
+            links,
+            vec![
+                (
+                    "output.hamspot_3_rx:output_FL".to_string(),
+                    "alsa_output.speakers:playback_FL".to_string()
+                ),
+                (
+                    "output.hamspot_3_rx:output_FR".to_string(),
+                    "alsa_output.speakers:playback_FR".to_string()
+                ),
+            ]
+        );
+        assert_eq!(
+            output_links_from_list(text, "pw-cat"),
+            vec![(
+                "pw-cat:output_FL".to_string(),
+                "alsa_output.speakers:playback_FL".to_string()
+            )]
+        );
+        assert!(output_links_from_list(text, "commander-rx-3").is_empty());
+    }
+
+    #[test]
+    fn a_missing_radio_port_keeps_the_wire_waiting() {
+        let links = vec![AudioLink {
+            output: "GQRX:output_FL".into(),
+            input: "hamspot_3_rx:playback_FL".into(),
+        }];
+        let outputs = vec!["GQRX:output_FL".into()];
+        let inputs = vec!["input.hamspot_3_tx:input_FL".into()];
+        let own = vec!["hamspot_3_rx".into(), "input.hamspot_3_tx".into()];
+        let pass = classify_saved(&links, &outputs, &inputs, &own);
+        assert!(pass.waiting_on_own);
+        assert!(pass.ready.is_empty());
     }
 }
