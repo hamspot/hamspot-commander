@@ -4,10 +4,14 @@
 //! `Date: 2026.10.18 Time: 14:32:05 UTC` and, when the offset is not zero,
 //! `Local Time Offset: -5.0 Hours;`. The printed instant is stored as the
 //! difference from this machine's clock. Later frames add that skew, so the
-//! digits keep moving until the next broadcast. The face shows that local
-//! time as hours and minutes plus the NATO zone letter (`02:34Q`).
+//! digits keep moving between syncs. A new sync is applied once a minute, so
+//! the face does not jump on every broadcast. The face shows local time as
+//! hours and minutes plus the NATO zone letter (`02:34Q`).
 
 use eframe::egui;
+
+/// One minute of machine time between applied syncs.
+const SYNC_MINUTE_MS: i64 = 60_000;
 
 /// System UTC minus the machine clock, in milliseconds, plus the local offset.
 #[derive(Clone, Debug, Default)]
@@ -15,6 +19,10 @@ pub struct SystemClock {
     skew_ms: i64,
     offset_hours: f64,
     seen: bool,
+    /// Machine time of the last applied sync.
+    applied_at_ms: i64,
+    /// The offset line after an applied sync belongs to that sync.
+    take_offset: bool,
 }
 
 /// One painted instant. The digits are local time in the trunking zone.
@@ -33,16 +41,27 @@ pub struct Readout {
 
 impl SystemClock {
     /// Apply one decoder line. `now_ms` is the machine clock as Unix milliseconds.
+    ///
+    /// The first sync sets the clock. Another sync is applied only after a
+    /// minute, which is also when a correction is taken. Syncs in between are
+    /// ignored so the digits do not jump.
     pub fn note_line(&mut self, line: &str, now_ms: i64) {
         if let Some(hours) = parse_offset(line) {
-            if self.seen {
+            if self.take_offset {
                 self.offset_hours = hours;
+                self.take_offset = false;
             }
             return;
         }
         let Some((year, month, day, hour, minute, second)) = parse_stamp(line) else {
             return;
         };
+        let due = !self.seen
+            || now_ms < self.applied_at_ms
+            || now_ms.saturating_sub(self.applied_at_ms) >= SYNC_MINUTE_MS;
+        if !due {
+            return;
+        }
         let unix = days_from_civil(year, month, day) * 86_400
             + hour as i64 * 3_600
             + minute as i64 * 60
@@ -51,6 +70,8 @@ impl SystemClock {
         // A missing offset line means the decoder saw zero.
         self.offset_hours = 0.0;
         self.seen = true;
+        self.applied_at_ms = now_ms;
+        self.take_offset = true;
     }
 
     pub fn face_at(&self, now_ms: i64) -> Option<Readout> {
@@ -458,6 +479,18 @@ mod tests {
         assert_eq!(face.date, "18 OCT 2026");
         let later = clock.face_at(now + 90_000).expect("later");
         assert_eq!((later.hour, later.minute, later.second), (9, 33, 35));
+        // A sync a few seconds later does not move the face.
+        clock.note_line("  Date: 2026.10.18 Time: 14:40:00 UTC", now + 5_000);
+        clock.note_line("  Local Time Offset: -4.0 Hours;", now + 5_000);
+        let held = clock.face_at(now + 5_000).expect("held");
+        assert_eq!((held.hour, held.minute, held.second), (9, 32, 10));
+        assert_eq!(held.zone, 'R');
+        // The next minute takes the correction.
+        clock.note_line("  Date: 2026.10.18 Time: 14:42:05 UTC", now + 90_000);
+        clock.note_line("  Local Time Offset: -5.0 Hours;", now + 90_000);
+        let corrected = clock.face_at(now + 90_000).expect("corrected");
+        assert_eq!((corrected.hour, corrected.minute, corrected.second), (9, 42, 5));
+        assert_eq!(corrected.zone, 'R');
     }
 
     #[test]
@@ -489,13 +522,13 @@ mod tests {
         clock.note_line("  Local Time Offset: -4.0 Hours;", 10);
         let quebec = clock.face_at(10).unwrap();
         assert_eq!(face_text(&quebec), "02:34Q");
-        clock.note_line("Date: 2026.10.18 Time: 06:34:00 UTC", 10);
-        clock.note_line("  Local Time Offset: -4.5 Hours;", 10);
-        let half = clock.face_at(10).unwrap();
+        clock.note_line("Date: 2026.10.18 Time: 06:34:00 UTC", 10 + 60_000);
+        clock.note_line("  Local Time Offset: -4.5 Hours;", 10 + 60_000);
+        let half = clock.face_at(10 + 60_000).unwrap();
         assert_eq!(face_text(&half), "02:04Q*");
         assert!(half.zone_half);
-        clock.note_line("Date: 2026.10.18 Time: 01:02:04 UTC", 1_010);
-        assert_eq!(clock.face_at(1_010).unwrap().zone, 'Z');
+        clock.note_line("Date: 2026.10.18 Time: 01:02:04 UTC", 10 + 120_000);
+        assert_eq!(clock.face_at(10 + 120_000).unwrap().zone, 'Z');
         assert_eq!(nato_zone(10.0).0, 'K');
         assert_eq!(nato_zone(-12.0).0, 'Y');
     }

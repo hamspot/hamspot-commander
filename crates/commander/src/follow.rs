@@ -1099,6 +1099,39 @@ pub fn plain_line(line: &str) -> String {
     strip_ansi(line)
 }
 
+/// Identity from a Phase 1 sync line. Other lines, including a registration,
+/// are not this site's banner.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SiteBanner {
+    pub wacn: String,
+    pub sys: String,
+    pub nac: String,
+    pub rfss: String,
+    pub site: String,
+}
+
+/// `Sync: +P25p1 WACN: BEE00; SYS: 6BD; NAC/CC: 6B5; RFSS: 001; Site: 037`.
+pub fn site_banner(line: &str) -> Option<SiteBanner> {
+    let line = plain_line(line);
+    if !line.contains("Sync:") || !line.contains("P25p1") || !line.contains("WACN:") {
+        return None;
+    }
+    let banner = SiteBanner {
+        wacn: hex_after(&line, "WACN: ").unwrap_or_default(),
+        sys: hex_after(&line, "SYS: ").unwrap_or_default(),
+        nac: hex_after(&line, "NAC/CC: ").unwrap_or_default(),
+        rfss: hex_after(&line, "RFSS: ").unwrap_or_default(),
+        site: hex_after(&line, "Site: ")
+            .or_else(|| hex_after(&line, "SITE: "))
+            .unwrap_or_default(),
+    };
+    if banner.wacn.is_empty() && banner.sys.is_empty() {
+        None
+    } else {
+        Some(banner)
+    }
+}
+
 fn strip_ansi(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut chars = line.chars();
@@ -1126,6 +1159,18 @@ mod tests {
             tg,
             alg: CLEAR_ALG,
         }
+    }
+
+    #[test]
+    fn a_phase1_sync_line_names_the_site() {
+        let line = "Sync: +P25p1 WACN: BEE00; SYS: 6BD; NAC/CC: 6B5; RFSS: 001; Site: 037; TSBK";
+        let banner = site_banner(line).expect("banner");
+        assert_eq!(banner.wacn, "BEE00");
+        assert_eq!(banner.sys, "6BD");
+        assert_eq!(banner.nac, "6B5");
+        assert_eq!(banner.rfss, "001");
+        assert_eq!(banner.site, "037");
+        assert!(site_banner("Unit Registration Response - WACN: BEE00; SYS: 2A1; SRC: 99").is_none());
     }
 
     #[test]

@@ -1,0 +1,193 @@
+#!/bin/bash
+# P25 Phase 1 receive pipe that records why dsd-fme exits.
+#
+# Same audio path as commander-demod-p25.rxpipe. stdin and stdout are
+# 48 kHz mono signed 16-bit little-endian. dsd-fme reads that stream and
+# sends 8 kHz mono voice to UDP. socat and sox turn the voice back into
+# the format the pipe plays. The first argument is the UDP port.
+#
+# stderr is appended to the trace log and still passed to Commander.
+# dsd-fme runs under catchsegv, so a fatal signal prints a backtrace on
+# that stderr. The script then writes the pid and wait status and exits.
+# The supervisor restarts the pipe, the same as the normal P25 script.
+
+set -euo pipefail
+
+port="${1:-23469}"
+case "$port" in
+    ''|*[!0-9]*)
+        echo "commander-demod-p25-trace: port must be a number" >&2
+        exit 1
+        ;;
+esac
+
+for program in dsd-fme socat sox; do
+    if ! command -v "$program" >/dev/null 2>&1; then
+        echo "commander-demod-p25-trace: ${program} is not on PATH" >&2
+        exit 1
+    fi
+done
+
+home_dir="${HOME:?HOME is not set}"
+log_dir="${home_dir}/.local/share/hamspot-commander"
+log="${log_dir}/dsd-fme-trace.log"
+install -d -m 755 "$log_dir"
+ulimit -c unlimited
+
+{
+    printf '%s\n' "===== $(date -Is) p25-trace ====="
+    dsd-fme -h 2>&1 | grep -E 'Build Version|MBElib Version' || true
+    printf 'core_pattern: %s\n' "$(cat /proc/sys/kernel/core_pattern 2>/dev/null || echo unknown)"
+    if command -v catchsegv >/dev/null 2>&1; then
+        printf 'catchsegv: %s\n' "$(command -v catchsegv)"
+    else
+        printf '%s\n' "catchsegv: absent"
+    fi
+    printf 'argv: dsd-fme -f1 -i - -o udp:127.0.0.1:%s\n' "$port"
+} >>"$log"
+echo "hamspot: trace log ${log}" >&2
+
+# fd 3 stays the stderr Commander is reading. The tee copies every later
+# line into the log without taking that stream away.
+exec 3>&2
+if command -v stdbuf >/dev/null 2>&1; then
+    exec 2> >(stdbuf -oL tee -a "$log" >&3)
+else
+    exec 2> >(tee -a "$log" >&3)
+fi
+
+decoder=""
+feed=""
+listener=""
+player=""
+voice=""
+audio=""
+search=""
+cleanup() {
+    if [[ -n "$decoder" ]]; then
+        kill "$decoder" 2>/dev/null || true
+    fi
+    if [[ -n "$feed" ]]; then
+        kill "$feed" 2>/dev/null || true
+    fi
+    if [[ -n "$listener" ]]; then
+        kill "$listener" 2>/dev/null || true
+    fi
+    if [[ -n "$player" ]]; then
+        kill "$player" 2>/dev/null || true
+    fi
+    if [[ -n "$voice" ]]; then
+        rm -f "$voice"
+    fi
+    if [[ -n "$audio" ]]; then
+        rm -f "$audio"
+    fi
+    if [[ -n "$search" ]]; then
+        rm -f "$search"
+    fi
+}
+trap cleanup EXIT
+
+voice="$(mktemp -u /tmp/hamspot-rxpipe.XXXXXX)"
+mkfifo -m 600 "$voice"
+
+# catchsegv prints the backtrace on its own stdout after the decoder
+# exits, and forwards the decoder's stderr. Both belong on this script's
+# stderr. The script's stdout stays the 48 kHz voice stream.
+#
+# The audio redirect has to be on this background command. Bash points a
+# bare & job at /dev/null when job control is off. A redirect on the
+# function call is closed when the function returns, so dsd-fme sees EOF,
+# prints "Exiting.", and the search helper dies with SIGPIPE (status 141).
+start_decoder() {
+    if command -v catchsegv >/dev/null 2>&1; then
+        catchsegv dsd-fme -f1 -i - -o "udp:127.0.0.1:${port}" <&0 >&2 2>&1 &
+    else
+        echo "hamspot: catchsegv is not on PATH" >&2
+        dsd-fme -f1 -i - -o "udp:127.0.0.1:${port}" <&0 >/dev/null &
+    fi
+    decoder=$!
+}
+
+# HAMSPOT_CC_EVENTS=1 keeps the search counter. Commander reads the
+# trunking lines from stderr either way. The function is called with the
+# audio on its stdin so the <&0 above is that stream.
+# HAMSPOT_CC_EVENTS=1 keeps the search counter. Commander reads the
+# trunking lines from stderr either way.
+#
+# dsd-fme prints "Sync: no sync" only after a carrier has already been
+# seen. A control channel that never locks is silent. The perl process
+# counts one search of audio and prints "hamspot: search". dsd walks
+# 10200 symbols before it resets (dsd_frame_sync.c). Phase 1 is 4800
+# symbols/s and this pipe is 48 kHz s16, 10 samples per symbol, so one
+# search is 204000 bytes. The line is that audio arriving. There is no sleep.
+if [[ "${HAMSPOT_CC_EVENTS:-}" == "1" ]]; then
+    audio="$(mktemp -u /tmp/hamspot-rxpipe-audio.XXXXXX)"
+    mkfifo -m 600 "$audio"
+    search="$(mktemp /tmp/hamspot-rxpipe-search.XXXXXX)"
+    cat >"$search" <<'PERL'
+use strict;
+use warnings;
+use IO::Handle;
+use Errno qw(EINTR);
+binmode STDIN;
+binmode STDOUT;
+STDERR->autoflush(1);
+STDOUT->autoflush(1);
+my $limit = 204000;
+my $n = 0;
+while (1) {
+    my $buf;
+    my $got = sysread(STDIN, $buf, 8192);
+    if (!defined $got) {
+        next if $! == EINTR;
+        exit 1;
+    }
+    last if $got == 0;
+    my $off = 0;
+    while ($off < $got) {
+        my $wrote = syswrite(STDOUT, $buf, $got - $off, $off);
+        if (!defined $wrote) {
+            next if $! == EINTR;
+            exit 1;
+        }
+        exit 1 if $wrote == 0;
+        $off += $wrote;
+    }
+    $n += $got;
+    while ($n >= $limit) {
+        $n -= $limit;
+        print STDERR "hamspot: search\n";
+    }
+}
+exit 0;
+PERL
+    perl "$search" <&0 >"$audio" &
+    feed=$!
+    start_decoder <"$audio"
+else
+    start_decoder <&0
+fi
+socat -u "udp-listen:${port}" - </dev/null >"$voice" &
+listener=$!
+sox -q -t raw -r 8000 -e signed -b 16 -c 1 "$voice" -t raw -r 48000 -e signed -b 16 -c 1 - </dev/null &
+player=$!
+
+# One exit is the fault. Name that pid, then let the trap stop the rest.
+set +e
+if [[ -n "${feed}" ]]; then
+    wait -n -p dead "$decoder" "$feed" "$listener" "$player"
+else
+    wait -n -p dead "$decoder" "$listener" "$player"
+fi
+status=$?
+set -e
+who="other"
+case "${dead:-}" in
+    "$decoder") who="decoder" ;;
+    "$feed") who="search" ;;
+    "$listener") who="socat" ;;
+    "$player") who="sox" ;;
+esac
+echo "hamspot: pipe exit ${who} pid=${dead:-0} status=${status}" >&2
+exit "$status"

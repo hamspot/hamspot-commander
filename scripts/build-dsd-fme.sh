@@ -4,9 +4,9 @@
 # With no arguments this builds the webaugur no-halfrate pair. That mbelib
 # omits the 3600x2450 half-rate decoder, and dsd-fme fills those frames with
 # silence. Phase 1 IMBE, D-STAR 3600x2400, and the Phase 2 air interface stay.
-# scripts/install.sh calls this form.
 #
 # --upstream builds unmodified lwvmobile mbelib and dsd-fme (audio_work).
+# scripts/install.sh passes --upstream.
 # Both libraries always come from the same side. Upstream
 # dsd-fme will not link a mbelib that is missing the half-rate symbols.
 #

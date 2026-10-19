@@ -62,6 +62,14 @@ pub struct ConfigFile {
     pub talkgroup_zone: usize,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub talkgroup_sel: usize,
+    /// Radio-id row that was open. Absent means the first row.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unit_sel: usize,
+    /// Indexes into `radios` whose talkgroup Follow box is on.
+    /// Absent in a station written before that box was stored.
+    /// This is not the Gpredict `follow` flag on a radio.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub control_follow: Vec<usize>,
     /// Meter order, lock, and the torn-off window when its screen place is known.
     #[serde(default, skip_serializing_if = "MetersFace::is_default")]
     pub meters: MetersFace,
@@ -349,7 +357,27 @@ pub fn validate(file: &ConfigFile) -> Result<(), String> {
     for rotator in &file.rotators {
         crate::rot::validate_spec(rotator)?;
     }
+    let mut seen_follow = Vec::new();
+    for index in &file.control_follow {
+        if *index >= file.radios.len() || seen_follow.contains(index) {
+            return Err(format!(
+                "control follow radio {index} is not in the radio list"
+            ));
+        }
+        seen_follow.push(*index);
+    }
     Ok(())
+}
+
+/// One flag per radio. `indexes` are the radios whose talkgroup Follow box is on.
+pub fn control_follow_flags(radio_count: usize, indexes: &[usize]) -> Vec<bool> {
+    let mut on = vec![false; radio_count];
+    for index in indexes {
+        if let Some(flag) = on.get_mut(*index) {
+            *flag = true;
+        }
+    }
+    on
 }
 
 /// A band-plan file name with no directory. `../x.json` is refused.
@@ -444,6 +472,8 @@ mod tests {
             channel_sel: 0,
             talkgroup_zone: 0,
             talkgroup_sel: 0,
+            unit_sel: 0,
+            control_follow: Vec::new(),
             meters: MetersFace::default(),
         }
     }
@@ -531,6 +561,35 @@ mod tests {
         assert!(loaded.talkgroups.zones[0].talkgroups.is_empty());
         assert!(loaded.units.is_empty());
         assert!(!text.contains("\"units\""));
+    }
+
+    #[test]
+    fn control_follow_round_trips_and_an_old_file_leaves_it_off() {
+        let mut file = sample();
+        let mut second = crate::cat::RadioSpec::dummy();
+        second.name = "HackRF".into();
+        file.radios = vec![crate::cat::RadioSpec::dummy(), second];
+        file.control_follow = vec![1];
+        file.unit_sel = 3;
+        let text = to_string(&file).unwrap();
+        assert!(text.contains("\"control_follow\""));
+        assert!(text.contains("\"unit_sel\""));
+        let back = parse(&text).unwrap();
+        assert_eq!(back.control_follow, vec![1]);
+        assert_eq!(control_follow_flags(back.radios.len(), &back.control_follow), vec![
+            false, true
+        ]);
+        assert_eq!(back.unit_sel, 3);
+        let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        value.as_object_mut().unwrap().remove("control_follow");
+        value.as_object_mut().unwrap().remove("unit_sel");
+        let loaded = parse(&value.to_string()).unwrap();
+        assert!(loaded.control_follow.is_empty());
+        assert_eq!(loaded.unit_sel, 0);
+        file.control_follow = vec![5];
+        assert!(to_string(&file).is_err());
+        file.control_follow = vec![1, 1];
+        assert!(to_string(&file).is_err());
     }
 
     #[test]

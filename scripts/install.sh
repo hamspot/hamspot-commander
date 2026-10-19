@@ -2,7 +2,8 @@
 # Install Hamspot Commander for Ubuntu 26.04.
 #
 # Apt packages, a release binary under ~/.local/bin, the desktop entry, and
-# its icon. Serial ports stay on the distro dialout udev rule. This script
+# its icon. dsd-fme and mbelib are the unmodified upstream libraries.
+# Serial ports stay on the distro dialout udev rule. This script
 # adds the user to dialout or plugdev only when they are not already a member.
 # It does not start Commander or Gqrx.
 
@@ -209,7 +210,7 @@ command -v rustc >/dev/null 2>&1 || die "rustc is not on PATH after apt install"
 
 install -d -m 755 "${home_dir}/.local/bin"
 install -m 755 "${root}/target/release/commander" "$bin_path"
-"${root}/scripts/build-dsd-fme.sh"
+"${root}/scripts/build-dsd-fme.sh" --upstream
 install_modems
 if p25voice_wanted; then
     "${root}/scripts/install-p25voice.sh"

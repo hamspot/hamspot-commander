@@ -287,6 +287,14 @@ pub fn strength_frac(db: f64) -> f32 {
     ((db - (-54.0)) / (60.0 - (-54.0))).clamp(0.0, 1.0) as f32
 }
 
+/// GQRX `l STRENGTH` is dBFS. Full scale is 0, and GQRX's own meter starts
+/// at -100. This face starts at S0, which is -54 on the hamlib scale, so
+/// -100 dBFS is drawn as S0. A reading before DSP starts is about -200 and
+/// stays on that stop. This is not a dBm calibration.
+pub fn gqrx_dbfs_to_s9(dbfs: f64) -> f64 {
+    dbfs + 46.0
+}
+
 pub fn strength_label(db: f64) -> String {
     if db >= 1.0 {
         format!("S9+{:.0}", db)
@@ -884,6 +892,7 @@ pub fn meter_faces(
     values: &[(&str, f64)],
     strength_db: f64,
     ptt: bool,
+    strength_dbfs: bool,
 ) -> Vec<MeterFace> {
     let listed = |id: &str| get_levels.iter().any(|(name, _, _)| *name == id);
     let span = |id: &str| {
@@ -904,7 +913,7 @@ pub fn meter_faces(
     ids.into_iter()
         .filter_map(|id| {
             let (min, max) = span(id).unwrap_or((0.0, 0.0));
-            face_for(id, value(id), min, max, strength_db, ptt)
+            face_for(id, value(id), min, max, strength_db, ptt, strength_dbfs)
         })
         .collect()
 }
@@ -916,12 +925,16 @@ fn face_for(
     max: f64,
     strength_db: f64,
     ptt: bool,
+    strength_dbfs: bool,
 ) -> Option<MeterFace> {
     let power = matches!(id, "RFPOWER_METER" | "RFPOWER_METER_WATTS" | "RFPOWER");
     let lamp = if power && ptt { Lamp::Red } else { Lamp::Warm };
     let (scale, frac) = match id {
         "STRENGTH" => {
-            let db = value.unwrap_or(strength_db);
+            let mut db = value.unwrap_or(strength_db);
+            if strength_dbfs {
+                db = gqrx_dbfs_to_s9(db);
+            }
             (s_scale(), strength_frac(db))
         }
         "SWR" => (swr_scale(), ((value.unwrap_or(1.0) - 1.0) / 4.0) as f32),
@@ -1421,6 +1434,34 @@ mod tests {
     }
 
     #[test]
+    fn gqrx_dbfs_uses_the_s_meter_and_a_hamlib_reading_does_not() {
+        assert!((gqrx_dbfs_to_s9(-100.0) - -54.0).abs() < 0.01);
+        assert!((gqrx_dbfs_to_s9(-46.0) - 0.0).abs() < 0.01);
+        assert!((gqrx_dbfs_to_s9(0.0) - 46.0).abs() < 0.01);
+        assert_eq!(strength_label(gqrx_dbfs_to_s9(-100.0)), "S0");
+        assert_eq!(strength_label(gqrx_dbfs_to_s9(-200.0)), "S0");
+        assert_eq!(strength_label(gqrx_dbfs_to_s9(-46.0)), "S9");
+        assert_eq!(strength_label(gqrx_dbfs_to_s9(-40.0)), "S9+6");
+        let gqrx = meter_faces(
+            &[("STRENGTH", 0.0, 0.0)],
+            &[("STRENGTH", -40.0)],
+            -40.0,
+            false,
+            true,
+        );
+        let hamlib = meter_faces(
+            &[("STRENGTH", -54.0, 60.0)],
+            &[("STRENGTH", -40.0)],
+            -40.0,
+            false,
+            false,
+        );
+        assert!((gqrx[0].frac - strength_frac(6.0)).abs() < 0.001);
+        assert!((hamlib[0].frac - strength_frac(-40.0)).abs() < 0.001);
+        assert!(gqrx[0].frac > hamlib[0].frac);
+    }
+
+    #[test]
     fn s_scale_matches_the_strength_span() {
         let scale = s_scale();
         assert_eq!(scale.name, "S");
@@ -1494,7 +1535,7 @@ mod tests {
             ("VD_METER", 12.0),
             ("AF", 0.2),
         ];
-        let faces = meter_faces(&get, &values, 0.0, true);
+        let faces = meter_faces(&get, &values, 0.0, true, false);
         let ids: Vec<&str> = faces.iter().map(|face| face.id.as_str()).collect();
         assert_eq!(ids, ["STRENGTH", "ALC", "SWR", "RFPOWER_METER", "VD_METER"]);
         assert_eq!(faces[2].scale.name, "SWR");
@@ -1507,7 +1548,7 @@ mod tests {
     #[test]
     fn power_falls_back_to_rfpower_when_the_radio_has_no_meter() {
         let get = [("RFPOWER", 0.0, 1.0), ("AF", 0.0, 1.0)];
-        let faces = meter_faces(&get, &[("RFPOWER", 0.4)], -54.0, false);
+        let faces = meter_faces(&get, &[("RFPOWER", 0.4)], -54.0, false, false);
         assert_eq!(faces.len(), 1);
         assert_eq!(faces[0].id, "RFPOWER");
         assert_eq!(faces[0].scale.name, "PWR");
@@ -1524,6 +1565,7 @@ mod tests {
             ],
             &[],
             -54.0,
+            false,
             false,
         );
         let saved = ["SWR".into(), "GONE".into(), "STRENGTH".into()];
@@ -1552,6 +1594,7 @@ mod tests {
             &[("STRENGTH", -54.0, 60.0), ("SWR", 1.0, 5.0)],
             &[],
             -54.0,
+            false,
             false,
         );
         let saved = ["SWR".into(), "STRENGTH".into()];

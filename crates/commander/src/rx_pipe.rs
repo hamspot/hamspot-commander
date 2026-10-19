@@ -362,12 +362,17 @@ pub fn release_voice_port(port: u16) {
     VOICE_PORTS.lock().expect("voice ports").remove(&port);
 }
 
-/// True when `command` is the P25 Phase 1 receive script.
+/// True when `command` is a P25 Phase 1 receive script.
+///
+/// The trace script is the same pipe with a crash log. Follow, the speaker
+/// gate, and decoder stderr stay on for both.
 pub fn is_p25_rx(command: &str) -> bool {
-    Path::new(command)
-        .file_name()
-        .and_then(|name| name.to_str())
-        == Some("commander-demod-p25.rxpipe")
+    matches!(
+        Path::new(command)
+            .file_name()
+            .and_then(|name| name.to_str()),
+        Some("commander-demod-p25.rxpipe" | "commander-demod-p25-trace.rxpipe")
+    )
 }
 
 /// Record `hamspot_{id}_rx`, run `command`, play to `speaker`.
@@ -957,6 +962,15 @@ mod tests {
         assert!(script_matches("commander-demod-p25.rxpipe", &scripts[0]));
         assert_eq!(choice_text("commander-demod-p25.rxpipe", &scripts), "p25");
         assert_eq!(pipeline_label("commander-demod-dmr.rxpipe"), "dmr");
+        assert!(is_p25_rx(
+            "/opt/modems/commander-demod-p25-trace.rxpipe"
+        ));
+        assert!(is_p25_rx("commander-demod-p25.rxpipe"));
+        assert!(!is_p25_rx("commander-demod-dmr.rxpipe"));
+        assert_eq!(
+            pipeline_label("commander-demod-p25-trace.rxpipe"),
+            "p25-trace"
+        );
         assert_eq!(pipeline_label("custom.rxpipe"), "custom");
         assert_eq!(choice_text("", &scripts), "none");
         let _ = std::fs::remove_dir_all(root);

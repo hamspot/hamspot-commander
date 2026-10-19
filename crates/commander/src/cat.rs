@@ -216,6 +216,9 @@ pub struct HubView {
     /// before it writes the open station file.
     pub audio_ready: bool,
     pub audio_note: String,
+    /// Bumps once each time the radio list is replaced. The window waits for
+    /// a newer value before it applies talkgroup Follow from a station file.
+    pub list_gen: u64,
 }
 
 enum HubCmd {
@@ -1123,7 +1126,17 @@ fn supervise(
         None => audio_note = "pw-dump is not available".into(),
     }
     let watch = DevWatch::open();
-    publish(&hub, &slots, selected, &serial, &look, false, &audio_note);
+    let mut list_gen = 0u64;
+    publish(
+        &hub,
+        &slots,
+        selected,
+        &serial,
+        &look,
+        false,
+        &audio_note,
+        list_gen,
+    );
     ctx.request_repaint();
     loop {
         let cmds = std::mem::take(&mut *hub.cmds.lock().expect("cat cmds"));
@@ -1272,6 +1285,7 @@ fn supervise(
                     specs,
                     selected: wanted,
                 } => {
+                    list_gen = list_gen.wrapping_add(1);
                     for slot in &mut slots {
                         stop_slot(slot);
                     }
@@ -1312,7 +1326,16 @@ fn supervise(
             for slot in &mut slots {
                 stop_slot(slot);
             }
-            publish(&hub, &slots, selected, &serial, &look, false, &audio_note);
+            publish(
+                &hub,
+                &slots,
+                selected,
+                &serial,
+                &look,
+                false,
+                &audio_note,
+                list_gen,
+            );
             break;
         }
         if let Some(watch) = &watch {
@@ -1373,7 +1396,16 @@ fn supervise(
         }
         let ready = audio_settled(&slots, &look.graph);
         if changed || slots.iter().any(|slot| slot.status_dirty) {
-            publish(&hub, &slots, selected, &serial, &look, ready, &audio_note);
+            publish(
+                &hub,
+                &slots,
+                selected,
+                &serial,
+                &look,
+                ready,
+                &audio_note,
+                list_gen,
+            );
             for slot in &mut slots {
                 slot.status_dirty = false;
             }
@@ -1781,6 +1813,7 @@ fn publish(
     look: &crate::audio::AudioLook,
     audio_ready: bool,
     audio_note: &str,
+    list_gen: u64,
 ) {
     let rows = slots
         .iter()
@@ -1827,6 +1860,7 @@ fn publish(
         connect_ports: look.connect_ports.clone(),
         audio_ready,
         audio_note: audio_note.to_string(),
+        list_gen,
     };
 }
 
