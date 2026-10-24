@@ -70,9 +70,48 @@ pub struct ConfigFile {
     /// This is not the Gpredict `follow` flag on a radio.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub control_follow: Vec<usize>,
+    /// Trunking job of a receiver. Absent means every followed radio is
+    /// both the control receiver and the voice receiver.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trunk_receivers: Vec<TrunkReceiver>,
+    /// Channel zones marked for the purple scan list, in zone-list order.
+    /// Absent in a station written before that list was stored.
+    /// SCAN and DWELL themselves are not stored.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scan_zones: Vec<usize>,
+    /// Talkgroup zones marked for HackRF monitoring. Indexes into
+    /// `talkgroups.zones`. Absent in an older station file.
+    /// SCAN and DWELL are not stored here either.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub monitor_zones: Vec<usize>,
+    /// Talkgroup numbers marked for HackRF monitoring. A number can be
+    /// stored before that talkgroup is in the file. 0 is not a talkgroup.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub monitor_talkgroups: Vec<u32>,
     /// Meter order, lock, and the torn-off window when its screen place is known.
     #[serde(default, skip_serializing_if = "MetersFace::is_default")]
     pub meters: MetersFace,
+}
+
+/// What one receiver does while Follow is on. A missing entry means Both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TrunkRole {
+    /// Stay on the control channel. Do not play voice.
+    Control,
+    /// Play voice. A far call may leave the control channel.
+    Voice,
+    /// Decode the control channel and play voice. A far call may leave.
+    Both,
+}
+
+/// One radio in the trunking receiver list. `radio` is an index into
+/// [`ConfigFile::radios`], the same index `control_follow` uses.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrunkReceiver {
+    pub radio: usize,
+    pub role: TrunkRole,
 }
 
 /// Where a torn-off window was. Every field is optional because Wayland does
@@ -366,6 +405,39 @@ pub fn validate(file: &ConfigFile) -> Result<(), String> {
         }
         seen_follow.push(*index);
     }
+    let mut seen_trunk = Vec::new();
+    for entry in &file.trunk_receivers {
+        if entry.radio >= file.radios.len() || seen_trunk.contains(&entry.radio) {
+            return Err(format!(
+                "trunk receiver {} is not in the radio list",
+                entry.radio
+            ));
+        }
+        seen_trunk.push(entry.radio);
+    }
+    let mut seen_zones = Vec::new();
+    for index in &file.scan_zones {
+        if *index >= file.channels.zones.len() || seen_zones.contains(index) {
+            return Err(format!("scan zone {index} is not in the zone list"));
+        }
+        seen_zones.push(*index);
+    }
+    let mut seen_monitor = Vec::new();
+    for index in &file.monitor_zones {
+        if *index >= file.talkgroups.zones.len() || seen_monitor.contains(index) {
+            return Err(format!(
+                "monitor zone {index} is not in the talkgroup list"
+            ));
+        }
+        seen_monitor.push(*index);
+    }
+    let mut seen_tg = Vec::new();
+    for tg in &file.monitor_talkgroups {
+        if *tg == 0 || seen_tg.contains(tg) {
+            return Err(format!("monitor talkgroup {tg} is not a talkgroup number"));
+        }
+        seen_tg.push(*tg);
+    }
     Ok(())
 }
 
@@ -474,8 +546,85 @@ mod tests {
             talkgroup_sel: 0,
             unit_sel: 0,
             control_follow: Vec::new(),
+            trunk_receivers: Vec::new(),
+            scan_zones: Vec::new(),
+            monitor_zones: Vec::new(),
+            monitor_talkgroups: Vec::new(),
             meters: MetersFace::default(),
         }
+    }
+
+    #[test]
+    fn scan_zones_round_trip_and_an_old_file_leaves_them_clear() {
+        let mut file = sample();
+        file.scan_zones = vec![0];
+        let text = to_string(&file).unwrap();
+        assert!(text.contains("\"scan_zones\""));
+        let back = parse(&text).unwrap();
+        assert_eq!(back.scan_zones, vec![0]);
+        let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        value.as_object_mut().unwrap().remove("scan_zones");
+        let loaded = parse(&value.to_string()).unwrap();
+        assert!(loaded.scan_zones.is_empty());
+        file.scan_zones = vec![4];
+        assert!(to_string(&file).is_err());
+        file.scan_zones = vec![0, 0];
+        assert!(to_string(&file).is_err());
+    }
+
+    #[test]
+    fn monitor_lists_round_trip_and_an_old_file_leaves_them_clear() {
+        let mut file = sample();
+        file.monitor_zones = vec![0];
+        file.monitor_talkgroups = vec![10006];
+        let text = to_string(&file).unwrap();
+        assert!(text.contains("\"monitor_zones\""));
+        assert!(text.contains("\"monitor_talkgroups\""));
+        let back = parse(&text).unwrap();
+        assert_eq!(back.monitor_zones, vec![0]);
+        assert_eq!(back.monitor_talkgroups, vec![10006]);
+        let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        value.as_object_mut().unwrap().remove("monitor_zones");
+        value.as_object_mut().unwrap().remove("monitor_talkgroups");
+        let loaded = parse(&value.to_string()).unwrap();
+        assert!(loaded.monitor_zones.is_empty());
+        assert!(loaded.monitor_talkgroups.is_empty());
+        file.monitor_zones = vec![1];
+        assert!(to_string(&file).is_err());
+        file.monitor_zones = vec![0, 0];
+        assert!(to_string(&file).is_err());
+        file.monitor_zones.clear();
+        file.monitor_talkgroups = vec![0];
+        assert!(to_string(&file).is_err());
+        file.monitor_talkgroups = vec![10006, 10006];
+        assert!(to_string(&file).is_err());
+    }
+
+    #[test]
+    fn a_hackrf_radio_loads_and_an_older_file_stays_hamlib() {
+        let mut file = sample();
+        let mut spec = crate::cat::RadioSpec::dummy();
+        spec.driver = crate::cat::RadioDriver::Hackrf;
+        spec.name = "HackRF".into();
+        spec.model = 0;
+        spec.park = false;
+        spec.device = "0000000000000000457863c8252d451f".into();
+        file.radios.push(spec);
+        let text = to_string(&file).unwrap();
+        assert!(text.contains("\"hackrf\""));
+        let back = parse(&text).unwrap();
+        assert_eq!(back.radios[0].driver, crate::cat::RadioDriver::Hackrf);
+        assert_eq!(back.radios[0].sample_rate, crate::hackrf::SAMPLE_RATE);
+        let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        value["radios"][0]["driver"] = serde_json::json!("hamlib");
+        value["radios"][0]["model"] = serde_json::json!(1);
+        value["radios"][0].as_object_mut().unwrap().remove("sample_rate");
+        let loaded = parse(&value.to_string()).unwrap();
+        assert_eq!(loaded.radios[0].driver, crate::cat::RadioDriver::Hamlib);
+        assert_eq!(loaded.radios[0].sample_rate, crate::hackrf::SAMPLE_RATE);
+        value["radios"][0]["driver"] = serde_json::json!("gqrx");
+        let gqrx = parse(&value.to_string()).unwrap();
+        assert_eq!(gqrx.radios[0].driver, crate::cat::RadioDriver::Gqrx);
     }
 
     #[test]
@@ -520,6 +669,8 @@ mod tests {
             mode: "FM".into(),
             control: true,
             encrypted: false,
+            vocoder: String::new(),
+            invert: false,
         });
         file.talkgroups.zones[0].talkgroups.push(crate::talkgroups::Talkgroup {
             name: "01-LEDISP — Law: Dispatch (County)".into(),
@@ -542,6 +693,9 @@ mod tests {
             gqrx: crate::cat::GqrxConfig::new(),
             rx_pipe: "commander-demod-p25.rxpipe".into(),
             tx_pipe: "commander-mod-p25.txpipe".into(),
+            sample_rate: crate::hackrf::SAMPLE_RATE,
+            lna_db: None,
+            vga_db: None,
         });
         let text = to_string(&file).unwrap();
         assert!(text.contains("\"talkgroups\""));
@@ -589,6 +743,50 @@ mod tests {
         file.control_follow = vec![5];
         assert!(to_string(&file).is_err());
         file.control_follow = vec![1, 1];
+        assert!(to_string(&file).is_err());
+    }
+
+    #[test]
+    fn trunk_receivers_round_trip_and_an_old_file_omits_them() {
+        let mut file = sample();
+        let mut second = crate::cat::RadioSpec::dummy();
+        second.name = "Voice".into();
+        file.radios = vec![crate::cat::RadioSpec::dummy(), second];
+        file.trunk_receivers = vec![
+            TrunkReceiver {
+                radio: 0,
+                role: TrunkRole::Control,
+            },
+            TrunkReceiver {
+                radio: 1,
+                role: TrunkRole::Voice,
+            },
+        ];
+        let text = to_string(&file).unwrap();
+        assert!(text.contains("\"trunk_receivers\""));
+        assert!(text.contains("\"control\""));
+        assert!(text.contains("\"voice\""));
+        let back = parse(&text).unwrap();
+        assert_eq!(back.trunk_receivers, file.trunk_receivers);
+        let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        value.as_object_mut().unwrap().remove("trunk_receivers");
+        let loaded = parse(&value.to_string()).unwrap();
+        assert!(loaded.trunk_receivers.is_empty());
+        file.trunk_receivers = vec![TrunkReceiver {
+            radio: 4,
+            role: TrunkRole::Both,
+        }];
+        assert!(to_string(&file).is_err());
+        file.trunk_receivers = vec![
+            TrunkReceiver {
+                radio: 0,
+                role: TrunkRole::Both,
+            },
+            TrunkReceiver {
+                radio: 0,
+                role: TrunkRole::Voice,
+            },
+        ];
         assert!(to_string(&file).is_err());
     }
 
@@ -679,6 +877,9 @@ mod tests {
             gqrx: crate::cat::GqrxConfig::new(),
             rx_pipe: String::new(),
             tx_pipe: String::new(),
+            sample_rate: crate::hackrf::SAMPLE_RATE,
+            lna_db: None,
+            vga_db: None,
         });
         let back = parse(&to_string(&file).unwrap()).unwrap();
         assert_eq!(back.radios.len(), 1);
@@ -919,5 +1120,29 @@ mod tests {
             BspInstall::NoFolder
         ));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_agent_guide_example_station_loads() {
+        let guide = include_str!("../../../docs/AGENT-HSCommander.md");
+        let at = guide.find("North-County.HSCommander").expect("heading");
+        let json_at = guide[at..].find("```json").expect("station fence");
+        let body = at + json_at + "```json".len();
+        let end = guide[body..].find("```").expect("station end");
+        let station = guide[body..body + end].trim();
+        let file = parse(station).expect("station");
+        assert_eq!(file.channels.zones.len(), 1);
+        assert_eq!(file.channels.zones[0].channels.len(), 3);
+        assert!(file.channels.zones[0].channels[0].control);
+        assert_eq!(file.tune.freq_hz, 855_212_500.0);
+        assert!(file.talkgroups.zones[0].talkgroups[1].encrypted);
+        let rest = &guide[body + end..];
+        let key_at = rest.find("```json").expect("key fence");
+        let key_body = key_at + "```json".len();
+        let key_end = rest[key_body..].find("```").expect("key end");
+        let keys = crate::keys::parse(rest[key_body..key_body + key_end].trim()).expect("keys");
+        assert_eq!(keys.keys.len(), 1);
+        assert!(keys.keys[0].text.is_empty());
+        assert_eq!(keys.keys[0].alg, "84");
     }
 }

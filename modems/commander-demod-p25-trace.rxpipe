@@ -165,6 +165,9 @@ PERL
     perl "$search" <&0 >"$audio" &
     feed=$!
     start_decoder <"$audio"
+elif [[ "${HAMSPOT_IDENTITY:-}" == "1" ]]; then
+    # Scanner glass. stderr stays. The hunt counter stays off.
+    start_decoder <&0
 else
     start_decoder <&0
 fi

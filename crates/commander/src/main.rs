@@ -15,14 +15,18 @@ mod dial;
 mod exit_watch;
 mod follow;
 mod gpredict_hw;
+mod hackrf;
+mod keys;
 mod plan;
 mod talkgroups;
 mod units;
 mod rot;
 mod rx_pipe;
+mod scan;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -34,10 +38,9 @@ use dial::{
     channel_dial, channel_window, digit_steps, format_hz, lock_toggle,
     merge_meter_order, meter, meter_columns, meter_faces, meter_hit, meter_origin, move_meter,
     order_with_clock, SYSTEM_CLOCK,
-    gqrx_dbfs_to_s9, needle_settled, paint_analog_meter, parse_freq, scale, step_needle,
-    strength_frac, strength_label, swatch, vfo_label, wheel_notches, zone_scale, MeterFace, Needle,
-    PaintSpan,
-    SubBand, HAM, METER_GAP, METER_H, METER_W,
+    gqrx_dbfs_to_s9, needle_settled, paint_analog_meter, parse_freq, scale, spectrum_plot,
+    step_needle, strength_frac, strength_label, swatch, vfo_label, wheel_notches, zone_scale,
+    MeterFace, Needle, PaintSpan, SubBand, HAM, METER_GAP, METER_H, METER_W, SPECTRUM_H,
 };
 use plan::{BandPlan, Use};
 
@@ -125,6 +128,22 @@ struct PendingTune {
     tune: config::Tune,
     levels: BTreeMap<String, f64>,
     after_gen: u64,
+    after_list: u64,
+}
+
+/// One clear talkgroup grant the HackRF voice channel can still play.
+struct HeardGrant {
+    hz: f64,
+    tg: u32,
+    seq: u64,
+}
+
+/// LNA and VGA the Tune sliders last sent. The station file and the hub
+/// catch up on a later frame. The sliders keep showing this pair until then.
+struct HackrfGainHold {
+    id: u64,
+    lna: u32,
+    vga: u32,
 }
 
 #[derive(Clone)]
@@ -164,6 +183,10 @@ struct Shared {
     /// `rigctld` it just opened. A loaded config waits for a newer value so
     /// it is not applied to the radio that was already on the screen.
     live_gen: u64,
+    /// Bumps once each time a live session publishes a snapshot. Hamlib does
+    /// not push a settled S-meter, so the channel scan treats a new value as
+    /// the next sample. This is not [`Shared::live_gen`].
+    poll_gen: u64,
 }
 
 struct App {
@@ -228,6 +251,23 @@ struct App {
     /// A later manual scroll is left alone.
     zone_list_follow: bool,
     channel_sel: usize,
+    /// Scroll the channel list to the row SCAN just landed on.
+    channel_list_follow: bool,
+    /// Hops the zone on screen. Not written to the station file.
+    memory_scan: scan::Scanner,
+    /// Zones double-clicked into the scan list. Stored on the station file.
+    /// While this is not empty, SCAN hops these zones in list order.
+    scan_zones: BTreeSet<usize>,
+    /// Talkgroup zones whose every talkgroup is monitored on a HackRF radio.
+    monitor_zones: BTreeSet<usize>,
+    /// Talkgroup numbers monitored even when their zone is not.
+    monitor_talkgroups: BTreeSet<u32>,
+    /// The scan running under a purple list was started as the amber all-zone
+    /// scan. Clearing the last marked zone returns to that amber scan.
+    scan_amber_origin: bool,
+    /// Set while SCAN's own recall is sending, so that tune does not treat
+    /// the hop as the operator taking the dial.
+    scan_sending: bool,
     channel_path: String,
     /// Last folder chosen in the channel browser. Absent means the working directory.
     channel_dir: Option<PathBuf>,
@@ -238,6 +278,22 @@ struct App {
     talkgroup_path: String,
     talkgroup_dir: Option<PathBuf>,
     talkgroup_note: String,
+    /// Keys beside the station file. Not written into the station JSON.
+    keys: keys::KeyFile,
+    key_sel: usize,
+    key_note: String,
+    key_id_edit: String,
+    key_alg_edit: String,
+    key_name_edit: String,
+    key_text_edit: String,
+    /// Last folder chosen in the key import dialog. Absent means the working directory.
+    key_dir: Option<PathBuf>,
+    /// Row the editor is showing. A different selection reloads the fields.
+    key_shown: Option<usize>,
+    /// CSV path last handed to the radios, and the radio-list generation
+    /// that received it. A new radio gets the same path.
+    key_runtime: String,
+    key_runtime_gen: u64,
     /// Radios named on a control channel. The description is the operator's text.
     units: Vec<units::Unit>,
     unit_sel: usize,
@@ -251,24 +307,83 @@ struct App {
     pending_control: Option<(u64, Vec<bool>)>,
     /// Last events flag sent to the hub, so a frame does not restart the pipe.
     cc_sent: HashMap<u64, bool>,
+    /// Last channel-vocoder command sent per radio. The station file keeps
+    /// the kind on the memory. This map only stops a repeat send.
+    vocoder_sent: HashMap<u64, (String, String)>,
     cc_voice_sent: HashMap<u64, bool>,
     /// Last control-channel mode sent, so a parked radio is not told again.
     cc_mode_sent: HashMap<u64, String>,
     followers: HashMap<u64, follow::Follower>,
-    feeds: HashMap<u64, follow::DsdFeed>,
+    /// Clear grants still inside the HackRF window, per radio.
+    hackrf_open: HashMap<u64, Vec<HeardGrant>>,
+    /// The grant on the voice discriminator. `None` is silence.
+    hackrf_call: HashMap<u64, Option<(f64, u32)>>,
+    /// A HackRF that left its control cluster for one voice call.
+    /// Cleared when that call ends. Not written to the station file.
+    hackrf_away: HashMap<u64, crate::hackrf::VoiceAway>,
+    /// Clear selected grants heard this frame from radios still on a
+    /// control channel. The voice receivers read it after every radio has
+    /// been parsed. Not written to the station file.
+    trunk_pool: Vec<(u64, f64, u32)>,
+    /// Trunking job per radio index. An index that is absent is Both.
+    trunk_receivers: Vec<config::TrunkReceiver>,
+    hackrf_seq: u64,
+    hackrf_cc_feeds: HashMap<u64, Vec<follow::DsdFeed>>,
+    hackrf_voice_feed: HashMap<u64, follow::DsdFeed>,
+    hackrf_watch_sent: HashMap<u64, (i64, Vec<i64>)>,
+    hackrf_voice_sent: HashMap<u64, u64>,
+    /// Site word already handed to a HackRF voice decoder. A repeat sync
+    /// line must not spawn another process.
+    hackrf_p2_sent: HashMap<u64, String>,
+    /// Radios whose parked face frequency was already sent as the HackRF dial.
+    /// Sending again would clear a capture failure that has already stuck.
+    hackrf_dial_seeded: BTreeSet<u64>,
+    /// Boards from the last `hackrf_info` while the HackRF dialog is open.
+    hackrf_seen: Vec<crate::hackrf::Dongle>,
+    hackrf_probe_note: String,
+    /// Peak holds the spectrum trace. Clear is the running average.
+    spectrum_peak: bool,
+    /// LNA position while that slider is dragging. The dongle is unchanged.
+    gain_drag_lna: Option<u32>,
+    /// VGA position while that slider is dragging. The dongle is unchanged.
+    gain_drag_vga: Option<u32>,
+    /// Gain sent from the Tune sliders and not yet reflected on the radio row.
+    hackrf_gain_hold: Option<HackrfGainHold>,
+    spectrum_seq: u64,
+    spectrum_center: f64,
+    spectrum_avg: Vec<f32>,
+    spectrum_peak_hold: Vec<f32>,
+    /// Scanner poll for a HackRF capture. The frame sequence restarts when
+    /// the LO moves, and a repeated count means the scanner has no new sample.
+    hackrf_scan_poll: u64,
+    hackrf_scan_seq: u64,
+    hackrf_scan_center: f64,
+    feeds: HashMap<u64, CcFeed>,
     /// Last decoder stderr lines per radio. The hub queue is drained for
     /// the follower, so this is what the Automation frame shows.
     cc_tail: HashMap<u64, Vec<String>>,
     /// Last Phase 1 sync identity per radio, for the scanner face.
     cc_site: HashMap<u64, follow::SiteBanner>,
+    /// Callsign, talkgroup, and access code from decoder text. Not a tune.
+    cc_identity: HashMap<u64, follow::AirIdentity>,
+    /// Last invert flag sent per radio. The channel file owns the value.
+    invert_sent: HashMap<u64, bool>,
     /// Trunking-system time as a skew from this machine's clock.
     system_clock: clock::SystemClock,
     config_path: String,
     /// Last folder chosen in the config browser. Absent means the working directory.
     config_dir: Option<PathBuf>,
     config_note: String,
+    /// Station last loaded or written. Exit compares the face to this.
+    station_saved: Option<config::ConfigFile>,
+    /// The window close was held so the operator can save or drop the station.
+    exit_prompt: bool,
+    /// The operator chose to close without writing. The next close must not ask.
+    exit_discard: bool,
     /// Canonical audio graph last written, so a quiet PipeWire graph is not saved again.
     audio_saved: String,
+    /// A PipeWire reset is already talking to systemd. The button stays dark.
+    pipewire_reset: Arc<AtomicBool>,
     /// A loaded file is not written back until the cards it asked for have appeared.
     audio_hold: bool,
     speaker_tex: Option<egui::TextureHandle>,
@@ -640,9 +755,11 @@ mod talkgroup_tab_tests {
             model_label: String::new(),
             audio_status: String::new(),
             rx_pipe_status: String::new(),
+            rx_chain: String::new(),
             rx_pipe_diverted: false,
             tx_pipe_status: String::new(),
             tx_pipe_diverted: false,
+            center_hz: 0.0,
         }
     }
 
@@ -685,6 +802,15 @@ mod talkgroup_tab_tests {
             .position(|(page, _)| *page == Page::RadioIds(3))
             .expect("radio ids");
         assert!(talk_at < radio_at);
+        let keys_at = both
+            .iter()
+            .position(|(page, _)| *page == Page::Keys)
+            .expect("keys");
+        let config_at = both
+            .iter()
+            .position(|(page, _)| *page == Page::Config)
+            .expect("config");
+        assert_eq!(keys_at + 1, config_at);
         let piped = [
             row(1, crate::cat::RadioDriver::Hamlib, "Dummy", "", false),
             row(
@@ -696,6 +822,15 @@ mod talkgroup_tab_tests {
             ),
         ];
         assert_eq!(talkgroup_radio_ids(&piped, true), vec![3]);
+        let tap = [row(
+            9,
+            crate::cat::RadioDriver::Tap,
+            "Desk",
+            "commander-demod-p25.rxpipe",
+            true,
+        )];
+        assert!(talkgroup_radio_ids(&tap, true).is_empty());
+        assert!(talkgroup_radio_ids(&tap, false).is_empty());
     }
 }
 
@@ -859,6 +994,8 @@ enum Page {
     Tune,
     Plan,
     Channels,
+    /// Station key list. The bytes are not in the station JSON.
+    Keys,
     /// Talkgroup directory for one radio's control-channel follower.
     Talkgroups(u64),
     /// Radios named on that control channel.
@@ -874,6 +1011,7 @@ const PAGES: &[(Page, &str)] = &[
     (Page::Channels, "Channels"),
     (Page::Meters, "Meters"),
     (Page::Levels, "Levels"),
+    (Page::Keys, "Keys"),
     (Page::Config, "Config"),
 ];
 
@@ -912,13 +1050,55 @@ fn directory_has_talkgroups(file: &talkgroups::TalkgroupFile) -> bool {
     file.zones.iter().any(|zone| !zone.talkgroups.is_empty())
 }
 
-/// Radios that get a Talkgroups tab. A live P25 receive pipe wins. With the
-/// pipe off, a saved directory still keeps a tab on each GQRX radio so the
+/// Which decoder stderr this radio is feeding. A pipe change starts a new
+/// feed so a P25 grant cannot finish on a DMR or NXDN line.
+enum CcFeed {
+    P25(follow::DsdFeed),
+    Dmr(follow::DmrFeed),
+    Nxdn(follow::NxdnFeed),
+}
+
+impl CcFeed {
+    fn for_pipe(command: &str) -> Self {
+        if crate::rx_pipe::is_dmr_rx(command) {
+            CcFeed::Dmr(follow::DmrFeed::default())
+        } else if crate::rx_pipe::is_nxdn_trunk(command) {
+            CcFeed::Nxdn(follow::NxdnFeed::default())
+        } else {
+            CcFeed::P25(follow::DsdFeed::default())
+        }
+    }
+
+    fn matches(&self, command: &str) -> bool {
+        match self {
+            CcFeed::Dmr(_) => crate::rx_pipe::is_dmr_rx(command),
+            CcFeed::Nxdn(_) => crate::rx_pipe::is_nxdn_trunk(command),
+            CcFeed::P25(_) => crate::rx_pipe::is_p25_rx(command),
+        }
+    }
+
+    fn push_line(&mut self, line: &str) -> Vec<follow::CcEvent> {
+        match self {
+            CcFeed::P25(feed) => feed.push_line(line),
+            CcFeed::Dmr(feed) => feed.push_line(line),
+            CcFeed::Nxdn(feed) => feed.push_line(line),
+        }
+    }
+}
+
+/// Radios that get a Talkgroups tab. A live trunking receive pipe wins. With
+/// the pipe off, a saved directory still keeps a tab on each GQRX radio so the
 /// list does not disappear when the decoder is stopped.
+/// A trunking receive pipe Commander may follow. An audio tap plays that
+/// demodulator from a discriminator and is not tuned.
+fn hears_trunk_pipe(row: &cat::RadioRow) -> bool {
+    row.spec.driver != cat::RadioDriver::Tap && crate::rx_pipe::is_trunk_rx(&row.spec.rx_pipe)
+}
+
 fn talkgroup_radio_ids(rows: &[cat::RadioRow], directory: bool) -> Vec<u64> {
     let piped: Vec<u64> = rows
         .iter()
-        .filter(|row| crate::rx_pipe::is_p25_rx(&row.spec.rx_pipe))
+        .filter(|row| row.spec.driver == cat::RadioDriver::Hackrf || hears_trunk_pipe(row))
         .map(|row| row.id)
         .collect();
     if !piped.is_empty() {
@@ -936,9 +1116,33 @@ fn talkgroup_radio_ids(rows: &[cat::RadioRow], directory: bool) -> Vec<u64> {
         return gqrx;
     }
     rows.iter()
-        .filter(|row| row.selected)
+        .filter(|row| row.selected && row.spec.driver != cat::RadioDriver::Tap)
         .map(|row| row.id)
         .collect()
+}
+
+fn radio_listen(row: &cat::RadioRow) -> String {
+    if row.spec.driver == cat::RadioDriver::Hackrf {
+        let serial = row.spec.device.trim();
+        if serial.is_empty() {
+            "direct".to_string()
+        } else {
+            serial.to_string()
+        }
+    } else if row.spec.driver == cat::RadioDriver::Tap {
+        "audio".to_string()
+    } else {
+        match row.port {
+            Some(port) => format!("127.0.0.1:{port}"),
+            None => "127.0.0.1".to_string(),
+        }
+    }
+}
+
+fn talkgroup_zone_of(file: &talkgroups::TalkgroupFile, tg: u32) -> Option<usize> {
+    file.zones
+        .iter()
+        .position(|zone| zone.talkgroups.iter().any(|row| row.tg == tg))
 }
 
 /// Dark folder-card stock. Neighbors in this list differ, and the first
@@ -1010,6 +1214,9 @@ fn folder_tab(ui: &mut egui::Ui, selected: bool, index: usize, label: &str) -> e
 const LCD_ORANGE: egui::Color32 = egui::Color32::from_rgb(232, 128, 42);
 const LCD_YELLOW: egui::Color32 = egui::Color32::from_rgb(245, 214, 64);
 const LCD_PAPER: egui::Color32 = egui::Color32::from_rgb(226, 222, 206);
+/// Column starts on a key row: id, algorithm, status, name.
+const KEY_LIST_X: [f32; 4] = [8.0, 72.0, 168.0, 256.0];
+const KEY_LIST_HEAD: [&str; 4] = ["Key ID", "Algorithm", "Status", "Name"];
 
 /// The scanner bezel and glass. The closure draws on the glass and fills the width.
 ///
@@ -1093,28 +1300,37 @@ fn lcd_title_row(ui: &mut egui::Ui, title: &str, mode: &str) {
     });
 }
 
-/// One key beside the scanner face. `lit` is the Follow key while it is on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeyLamp {
+    Dark,
+    Green,
+    Amber,
+    Purple,
+}
+
+/// One key beside the scanner face. Green is Follow or a one-zone scan.
+/// Amber is the all-zone scan. Purple is a scan limited to marked zones.
 /// Load and Save stay dark; they act on the click.
-fn radio_key(ui: &mut egui::Ui, label: &str, lit: bool, enabled: bool) -> egui::Response {
+fn radio_key(ui: &mut egui::Ui, label: &str, lamp: KeyLamp, enabled: bool) -> egui::Response {
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(72.0, 46.0), egui::Sense::click());
     if !ui.is_rect_visible(rect) {
         return response;
     }
     let hover = enabled && response.hovered();
-    let fill = if lit {
-        egui::Color32::from_rgb(18, 58, 28)
-    } else if hover {
-        egui::Color32::from_rgb(48, 48, 52)
-    } else {
-        egui::Color32::from_rgb(28, 28, 32)
+    let fill = match lamp {
+        KeyLamp::Green => egui::Color32::from_rgb(18, 58, 28),
+        KeyLamp::Amber => egui::Color32::from_rgb(72, 48, 10),
+        KeyLamp::Purple => egui::Color32::from_rgb(42, 16, 64),
+        KeyLamp::Dark if hover => egui::Color32::from_rgb(48, 48, 52),
+        KeyLamp::Dark => egui::Color32::from_rgb(28, 28, 32),
     };
-    let edge = if lit {
-        egui::Color32::from_rgb(46, 176, 78)
-    } else if hover {
-        egui::Color32::from_rgb(120, 120, 126)
-    } else {
-        egui::Color32::from_rgb(78, 78, 84)
+    let edge = match lamp {
+        KeyLamp::Green => egui::Color32::from_rgb(46, 176, 78),
+        KeyLamp::Amber => egui::Color32::from_rgb(214, 148, 32),
+        KeyLamp::Purple => egui::Color32::from_rgb(168, 96, 214),
+        KeyLamp::Dark if hover => egui::Color32::from_rgb(120, 120, 126),
+        KeyLamp::Dark => egui::Color32::from_rgb(78, 78, 84),
     };
     ui.painter().rect(
         rect,
@@ -1125,10 +1341,13 @@ fn radio_key(ui: &mut egui::Ui, label: &str, lit: bool, enabled: bool) -> egui::
     );
     let text = if !enabled {
         egui::Color32::from_rgb(110, 108, 100)
-    } else if lit {
-        egui::Color32::from_rgb(150, 230, 140)
     } else {
-        egui::Color32::from_rgb(232, 228, 216)
+        match lamp {
+            KeyLamp::Green => egui::Color32::from_rgb(150, 230, 140),
+            KeyLamp::Amber => egui::Color32::from_rgb(255, 196, 96),
+            KeyLamp::Purple => egui::Color32::from_rgb(220, 170, 255),
+            KeyLamp::Dark => egui::Color32::from_rgb(232, 228, 216),
+        }
     };
     ui.painter().text(
         rect.center(),
@@ -1138,6 +1357,29 @@ fn radio_key(ui: &mut egui::Ui, label: &str, lit: bool, enabled: bool) -> egui::
         text,
     );
     response
+}
+
+/// Column titles above the key list. They stay put while the rows scroll.
+fn key_list_header(ui: &mut egui::Ui) {
+    let (rect, _response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), egui::Sense::hover());
+    let color = ui.visuals().weak_text_color();
+    let font = egui::FontId::monospace(12.0);
+    let painter = ui.painter();
+    for (x, label) in KEY_LIST_X.iter().zip(KEY_LIST_HEAD) {
+        painter.text(
+            rect.left_center() + egui::vec2(*x, 0.0),
+            egui::Align2::LEFT_CENTER,
+            label,
+            font.clone(),
+            color,
+        );
+    }
+    let rule = egui::Rect::from_min_max(
+        egui::pos2(rect.left(), rect.bottom() - 1.0),
+        rect.right_bottom(),
+    );
+    painter.rect_filled(rule, egui::CornerRadius::ZERO, color);
 }
 
 fn page_tabs(
@@ -1211,6 +1453,7 @@ impl App {
             snap,
             cmds: Vec::new(),
             live_gen: 0,
+            poll_gen: 0,
         }));
         let wake = Arc::new(Condvar::new());
         let face = Arc::new(Mutex::new(cat::FaceGate::new()));
@@ -1239,6 +1482,11 @@ impl App {
         let channel_dir = cc
             .storage
             .and_then(|storage| storage.get_string("channel_dir"))
+            .map(PathBuf::from)
+            .filter(|dir| dir.is_dir());
+        let key_dir = cc
+            .storage
+            .and_then(|storage| storage.get_string("key_dir"))
             .map(PathBuf::from)
             .filter(|dir| dir.is_dir());
         let config_dir = cc
@@ -1296,6 +1544,13 @@ impl App {
             channel_zone: 0,
             zone_list_follow: true,
             channel_sel: 0,
+            channel_list_follow: false,
+            memory_scan: scan::Scanner::new(),
+            scan_zones: BTreeSet::new(),
+            monitor_zones: BTreeSet::new(),
+            monitor_talkgroups: BTreeSet::new(),
+            scan_amber_origin: false,
+            scan_sending: false,
             channel_path: String::new(),
             channel_dir,
             channel_note: String::new(),
@@ -1305,23 +1560,66 @@ impl App {
             talkgroup_path: String::new(),
             talkgroup_dir: None,
             talkgroup_note: String::new(),
+            keys: keys::empty(),
+            key_sel: 0,
+            key_note: String::new(),
+            key_id_edit: String::new(),
+            key_alg_edit: keys::ALG_DES.to_string(),
+            key_name_edit: String::new(),
+            key_text_edit: String::new(),
+            key_dir,
+            key_shown: None,
+            key_runtime: String::new(),
+            key_runtime_gen: 0,
             units: Vec::new(),
             unit_sel: 0,
             unit_desc_dirty: false,
             cc_on: HashMap::new(),
             pending_control: None,
             cc_sent: HashMap::new(),
+            vocoder_sent: HashMap::new(),
             cc_voice_sent: HashMap::new(),
             cc_mode_sent: HashMap::new(),
             followers: HashMap::new(),
+            hackrf_open: HashMap::new(),
+            hackrf_call: HashMap::new(),
+            hackrf_away: HashMap::new(),
+            trunk_pool: Vec::new(),
+            trunk_receivers: Vec::new(),
+            hackrf_seq: 0,
+            hackrf_cc_feeds: HashMap::new(),
+            hackrf_voice_feed: HashMap::new(),
+            hackrf_watch_sent: HashMap::new(),
+            hackrf_voice_sent: HashMap::new(),
+            hackrf_p2_sent: HashMap::new(),
+            hackrf_dial_seeded: BTreeSet::new(),
+            hackrf_seen: Vec::new(),
+            hackrf_probe_note: String::new(),
+            spectrum_peak: false,
+            gain_drag_lna: None,
+            gain_drag_vga: None,
+            hackrf_gain_hold: None,
+            spectrum_seq: 0,
+            spectrum_center: 0.0,
+            spectrum_avg: Vec::new(),
+            spectrum_peak_hold: Vec::new(),
+            hackrf_scan_poll: 0,
+            hackrf_scan_seq: 0,
+            hackrf_scan_center: 0.0,
             feeds: HashMap::new(),
             cc_tail: HashMap::new(),
             cc_site: HashMap::new(),
+            cc_identity: HashMap::new(),
+            invert_sent: HashMap::new(),
             system_clock: clock::SystemClock::default(),
             config_path: String::new(),
             config_dir,
             config_note: String::new(),
+            station_saved: None,
+            exit_prompt: false,
+            exit_discard: false,
             audio_saved: crate::audio::canonical(&crate::audio::AudioGraph::default()),
+            pipewire_reset: Arc::new(AtomicBool::new(false)),
             audio_hold: false,
             speaker_tex: None,
             mic_tex: None,
@@ -1405,9 +1703,44 @@ impl App {
         }
     }
 
-    fn snap_gen(&self) -> (Snapshot, u64) {
+    fn snap_gen(&self) -> (Snapshot, u64, u64) {
         let guard = self.shared.lock().expect("rig thread");
-        (guard.snap.clone(), guard.live_gen)
+        (guard.snap.clone(), guard.live_gen, guard.poll_gen)
+    }
+
+    /// The dial reads the HackRF center. The rigctl snapshot has no port
+    /// for this radio, and an empty receive range would refuse the wheel.
+    fn overlay_hackrf(&self, snap: &mut Snapshot) {
+        let view = self.hub.view();
+        let Some(row) = view
+            .rows
+            .iter()
+            .find(|row| row.selected && row.spec.driver == cat::RadioDriver::Hackrf)
+        else {
+            return;
+        };
+        // Caps stay up before the first capture. An empty receive range is
+        // what paints "No channel this radio can tune." and leaves the face
+        // on the rigctl session this driver already closed.
+        let center = row.center_hz;
+        snap.kind = LinkKind::Live;
+        snap.model = "HackRF".into();
+        snap.endpoint = "direct".into();
+        if center > 0.0 {
+            snap.freq_hz = center;
+        }
+        snap.mode = "FM".into();
+        snap.passband_hz = 12_500;
+        snap.message.clear();
+        snap.caps.model = "HackRF".into();
+        snap.caps.can_set_freq = true;
+        snap.caps.can_set_mode = false;
+        snap.caps.modes = vec!["FM".into()];
+        snap.caps.rx_ranges = vec![rigctl::Range {
+            min: 1_000_000.0,
+            max: 6_000_000_000.0,
+            step: 1.0,
+        }];
     }
 
     fn send(&self, cmd: Command) {
@@ -1475,14 +1808,25 @@ impl App {
         let Some(row) = rows.iter().find(|row| row.selected) else {
             return false;
         };
-        if row.spec.follow || !crate::rx_pipe::is_p25_rx(&row.spec.rx_pipe) {
+        if row.spec.follow {
+            return false;
+        }
+        if row.spec.driver == cat::RadioDriver::Hackrf {
+            return self.cc_on.get(&row.id).copied().unwrap_or(false);
+        }
+        if !hears_trunk_pipe(row) {
             return false;
         }
         self.cc_on.get(&row.id).copied().unwrap_or(false)
     }
 
     fn dial_held(&self) -> bool {
-        self.following() || self.following_control()
+        if self.following() {
+            return true;
+        }
+        // Trunk Follow parks and grants. SCAN is the writer while it is
+        // hopping control channels. Follow resumes when the scan stops.
+        self.following_control() && !self.memory_scan.is_on()
     }
 
     fn can_tune_freq(&self, snap: &Snapshot, main: bool) -> bool {
@@ -1612,6 +1956,25 @@ impl App {
     }
 
     fn hold_and_send(&mut self, hz: f64) {
+        if !self.scan_sending {
+            self.stop_scan();
+        }
+        if let Some(row) = self
+            .hub
+            .view()
+            .rows
+            .iter()
+            .find(|row| row.selected && row.spec.driver == cat::RadioDriver::Hackrf)
+            .map(|row| row.id)
+        {
+            if self.cc_on.get(&row).copied().unwrap_or(false) {
+                return;
+            }
+            self.hold_freq = Some(hz);
+            self.freq_text = format_hz(hz);
+            self.hub.hackrf_dial(row, hz);
+            return;
+        }
         if !frequency_writes_allowed(self.dial_held()) {
             return;
         }
@@ -1666,13 +2029,9 @@ fn pipe_block_label(command: &str, fallback: &str) -> String {
 
 impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        // The open station is the copy of the face. A crash never reaches
-        // here, so a change that has to survive that is written when it happens.
-        if !self.config_path.is_empty() {
-            let snap = self.shared.lock().expect("rig thread").snap.clone();
-            self.unit_desc_dirty = false;
-            self.save_config(&snap);
-        }
+        // The close prompt writes the station when the operator says to.
+        // A crash never reaches either path. Edits that must survive a crash
+        // are still written when they happen.
         self.hub.shutdown();
         self.rotators.shutdown();
         // A crash never reaches here. The cleanup child covers that, and this
@@ -1688,6 +2047,9 @@ impl eframe::App for App {
         }
         if let Some(dir) = &self.channel_dir {
             storage.set_string("channel_dir", dir.display().to_string());
+        }
+        if let Some(dir) = &self.key_dir {
+            storage.set_string("key_dir", dir.display().to_string());
         }
         if let Some(dir) = &self.config_dir {
             storage.set_string("config_dir", dir.display().to_string());
@@ -1719,12 +2081,18 @@ impl eframe::App for App {
                 meters.drag = None;
             }
         }
-        let (mut snap, live_gen) = self.snap_gen();
+        let (mut snap, live_gen, poll_gen) = self.snap_gen();
+        self.overlay_hackrf(&mut snap);
+        self.clear_stale_channel_note(&snap);
         self.maybe_push_loaded(&snap, live_gen);
+        self.seed_hackrf_dial(&snap);
         self.autosave_audio(&snap);
         self.flush_rx_pipe(&snap);
         self.flush_tx_pipe(&snap);
         self.service_cc(&snap);
+        self.release_memory_scan(&snap);
+        self.drain_identity();
+        self.apply_channel_vocoder();
         self.sync_gpredict();
         let follow = self.following();
         self.face.lock().expect("face").follow = follow;
@@ -1855,12 +2223,19 @@ impl eframe::App for App {
         match cat_driver {
             Some(cat::RadioDriver::Hamlib) => self.hamlib_window(&ctx),
             Some(cat::RadioDriver::Gqrx) => self.gqrx_window(&ctx),
+            Some(cat::RadioDriver::Hackrf) => self.hackrf_window(&ctx),
+            Some(cat::RadioDriver::Tap) => self.tap_window(&ctx),
             None => {}
         }
         if self.rot_edit.is_some() {
             self.rotator_window(&ctx);
         }
         self.show_meter_window(&ctx, &snap);
+        // Clicks in this frame already ran. A channel or zone pick stops
+        // the scan before this hop, and service_cc has already stored any
+        // neighbor announcement from the control channel we are held on.
+        self.advance_memory_scan(&ctx, &snap, poll_gen);
+        self.consider_close(&ctx, &snap);
     }
 }
 
@@ -1913,6 +2288,7 @@ impl App {
             Page::Tune => self.page_tune(ui, snap),
             Page::Plan => self.page_plan(ui, snap),
             Page::Channels => self.page_channels(ui, snap),
+            Page::Keys => self.page_keys(ui),
             Page::Talkgroups(id) => self.page_talkgroups(ui, id, snap),
             Page::RadioIds(id) => self.page_radio_ids(ui, id, snap),
             Page::Meters => self.page_meters(ui, snap),
@@ -2068,6 +2444,10 @@ impl App {
             ui.take_available_width();
             self.buttons(ui, snap);
         });
+        if self.selected_hackrf() {
+            ui.add_space(8.0);
+            self.hackrf_spectrum(ui, snap, freq);
+        }
         if self.show_spread {
             ui.add_space(8.0);
             // One line per zone. Subbands share that line, with a small gap
@@ -2210,13 +2590,13 @@ impl App {
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 6.0;
                 ui.set_width(72.0);
-                if radio_key(ui, "LOAD", false, true).clicked() {
+                if radio_key(ui, "LOAD", KeyLamp::Dark, true).clicked() {
                     self.browse_plan(false);
                 }
-                if radio_key(ui, "SAVE", false, true).clicked() {
+                if radio_key(ui, "SAVE", KeyLamp::Dark, true).clicked() {
                     self.browse_plan(true);
                 }
-                if radio_key(ui, "ADD", false, true).clicked() {
+                if radio_key(ui, "ADD", KeyLamp::Dark, true).clicked() {
                     let color = self
                         .plan
                         .zones
@@ -2463,11 +2843,88 @@ impl App {
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 6.0;
                 ui.set_width(72.0);
-                if radio_key(ui, "LOAD", false, true).clicked() {
+                if radio_key(ui, "LOAD", KeyLamp::Dark, true).clicked() {
                     self.browse_channels(false);
                 }
-                if radio_key(ui, "SAVE", false, true).clicked() {
+                if radio_key(ui, "SAVE", KeyLamp::Dark, true).clicked() {
                     self.browse_channels(true);
+                }
+                let scan_on = self.memory_scan.is_on();
+                let all_zones = self.memory_scan.all_zones();
+                let listed_on = !self.scan_zones.is_empty();
+                let listed = if listed_on {
+                    self.listed_targets(snap)
+                } else {
+                    Vec::new()
+                };
+                let lamp = if scan_on && listed_on {
+                    KeyLamp::Purple
+                } else if all_zones {
+                    KeyLamp::Amber
+                } else if scan_on {
+                    KeyLamp::Green
+                } else {
+                    KeyLamp::Dark
+                };
+                let link_block = self.scan_link_block(snap);
+                let zone_block = self.scan_block_reason(snap);
+                let any_zone = link_block.is_none() && !self.every_target(snap).is_empty();
+                let scan_ready = if listed_on {
+                    !listed.is_empty()
+                } else {
+                    any_zone
+                };
+                let scan_key = radio_key(ui, "SCAN", lamp, link_block.is_none() && scan_ready);
+                let scan_double = scan_key.double_clicked();
+                let scan_clicked = scan_key.clicked();
+                if listed_on && !listed.is_empty() {
+                    scan_key.on_hover_text("Selected zones.");
+                } else if listed_on {
+                    scan_key.on_hover_text("No channel this radio can tune.");
+                } else if all_zones {
+                    scan_key.on_hover_text("Every zone.");
+                } else if zone_block.is_some() && any_zone {
+                    scan_key.on_hover_text(
+                        "This zone has no channel this radio can tune. Double-click scans every zone.",
+                    );
+                } else if let Some(reason) = link_block.or(zone_block) {
+                    scan_key.on_hover_text(reason);
+                }
+                if scan_double {
+                    // The first click of the double already stopped a running
+                    // scan. Marked zones win over the amber all-zone scan.
+                    if let Some(reason) = link_block {
+                        self.channel_note = reason.to_string();
+                    } else if listed_on {
+                        self.start_listed_scan(snap);
+                    } else if !any_zone {
+                        self.channel_note = "No channel this radio can tune.".to_string();
+                    } else {
+                        self.start_all_scan(snap);
+                    }
+                } else if scan_clicked {
+                    if scan_on {
+                        self.stop_scan();
+                    } else if listed_on {
+                        self.start_listed_scan(snap);
+                    } else if let Some(reason) = link_block.or(zone_block) {
+                        self.channel_note = reason.to_string();
+                    } else {
+                        self.start_memory_scan(snap);
+                    }
+                }
+                let dwell = radio_key(
+                    ui,
+                    "DWELL",
+                    if self.memory_scan.dwell_on() {
+                        KeyLamp::Green
+                    } else {
+                        KeyLamp::Dark
+                    },
+                    true,
+                );
+                if dwell.clicked() {
+                    self.memory_scan.toggle_dwell();
                 }
             });
             lcd_panel(ui, |ui| {
@@ -2583,13 +3040,22 @@ impl App {
                         let jump = self.zone_list_follow;
                         let count = self.channels.zones.len();
                         for idx in 0..count {
-                            let (clicked, response) = self.zone_row(ui, idx);
+                            let (clicked, doubled, response) = self.zone_row(ui, idx);
                             if jump && idx == self.channel_zone {
                                 response.scroll_to_me(Some(egui::Align::Center));
                             }
-                            if clicked {
+                            if doubled {
+                                // The first click already selected this zone.
+                                // This click only marks or unmarks the scan list.
+                                self.toggle_scan_zone(snap, idx);
+                            } else if clicked && idx != self.channel_zone {
                                 self.channel_zone = idx;
-                                self.channel_sel = 0;
+                                let in_list = self.scan_zones.is_empty() || self.scan_zones.contains(&idx);
+                                if self.memory_scan.is_on() && in_list {
+                                    self.retarget_scan(snap);
+                                } else if !self.memory_scan.is_on() {
+                                    self.channel_sel = 0;
+                                }
                             }
                         }
                         self.zone_list_follow = false;
@@ -2610,9 +3076,11 @@ impl App {
                             .unwrap_or(0);
                         for idx in 0..count {
                             if self.channel_row(ui, idx) {
+                                self.stop_scan();
                                 self.recall_channel(snap, idx);
                             }
                         }
+                        self.channel_list_follow = false;
                     });
             });
             ui.vertical(|ui| {
@@ -2732,6 +3200,67 @@ impl App {
         }
     }
 
+    /// Read a dsd-fme hex CSV from disk. The first line is the header.
+    /// Cancel leaves the stored keys alone.
+    fn browse_keys(&mut self) {
+        let dir = remembered_dir(&self.key_dir);
+        let picked = rfd::FileDialog::new()
+            .set_title("Import keys")
+            .add_filter("dsd-fme hex CSV", &["csv", "txt"])
+            .add_filter("All files", &["*"])
+            .set_directory(&dir)
+            .pick_file();
+        let Some(path) = picked else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            if parent.is_dir() {
+                self.key_dir = Some(parent.to_path_buf());
+            }
+        }
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(err) => {
+                self.key_note = format!("Could not read {}: {err}", path.display());
+                return;
+            }
+        };
+        match keys::import_csv(&mut self.keys, &text) {
+            Ok(count) => {
+                self.key_shown = None;
+                self.save_keys();
+                if self.key_note.is_empty() {
+                    self.key_note = format!("Imported {count}.");
+                }
+            }
+            Err(err) => self.key_note = err,
+        }
+    }
+
+    /// Write the key list as the hex CSV Import reads. Cancel writes nothing.
+    fn export_keys(&mut self) {
+        let dir = remembered_dir(&self.key_dir);
+        let picked = rfd::FileDialog::new()
+            .set_title("Export keys")
+            .add_filter("dsd-fme hex CSV", &["csv", "txt"])
+            .add_filter("All files", &["*"])
+            .set_directory(&dir)
+            .set_file_name("keys.csv")
+            .save_file();
+        let Some(path) = picked else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            if parent.is_dir() {
+                self.key_dir = Some(parent.to_path_buf());
+            }
+        }
+        match keys::export_file(&path, &self.keys) {
+            Ok(count) => self.key_note = format!("Exported {count}."),
+            Err(err) => self.key_note = err,
+        }
+    }
+
     fn load_channels(&mut self) {
         match channels::load_file(Path::new(&self.channel_path)) {
             Ok(file) => {
@@ -2739,6 +3268,7 @@ impl App {
                 self.channel_zone = 0;
                 self.channel_sel = 0;
                 self.channel_note.clear();
+                self.clear_scan_zones();
             }
             Err(err) => {
                 self.channel_note = err;
@@ -2979,10 +3509,10 @@ impl App {
         let p25: Vec<_> = radios
             .rows
             .iter()
-            .filter(|row| crate::rx_pipe::is_p25_rx(&row.spec.rx_pipe))
+            .filter(|row| hears_trunk_pipe(row))
             .collect();
         if p25.is_empty() {
-            ui.label("No P25 receive pipe is on.");
+            ui.label("No trunking receive pipe is on.");
             return;
         }
         let mut devices = Vec::new();
@@ -3005,7 +3535,7 @@ impl App {
         for row in radios
             .rows
             .iter()
-            .filter(|row| crate::rx_pipe::is_p25_rx(&row.spec.rx_pipe))
+            .filter(|row| hears_trunk_pipe(row))
         {
             let mut follow = self.cc_on.get(&row.id).copied().unwrap_or(false);
             let toggle = ui.add_enabled(
@@ -3180,10 +3710,7 @@ impl App {
                     ui.label("Status");
                     ui.end_row();
                     for row in &view.rows {
-                        let listen = match row.port {
-                            Some(port) => format!("127.0.0.1:{port}"),
-                            None => "127.0.0.1".to_string(),
-                        };
+                        let listen = radio_listen(row);
                         let device = if row.spec.device.trim().is_empty() {
                             "—".to_string()
                         } else {
@@ -3215,6 +3742,12 @@ impl App {
                 if ui.button("Add GQRX").clicked() {
                     self.open_gqrx(None);
                 }
+                if ui.button("Add HackRF").clicked() {
+                    self.open_hackrf(None);
+                }
+                if ui.button("Add audio tap").clicked() {
+                    self.open_tap(None);
+                }
                 let selected = view.rows.iter().find(|row| row.selected).map(|row| row.id);
                 if ui
                     .add_enabled(selected.is_some(), egui::Button::new("Edit"))
@@ -3225,6 +3758,8 @@ impl App {
                             match row.spec.driver {
                                 cat::RadioDriver::Hamlib => self.open_hamlib(Some(row)),
                                 cat::RadioDriver::Gqrx => self.open_gqrx(Some(row)),
+                                cat::RadioDriver::Hackrf => self.open_hackrf(Some(row)),
+                                cat::RadioDriver::Tap => self.open_tap(Some(row)),
                             }
                         }
                     }
@@ -3253,6 +3788,26 @@ impl App {
         }
     }
 
+    /// Clear WirePlumber's saved defaults, restart the user PipeWire session,
+    /// then drop this station's speaker and microphone pins. The hub wires
+    /// the cards to whatever the desktop default is after that restart.
+    fn start_pipewire_reset(&self) {
+        if self
+            .pipewire_reset
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let flag = Arc::clone(&self.pipewire_reset);
+        let hub = Arc::clone(&self.hub);
+        thread::spawn(move || {
+            let reset = crate::audio::reset_user_pipewire();
+            hub.reset_pipewire_defaults(reset);
+            flag.store(false, Ordering::Release);
+        });
+    }
+
     fn audio_frame(&mut self, ui: &mut egui::Ui) {
         let view = self.hub.view();
         let mut endpoint = None;
@@ -3267,6 +3822,21 @@ impl App {
                 {
                     launch_helvum();
                 }
+                let resetting = self.pipewire_reset.load(Ordering::Acquire);
+                let label = if resetting {
+                    "Resetting PipeWire…"
+                } else {
+                    "Reset PipeWire"
+                };
+                if ui
+                    .add_enabled(!resetting, egui::Button::new(label).small())
+                    .on_hover_text(
+                        "Forget WirePlumber's saved devices and rewire this station to the desktop default sink and source. Live audio drops until PipeWire is back.",
+                    )
+                    .clicked()
+                {
+                    self.start_pipewire_reset();
+                }
             });
             ui.add_space(4.0);
             if self.config_path.is_empty() {
@@ -3279,11 +3849,12 @@ impl App {
                 );
             }
             for row in &view.rows {
+                let tap = row.spec.driver == cat::RadioDriver::Tap;
                 let rx = crate::audio::describe(&row.make, &row.model_label, row.id, "RX");
                 let tx = crate::audio::describe(&row.make, &row.model_label, row.id, "TX");
                 ui.label(format!("{}  {} {}", row.id, row.make, row.model_label));
                 ui.horizontal(|ui| {
-                    ui.label(rx);
+                    ui.label(if tap { "Speaker".to_string() } else { rx });
                     let current = audio_device_label(&view.playback, &row.spec.audio.output);
                     egui::ComboBox::from_id_salt(("audio-out", row.id))
                         .selected_text(current)
@@ -3304,7 +3875,7 @@ impl App {
                         });
                 });
                 ui.horizontal(|ui| {
-                    ui.label(tx);
+                    ui.label(if tap { "Audio in".to_string() } else { tx });
                     let current = audio_device_label(&view.capture, &row.spec.audio.input);
                     egui::ComboBox::from_id_salt(("audio-in", row.id))
                         .selected_text(current)
@@ -3364,6 +3935,7 @@ impl App {
                             .color(egui::Color32::from_rgb(220, 160, 80)),
                     );
                 }
+                if !tap {
                 ui.horizontal(|ui| {
                     ui.label("TX pipe");
                     let scripts = crate::rx_pipe::tx_scripts();
@@ -3397,6 +3969,7 @@ impl App {
                         egui::RichText::new(&row.tx_pipe_status)
                             .color(egui::Color32::from_rgb(220, 160, 80)),
                     );
+                }
                 }
                 ui.add_space(4.0);
             }
@@ -3490,9 +4063,10 @@ impl App {
                 input: row.spec.audio.input.clone(),
                 output: row.spec.audio.output.clone(),
                 rx_pipe_live: row.rx_pipe_diverted,
-                rx_pipe_label: pipe_block_label(&row.spec.rx_pipe, "RX pipe"),
+                rx_pipe_label: pipe_block_label(&row.rx_chain, "RX pipe"),
                 tx_pipe_live: row.tx_pipe_diverted,
                 tx_pipe_label: pipe_block_label(&row.spec.tx_pipe, "TX pipe"),
+                tap: row.spec.driver == cat::RadioDriver::Tap,
             })
             .collect();
         let bindings: Vec<bay::RadioBinding> = radios
@@ -3505,6 +4079,15 @@ impl App {
             .collect();
         ui.add_space(8.0);
         ui.label("Drag a wire from a microphone to the radio, or from the radio to a speaker.");
+        if view
+            .rows
+            .iter()
+            .any(|row| row.spec.driver == cat::RadioDriver::Tap)
+        {
+            ui.label(
+                "An audio tap takes a discriminator or line input on the left and plays the demodulator on the right. Commander does not tune that radio.",
+            );
+        }
         let input = bay::BayIn {
             captures: &view.capture,
             playbacks: &view.playback,
@@ -3760,6 +4343,194 @@ impl App {
             }
         };
         self.cat_edit = Some(draft);
+    }
+
+    fn open_hackrf(&mut self, row: Option<&cat::RadioRow>) {
+        let draft = if let Some(row) = row {
+            CatDraft {
+                id: Some(row.id),
+                name: row.spec.name.clone(),
+                model: 0,
+                device: row.spec.device.clone(),
+                serial_speed: String::new(),
+                civ: String::new(),
+                ptt_type: String::new(),
+                ptt_file: String::new(),
+                conf: String::new(),
+                park: false,
+                port_label: "direct".into(),
+                error: String::new(),
+                driver: cat::RadioDriver::Hackrf,
+            }
+        } else {
+            CatDraft {
+                id: None,
+                name: "HackRF".into(),
+                model: 0,
+                device: String::new(),
+                serial_speed: String::new(),
+                civ: String::new(),
+                ptt_type: String::new(),
+                ptt_file: String::new(),
+                conf: String::new(),
+                park: false,
+                port_label: "direct".into(),
+                error: String::new(),
+                driver: cat::RadioDriver::Hackrf,
+            }
+        };
+        self.probe_hackrf_dongles();
+        self.cat_edit = Some(draft);
+    }
+
+    fn open_tap(&mut self, row: Option<&cat::RadioRow>) {
+        let draft = if let Some(row) = row {
+            CatDraft {
+                id: Some(row.id),
+                name: row.spec.name.clone(),
+                model: 0,
+                device: String::new(),
+                serial_speed: String::new(),
+                civ: String::new(),
+                ptt_type: String::new(),
+                ptt_file: String::new(),
+                conf: String::new(),
+                park: false,
+                port_label: "audio".into(),
+                error: String::new(),
+                driver: cat::RadioDriver::Tap,
+            }
+        } else {
+            CatDraft {
+                id: None,
+                name: "Audio tap".into(),
+                model: 0,
+                device: String::new(),
+                serial_speed: String::new(),
+                civ: String::new(),
+                ptt_type: String::new(),
+                ptt_file: String::new(),
+                conf: String::new(),
+                park: false,
+                port_label: "audio".into(),
+                error: String::new(),
+                driver: cat::RadioDriver::Tap,
+            }
+        };
+        self.cat_edit = Some(draft);
+    }
+
+    fn tap_window(&mut self, ctx: &egui::Context) {
+        let mut open = true;
+        let mut commit = false;
+        egui::Window::new("Audio tap").open(&mut open).show(ctx, |ui| {
+            let Some(edit) = &mut self.cat_edit else {
+                return;
+            };
+            ui.horizontal(|ui| {
+                ui.label("Name");
+                ui.text_edit_singleline(&mut edit.name);
+            });
+            ui.label(
+                "This block replaces the radio. Wire a discriminator or line input to it, then choose a demodulator. The external radio stays on the frequency you set there.",
+            );
+            if !edit.error.is_empty() {
+                ui.label(
+                    egui::RichText::new(&edit.error).color(egui::Color32::from_rgb(220, 160, 80)),
+                );
+            }
+            if ui.button("Save").clicked() {
+                commit = true;
+            }
+        });
+        if !open {
+            self.cat_edit = None;
+            return;
+        }
+        if commit {
+            self.commit_hamlib();
+        }
+    }
+
+    fn probe_hackrf_dongles(&mut self) {
+        match crate::hackrf::list_dongles() {
+            Ok(list) => {
+                self.hackrf_seen = list;
+                self.hackrf_probe_note.clear();
+            }
+            Err(err) => {
+                self.hackrf_seen.clear();
+                self.hackrf_probe_note = err;
+            }
+        }
+    }
+
+    fn hackrf_window(&mut self, ctx: &egui::Context) {
+        let mut open = true;
+        let mut commit = false;
+        let mut refresh = false;
+        let seen = self.hackrf_seen.clone();
+        let probe_note = self.hackrf_probe_note.clone();
+        egui::Window::new("HackRF").open(&mut open).show(ctx, |ui| {
+            let Some(edit) = &mut self.cat_edit else {
+                return;
+            };
+            ui.horizontal(|ui| {
+                ui.label("Name");
+                ui.text_edit_singleline(&mut edit.name);
+            });
+            ui.label("Connected");
+            if ui
+                .selectable_label(edit.device.trim().is_empty(), "only HackRF")
+                .clicked()
+            {
+                edit.device.clear();
+            }
+            if seen.is_empty() {
+                let note = if probe_note.is_empty() {
+                    "No HackRF found.".to_string()
+                } else {
+                    probe_note.clone()
+                };
+                ui.label(egui::RichText::new(note).color(egui::Color32::from_rgb(220, 160, 80)));
+            }
+            for dongle in &seen {
+                let label = crate::hackrf::dongle_label(dongle);
+                if ui
+                    .selectable_label(edit.device == dongle.serial, label)
+                    .clicked()
+                {
+                    edit.device.clone_from(&dongle.serial);
+                }
+            }
+            if ui.button("Refresh").clicked() {
+                refresh = true;
+            }
+            ui.horizontal(|ui| {
+                ui.label("Serial");
+                ui.text_edit_singleline(&mut edit.device);
+            });
+            ui.label("An empty serial uses the only HackRF. Save stores the serial you pick.");
+            ui.label("Listen  direct");
+            if !edit.error.is_empty() {
+                ui.label(
+                    egui::RichText::new(&edit.error).color(egui::Color32::from_rgb(220, 160, 80)),
+                );
+            }
+            if ui.button("Save").clicked() {
+                commit = true;
+            }
+        });
+        if !open {
+            self.cat_edit = None;
+            return;
+        }
+        if refresh {
+            self.probe_hackrf_dongles();
+        }
+        if commit {
+            self.commit_hamlib();
+        }
     }
 
     fn gqrx_window(&mut self, ctx: &egui::Context) {
@@ -4097,17 +4868,24 @@ impl App {
                         .map(|row| row.spec.follow)
                 })
                 .unwrap_or(false),
-            audio: edit
-                .id
-                .and_then(|id| {
-                    self.hub
-                        .view()
-                        .rows
-                        .iter()
-                        .find(|row| row.id == id)
-                        .map(|row| row.spec.audio.clone())
-                })
-                .unwrap_or_default(),
+            audio: {
+                let mut audio = edit
+                    .id
+                    .and_then(|id| {
+                        self.hub
+                            .view()
+                            .rows
+                            .iter()
+                            .find(|row| row.id == id)
+                            .map(|row| row.spec.audio.clone())
+                    })
+                    .unwrap_or_default();
+                if edit.driver == cat::RadioDriver::Tap {
+                    audio.rx = false;
+                    audio.tx = false;
+                }
+                audio
+            },
             gqrx: match edit.driver {
                 cat::RadioDriver::Gqrx if edit.id.is_none() => cat::gqrx_chooser_config(),
                 cat::RadioDriver::Gqrx => edit
@@ -4121,7 +4899,9 @@ impl App {
                             .map(|row| row.spec.gqrx.clone())
                     })
                     .unwrap_or_else(cat::gqrx_chooser_config),
-                cat::RadioDriver::Hamlib => cat::GqrxConfig::new(),
+                cat::RadioDriver::Hamlib | cat::RadioDriver::Hackrf | cat::RadioDriver::Tap => {
+                    cat::GqrxConfig::new()
+                }
             },
             rx_pipe: edit
                 .id
@@ -4145,6 +4925,45 @@ impl App {
                         .map(|row| row.spec.tx_pipe.clone())
                 })
                 .unwrap_or_default(),
+            sample_rate: edit
+                .id
+                .and_then(|id| {
+                    self.hub
+                        .view()
+                        .rows
+                        .iter()
+                        .find(|row| row.id == id)
+                        .map(|row| row.spec.sample_rate)
+                })
+                .unwrap_or(crate::hackrf::SAMPLE_RATE),
+            lna_db: edit.id.and_then(|id| {
+                self.hackrf_gain_hold
+                    .as_ref()
+                    .filter(|hold| hold.id == id)
+                    .map(|hold| hold.lna)
+                    .or_else(|| {
+                        self.hub
+                            .view()
+                            .rows
+                            .iter()
+                            .find(|row| row.id == id)
+                            .and_then(|row| row.spec.lna_db)
+                    })
+            }),
+            vga_db: edit.id.and_then(|id| {
+                self.hackrf_gain_hold
+                    .as_ref()
+                    .filter(|hold| hold.id == id)
+                    .map(|hold| hold.vga)
+                    .or_else(|| {
+                        self.hub
+                            .view()
+                            .rows
+                            .iter()
+                            .find(|row| row.id == id)
+                            .and_then(|row| row.spec.vga_db)
+                    })
+            }),
         };
         if let Err(err) = cat::validate_spec(&spec) {
             if let Some(edit) = &mut self.cat_edit {
@@ -4166,13 +4985,27 @@ impl App {
         let Some(pending) = &self.pending_tune else {
             return;
         };
-        if live_gen <= pending.after_gen {
-            return;
-        }
         let view = self.hub.view();
         let Some(row) = view.rows.iter().find(|row| row.selected) else {
             return;
         };
+        if row.spec.driver == cat::RadioDriver::Hackrf {
+            if view.list_gen <= pending.after_list {
+                return;
+            }
+            let hz = pending.tune.freq_hz;
+            let id = row.id;
+            self.pending_tune = None;
+            if hz.is_finite() && hz > 0.0 {
+                self.hold_freq = Some(hz);
+                self.freq_text = format_hz(hz);
+                self.hub.hackrf_dial(id, hz);
+            }
+            return;
+        }
+        if live_gen <= pending.after_gen {
+            return;
+        }
         let Some(port) = row.port else {
             return;
         };
@@ -4184,6 +5017,34 @@ impl App {
         let levels = pending.levels.clone();
         self.pending_tune = None;
         self.push_radio(snap, &tune, &levels);
+    }
+
+    /// The face still shows the frequency of the rig this HackRF replaced.
+    /// One dial send starts capture there. Follow keeps the watch center.
+    fn seed_hackrf_dial(&mut self, snap: &Snapshot) {
+        if snap.model != "HackRF" || !snap.online() {
+            return;
+        }
+        let view = self.hub.view();
+        let Some(row) = view.rows.iter().find(|row| {
+            row.selected && row.spec.driver == cat::RadioDriver::Hackrf
+        }) else {
+            return;
+        };
+        if row.center_hz > 0.0 || row.spec.follow || self.following_control() {
+            return;
+        }
+        if !self.hackrf_dial_seeded.insert(row.id) {
+            return;
+        }
+        let hz = snap.freq_hz;
+        if !hz.is_finite() || hz < 1_000_000.0 {
+            self.hackrf_dial_seeded.remove(&row.id);
+            return;
+        }
+        self.hold_freq = Some(hz);
+        self.freq_text = format_hz(hz);
+        self.hub.hackrf_dial(row.id, hz);
     }
 
     fn browse_config(&mut self, save: bool, snap: &Snapshot) {
@@ -4225,8 +5086,87 @@ impl App {
 
     fn load_config(&mut self, snap: &Snapshot) {
         match config::load_file(Path::new(&self.config_path)) {
-            Ok(file) => self.apply_config(snap, file),
+            Ok(mut file) => {
+                file.scan_zones.sort_unstable();
+                self.station_saved = Some(file.clone());
+                self.apply_config(snap, file);
+            }
             Err(err) => self.config_note = err,
+        }
+        self.load_keys();
+    }
+
+    fn load_keys(&mut self) {
+        self.key_shown = None;
+        if self.config_path.is_empty() {
+            self.keys = keys::empty();
+            self.sync_key_csv();
+            return;
+        }
+        match keys::load_file(&keys::path_beside(Path::new(&self.config_path))) {
+            Ok(file) => {
+                self.keys = file;
+                self.key_note.clear();
+            }
+            Err(err) => {
+                self.keys = keys::empty();
+                self.key_note = err;
+            }
+        }
+        if self.key_sel >= self.keys.keys.len() {
+            self.key_sel = 0;
+        }
+        self.sync_key_csv();
+    }
+
+    fn save_keys(&mut self) {
+        if self.config_path.is_empty() {
+            self.key_note = "The station has not been saved.".into();
+            self.sync_key_csv();
+            return;
+        }
+        let path = keys::path_beside(Path::new(&self.config_path));
+        match keys::save_file(&path, &self.keys) {
+            Ok(()) => self.key_note.clear(),
+            Err(err) => self.key_note = err,
+        }
+        self.sync_key_csv();
+    }
+
+    /// Hand the private CSV to every radio. A repeat of the same path on the
+    /// same radio list does not send again.
+    fn sync_key_csv(&mut self) {
+        let path = match keys::publish_runtime(&self.keys) {
+            Ok(path) => path,
+            Err(err) => {
+                self.key_note = err;
+                return;
+            }
+        };
+        let gen = self.hub.view().list_gen;
+        if self.key_runtime == path && self.key_runtime_gen == gen {
+            return;
+        }
+        self.key_runtime = path.clone();
+        self.key_runtime_gen = gen;
+        self.hub.set_key_csv(&path);
+    }
+
+    /// A key id printed by the decoder becomes a placeholder. A row that is
+    /// already there is left alone.
+    fn note_asked_keys(&mut self, lines: &[String]) {
+        let mut added = false;
+        for line in lines {
+            let plain = follow::plain_line(line);
+            if let Some((alg, kid)) = follow::key_on_line(plain.trim()) {
+                if keys::note_missing(&mut self.keys, alg, kid) {
+                    added = true;
+                }
+            }
+        }
+        if added {
+            self.key_shown = None;
+            self.save_keys();
         }
     }
 
@@ -4242,10 +5182,106 @@ impl App {
             Ok(()) => {
                 self.audio_saved = crate::audio::canonical(&file.audio);
                 self.audio_hold = false;
+                self.unit_desc_dirty = false;
                 self.config_note.clear();
+                self.station_saved = Some(file);
             }
             Err(err) => self.config_note = err,
         }
+    }
+
+    /// True when the face differs from the station last loaded or written.
+    /// No saved copy means the open face has not been written yet.
+    fn station_changed(&mut self, snap: &Snapshot) -> Result<bool, String> {
+        let now = self.capture_config(snap)?;
+        Ok(self.station_saved.as_ref() != Some(&now))
+    }
+
+    fn consider_close(&mut self, ctx: &egui::Context, snap: &Snapshot) {
+        if ctx.input(|input| input.viewport().close_requested()) {
+            if self.exit_discard {
+                return;
+            }
+            if self.exit_prompt {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            } else {
+                match self.station_changed(snap) {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                        self.exit_prompt = true;
+                    }
+                    Err(err) => {
+                        self.config_note = err;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                        self.exit_prompt = true;
+                    }
+                }
+            }
+        }
+        if self.exit_prompt {
+            self.exit_dialog(ctx, snap);
+        }
+    }
+
+    fn exit_dialog(&mut self, ctx: &egui::Context, snap: &Snapshot) {
+        let name = if self.config_path.is_empty() {
+            "this station".to_string()
+        } else {
+            file_label(&self.config_path)
+        };
+        let note = self.config_note.clone();
+        let mut choice = None;
+        let response = egui::Modal::new(egui::Id::new("station-exit")).show(ctx, |ui| {
+            ui.set_min_width(320.0);
+            ui.label(format!("Save changes to {name}?"));
+            if !note.is_empty() {
+                ui.label(
+                    egui::RichText::new(&note).color(egui::Color32::from_rgb(220, 160, 80)),
+                );
+            }
+            ui.horizontal(|ui| {
+                if ui.button("Save").clicked() {
+                    choice = Some(true);
+                }
+                if ui.button("Don't save").clicked() {
+                    choice = Some(false);
+                }
+                if ui.button("Cancel").clicked() {
+                    choice = None;
+                    self.exit_prompt = false;
+                }
+            });
+        });
+        if self.exit_prompt && response.should_close() {
+            self.exit_prompt = false;
+            return;
+        }
+        match choice {
+            Some(true) => self.save_and_close(ctx, snap),
+            Some(false) => self.discard_and_close(ctx),
+            None => {}
+        }
+    }
+
+    fn save_and_close(&mut self, ctx: &egui::Context, snap: &Snapshot) {
+        if self.config_path.is_empty() {
+            self.browse_config(true, snap);
+        } else {
+            self.save_config(snap);
+        }
+        let saved = self.station_changed(snap).ok() == Some(false);
+        if saved {
+            self.exit_prompt = false;
+            self.exit_discard = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    fn discard_and_close(&mut self, ctx: &egui::Context) {
+        self.exit_prompt = false;
+        self.exit_discard = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 
     /// PipeWire edits land in the open station file. No open file means there
@@ -4280,6 +5316,10 @@ impl App {
             levels.insert(name.clone(), self.shown_level(&name, snap));
         }
         let split = !snap.tx_vfo.is_empty() && !snap.tx_vfo.eq_ignore_ascii_case(&snap.vfo);
+        let radio_count = self.hub.view().rows.len();
+        self.trunk_receivers.retain(|entry| entry.radio < radio_count);
+        self.trunk_receivers.sort_by_key(|entry| entry.radio);
+        self.trunk_receivers.dedup_by_key(|entry| entry.radio);
         Ok(config::ConfigFile {
             version: 1,
             bsp_name,
@@ -4322,7 +5362,16 @@ impl App {
                 .view()
                 .rows
                 .into_iter()
-                .map(|row| row.spec)
+                .map(|row| {
+                    let mut spec = row.spec;
+                    if let Some(hold) = &self.hackrf_gain_hold {
+                        if hold.id == row.id {
+                            spec.lna_db = Some(hold.lna);
+                            spec.vga_db = Some(hold.vga);
+                        }
+                    }
+                    spec
+                })
                 .collect(),
             audio: self.hub.view().audio.clone(),
             rotators: self
@@ -4345,6 +5394,7 @@ impl App {
             talkgroup_zone: self.talkgroup_zone,
             talkgroup_sel: self.talkgroup_sel,
             unit_sel: self.unit_sel,
+            trunk_receivers: self.trunk_receivers.clone(),
             control_follow: match &self.pending_control {
                 Some((_, flags)) => flags
                     .iter()
@@ -4362,6 +5412,9 @@ impl App {
                     .map(|(index, _)| index)
                     .collect(),
             },
+            scan_zones: self.scan_zones.iter().copied().collect(),
+            monitor_zones: self.monitor_zones.iter().copied().collect(),
+            monitor_talkgroups: self.monitor_talkgroups.iter().copied().collect(),
             meters: self.meters_face(),
         })
     }
@@ -4397,6 +5450,9 @@ impl App {
     }
 
     fn apply_config(&mut self, _snap: &Snapshot, file: config::ConfigFile) {
+        self.gain_drag_lna = None;
+        self.gain_drag_vga = None;
+        self.hackrf_gain_hold = None;
         let config::ConfigFile {
             bsp_name,
             bsp,
@@ -4416,6 +5472,10 @@ impl App {
             talkgroup_sel,
             unit_sel,
             control_follow,
+            trunk_receivers,
+            scan_zones,
+            monitor_zones,
+            monitor_talkgroups,
             meters,
             ..
         } = file;
@@ -4439,10 +5499,12 @@ impl App {
         // An empty list is the hamlib dummy. The face fields are sent once
         // that new session is the one on screen.
         let after_gen = self.shared.lock().expect("rig thread").live_gen;
+        let after_list = self.hub.view().list_gen;
         self.pending_tune = Some(PendingTune {
             tune: tune.clone(),
             levels: levels.clone(),
             after_gen,
+            after_list,
         });
         self.audio_saved = crate::audio::canonical(&audio);
         self.audio_hold = true;
@@ -4452,12 +5514,27 @@ impl App {
         let follow_flags = config::control_follow_flags(radios.len(), &control_follow);
         self.hub.replace(radios, selected);
         self.pending_control = Some((list_gen, follow_flags));
+        self.trunk_receivers = trunk_receivers;
         self.cc_on.clear();
         self.hub.apply_audio(audio);
         self.rotators.replace(rotators);
         self.page = page_from_name(&page);
         self.channel_zone = channel_zone;
         self.channel_sel = channel_sel;
+        self.clear_scan_zones();
+        self.scan_zones = scan_zones.into_iter().collect();
+        self.monitor_zones = monitor_zones.into_iter().collect();
+        self.monitor_talkgroups = monitor_talkgroups.into_iter().collect();
+        self.hackrf_open.clear();
+        self.hackrf_call.clear();
+        self.hackrf_away.clear();
+        self.trunk_pool.clear();
+        self.hackrf_cc_feeds.clear();
+        self.hackrf_voice_feed.clear();
+        self.hackrf_watch_sent.clear();
+        self.hackrf_voice_sent.clear();
+        self.hackrf_p2_sent.clear();
+        self.hackrf_dial_seeded.clear();
         self.talkgroup_zone = talkgroup_zone;
         self.talkgroup_sel = talkgroup_sel;
         self.unit_sel = unit_sel;
@@ -4629,7 +5706,7 @@ impl App {
         }
     }
 
-    fn zone_row(&self, ui: &mut egui::Ui, idx: usize) -> (bool, egui::Response) {
+    fn zone_row(&self, ui: &mut egui::Ui, idx: usize) -> (bool, bool, egui::Response) {
         let name = self
             .channels
             .zones
@@ -4639,7 +5716,26 @@ impl App {
         let (rect, response) =
             ui.allocate_exact_size(egui::vec2(ui.available_width(), 26.0), egui::Sense::click());
         let painter = ui.painter();
-        if self.channel_zone == idx {
+        let listed = self.scan_zones.contains(&idx);
+        let text = if listed {
+            egui::Color32::from_rgb(236, 226, 246)
+        } else {
+            ui.visuals().text_color()
+        };
+        if listed {
+            let edge = if self.channel_zone == idx {
+                egui::Stroke::new(1.5, egui::Color32::from_rgb(186, 120, 230))
+            } else {
+                egui::Stroke::NONE
+            };
+            painter.rect(
+                rect,
+                egui::CornerRadius::same(4),
+                egui::Color32::from_rgb(42, 16, 64),
+                edge,
+                egui::StrokeKind::Inside,
+            );
+        } else if self.channel_zone == idx {
             painter.rect_filled(rect, egui::CornerRadius::same(4), HAM.gamma_multiply(0.28));
         } else if idx % 2 == 1 {
             painter.rect_filled(rect, egui::CornerRadius::ZERO, ui.visuals().faint_bg_color);
@@ -4649,9 +5745,11 @@ impl App {
             egui::Align2::LEFT_CENTER,
             &name,
             egui::FontId::proportional(14.0),
-            ui.visuals().text_color(),
+            text,
         );
-        (response.clicked(), response.on_hover_text(name))
+        let clicked = response.clicked();
+        let doubled = response.double_clicked();
+        (clicked, doubled, response)
     }
 
     fn channel_row(&self, ui: &mut egui::Ui, idx: usize) -> bool {
@@ -4688,6 +5786,9 @@ impl App {
             egui::FontId::monospace(14.0),
             ui.visuals().text_color(),
         );
+        if self.channel_list_follow && idx == self.channel_sel {
+            response.scroll_to_me(Some(egui::Align::Center));
+        }
         response.clicked()
     }
 
@@ -4727,9 +5828,13 @@ impl App {
         let mut freq_changed = false;
         let mut control = channel.control;
         let mut encrypted = channel.encrypted;
+        let vocoder_now = channels::vocoder_kind(&channel.vocoder);
         let mut picked = None;
+        let mut vocoder_pick = None;
         let mut add = false;
         let mut delete = false;
+        let show_invert = channels::vocoder_can_invert(vocoder_now);
+        let mut invert = channel.invert;
         frame.show(ui, |ui| {
             ui.set_min_width(inner);
             ui.label(egui::RichText::new(format!("Channel {}", sel + 1)).strong());
@@ -4762,8 +5867,26 @@ impl App {
                         }
                     });
             });
+            ui.horizontal(|ui| {
+                ui.label("Vocoder");
+                egui::ComboBox::from_id_salt(("ch-vocoder", zone_idx, sel))
+                    .width(180.0)
+                    .selected_text(channels::vocoder_label(vocoder_now))
+                    .show_ui(ui, |ui| {
+                        for (value, label) in channels::VOCODER_CHOICES {
+                            let on = vocoder_now == *value;
+                            if ui.selectable_label(on, *label).clicked() && !on {
+                                vocoder_pick = Some((*value).to_string());
+                            }
+                        }
+                    });
+            });
+            if show_invert {
+                ui.checkbox(&mut invert, "Invert");
+            }
             ui.checkbox(&mut control, "Control");
-            ui.checkbox(&mut encrypted, "Encrypted");
+            ui.checkbox(&mut encrypted, "Encrypted")
+                .on_hover_text("No encryption key is stored, so this is not scanned or played.");
             ui.horizontal(|ui| {
                 if ui.button("Add").clicked() {
                     add = true;
@@ -4810,7 +5933,11 @@ impl App {
             .zones
             .get(zone_idx)
             .and_then(|zone| zone.channels.get(sel))
-            .is_some_and(|channel| channel.control != control || channel.encrypted != encrypted);
+            .is_some_and(|channel| {
+                channel.control != control
+                    || channel.encrypted != encrypted
+                    || (show_invert && channel.invert != invert)
+            });
         if flags_changed {
             if let Some(channel) = self
                 .channels
@@ -4820,6 +5947,22 @@ impl App {
             {
                 channel.control = control;
                 channel.encrypted = encrypted;
+                if show_invert {
+                    channel.invert = invert;
+                }
+            }
+        }
+        if let Some(kind) = vocoder_pick {
+            if let Some(channel) = self
+                .channels
+                .zones
+                .get_mut(zone_idx)
+                .and_then(|zone| zone.channels.get_mut(sel))
+            {
+                channel.vocoder = kind.clone();
+                if !channels::vocoder_can_invert(&kind) {
+                    channel.invert = false;
+                }
             }
         }
         if delete {
@@ -4845,6 +5988,8 @@ impl App {
             mode,
             control: false,
             encrypted: false,
+            vocoder: String::new(),
+            invert: false,
         });
         self.channel_sel = zone.channels.len() - 1;
         self.channel_note.clear();
@@ -4882,6 +6027,469 @@ impl App {
         }
     }
 
+    fn selected_trunk(&self) -> bool {
+        self.hub.view().rows.iter().any(|row| {
+            if !row.selected {
+                return false;
+            }
+            if row.spec.driver == cat::RadioDriver::Hackrf {
+                return self.cc_on.get(&row.id).copied().unwrap_or(false);
+            }
+            hears_trunk_pipe(row)
+        })
+    }
+
+    /// Frequency the scanner is measuring.
+    fn scan_memory_hz(&self) -> Option<f64> {
+        let zone = self.memory_scan.zone()?;
+        let index = self.memory_scan.index()?;
+        let hz = self.channels.zones.get(zone)?.channels.get(index)?.hz;
+        if hz.is_finite() && hz > 0.0 {
+            Some(hz)
+        } else {
+            None
+        }
+    }
+
+    /// One scanner sample from the capture. A rigctl poll never arrives for
+    /// this radio, and the capture sequence goes back to 1 when the LO moves.
+    fn hackrf_scan_sample(&mut self, snap: &Snapshot) -> (u64, f64, f64) {
+        let spec = self.hub.spectrum();
+        let fresh = !spec.db.is_empty()
+            && spec.seq != 0
+            && (spec.seq != self.hackrf_scan_seq
+                || (spec.center_hz - self.hackrf_scan_center).abs() > 1.0);
+        if fresh {
+            self.hackrf_scan_poll = self.hackrf_scan_poll.wrapping_add(1);
+            if self.hackrf_scan_poll == 0 {
+                self.hackrf_scan_poll = 1;
+            }
+            self.hackrf_scan_seq = spec.seq;
+            self.hackrf_scan_center = spec.center_hz;
+        }
+        let center = if spec.center_hz > 0.0 {
+            spec.center_hz
+        } else {
+            snap.freq_hz
+        };
+        let target = self.scan_memory_hz().unwrap_or(center);
+        let strength = crate::hackrf::channel_db(&spec.db, spec.center_hz, target);
+        let freq = crate::hackrf::scan_freq(center, target, strength);
+        (self.hackrf_scan_poll, freq, strength)
+    }
+
+    fn zone_candidates(&self, snap: &Snapshot, zone_index: usize) -> Vec<scan::Candidate> {
+        let Some(zone) = self.channels.zones.get(zone_index) else {
+            return Vec::new();
+        };
+        zone.channels
+            .iter()
+            .enumerate()
+            .map(|(index, channel)| scan::Candidate {
+                index,
+                hz: channel.hz,
+                control: channel.control,
+                tunable: channel.hz.is_finite()
+                    && channel.hz > 0.0
+                    && !channel.encrypted
+                    && snap.caps.allow_freq(channel.hz).is_some(),
+            })
+            .collect()
+    }
+
+    fn scan_targets(&self, snap: &Snapshot) -> Vec<scan::Memory> {
+        scan::targets(
+            self.channel_zone,
+            &self.zone_candidates(snap, self.channel_zone),
+            self.selected_trunk(),
+        )
+    }
+
+    fn every_target(&self, snap: &Snapshot) -> Vec<scan::Memory> {
+        let trunk = self.selected_trunk();
+        self.channels
+            .zones
+            .iter()
+            .enumerate()
+            .flat_map(|(zone, _)| scan::targets(zone, &self.zone_candidates(snap, zone), trunk))
+            .collect()
+    }
+
+    /// Tunable memories in the marked zones, in zone-list order.
+    fn listed_targets(&self, snap: &Snapshot) -> Vec<scan::Memory> {
+        let trunk = self.selected_trunk();
+        self.scan_zones
+            .iter()
+            .flat_map(|zone| scan::targets(*zone, &self.zone_candidates(snap, *zone), trunk))
+            .collect()
+    }
+
+    fn stop_scan(&mut self) {
+        self.memory_scan.stop();
+        self.scan_amber_origin = false;
+    }
+
+    /// The channel document changed. Marked zones from the previous file
+    /// are dropped. A purple scan that was not amber underneath stops.
+    /// An amber scan keeps walking every zone of the file now on screen.
+    fn clear_scan_zones(&mut self) {
+        let had = !self.scan_zones.is_empty();
+        self.scan_zones.clear();
+        if !self.memory_scan.is_on() {
+            self.scan_amber_origin = false;
+            return;
+        }
+        if had && !self.scan_amber_origin {
+            self.stop_scan();
+        }
+    }
+
+    fn scan_link_block(&self, snap: &Snapshot) -> Option<&'static str> {
+        if snap.kind != LinkKind::Live {
+            return Some("The radio is not on.");
+        }
+        if self.following() {
+            return Some("Gpredict is moving this radio.");
+        }
+        None
+    }
+
+    fn scan_block_reason(&self, snap: &Snapshot) -> Option<&'static str> {
+        if let Some(reason) = self.scan_link_block(snap) {
+            return Some(reason);
+        }
+        if self.scan_targets(snap).is_empty() {
+            return Some("This zone has no channel this radio can tune.");
+        }
+        None
+    }
+
+    fn start_memory_scan(&mut self, snap: &Snapshot) {
+        self.scan_amber_origin = false;
+        let memories = self.scan_targets(snap);
+        let Some(first) = memories
+            .iter()
+            .find(|memory| memory.index == self.channel_sel)
+            .copied()
+            .or_else(|| memories.first().copied())
+        else {
+            self.memory_scan.stop();
+            return;
+        };
+        self.memory_scan.start(
+            self.channel_zone,
+            first.index,
+            first.hz,
+            self.selected_trunk(),
+            false,
+        );
+        self.channel_sel = first.index;
+        self.channel_list_follow = true;
+    }
+
+    /// Amber scan. The list is every tunable memory, zone by zone.
+    fn start_all_scan(&mut self, snap: &Snapshot) {
+        let memories = self.every_target(snap);
+        let Some(first) = memories
+            .iter()
+            .copied()
+            .find(|memory| memory.zone == self.channel_zone)
+            .or_else(|| memories.first().copied())
+        else {
+            self.channel_note = "No channel this radio can tune.".into();
+            return;
+        };
+        self.scan_amber_origin = true;
+        self.channel_zone = first.zone;
+        self.memory_scan
+            .start(first.zone, first.index, first.hz, self.selected_trunk(), true);
+        self.channel_sel = first.index;
+        self.channel_list_follow = true;
+        self.zone_list_follow = true;
+    }
+
+    /// Purple scan. Marked zones only. Does not record an amber origin;
+    /// a double-click of SCAN while marks exist stops first, and that stop
+    /// already cleared the origin.
+    fn start_listed_scan(&mut self, snap: &Snapshot) {
+        let memories = self.listed_targets(snap);
+        let Some(first) = memories
+            .iter()
+            .copied()
+            .find(|memory| memory.zone == self.channel_zone)
+            .or_else(|| memories.first().copied())
+        else {
+            self.channel_note = "No channel this radio can tune.".into();
+            return;
+        };
+        self.scan_amber_origin = false;
+        self.channel_zone = first.zone;
+        self.memory_scan
+            .start(first.zone, first.index, first.hz, self.selected_trunk(), true);
+        self.channel_sel = first.index;
+        self.channel_list_follow = true;
+        self.zone_list_follow = true;
+    }
+
+    fn toggle_scan_zone(&mut self, snap: &Snapshot, idx: usize) {
+        if !self.scan_zones.remove(&idx) {
+            self.scan_zones.insert(idx);
+        }
+        if self.memory_scan.is_on() {
+            self.apply_scan_list(snap);
+        }
+    }
+
+    /// The marked zones changed while SCAN is on. The floor stays. Dropping
+    /// the last mark returns to amber when this scan began as amber.
+    fn apply_scan_list(&mut self, snap: &Snapshot) {
+        if self.scan_zones.is_empty() {
+            if self.scan_amber_origin {
+                self.memory_scan.follow_list();
+                self.keep_or_jump(&self.every_target(snap));
+                return;
+            }
+            self.start_memory_scan(snap);
+            if !self.memory_scan.is_on() {
+                self.channel_note = "This zone has no channel this radio can tune.".into();
+            }
+            return;
+        }
+        let memories = self.listed_targets(snap);
+        if memories.is_empty() {
+            self.stop_scan();
+            self.channel_note = "No channel this radio can tune.".into();
+            return;
+        }
+        self.memory_scan.follow_list();
+        self.keep_or_jump(&memories);
+    }
+
+    /// Stay on the current memory when it is still in `memories`. Otherwise
+    /// jump to the first memory of that zone, or the first memory in the list.
+    fn keep_or_jump(&mut self, memories: &[scan::Memory]) {
+        let zone = self.memory_scan.zone();
+        let index = self.memory_scan.index();
+        let still = memories
+            .iter()
+            .any(|memory| Some(memory.zone) == zone && Some(memory.index) == index);
+        if still {
+            return;
+        }
+        let Some(next) = zone
+            .and_then(|zone| memories.iter().copied().find(|memory| memory.zone == zone))
+            .or_else(|| memories.first().copied())
+        else {
+            self.stop_scan();
+            self.channel_note = "No channel this radio can tune.".into();
+            return;
+        };
+        self.memory_scan.jump(next.zone, next.index, next.hz);
+        self.channel_zone = next.zone;
+        self.channel_sel = next.index;
+        self.channel_list_follow = true;
+        self.zone_list_follow = true;
+    }
+
+    /// SCAN stays on. A one-zone scan measures the new zone from scratch.
+    /// An all-zone scan jumps into it and keeps walking the other zones.
+    fn retarget_scan(&mut self, snap: &Snapshot) {
+        if !self.scan_zones.is_empty() {
+            let memories = self.listed_targets(snap);
+            let Some(first) = memories
+                .iter()
+                .copied()
+                .find(|memory| memory.zone == self.channel_zone)
+            else {
+                self.stop_scan();
+                self.channel_sel = 0;
+                self.channel_note = "This zone has no channel this radio can tune.".into();
+                return;
+            };
+            self.memory_scan.follow_list();
+            self.memory_scan.jump(first.zone, first.index, first.hz);
+            self.channel_sel = first.index;
+            self.channel_list_follow = true;
+            return;
+        }
+        if self.memory_scan.all_zones() {
+            let memories = self.every_target(snap);
+            let Some(first) = memories
+                .iter()
+                .copied()
+                .find(|memory| memory.zone == self.channel_zone)
+            else {
+                self.stop_scan();
+                self.channel_sel = 0;
+                self.channel_note = "This zone has no channel this radio can tune.".into();
+                return;
+            };
+            self.memory_scan.jump(first.zone, first.index, first.hz);
+            self.channel_sel = first.index;
+            self.channel_list_follow = true;
+            return;
+        }
+        let memories = self.scan_targets(snap);
+        let Some(first) = memories.first().copied() else {
+            self.stop_scan();
+            self.channel_sel = 0;
+            self.channel_note = "This zone has no channel this radio can tune.".into();
+            return;
+        };
+        self.scan_amber_origin = false;
+        self.memory_scan.start(
+            self.channel_zone,
+            first.index,
+            first.hz,
+            self.selected_trunk(),
+            false,
+        );
+        self.channel_sel = first.index;
+        self.channel_list_follow = true;
+    }
+
+    /// The short status sentence stays after the scan that wrote it has
+    /// stopped. Drop it once this radio can tune a channel in the list.
+    fn clear_stale_channel_note(&mut self, snap: &Snapshot) {
+        if self.channel_note != "No channel this radio can tune." {
+            return;
+        }
+        let tunable = if self.scan_zones.is_empty() {
+            !self.every_target(snap).is_empty()
+        } else {
+            !self.listed_targets(snap).is_empty()
+        };
+        if tunable {
+            self.channel_note.clear();
+        }
+    }
+
+    /// Drop SCAN when the radio, Gpredict, or the zone can no longer be
+    /// hopped. Trunk Follow does not drop it; the scan owns those hops.
+    fn release_memory_scan(&mut self, snap: &Snapshot) {
+        if !self.memory_scan.is_on() {
+            return;
+        }
+        if snap.ptt {
+            self.stop_scan();
+            return;
+        }
+        if let Some(reason) = self.scan_link_block(snap) {
+            self.stop_scan();
+            self.channel_note = reason.to_string();
+            return;
+        }
+        if !self.scan_zones.is_empty() {
+            if self.listed_targets(snap).is_empty() {
+                self.stop_scan();
+                self.channel_note = "No channel this radio can tune.".into();
+            }
+            return;
+        }
+        if self.memory_scan.all_zones() {
+            return;
+        }
+        if self.scan_targets(snap).is_empty() {
+            self.stop_scan();
+            self.channel_note = "This zone has no channel this radio can tune.".into();
+        }
+    }
+
+    fn advance_memory_scan(&mut self, ctx: &egui::Context, snap: &Snapshot, poll_gen: u64) {
+        if let Some(deadline) = self.memory_scan.dwell_deadline() {
+            let now = std::time::Instant::now();
+            if deadline > now {
+                ctx.request_repaint_after(deadline.saturating_duration_since(now));
+            } else {
+                ctx.request_repaint();
+            }
+        }
+        if !self.memory_scan.is_on() {
+            return;
+        }
+        let memories = if !self.scan_zones.is_empty() {
+            self.listed_targets(snap)
+        } else if self.memory_scan.all_zones() {
+            self.every_target(snap)
+        } else {
+            self.scan_targets(snap)
+        };
+        // A zone outside the list must not stop the scan. The click handler
+        // jumps only when that zone is one the scan is allowed to hop.
+        let step_zone = if memories.iter().any(|memory| memory.zone == self.channel_zone) {
+            self.channel_zone
+        } else {
+            self.memory_scan.zone().unwrap_or(self.channel_zone)
+        };
+        let (poll_gen, freq_hz, strength) = if snap.model == "HackRF" {
+            self.hackrf_scan_sample(snap)
+        } else if snap.model == "GQRX" {
+            (poll_gen, snap.freq_hz, gqrx_dbfs_to_s9(snap.strength_db))
+        } else {
+            (poll_gen, snap.freq_hz, snap.strength_db)
+        };
+        let action = self.memory_scan.step(
+            &scan::Sample {
+                now: std::time::Instant::now(),
+                poll_gen,
+                freq_hz,
+                strength_db: strength,
+                trunk: self.selected_trunk(),
+            },
+            step_zone,
+            &memories,
+        );
+        match action {
+            scan::Action::Idle => {}
+            scan::Action::Stop => {
+                // A trunk or zone change stops the scan while the marked
+                // channels are still tunable. That stop is not an empty list.
+                let note = if self.scan_zones.is_empty() {
+                    self.scan_block_reason(snap)
+                } else if self.listed_targets(snap).is_empty() {
+                    Some("No channel this radio can tune.")
+                } else {
+                    None
+                };
+                self.stop_scan();
+                if let Some(note) = note {
+                    self.channel_note = note.to_string();
+                } else if self.channel_note == "No channel this radio can tune." {
+                    self.channel_note.clear();
+                }
+            }
+            scan::Action::Tune { index, resend } => {
+                if let Some(zone) = self.memory_scan.zone() {
+                    if zone != self.channel_zone {
+                        self.channel_zone = zone;
+                        self.zone_list_follow = true;
+                        self.channel_list_follow = true;
+                    }
+                }
+                if index != self.channel_sel {
+                    self.channel_list_follow = true;
+                }
+                self.channel_sel = index;
+                if resend {
+                    self.scan_sending = true;
+                    self.recall_channel(snap, index);
+                    self.scan_sending = false;
+                }
+            }
+        }
+    }
+
+    /// A clear unmarked grant is heard. An encrypted grant, or a talkgroup or
+    /// channel marked encrypted, is heard only when a filled key is loaded.
+    /// A placeholder does not count.
+    fn hear_grant(&self, alg: u16, tg: u32, hz: f64) -> bool {
+        follow::hear_clear(
+            alg,
+            talkgroups::is_encrypted(&self.talkgroups, tg),
+            channels::hz_encrypted(&self.channels, hz),
+        ) || keys::has_filled(&self.keys)
+    }
+
     fn recall_channel(&mut self, snap: &Snapshot, idx: usize) {
         self.channel_sel = idx;
         let Some(channel) = self
@@ -4895,7 +6503,13 @@ impl App {
         let hz = channel.hz;
         let mode = channel.mode.clone();
         let control = channel.control;
-        if control {
+        // No key is stored. Selecting the row still opens the editor.
+        if channel.encrypted {
+            return;
+        }
+        // A scan hop is not the operator picking a control. hold() would
+        // reset every trunk follower, including a radio this scan is not tuning.
+        if control && !self.scan_sending {
             self.hold_control(hz);
         }
         if hz.is_finite() && hz > 0.0 && snap.caps.allow_freq(hz).is_some() {
@@ -5236,6 +6850,9 @@ impl App {
         {
             let tail = self.cc_tail.entry(id).or_default();
             for line in lines {
+                if keys::is_key_dump(line) {
+                    continue;
+                }
                 let plain = follow::plain_line(line);
                 let plain = plain.trim();
                 if plain.is_empty() {
@@ -5254,8 +6871,18 @@ impl App {
             }
         }
         if let Some(banner) = banner {
+            if let Some(word) = follow::p2_parameter_word(&banner) {
+                let hackrf = self.hub.view().rows.iter().any(|row| {
+                    row.id == id && row.spec.driver == cat::RadioDriver::Hackrf
+                });
+                if hackrf && self.hackrf_p2_sent.get(&id) != Some(&word) {
+                    self.hub.hackrf_p2(id, &word);
+                    self.hackrf_p2_sent.insert(id, word);
+                }
+            }
             self.cc_site.insert(id, banner);
         }
+        self.note_identity(id, lines);
         let now = clock::unix_now_ms();
         for plain in plains {
             self.system_clock.note_line(&plain, now);
@@ -5275,7 +6902,7 @@ impl App {
             .show(ui, |ui| {
                 if lines.is_empty() {
                     ui.label(
-                        "No decoder lines yet. This is dsd-fme stderr from the P25 receive pipe.",
+                        "No decoder lines yet. This is dsd-fme stderr from the trunking receive pipe.",
                     );
                 } else {
                     for line in &lines {
@@ -5308,17 +6935,120 @@ impl App {
         }
     }
 
-    /// Park a P25 radio on a control memory and hop to the newest clear grant.
+    /// Insert the selected memory's vocoder into the selected radio.
+    ///
+    /// The demod starts when the memory is selected. Squelch is not polled.
+    /// Its stderr is the scanner identity, not a grant. While that radio
+    /// is following a trunked control channel, its own receive pipe stays.
+    fn apply_channel_vocoder(&mut self) {
+        let rows = self.hub.view().rows;
+        let selected = rows.iter().find(|row| row.selected).map(|row| row.id);
+        let selected_channel = self
+            .channels
+            .zones
+            .get(self.channel_zone)
+            .and_then(|zone| zone.channels.get(self.channel_sel));
+        let encrypted = selected_channel.is_some_and(|channel| channel.encrypted);
+        let kind = if encrypted {
+            String::new()
+        } else {
+            selected_channel
+                .map(|channel| channels::vocoder_kind(&channel.vocoder).to_string())
+                .unwrap_or_default()
+        };
+        let channel_invert = !encrypted && selected_channel.is_some_and(|channel| channel.invert);
+        self.vocoder_sent
+            .retain(|id, _| rows.iter().any(|row| row.id == *id));
+        self.invert_sent
+            .retain(|id, _| rows.iter().any(|row| row.id == *id));
+        for row in &rows {
+            let following = self.cc_on.get(&row.id).copied().unwrap_or(false)
+                && !row.spec.follow
+                && crate::rx_pipe::is_trunk_rx(&row.spec.rx_pipe);
+            let use_kind = if Some(row.id) == selected && !following {
+                kind.as_str()
+            } else {
+                ""
+            };
+            let (command, note) = match crate::rx_pipe::vocoder_command(use_kind) {
+                Ok(command) => (command, String::new()),
+                Err(err) => (String::new(), err),
+            };
+            let running = if command.is_empty() {
+                row.spec.rx_pipe.as_str()
+            } else {
+                command.as_str()
+            };
+            let want_invert = Some(row.id) == selected
+                && channel_invert
+                && crate::rx_pipe::invert_applies(running, &kind);
+            if self
+                .vocoder_sent
+                .get(&row.id)
+                .is_some_and(|(sent, sent_note)| sent == &command && sent_note == &note)
+            {
+                // The demod is already the one this memory asked for.
+            } else {
+                self.cc_identity.remove(&row.id);
+                self.hub
+                    .set_vocoder(row.id, command.clone(), note.clone());
+                self.vocoder_sent.insert(row.id, (command, note));
+            }
+            if self.invert_sent.get(&row.id) != Some(&want_invert) {
+                self.cc_identity.remove(&row.id);
+                self.hub.set_invert(row.id, want_invert);
+                self.invert_sent.insert(row.id, want_invert);
+            }
+        }
+    }
+
+    /// Scanner-glass lines from a channel vocoder. They are not fed to a follower.
+    fn drain_identity(&mut self) {
+        let ids: Vec<u64> = self.hub.view().rows.iter().map(|row| row.id).collect();
+        self.cc_identity.retain(|id, _| ids.contains(id));
+        for id in ids {
+            let lines = self.hub.take_identity(id);
+            self.note_identity(id, &lines);
+        }
+    }
+
+    fn note_identity(&mut self, id: u64, lines: &[String]) {
+        if lines.is_empty() {
+            return;
+        }
+        let ident = self.cc_identity.entry(id).or_default();
+        for line in lines {
+            follow::note_identity(ident, line);
+        }
+    }
+
+    /// Park a trunking radio on a control memory and hop to the newest clear grant.
     /// Gpredict follow keeps the radio. The decoder process stays up across hops.
     fn service_cc(&mut self, snap: &Snapshot) {
+        self.sync_key_csv();
         self.apply_saved_control_follow();
+        self.trunk_pool.clear();
         let rows = self.hub.view().rows;
-        let p25: Vec<(u64, bool, bool)> = rows
+        let trunk: Vec<(u64, bool, bool, String)> = rows
             .iter()
-            .filter(|row| crate::rx_pipe::is_p25_rx(&row.spec.rx_pipe))
-            .map(|row| (row.id, row.selected, row.spec.follow))
+            .filter(|row| {
+                row.spec.driver != cat::RadioDriver::Hackrf && hears_trunk_pipe(row)
+            })
+            .map(|row| {
+                (
+                    row.id,
+                    row.selected,
+                    row.spec.follow,
+                    row.spec.rx_pipe.clone(),
+                )
+            })
             .collect();
-        let ids: Vec<u64> = p25.iter().map(|row| row.0).collect();
+        let mut ids: Vec<u64> = trunk.iter().map(|row| row.0).collect();
+        ids.extend(
+            rows.iter()
+                .filter(|row| row.spec.driver == cat::RadioDriver::Hackrf)
+                .map(|row| row.id),
+        );
         self.cc_on.retain(|id, _| ids.contains(id));
         self.cc_sent.retain(|id, _| ids.contains(id));
         self.cc_voice_sent.retain(|id, _| ids.contains(id));
@@ -5332,7 +7062,7 @@ impl App {
         let controls = channels::zone_controls(&self.channels, self.channel_zone);
         let control_hz: Vec<f64> = controls.iter().map(|(hz, _, _)| *hz).collect();
 
-        for (id, selected, gpredict) in p25 {
+        for (id, selected, gpredict, pipe) in trunk {
             let on = self.cc_on.get(&id).copied().unwrap_or(false);
             let events = on && !gpredict;
             if self.cc_sent.get(&id).copied() != Some(events) {
@@ -5340,16 +7070,25 @@ impl App {
                 self.cc_sent.insert(id, events);
             }
             let lines = self.hub.take_cc_events(id);
+            self.note_asked_keys(&lines);
             self.note_decoder(id, &lines);
             // The advertisement is useful with Follow off. The feed has to
             // see every line or a header and its frequency can land on
             // different wakes.
             let mut parsed = Vec::new();
+            let mut feed_reset = false;
             {
-                let feed = self.feeds.entry(id).or_default();
+                let feed = self.feeds.entry(id).or_insert_with(|| CcFeed::for_pipe(&pipe));
+                if !feed.matches(&pipe) {
+                    *feed = CcFeed::for_pipe(&pipe);
+                    feed_reset = true;
+                }
                 for line in &lines {
                     parsed.extend(feed.push_line(line));
                 }
+            }
+            if feed_reset {
+                self.cc_identity.remove(&id);
             }
             let mut added = false;
             if let Some(zone) = self.channels.zones.get_mut(self.channel_zone) {
@@ -5389,6 +7128,16 @@ impl App {
                 }
                 continue;
             }
+            if selected && self.memory_scan.is_on() {
+                // SCAN is walking control channels and holding an active one
+                // so the adjacent-site lines stored above can arrive. A voice
+                // grant must not take the dial during that listen.
+                if self.cc_voice_sent.get(&id).copied() != Some(true) {
+                    self.hub.set_cc_voice(id, true);
+                    self.cc_voice_sent.insert(id, true);
+                }
+                continue;
+            }
             if !self.followers.contains_key(&id) {
                 self.followers
                     .insert(id, follow::Follower::new(control_hz.clone()));
@@ -5398,6 +7147,73 @@ impl App {
                     follower.set_controls(control_hz.clone());
                 }
             }
+            let role = rows
+                .iter()
+                .position(|row| row.id == id)
+                .map(|index| self.trunk_role_at(index))
+                .unwrap_or(config::TrunkRole::Both);
+            // A receiver already on a voice channel is hearing that channel,
+            // not a new control-channel grant. A control receiver never leaves.
+            let on_control = role == config::TrunkRole::Control
+                || self
+                    .followers
+                    .get(&id)
+                    .is_none_or(|follower| follower.role() != follow::Role::Voice);
+            if on_control {
+                let zones: Vec<usize> = self.monitor_zones.iter().copied().collect();
+                let marked: Vec<u32> = self.monitor_talkgroups.iter().copied().collect();
+                for event in &parsed {
+                    if let follow::CcEvent::Grant { hz, tg, alg } = event {
+                        if !self.hear_grant(*alg, *tg, *hz) || !hz.is_finite() || *hz < 1_000_000.0
+                        {
+                            continue;
+                        }
+                        let zone = talkgroup_zone_of(&self.talkgroups, *tg);
+                        if crate::hackrf::tg_selected(zone, *tg, &zones, &marked) {
+                            self.trunk_pool.push((id, *hz, *tg));
+                        }
+                    }
+                }
+            }
+            // A dedicated control receiver keeps hunting. Voice grants, an
+            // encryption notice, and a terminator must not take its dial.
+            let keyed = keys::has_filled(&self.keys);
+            let parsed: Vec<follow::CcEvent> = parsed
+                .into_iter()
+                .filter_map(|event| {
+                    if role == config::TrunkRole::Control
+                        && matches!(
+                            event,
+                            follow::CcEvent::Grant { .. }
+                                | follow::CcEvent::Alg(_)
+                                | follow::CcEvent::End
+                        )
+                    {
+                        return None;
+                    }
+                    match event {
+                        follow::CcEvent::Grant { hz, tg, alg } => {
+                            if !self.hear_grant(alg, tg, hz) {
+                                return None;
+                            }
+                            // The hamlib follower hops a clear grant. The
+                            // decoder still has the real algorithm and the
+                            // key file. A non-clear Alg line must not send
+                            // the radio back before that voice is played.
+                            if alg != follow::CLEAR_ALG && keyed {
+                                return Some(follow::CcEvent::Grant {
+                                    hz,
+                                    tg,
+                                    alg: follow::CLEAR_ALG,
+                                });
+                            }
+                            Some(follow::CcEvent::Grant { hz, tg, alg })
+                        }
+                        follow::CcEvent::Alg(alg) if alg != follow::CLEAR_ALG && keyed => None,
+                        other => Some(other),
+                    }
+                })
+                .collect();
             if let Some(follower) = self.followers.get_mut(&id) {
                 for event in parsed {
                     follower.push(event);
@@ -5463,6 +7279,337 @@ impl App {
                 self.cc_voice_sent.insert(id, play);
             }
         }
+        self.service_hackrf(snap);
+        self.steer_voice_radios();
+    }
+
+    /// HackRF Follow. A grant inside the window is a discriminator offset.
+    /// A clear selected grant outside the window retunes this radio onto
+    /// that voice channel until the voice decoder finishes the call, then
+    /// the control cluster returns. A control-only receiver never leaves.
+    /// A control channel's terminator does not end the call.
+    fn service_hackrf(&mut self, snap: &Snapshot) {
+        let rows = self.hub.view().rows;
+        let direct: Vec<(usize, u64, bool)> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.spec.driver == cat::RadioDriver::Hackrf)
+            .map(|(index, row)| (index, row.id, row.spec.follow))
+            .collect();
+        let ids: Vec<u64> = direct.iter().map(|row| row.1).collect();
+        self.hackrf_open.retain(|id, _| ids.contains(id));
+        self.hackrf_call.retain(|id, _| ids.contains(id));
+        self.hackrf_away.retain(|id, _| ids.contains(id));
+        self.hackrf_cc_feeds.retain(|id, _| ids.contains(id));
+        self.hackrf_voice_feed.retain(|id, _| ids.contains(id));
+        self.hackrf_watch_sent.retain(|id, _| ids.contains(id));
+        self.hackrf_voice_sent.retain(|id, _| ids.contains(id));
+        self.hackrf_p2_sent.retain(|id, _| ids.contains(id));
+        if direct.is_empty() {
+            return;
+        }
+        let controls = channels::zone_controls(&self.channels, self.channel_zone);
+        let control_hz: Vec<f64> = controls.iter().map(|(hz, _, _)| *hz).collect();
+        let zones: Vec<usize> = self.monitor_zones.iter().copied().collect();
+        let marked: Vec<u32> = self.monitor_talkgroups.iter().copied().collect();
+        let (cluster, cluster_controls) =
+            crate::hackrf::place(&control_hz).unwrap_or((0.0, Vec::new()));
+        let away_now: Vec<u64> = self.hackrf_away.keys().copied().collect();
+        struct Tick {
+            id: u64,
+            scanning: bool,
+            role: config::TrunkRole,
+            voice_events: Vec<follow::CcEvent>,
+        }
+        let mut ticks: Vec<Tick> = Vec::new();
+
+        for (index, id, gpredict) in direct {
+            let on = self.cc_on.get(&id).copied().unwrap_or(false);
+            let events = on && !gpredict;
+            if self.cc_sent.get(&id).copied() != Some(events) {
+                self.hub.set_cc(id, events);
+                self.cc_sent.insert(id, events);
+            }
+            let groups = self.hub.take_hackrf_controls(id);
+            let voice_lines = self.hub.take_hackrf_voice(id);
+            let mut logged = Vec::new();
+            for lines in &groups {
+                logged.extend(lines.iter().cloned());
+            }
+            logged.extend(voice_lines.iter().cloned());
+            self.note_asked_keys(&logged);
+            self.note_decoder(id, &logged);
+            let mut parsed = Vec::new();
+            {
+                let feeds = self.hackrf_cc_feeds.entry(id).or_default();
+                if feeds.len() != groups.len() {
+                    *feeds = vec![follow::DsdFeed::default(); groups.len()];
+                }
+                for (feed, lines) in feeds.iter_mut().zip(groups) {
+                    for line in lines {
+                        parsed.extend(feed.push_line(&line));
+                    }
+                }
+            }
+            let mut voice_events = Vec::new();
+            {
+                let feed = self.hackrf_voice_feed.entry(id).or_default();
+                for line in &voice_lines {
+                    voice_events.extend(feed.push_line(line));
+                }
+            }
+            let mut added = false;
+            if let Some(zone) = self.channels.zones.get_mut(self.channel_zone) {
+                for event in &parsed {
+                    if let follow::CcEvent::Adjacent { hz, rfss, site } = event {
+                        if channels::add_control(zone, *hz, *rfss, *site) {
+                            added = true;
+                        }
+                    }
+                }
+            }
+            for event in &parsed {
+                match event {
+                    follow::CcEvent::Grant { tg, alg, .. } => {
+                        let encrypted = *alg != follow::CLEAR_ALG;
+                        if talkgroups::note_seen(&mut self.talkgroups, *tg, encrypted) {
+                            added = true;
+                        }
+                    }
+                    follow::CcEvent::Unit(sight) => {
+                        if units::note(&mut self.units, sight) {
+                            added = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if added && !self.config_path.is_empty() {
+                self.save_config(snap);
+            }
+            if !events {
+                self.hackrf_open.remove(&id);
+                self.hackrf_call.insert(id, None);
+                self.hackrf_away.remove(&id);
+                self.hackrf_watch_sent.remove(&id);
+                self.hackrf_voice_sent.remove(&id);
+                continue;
+            }
+            let role = self.trunk_role_at(index);
+            let scanning = rows.iter().any(|row| row.id == id && row.selected)
+                && self.memory_scan.is_on();
+            // Grants from a radio that has left the cluster are voice-channel
+            // link control. A scan parked outside the cluster is the same.
+            let parked_outside = scanning
+                && self
+                    .scan_memory_hz()
+                    .is_some_and(|hz| !crate::hackrf::inside(cluster, hz));
+            if !away_now.contains(&id) && !parked_outside {
+                for event in &parsed {
+                    if let follow::CcEvent::Grant { hz, tg, alg } = event {
+                        if !self.hear_grant(*alg, *tg, *hz) || !hz.is_finite() || *hz < 1_000_000.0
+                        {
+                            continue;
+                        }
+                        let zone = talkgroup_zone_of(&self.talkgroups, *tg);
+                        if crate::hackrf::tg_selected(zone, *tg, &zones, &marked) {
+                            self.trunk_pool.push((id, *hz, *tg));
+                        }
+                    }
+                }
+            }
+            ticks.push(Tick {
+                id,
+                scanning,
+                role,
+                voice_events,
+            });
+        }
+
+        for tick in ticks {
+            self.hold_freq = None;
+            let may_play = tick.role != config::TrunkRole::Control;
+            let may_leave = may_play && !tick.scanning;
+            let fresh: Vec<(f64, u32)> = if may_play {
+                self.trunk_pool
+                    .iter()
+                    .filter(|(from, _, _)| !away_now.contains(&tick.id) || *from != tick.id)
+                    .map(|(_, hz, tg)| (*hz, *tg))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            // SCAN reads each control from the capture already running.
+            // A memory outside the cluster is a capture of its own, and a
+            // voice trip must not fight that hop.
+            let scan = if tick.scanning {
+                Some(match self.scan_memory_hz() {
+                    Some(hz) => {
+                        let (cluster, controls) = if cluster >= 1_000_000.0 {
+                            (cluster, cluster_controls.clone())
+                        } else {
+                            (hz, vec![hz])
+                        };
+                        crate::hackrf::scan_capture(cluster, &controls, hz)
+                    }
+                    None => (cluster, cluster_controls.clone()),
+                })
+            } else {
+                None
+            };
+            let keyed = keys::has_filled(&self.keys);
+            let previous = self.hackrf_call.get(&tick.id).copied().flatten();
+            let open = self
+                .hackrf_open
+                .remove(&tick.id)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|row| {
+                    let zone = talkgroup_zone_of(&self.talkgroups, row.tg);
+                    self.hear_grant(follow::CLEAR_ALG, row.tg, row.hz)
+                        && crate::hackrf::tg_selected(zone, row.tg, &zones, &marked)
+                })
+                .map(|row| (row.hz, row.tg, row.seq))
+                .collect();
+            let saw = |kind: fn(&follow::CcEvent) -> bool| tick.voice_events.iter().any(kind);
+            // A filled key is supposed to play this call. The air algorithm
+            // stays non-clear after the decoder has the key.
+            let saw_end = tick.voice_events.iter().any(|event| match event {
+                follow::CcEvent::End => true,
+                follow::CcEvent::Alg(alg) => *alg != follow::CLEAR_ALG && !keyed,
+                _ => false,
+            });
+            let picked = crate::hackrf::follow_capture(
+                cluster,
+                &cluster_controls,
+                scan,
+                may_play,
+                may_leave,
+                open,
+                self.hackrf_seq,
+                previous,
+                &fresh,
+                self.hackrf_away.get(&tick.id).copied(),
+                saw(|event| matches!(event, follow::CcEvent::Sync)),
+                saw(|event| matches!(event, follow::CcEvent::SyncLost)),
+                saw_end,
+                saw(|event| matches!(event, follow::CcEvent::Search)),
+            );
+            self.hackrf_seq = picked.seq;
+            self.hackrf_open.insert(
+                tick.id,
+                picked
+                    .open
+                    .into_iter()
+                    .map(|(hz, tg, seq)| HeardGrant { hz, tg, seq })
+                    .collect(),
+            );
+            self.hackrf_call.insert(tick.id, picked.call);
+            if let Some(away) = picked.away {
+                self.hackrf_away.insert(tick.id, away);
+            } else {
+                self.hackrf_away.remove(&tick.id);
+            }
+            let sig = (
+                picked.center.round() as i64,
+                picked
+                    .controls
+                    .iter()
+                    .map(|hz| hz.round() as i64)
+                    .collect::<Vec<_>>(),
+            );
+            if self.hackrf_watch_sent.get(&tick.id) != Some(&sig) {
+                self.hub.hackrf_watch(tick.id, picked.center, picked.controls);
+                self.hackrf_watch_sent.insert(tick.id, sig);
+            }
+            if self.hackrf_voice_sent.get(&tick.id).copied() != Some(picked.voice_hz) {
+                self.hub.hackrf_voice(tick.id, picked.voice_hz);
+                self.hackrf_voice_sent.insert(tick.id, picked.voice_hz);
+            }
+        }
+    }
+
+    /// Role stored for this radio index. A radio with no entry is both the
+    /// control receiver and the voice receiver.
+    fn trunk_role_at(&self, index: usize) -> config::TrunkRole {
+        self.trunk_receivers
+            .iter()
+            .find(|entry| entry.radio == index)
+            .map(|entry| entry.role)
+            .unwrap_or(config::TrunkRole::Both)
+    }
+
+    /// Follow off, or Control / Voice / Both. Both is the default and is
+    /// not written. Control and Voice are written on the station file.
+    fn set_trunk_role(
+        &mut self,
+        index: usize,
+        role: Option<config::TrunkRole>,
+        snap: &Snapshot,
+    ) {
+        let rows = self.hub.view().rows;
+        let Some(row) = rows.get(index) else {
+            return;
+        };
+        let id = row.id;
+        self.trunk_receivers.retain(|entry| entry.radio != index);
+        match role {
+            None => {
+                self.cc_on.insert(id, false);
+                self.hackrf_away.remove(&id);
+            }
+            Some(config::TrunkRole::Both) => {
+                self.cc_on.insert(id, true);
+            }
+            Some(role) => {
+                self.cc_on.insert(id, true);
+                if role == config::TrunkRole::Control {
+                    self.hackrf_away.remove(&id);
+                }
+                self.trunk_receivers
+                    .push(config::TrunkReceiver { radio: index, role });
+                self.trunk_receivers.sort_by_key(|entry| entry.radio);
+            }
+        }
+        if !self.config_path.is_empty() {
+            self.save_config(snap);
+        }
+    }
+
+    /// A hamlib radio marked Voice takes one grant from a receiver that is
+    /// still on the control channel. Its own decoder ends the hop. A radio
+    /// that has not learned a channel map stays on the control channel.
+    fn steer_voice_radios(&mut self) {
+        let rows = self.hub.view().rows;
+        let grants = self.trunk_pool.clone();
+        for (index, row) in rows.iter().enumerate() {
+            if row.spec.driver == cat::RadioDriver::Hackrf || !hears_trunk_pipe(row) {
+                continue;
+            }
+            if row.spec.follow || !self.cc_on.get(&row.id).copied().unwrap_or(false) {
+                continue;
+            }
+            if self.trunk_role_at(index) != config::TrunkRole::Voice {
+                continue;
+            }
+            if row.selected && self.memory_scan.is_on() {
+                continue;
+            }
+            let Some((_, hz, tg)) = grants.iter().rev().find(|(from, _, _)| *from != row.id) else {
+                continue;
+            };
+            let Some(follower) = self.followers.get_mut(&row.id) else {
+                continue;
+            };
+            if follower.role() == follow::Role::Voice || follower.voice_hz().is_some() {
+                continue;
+            }
+            follower.push(follow::CcEvent::Grant {
+                hz: *hz,
+                tg: *tg,
+                alg: follow::CLEAR_ALG,
+            });
+        }
     }
 
     /// One mode command for the control memory. A later frame does not repeat it.
@@ -5485,7 +7632,7 @@ impl App {
     }
 
     /// Write a radio-id description when the field is left.
-    /// Closing the window writes it too. A crash does not reach that close.
+    /// The exit prompt writes it too when the operator saves. A crash does not.
     fn save_unit_description(&mut self, snap: &Snapshot) {
         if !self.unit_desc_dirty {
             return;
@@ -5633,6 +7780,7 @@ impl App {
         selected: bool,
         radio_name: &str,
         follow: bool,
+        direct: bool,
         snap: &Snapshot,
     ) {
         fn clip(ui: &egui::Ui, text: &str, font: egui::FontId, max_w: f32) -> String {
@@ -5670,7 +7818,34 @@ impl App {
             (name.trim().to_string(), String::new())
         }
 
-        let (status, tg, live, encrypted, hz) = if let Some(follower) = self.followers.get(&id) {
+        let (status, tg, live, encrypted, hz) = if direct {
+            let call = self.hackrf_call.get(&id).copied().flatten();
+            let tg = call.map(|(_, tg)| tg);
+            let live = tg.is_some();
+            let control_hz = if selected && self.memory_scan.is_on() {
+                self.scan_memory_hz()
+            } else {
+                None
+            }
+            .or_else(|| {
+                channels::zone_controls(&self.channels, self.channel_zone)
+                    .first()
+                    .map(|(hz, _, _)| *hz)
+            });
+            let hz = call.map(|(hz, _)| hz).or(control_hz);
+            let status = if selected && self.memory_scan.is_on() {
+                "scanning".to_string()
+            } else if !follow {
+                "follow is off".to_string()
+            } else if let Some(tg) = tg {
+                format!("voice talkgroup {tg}")
+            } else if self.cc_site.contains_key(&id) {
+                "locked".to_string()
+            } else {
+                "watching".to_string()
+            };
+            (status, tg, live, false, hz)
+        } else if let Some(follower) = self.followers.get(&id) {
             let active = follower.active_tg();
             let heard = follower.heard().cloned();
             let status = follower.status().to_string();
@@ -5748,20 +7923,49 @@ impl App {
         let rssi = if selected && snap.online() {
             if snap.model == "GQRX" {
                 strength_label(gqrx_dbfs_to_s9(snap.strength_db))
-            } else {
+            } else if snap.model == "HackRF" {
+                let spec = self.hub.spectrum();
+                let at = hz.unwrap_or(spec.center_hz);
+                let db = crate::hackrf::channel_db(&spec.db, spec.center_hz, at);
+                if db.is_finite() {
+                    format!("{db:.0} dB")
+                } else {
+                    "—".to_string()
+                }
+            } else if snap.strength_db.is_finite() {
                 format!("{:.0} dB", snap.strength_db)
+            } else {
+                "—".to_string()
             }
         } else {
             "—".to_string()
         };
         let freq = hz.map(|hz| format!("{:.6} MHz", hz / 1_000_000.0));
-        let (headline, headline_live) = if tg.is_some() && !alias.is_empty() {
+        let (mut headline, mut headline_live) = if tg.is_some() && !alias.is_empty() {
             (alias, live)
         } else if status.starts_with("scanning") {
             ("SCAN".to_string(), false)
         } else {
             (status.clone(), false)
         };
+        let ident = self.cc_identity.get(&id).cloned().unwrap_or_default();
+        let glass = follow::glass_rows(if live { tg } else { None }, &ident);
+        let heard_identity = glass.headline.is_some() || glass.tgid.is_some();
+        if let Some(text) = glass.headline.clone() {
+            headline = text;
+            headline_live = true;
+        }
+        let mut detail = detail;
+        let mut encrypted = encrypted;
+        let shown_tg = if live { tg } else { glass.tgid.or(tg) };
+        if !live {
+            if let Some(text) = glass.detail.clone() {
+                detail = text;
+            }
+            if heard_identity {
+                encrypted = glass.encrypted;
+            }
+        }
 
         let width = ui.available_width();
         let (outer, _) = ui.allocate_exact_size(egui::vec2(width, 204.0), egui::Sense::hover());
@@ -5848,7 +8052,7 @@ impl App {
         );
         y += 32.0;
         let id_font = egui::FontId::monospace(15.0);
-        let tgid = match tg {
+        let tgid = match shown_tg {
             Some(tg) => format!("TGID {tg}"),
             None => "TGID —".to_string(),
         };
@@ -5896,7 +8100,10 @@ impl App {
         } else {
             site.rfss.clone()
         };
-        let facts = format!("Sys {sys}   RFSS {rfss}   Site {site_id}");
+        let facts = glass
+            .facts
+            .clone()
+            .unwrap_or_else(|| format!("Sys {sys}   RFSS {rfss}   Site {site_id}"));
         painter.text(
             egui::pos2(left, y),
             egui::Align2::LEFT_TOP,
@@ -5924,7 +8131,13 @@ impl App {
         } else {
             site.nac.clone()
         };
-        let net = format!("WACN {wacn}    NAC {nac}");
+        let net = if !site.wacn.is_empty() || !site.nac.is_empty() {
+            format!("WACN {wacn}    NAC {nac}")
+        } else if let Some(code) = &glass.code_line {
+            code.clone()
+        } else {
+            format!("WACN {wacn}    NAC {nac}")
+        };
         painter.text(
             egui::pos2(left, y),
             egui::Align2::LEFT_TOP,
@@ -5942,24 +8155,322 @@ impl App {
         );
     }
 
+    /// Every station radio, so a second receiver can stay on the control
+    /// channel while another follows a voice call outside the HackRF window.
+    fn trunk_receiver_strip(&mut self, ui: &mut egui::Ui, snap: &Snapshot) {
+        let rows = self.hub.view().rows;
+        if rows.is_empty() {
+            return;
+        }
+        ui.add_space(8.0);
+        ui.label("Receivers");
+        ui.label(
+            egui::RichText::new(
+                "One dongle cannot watch the control channel and a far voice channel at the same time. Add a second receiver to keep a dedicated control channel.",
+            )
+            .weak()
+            .small(),
+        );
+        let choices = [
+            ("Off", None),
+            ("Control", Some(config::TrunkRole::Control)),
+            ("Voice", Some(config::TrunkRole::Voice)),
+            ("Both", Some(config::TrunkRole::Both)),
+        ];
+        let mut pick = None;
+        for (index, row) in rows.iter().enumerate() {
+            let trunk = row.spec.driver == cat::RadioDriver::Hackrf || hears_trunk_pipe(row);
+            let cc = self.cc_on.get(&row.id).copied().unwrap_or(false);
+            let current = if cc {
+                Some(self.trunk_role_at(index))
+            } else {
+                None
+            };
+            ui.horizontal(|ui| {
+                for (label, role) in choices {
+                    let response = ui
+                        .add_enabled(trunk, egui::Button::new(label).selected(current == role))
+                        .on_hover_text(if !trunk {
+                            "This radio has no trunking receive pipe."
+                        } else if role == Some(config::TrunkRole::Control) {
+                            "Stays on the control channel and does not play voice. Pair it with a Voice receiver. One dongle cannot do both jobs."
+                        } else if role == Some(config::TrunkRole::Voice) {
+                            "Plays voice. A clear call outside the 6 MHz window leaves the control channel until that call ends. A hamlib radio still has to learn the channel map on a control channel before it can hop."
+                        } else if role == Some(config::TrunkRole::Both) {
+                            "Decodes the control channel and plays voice. A call outside the 6 MHz window drops the control channel until that call ends."
+                        } else {
+                            "Follow is off. This radio does not decode the control channel."
+                        });
+                    if response.clicked() && trunk && current != role {
+                        pick = Some((index, role));
+                    }
+                }
+                ui.label(&row.spec.name);
+                if let Some(away) = self.hackrf_away.get(&row.id) {
+                    ui.label(
+                        egui::RichText::new(format!("on voice {:.4} MHz", away.hz / 1_000_000.0))
+                            .color(egui::Color32::from_rgb(220, 160, 80)),
+                    );
+                }
+            });
+        }
+        if let Some((index, role)) = pick {
+            self.set_trunk_role(index, role, snap);
+        }
+    }
+
+    fn page_keys(&mut self, ui: &mut egui::Ui) {
+        if self.config_path.is_empty() {
+            ui.label("The station has not been saved.");
+            return;
+        }
+        ui.label(keys::path_beside(Path::new(&self.config_path)).display().to_string());
+        if !self.key_note.is_empty() {
+            ui.label(
+                egui::RichText::new(&self.key_note).color(egui::Color32::from_rgb(220, 160, 80)),
+            );
+        }
+        ui.horizontal(|ui| {
+            if ui.button("Add").clicked() {
+                self.key_sel = keys::add_placeholder(&mut self.keys);
+                self.key_shown = None;
+                self.save_keys();
+            }
+            let can_remove = self.key_sel < self.keys.keys.len();
+            if ui.add_enabled(can_remove, egui::Button::new("Remove")).clicked() {
+                self.keys.keys.remove(self.key_sel);
+                if self.key_sel >= self.keys.keys.len() && self.key_sel > 0 {
+                    self.key_sel -= 1;
+                }
+                self.key_shown = None;
+                self.save_keys();
+            }
+            if ui
+                .button("Import")
+                .on_hover_text("A dsd-fme hex CSV. The first line is the header.")
+                .clicked()
+            {
+                self.browse_keys();
+            }
+            if ui
+                .button("Export")
+                .on_hover_text("A dsd-fme hex CSV. The first line is the header.")
+                .clicked()
+            {
+                self.export_keys();
+            }
+        });
+        if self.keys.keys.is_empty() {
+            ui.label("No keys. A key id the decoder prints is added here with blank text.");
+            if ui
+                .button("Generate")
+                .on_hover_text("Random DES key for local debugging. Change the algorithm and generate again for RC4 or AES-256.")
+                .clicked()
+            {
+                self.generate_selected_key();
+            }
+            return;
+        }
+        if self.key_sel >= self.keys.keys.len() {
+            self.key_sel = 0;
+            self.key_shown = None;
+        }
+        if self.key_shown != Some(self.key_sel) {
+            if let Some(row) = self.keys.keys.get(self.key_sel) {
+                self.key_id_edit = row.key_id.clone();
+                self.key_alg_edit = row.alg.clone();
+                self.key_name_edit = row.name.clone();
+                self.key_text_edit = row.text.clone();
+            }
+            self.key_shown = Some(self.key_sel);
+        }
+        let mut order: Vec<usize> = (0..self.keys.keys.len()).collect();
+        order.sort_by_key(|index| {
+            let row = &self.keys.keys[*index];
+            (row.is_filled(), row.key_id.clone())
+        });
+        ui.add_space(8.0);
+        let gap = ui.spacing().item_spacing.x;
+        let widths = fit_columns(ui.available_width(), gap, &[460.0, 320.0], 0);
+        let list_w = widths[0];
+        let editor_w = widths[1];
+        let height = ui.available_height().max(80.0);
+        ui.horizontal_top(|ui| {
+            ui.vertical(|ui| {
+                ui.set_width(list_w);
+                key_list_header(ui);
+                egui::ScrollArea::vertical()
+                    .id_salt("key-list")
+                    .auto_shrink([false, false])
+                    .max_height((height - 22.0).max(40.0))
+                    .show(ui, |ui| {
+                        for (stripe, index) in order.iter().copied().enumerate() {
+                            if self.key_row(ui, index, stripe) {
+                                self.key_sel = index;
+                            }
+                        }
+                    });
+            });
+            ui.vertical(|ui| {
+                ui.set_width(editor_w);
+                egui::ScrollArea::vertical()
+                    .id_salt("key-editor")
+                    .auto_shrink([false, true])
+                    .max_height(height)
+                    .show(ui, |ui| {
+                        ui.label("Key ID");
+                        ui.text_edit_singleline(&mut self.key_id_edit);
+                        ui.label("Algorithm");
+                        let current = keys::alg_label(&self.key_alg_edit);
+                        egui::ComboBox::from_id_salt("key-alg")
+                            .selected_text(current)
+                            .show_ui(ui, |ui| {
+                                for (alg, label) in keys::ALG_CHOICES {
+                                    ui.selectable_value(
+                                        &mut self.key_alg_edit,
+                                        (*alg).to_string(),
+                                        *label,
+                                    );
+                                }
+                                if keys::expected_len(&self.key_alg_edit).is_none() {
+                                    let alg = self.key_alg_edit.clone();
+                                    ui.selectable_value(&mut self.key_alg_edit, alg.clone(), alg);
+                                }
+                            });
+                        ui.label("Name");
+                        ui.text_edit_singleline(&mut self.key_name_edit);
+                        ui.label("Key text");
+                        ui.text_edit_multiline(&mut self.key_text_edit);
+                        ui.horizontal(|ui| {
+                            if ui.button("Save").clicked() {
+                                match keys::apply_edit(
+                                    &mut self.keys,
+                                    self.key_sel,
+                                    &self.key_id_edit,
+                                    &self.key_alg_edit,
+                                    &self.key_name_edit,
+                                    &self.key_text_edit,
+                                ) {
+                                    Ok(()) => {
+                                        self.key_shown = None;
+                                        self.save_keys();
+                                    }
+                                    Err(err) => self.key_note = err,
+                                }
+                            }
+                            if ui
+                                .button("Generate")
+                                .on_hover_text("Replaces the key text with random hex for the algorithm above and saves it. For a radio you program yourself.")
+                                .clicked()
+                            {
+                                self.generate_selected_key();
+                            }
+                        });
+                    });
+            });
+        });
+    }
+
+    /// One key row. Same stripe and selection fill as a channel row.
+    /// Missing stays amber in the status column. The key text stays off the list.
+    fn key_row(&self, ui: &mut egui::Ui, index: usize, stripe: usize) -> bool {
+        let Some(row) = self.keys.keys.get(index) else {
+            return false;
+        };
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 26.0), egui::Sense::click());
+        let painter = ui.painter();
+        if self.key_sel == index {
+            painter.rect_filled(rect, egui::CornerRadius::same(4), HAM.gamma_multiply(0.28));
+        } else if stripe % 2 == 1 {
+            painter.rect_filled(rect, egui::CornerRadius::ZERO, ui.visuals().faint_bg_color);
+        }
+        let font = egui::FontId::monospace(14.0);
+        let normal = ui.visuals().text_color();
+        let amber = egui::Color32::from_rgb(220, 160, 80);
+        let filled = row.is_filled();
+        let alg = keys::alg_label(&row.alg);
+        let status = if filled { "key" } else { "missing" };
+        let cells = [row.key_id.as_str(), alg.as_str(), status, row.name.as_str()];
+        for (slot, text) in cells.iter().enumerate() {
+            if text.is_empty() {
+                continue;
+            }
+            let color = if slot == 2 && !filled { amber } else { normal };
+            painter.text(
+                rect.left_center() + egui::vec2(KEY_LIST_X[slot], 0.0),
+                egui::Align2::LEFT_CENTER,
+                text,
+                font.clone(),
+                color,
+            );
+        }
+        response.clicked()
+    }
+
+    /// Fill the selected row with a random key and write the key file.
+    /// An empty list gets one DES row. A DMR placeholder is refused.
+    fn generate_selected_key(&mut self) {
+        if self.config_path.is_empty() {
+            self.key_note = "The station has not been saved.".into();
+            return;
+        }
+        if self.keys.keys.is_empty() {
+            self.key_sel = keys::add_placeholder(&mut self.keys);
+            let row = &self.keys.keys[self.key_sel];
+            self.key_id_edit = row.key_id.clone();
+            self.key_alg_edit = row.alg.clone();
+            self.key_name_edit.clear();
+            self.key_text_edit.clear();
+            self.key_shown = Some(self.key_sel);
+        }
+        let text = match keys::generate_text(&self.key_alg_edit) {
+            Ok(text) => text,
+            Err(err) => {
+                self.key_note = err;
+                return;
+            }
+        };
+        self.key_text_edit = text;
+        match keys::apply_edit(
+            &mut self.keys,
+            self.key_sel,
+            &self.key_id_edit,
+            &self.key_alg_edit,
+            &self.key_name_edit,
+            &self.key_text_edit,
+        ) {
+            Ok(()) => {
+                self.key_shown = None;
+                self.save_keys();
+            }
+            Err(err) => self.key_note = err,
+        }
+    }
+
     fn page_talkgroups(&mut self, ui: &mut egui::Ui, id: u64, snap: &Snapshot) {
         let rows = self.hub.view().rows;
         let Some(row) = rows.iter().find(|row| row.id == id) else {
             ui.label("This radio is gone.");
             return;
         };
-        let p25 = crate::rx_pipe::is_p25_rx(&row.spec.rx_pipe);
+        let direct = row.spec.driver == cat::RadioDriver::Hackrf;
+        let trunk = direct || hears_trunk_pipe(row);
         let selected = row.selected;
         let radio_name = row.spec.name.clone();
         let gpredict = row.spec.follow;
-        let mut follow = p25 && self.cc_on.get(&id).copied().unwrap_or(false);
+        let mut follow = trunk && self.cc_on.get(&id).copied().unwrap_or(false);
         if !self.talkgroup_note.is_empty() {
             ui.label(
                 egui::RichText::new(&self.talkgroup_note)
                     .color(egui::Color32::from_rgb(220, 160, 80)),
             );
         }
-        let active = self.followers.get(&id).and_then(|follower| follower.active_tg());
+        let active = if direct {
+            self.hackrf_call.get(&id).and_then(|call| call.map(|(_, tg)| tg))
+        } else {
+            self.followers.get(&id).and_then(|follower| follower.active_tg())
+        };
         ui.horizontal_top(|ui| {
             // The face is 204 px. Three 46 px keys with 6 px between them
             // sit on the vertical middle of that bezel, 4 px from its edge.
@@ -5972,32 +8483,43 @@ impl App {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 ui.set_width(72.0);
                 ui.add_space(((face_h - stack) * 0.5).max(0.0));
-                if radio_key(ui, "LOAD", false, true).clicked() {
+                if radio_key(ui, "LOAD", KeyLamp::Dark, true).clicked() {
                     self.browse_talkgroups(false);
                 }
                 ui.add_space(key_gap);
-                if radio_key(ui, "SAVE", false, true).clicked() {
+                if radio_key(ui, "SAVE", KeyLamp::Dark, true).clicked() {
                     self.browse_talkgroups(true);
                 }
                 ui.add_space(key_gap);
-                let toggle = radio_key(ui, "FOLLOW", follow, p25);
-                if toggle.clicked() && p25 {
+                let toggle = radio_key(
+                    ui,
+                    "FOLLOW",
+                    if follow { KeyLamp::Green } else { KeyLamp::Dark },
+                    trunk,
+                );
+                if toggle.clicked() && trunk {
                     follow = !follow;
                 }
-                if !p25 {
-                    toggle.on_hover_text("The P25 receive pipe is off.");
+                if !trunk {
+                    toggle.on_hover_text("The trunking receive pipe is off.");
                 } else if gpredict {
                     toggle.on_hover_text("Gpredict is moving this radio.");
                 }
             });
-            self.scanner_face(ui, id, selected, &radio_name, follow, snap);
+            self.scanner_face(ui, id, selected, &radio_name, follow, direct, snap);
         });
         if self.cc_on.get(&id).copied().unwrap_or(false) != follow {
             self.cc_on.insert(id, follow);
+            if !follow {
+                if let Some(index) = rows.iter().position(|row| row.id == id) {
+                    self.trunk_receivers.retain(|entry| entry.radio != index);
+                }
+            }
             if !self.config_path.is_empty() {
                 self.save_config(snap);
             }
         }
+        self.trunk_receiver_strip(ui, snap);
         if self.talkgroups.zones.is_empty() {
             ui.label("No zones in this talkgroup file.");
             return;
@@ -6038,16 +8560,35 @@ impl App {
                                     .iter()
                                     .any(|row| row.tg == tg)
                             });
+                            let listed = self.monitor_zones.contains(&idx);
                             let (rect, response) = ui.allocate_exact_size(
                                 egui::vec2(ui.available_width(), 26.0),
                                 egui::Sense::click(),
                             );
+                            let text = if listed && !decoding {
+                                egui::Color32::from_rgb(236, 226, 246)
+                            } else {
+                                ui.visuals().text_color()
+                            };
                             if decoding {
                                 // Same dark red as the talkgroup row for this grant.
                                 ui.painter().rect_filled(
                                     rect,
                                     egui::CornerRadius::same(4),
                                     egui::Color32::from_rgb(146, 24, 18),
+                                );
+                            } else if listed {
+                                let edge = if selected {
+                                    egui::Stroke::new(1.5, egui::Color32::from_rgb(186, 120, 230))
+                                } else {
+                                    egui::Stroke::NONE
+                                };
+                                ui.painter().rect(
+                                    rect,
+                                    egui::CornerRadius::same(4),
+                                    egui::Color32::from_rgb(42, 16, 64),
+                                    edge,
+                                    egui::StrokeKind::Inside,
                                 );
                             } else if selected {
                                 ui.painter().rect_filled(
@@ -6067,8 +8608,11 @@ impl App {
                                 egui::Align2::LEFT_CENTER,
                                 &name,
                                 egui::FontId::proportional(14.0),
-                                ui.visuals().text_color(),
+                                text,
                             );
+                            if response.double_clicked() {
+                                self.toggle_monitor_zone(idx);
+                            }
                             if response.clicked() {
                                 self.talkgroup_zone = idx;
                                 self.talkgroup_sel = 0;
@@ -6094,7 +8638,19 @@ impl App {
                                     .map(|zone| zone.talkgroups.len())
                                     .unwrap_or(0);
                                 for idx in 0..count {
-                                    if self.talkgroup_row(ui, idx, active) {
+                                    let (clicked, doubled) = self.talkgroup_row(ui, idx, active);
+                                    if doubled {
+                                        if let Some(tg) = self
+                                            .talkgroups
+                                            .zones
+                                            .get(self.talkgroup_zone)
+                                            .and_then(|zone| zone.talkgroups.get(idx))
+                                            .map(|row| row.tg)
+                                        {
+                                            self.toggle_monitor_talkgroup(tg);
+                                        }
+                                    }
+                                    if clicked {
                                         self.talkgroup_sel = idx;
                                     }
                                 }
@@ -6113,23 +8669,45 @@ impl App {
         });
     }
 
-    fn talkgroup_row(&self, ui: &mut egui::Ui, idx: usize, active: Option<u32>) -> bool {
+    fn toggle_monitor_zone(&mut self, idx: usize) {
+        if !self.monitor_zones.remove(&idx) {
+            self.monitor_zones.insert(idx);
+        }
+    }
+
+    fn toggle_monitor_talkgroup(&mut self, tg: u32) {
+        if tg == 0 {
+            return;
+        }
+        if !self.monitor_talkgroups.remove(&tg) {
+            self.monitor_talkgroups.insert(tg);
+        }
+    }
+
+    fn talkgroup_row(&self, ui: &mut egui::Ui, idx: usize, active: Option<u32>) -> (bool, bool) {
         let Some(row) = self
             .talkgroups
             .zones
             .get(self.talkgroup_zone)
             .and_then(|zone| zone.talkgroups.get(idx))
         else {
-            return false;
+            return (false, false);
         };
         let slot = format!("{:>4}", idx + 1);
-        let mut text = format!("{slot}   {:>8}   {}", row.tg, row.name);
+        let mut label = format!("{slot}   {:>8}   {}", row.tg, row.name);
         if row.encrypted {
-            text.push_str("  enc");
+            label.push_str("  enc");
         }
         let followed = active == Some(row.tg);
+        let listed = self.monitor_talkgroups.contains(&row.tg);
+        let open = self.talkgroup_sel == idx;
         let (rect, response) =
             ui.allocate_exact_size(egui::vec2(ui.available_width(), 26.0), egui::Sense::click());
+        let color = if listed && !followed {
+            egui::Color32::from_rgb(236, 226, 246)
+        } else {
+            ui.visuals().text_color()
+        };
         if followed {
             // Same dark red as the meter needle. The row is decoding this grant.
             ui.painter().rect_filled(
@@ -6137,7 +8715,20 @@ impl App {
                 egui::CornerRadius::same(4),
                 egui::Color32::from_rgb(146, 24, 18),
             );
-        } else if self.talkgroup_sel == idx {
+        } else if listed {
+            let edge = if open {
+                egui::Stroke::new(1.5, egui::Color32::from_rgb(186, 120, 230))
+            } else {
+                egui::Stroke::NONE
+            };
+            ui.painter().rect(
+                rect,
+                egui::CornerRadius::same(4),
+                egui::Color32::from_rgb(42, 16, 64),
+                edge,
+                egui::StrokeKind::Inside,
+            );
+        } else if open {
             ui.painter().rect_filled(
                 rect,
                 egui::CornerRadius::same(4),
@@ -6153,11 +8744,11 @@ impl App {
         ui.painter().text(
             rect.left_center() + egui::vec2(8.0, 0.0),
             egui::Align2::LEFT_CENTER,
-            text,
+            label,
             egui::FontId::monospace(14.0),
-            ui.visuals().text_color(),
+            color,
         );
-        response.clicked()
+        (response.clicked(), response.double_clicked())
     }
 
     fn talkgroup_editor(&mut self, ui: &mut egui::Ui, width: f32) {
@@ -6210,7 +8801,8 @@ impl App {
                 ui.label("Number");
                 ui.add(egui::DragValue::new(&mut tg).range(0..=16_777_215u32));
             });
-            ui.checkbox(&mut encrypted, "Encrypted");
+            ui.checkbox(&mut encrypted, "Encrypted")
+                .on_hover_text("No encryption key is stored, so this is not scanned or played.");
             ui.horizontal(|ui| {
                 if ui.button("Add").clicked() {
                     add = true;
@@ -6846,6 +9438,220 @@ impl App {
         .inner
     }
 
+    fn selected_hackrf(&self) -> bool {
+        self.hub.view().rows.iter().any(|row| {
+            row.selected && row.spec.driver == cat::RadioDriver::Hackrf
+        })
+    }
+
+    /// Fold one published frame into the average and the decaying peak.
+    /// A new center, or a capture that restarted, drops the old trace.
+    fn fold_spectrum(&mut self, spec: &crate::hackrf::SpectrumSnap) {
+        if spec.db.is_empty() || spec.seq == 0 {
+            return;
+        }
+        let restarted = spec.seq < self.spectrum_seq;
+        let moved = (spec.center_hz - self.spectrum_center).abs() > 1.0
+            || self.spectrum_avg.len() != spec.db.len();
+        if spec.seq == self.spectrum_seq && !moved {
+            return;
+        }
+        self.spectrum_seq = spec.seq;
+        self.spectrum_center = spec.center_hz;
+        if restarted || moved {
+            self.spectrum_avg.clone_from(&spec.db);
+            self.spectrum_peak_hold.clone_from(&spec.db);
+            return;
+        }
+        for (avg, sample) in self.spectrum_avg.iter_mut().zip(&spec.db) {
+            *avg = *avg * 0.62 + sample * 0.38;
+        }
+        for (peak, sample) in self.spectrum_peak_hold.iter_mut().zip(&spec.db) {
+            *peak = (*peak - 0.35).max(*sample);
+        }
+    }
+
+    /// Spectrum under the tuner buttons, the height of the bandspread block.
+    /// Avg and Peak use the same buttons as the row above the glass.
+    fn hackrf_spectrum(&mut self, ui: &mut egui::Ui, snap: &Snapshot, freq: f64) {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.take_available_width();
+            let radio = self.hub.view().rows.into_iter().find(|row| {
+                row.selected && row.spec.driver == cat::RadioDriver::Hackrf
+            });
+            if let Some(row) = radio.as_ref() {
+                let matched = self.hackrf_gain_hold.as_ref().is_some_and(|hold| {
+                    hold.id == row.id
+                        && row.spec.lna_db == Some(hold.lna)
+                        && row.spec.vga_db == Some(hold.vga)
+                });
+                if matched {
+                    self.hackrf_gain_hold = None;
+                }
+            }
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add(egui::Button::new("Avg").selected(!self.spectrum_peak))
+                    .clicked()
+                {
+                    self.spectrum_peak = false;
+                }
+                if ui
+                    .add(egui::Button::new("Peak").selected(self.spectrum_peak))
+                    .clicked()
+                {
+                    self.spectrum_peak = true;
+                }
+                if let Some(row) = radio {
+                    ui.add_space(8.0);
+                    let id = row.id;
+                    let spec = row.spec;
+                    self.hackrf_gain_slider(ui, snap, id, &spec, true);
+                    ui.add_space(8.0);
+                    self.hackrf_gain_slider(ui, snap, id, &spec, false);
+                }
+            });
+            let frame = self.hub.spectrum();
+            self.fold_spectrum(&frame);
+            let center = if frame.center_hz > 0.0 {
+                frame.center_hz
+            } else {
+                freq
+            };
+            let trace: &[f32] = if frame.db.is_empty() {
+                &[]
+            } else if self.spectrum_peak {
+                &self.spectrum_peak_hold
+            } else {
+                &self.spectrum_avg
+            };
+            if let Some(hz) = spectrum_plot(
+                ui,
+                "Spec",
+                center,
+                crate::hackrf::SAMPLE_RATE as f64,
+                crate::hackrf::FILTER_HZ,
+                trace,
+                freq,
+                SPECTRUM_H,
+            ) {
+                if self.can_tune_freq(snap, true) {
+                    self.tune(snap, hz);
+                }
+            }
+        });
+    }
+
+    /// Gain the sliders show before a drag. A hold wins until the radio row
+    /// has stored the same pair.
+    fn applied_hackrf_gain(&self, id: u64, spec: &cat::RadioSpec) -> (u32, u32) {
+        if let Some(hold) = &self.hackrf_gain_hold {
+            if hold.id == id {
+                return (hold.lna, hold.vga);
+            }
+        }
+        let gain = cat::resolved_rx_gain(spec);
+        (
+            gain.lna_db.unwrap_or(crate::hackrf::LNA_OMITTED),
+            gain.vga_db.unwrap_or(crate::hackrf::VGA_OMITTED),
+        )
+    }
+
+    fn commit_hackrf_gain(&mut self, snap: &Snapshot, id: u64, lna: u32, vga: u32) {
+        let lna = crate::hackrf::snap_lna(lna);
+        let vga = crate::hackrf::snap_vga(vga);
+        self.gain_drag_lna = None;
+        self.gain_drag_vga = None;
+        self.hackrf_gain_hold = Some(HackrfGainHold { id, lna, vga });
+        self.hub.hackrf_gain(id, lna, vga);
+        if !self.config_path.is_empty() {
+            self.save_config(snap);
+        }
+    }
+
+    /// One horizontal HackRF gain slider. `lna` selects LNA; VGA is the other.
+    /// The wheel takes one legal step while the pointer is on the slider.
+    /// The capture restarts when the drag ends or the wheel steps.
+    fn hackrf_gain_slider(
+        &mut self,
+        ui: &mut egui::Ui,
+        snap: &Snapshot,
+        id: u64,
+        spec: &cat::RadioSpec,
+        lna: bool,
+    ) {
+        let (base_lna, base_vga) = self.applied_hackrf_gain(id, spec);
+        let (step, max, base) = if lna {
+            (
+                crate::hackrf::LNA_STEP,
+                crate::hackrf::LNA_MAX,
+                base_lna,
+            )
+        } else {
+            (
+                crate::hackrf::VGA_STEP,
+                crate::hackrf::VGA_MAX,
+                base_vga,
+            )
+        };
+        let mut value = if lna {
+            self.gain_drag_lna.unwrap_or(base)
+        } else {
+            self.gain_drag_vga.unwrap_or(base)
+        };
+        ui.spacing_mut().slider_width = 112.0;
+        let response = ui.add(
+            egui::Slider::new(&mut value, 0u32..=max)
+                .integer()
+                .step_by(f64::from(step))
+                .suffix(" dB")
+                .text(if lna { "LNA" } else { "VGA" })
+                .trailing_fill(true),
+        );
+        let notch = if lna { "8 dB" } else { "2 dB" };
+        let stage = if lna { "LNA" } else { "VGA" };
+        let response = response.on_hover_text(format!(
+            "HackRF {stage}. The wheel changes it by {notch} while the pointer is on this slider."
+        ));
+        let notches = if response.hovered() {
+            ui.input(|input| {
+                wheel_notches(input.events.iter().filter_map(|event| match event {
+                    egui::Event::MouseWheel { delta, phase, .. } => match phase {
+                        egui::TouchPhase::End | egui::TouchPhase::Cancel => None,
+                        _ => Some(delta.y),
+                    },
+                    _ => None,
+                }))
+            })
+        } else {
+            0
+        };
+        if notches != 0 {
+            value = crate::hackrf::step_stage(value, notches, step, max);
+        }
+        let stopped = response.drag_stopped();
+        let dragging = response.dragged() && !stopped && notches == 0;
+        if lna {
+            self.gain_drag_lna = dragging.then_some(value);
+        } else {
+            self.gain_drag_vga = dragging.then_some(value);
+        }
+        let typed = response.changed() && !response.dragged();
+        if (notches != 0 || stopped || typed) && value != base {
+            let lna_value = if lna {
+                value
+            } else {
+                self.gain_drag_lna.unwrap_or(base_lna)
+            };
+            let vga_value = if lna {
+                self.gain_drag_vga.unwrap_or(base_vga)
+            } else {
+                value
+            };
+            self.commit_hackrf_gain(snap, id, lna_value, vga_value);
+        }
+    }
+
     fn buttons(&mut self, ui: &mut egui::Ui, snap: &Snapshot) {
         ui.horizontal_wrapped(|ui| {
             self.func_btn(ui, snap, "ATU", "TUNER");
@@ -7177,6 +9983,17 @@ fn drive(
         };
 
         let mut armed = false;
+        if connect.is_none() {
+            let release = {
+                let gate = face.lock().expect("face");
+                gate.face_down && gate.face_port.is_none()
+            };
+            if release && matches!(session, Session::Live(_)) {
+                session = Session::Down {
+                    message: String::new(),
+                };
+            }
+        }
         let demo = face.lock().expect("face").demo;
         if !demo {
             if let Some(port) = connect {
@@ -7287,6 +10104,9 @@ fn drive(
             let mut guard = shared.lock().expect("ui");
             if armed && snap.kind == LinkKind::Live {
                 guard.live_gen = guard.live_gen.wrapping_add(1);
+            }
+            if matches!(session, Session::Live(_)) {
+                guard.poll_gen = guard.poll_gen.wrapping_add(1);
             }
             guard.snap = snap;
         }

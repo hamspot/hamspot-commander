@@ -7,7 +7,9 @@
 //! null` removes an id. Those lines are merged; a changed line is not a new graph.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::process::Command;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -366,6 +368,68 @@ pub fn has_device(graph: &AudioGraph, name: &str) -> bool {
     graph.devices.iter().any(|device| device.name == name)
 }
 
+/// The loopback stream has at least one port. A station file can restore
+/// `hamspot_{id}_rx` as a lingering null-sink with the same name and no stream.
+pub fn stream_ports_ready(output: bool, node: &str) -> bool {
+    let Ok(ports) = pw_ports(output) else {
+        return false;
+    };
+    !ports_of(&ports, node).is_empty()
+}
+
+/// `card_present` is the sink or source name. `stream_ready` is the paired
+/// `output.hamspot_*` or `input.hamspot_*` node. A linger card occupies the
+/// name the loopback has to bind.
+pub fn linger_occupies(card_present: bool, stream_ready: bool) -> bool {
+    card_present && !stream_ready
+}
+
+/// Remove one hamspot node so `pw-loopback` can take its name. A name that is
+/// already gone is success. Anything other than a `hamspot_` node is refused.
+pub fn destroy_named_node(name: &str) -> Result<(), String> {
+    if !safe_hamspot_name(name) {
+        return Err(format!("not removing {name}"));
+    }
+    let output = command_output(
+        "pw-dump",
+        &["-N".into(), "-R".into(), "-i".into(), "0".into()],
+    )?;
+    if !output.status.success() {
+        return Err(format!(
+            "pw-dump: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let items: Vec<serde_json::Value> =
+        serde_json::from_str(&text).map_err(|err| format!("pw-dump: {err}"))?;
+    for item in items {
+        if item.get("type").and_then(serde_json::Value::as_str) != Some("PipeWire:Interface:Node")
+        {
+            continue;
+        }
+        let node_name = item
+            .get("info")
+            .and_then(|info| info.get("props"))
+            .and_then(|props| props.get("node.name"))
+            .and_then(serde_json::Value::as_str);
+        if node_name != Some(name) {
+            continue;
+        }
+        let Some(id) = item.get("id").and_then(serde_json::Value::as_u64) else {
+            continue;
+        };
+        let result = command_output("pw-cli", &["destroy".into(), id.to_string()])?;
+        if !result.status.success() {
+            return Err(format!(
+                "pw-cli destroy: {}",
+                String::from_utf8_lossy(&result.stderr).trim()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// A name Commander is willing to recreate. Anything else is only recorded.
 pub fn safe_hamspot_name(name: &str) -> bool {
     name.starts_with("hamspot_")
@@ -615,6 +679,198 @@ pub fn default_source() -> Result<String, String> {
     pactl_line(&["get-default-source".into()])
 }
 
+/// WirePlumber files that pin a sink, a source, a profile, a route, a stream
+/// target, or a Bluetooth profile. Stock PipeWire has none of these.
+const WIREPLUMBER_STATE_FILES: &[&str] = &[
+    "default-nodes",
+    "default-profile",
+    "default-routes",
+    "stream-properties",
+    "bluetooth-autoswitch",
+];
+
+/// What the Config button did to the user PipeWire session.
+pub struct UserPipewireReset {
+    /// The user services were stopped and started again.
+    pub restarted: bool,
+    /// Empty when the desktop default device is ready.
+    pub error: Option<String>,
+}
+
+/// A name `pactl get-default-sink` can be wired to. `auto_null` is the
+/// fallback PipeWire inserts when the kernel has no card.
+pub fn sink_is_desktop_default(name: &str, kernel_has_cards: bool) -> bool {
+    let name = name.trim();
+    if name.is_empty() || name.starts_with('@') {
+        return false;
+    }
+    if name == "auto_null" {
+        return !kernel_has_cards;
+    }
+    true
+}
+
+/// Drop the saved WirePlumber defaults in `dir`. Other files there stay.
+pub fn clear_wireplumber_files(dir: &Path) -> Result<(), String> {
+    for name in WIREPLUMBER_STATE_FILES {
+        let path = dir.join(name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(format!("remove {}: {err}", path.display())),
+        }
+    }
+    Ok(())
+}
+
+fn wireplumber_state_dir() -> Result<PathBuf, String> {
+    if let Some(dir) = std::env::var_os("XDG_STATE_HOME") {
+        if !dir.is_empty() {
+            return Ok(PathBuf::from(dir).join("wireplumber"));
+        }
+    }
+    let home = std::env::var_os("HOME").filter(|home| !home.is_empty());
+    let Some(home) = home else {
+        return Err("HOME is not set, so WirePlumber state cannot be reset".into());
+    };
+    Ok(PathBuf::from(home).join(".local/state/wireplumber"))
+}
+
+fn systemctl(args: &[&str]) -> Result<(), String> {
+    let owned: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+    let output = command_output("systemctl", &owned)?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if err.is_empty() {
+        Err(format!("systemctl {} failed", args.join(" ")))
+    } else {
+        Err(format!("systemctl: {err}"))
+    }
+}
+
+fn systemctl_ok(args: &[&str]) -> bool {
+    systemctl(args).is_ok()
+}
+
+fn kernel_has_soundcards() -> bool {
+    let text = std::fs::read_to_string("/proc/asound/cards").unwrap_or_default();
+    text.lines().any(|line| line.trim_start().starts_with(|ch: char| ch.is_ascii_digit()))
+}
+
+fn sink_ready() -> Result<bool, String> {
+    let name = default_sink().unwrap_or_default();
+    Ok(sink_is_desktop_default(&name, kernel_has_soundcards()))
+}
+
+/// `pactl subscribe` is the signal that a card or the default sink changed.
+/// The call returns when the sink is a real device, or when subscribe ends.
+/// A kernel card that PipeWire never opens leaves this read sitting there:
+/// WirePlumber has no "enumeration finished" event for a card that does not appear.
+fn wait_for_desktop_default() -> Result<(), String> {
+    if sink_ready()? {
+        return Ok(());
+    }
+    let mut child = Command::new("pactl")
+        .arg("subscribe")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|err| format!("pactl subscribe: {err}"))?;
+    let ready = match child.stdout.take() {
+        Some(stdout) => read_subscribe_until_ready(stdout),
+        None => Err("pactl subscribe: no output".into()),
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    ready
+}
+
+fn read_subscribe_until_ready(stdout: impl std::io::Read) -> Result<(), String> {
+    if sink_ready()? {
+        return Ok(());
+    }
+    let reader = BufReader::new(stdout);
+    for line in reader.lines() {
+        line.map_err(|err| format!("pactl subscribe: {err}"))?;
+        if sink_ready()? {
+            return Ok(());
+        }
+    }
+    if sink_ready()? {
+        Ok(())
+    } else {
+        Err("PipeWire did not publish a default device".into())
+    }
+}
+
+/// Stop the user PipeWire session, delete WirePlumber's saved defaults, and
+/// start the session again. The sockets are stopped too, so a client reconnect
+/// cannot bring the old daemon back before those files are gone.
+pub fn reset_user_pipewire() -> UserPipewireReset {
+    let dir = match wireplumber_state_dir() {
+        Ok(dir) => dir,
+        Err(err) => {
+            return UserPipewireReset {
+                restarted: false,
+                error: Some(err),
+            };
+        }
+    };
+    if let Err(err) = systemctl(&[
+        "--user",
+        "stop",
+        "wireplumber.service",
+        "filter-chain.service",
+        "pipewire-pulse.service",
+        "pipewire.service",
+        "pipewire-pulse.socket",
+        "pipewire.socket",
+    ]) {
+        return UserPipewireReset {
+            restarted: false,
+            error: Some(err),
+        };
+    }
+    let cleared = clear_wireplumber_files(&dir);
+    if let Err(err) = systemctl(&[
+        "--user",
+        "start",
+        "pipewire.socket",
+        "pipewire-pulse.socket",
+        "pipewire.service",
+        "wireplumber.service",
+        "pipewire-pulse.service",
+    ]) {
+        return UserPipewireReset {
+            restarted: false,
+            error: Some(err),
+        };
+    }
+    // filter-chain stops with pipewire (BindsTo). Start it again only when
+    // the user had it enabled. A disabled unit stays down.
+    if systemctl_ok(&["--user", "is-enabled", "filter-chain.service"]) {
+        if let Err(err) = systemctl(&["--user", "start", "filter-chain.service"]) {
+            return UserPipewireReset {
+                restarted: true,
+                error: Some(err),
+            };
+        }
+    }
+    let ready = wait_for_desktop_default();
+    let error = match (cleared, ready) {
+        (Err(err), _) => Some(err),
+        (Ok(()), Err(err)) => Some(err),
+        (Ok(()), Ok(())) => None,
+    };
+    UserPipewireReset {
+        restarted: true,
+        error,
+    }
+}
+
 fn pactl_line(args: &[String]) -> Result<String, String> {
     let output = command_output("pactl", args)?;
     if !output.status.success() {
@@ -753,6 +1009,19 @@ mod tests {
         assert_eq!(pairs.len(), 2);
         assert_eq!(pairs[0].0, "mic:capture_MONO");
         assert_eq!(pairs[1].1, "input.hamspot_1_tx:input_FR");
+    }
+
+    #[test]
+    fn a_linger_card_occupies_the_name_until_the_stream_exists() {
+        assert!(linger_occupies(true, false));
+        assert!(!linger_occupies(true, true));
+        assert!(!linger_occupies(false, false));
+    }
+
+    #[test]
+    fn destroy_named_node_refuses_a_speaker() {
+        let err = destroy_named_node("bluez_output.E8:85:EF:F7:B7:10").unwrap_err();
+        assert!(err.contains("not removing"));
     }
 
     #[test]
@@ -910,5 +1179,47 @@ hamspot_3_rx:monitor_FL
         let pass = classify_saved(&links, &outputs, &inputs, &own);
         assert!(pass.waiting_on_own);
         assert!(pass.ready.is_empty());
+    }
+
+    #[test]
+    fn saved_wireplumber_defaults_are_removed() {
+        let dir = std::env::temp_dir().join(format!("hs-wp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in [
+            "default-nodes",
+            "default-profile",
+            "default-routes",
+            "stream-properties",
+            "bluetooth-autoswitch",
+            "keep-me",
+        ] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        clear_wireplumber_files(&dir).unwrap();
+        for name in [
+            "default-nodes",
+            "default-profile",
+            "default-routes",
+            "stream-properties",
+            "bluetooth-autoswitch",
+        ] {
+            assert!(!dir.join(name).exists(), "{name}");
+        }
+        assert!(dir.join("keep-me").exists());
+        clear_wireplumber_files(&dir).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_fallback_sink_is_not_a_desktop_default_when_a_card_exists() {
+        assert!(!sink_is_desktop_default("", true));
+        assert!(!sink_is_desktop_default("@DEFAULT_SINK@", true));
+        assert!(!sink_is_desktop_default("auto_null", true));
+        assert!(sink_is_desktop_default("auto_null", false));
+        assert!(sink_is_desktop_default(
+            "alsa_output.pci-0000_00_1b.0.analog-stereo",
+            true
+        ));
     }
 }

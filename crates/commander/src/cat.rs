@@ -69,13 +69,26 @@ impl FaceGate {
 pub enum RadioDriver {
     Hamlib,
     Gqrx,
+    Hackrf,
+    /// Discriminator or line input. No rig, no virtual card, no tuning.
+    Tap,
 }
 
 pub fn driver_name(driver: RadioDriver) -> &'static str {
     match driver {
         RadioDriver::Hamlib => "hamlib",
         RadioDriver::Gqrx => "gqrx",
+        RadioDriver::Hackrf => "hackrf",
+        RadioDriver::Tap => "tap",
     }
+}
+
+fn default_sample_rate() -> u32 {
+    crate::hackrf::SAMPLE_RATE
+}
+
+fn sample_rate_is_default(rate: &u32) -> bool {
+    *rate == crate::hackrf::SAMPLE_RATE
 }
 
 fn default_true() -> bool {
@@ -158,6 +171,21 @@ pub struct RadioSpec {
     /// The pipe does not key the radio.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub tx_pipe: String,
+    /// HackRF sample rate. Hamlib and GQRX do not read it. An older file
+    /// loads at 8 Msps.
+    #[serde(
+        default = "default_sample_rate",
+        skip_serializing_if = "sample_rate_is_default"
+    )]
+    pub sample_rate: u32,
+    /// HackRF LNA in dB, on the legal 8 dB steps. The Tune slider writes it.
+    /// Absent leaves the GQRX gain map, then the transfer tool's own default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lna_db: Option<u32>,
+    /// HackRF VGA in dB, on the legal 2 dB steps. The Tune slider writes it.
+    /// Absent leaves the GQRX gain map, then the transfer tool's own default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vga_db: Option<u32>,
 }
 
 impl RadioSpec {
@@ -178,6 +206,9 @@ impl RadioSpec {
             gqrx: GqrxConfig::new(),
             rx_pipe: String::new(),
             tx_pipe: String::new(),
+            sample_rate: default_sample_rate(),
+            lna_db: None,
+            vga_db: None,
         }
     }
 }
@@ -194,12 +225,17 @@ pub struct RadioRow {
     pub audio_status: String,
     /// Empty when the RX pipe is off. A failure stays here until the command changes.
     pub rx_pipe_status: String,
+    /// Command in the receive chain. A channel vocoder replaces the radio pipe
+    /// here without changing `spec.rx_pipe`.
+    pub rx_chain: String,
     /// The pipe process is in the speaker path, so the bay draws it as a block.
     pub rx_pipe_diverted: bool,
     /// Empty when the TX pipe is off.
     pub tx_pipe_status: String,
     /// The pipe process is in the microphone path, so the bay draws it as a block.
     pub tx_pipe_diverted: bool,
+    /// HackRF center, or 0 when that capture is not running.
+    pub center_hz: f64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -233,7 +269,9 @@ enum HubCmd {
     /// The station file's saved graph. Missing radio cards are created from it.
     ApplyAudio(crate::audio::AudioGraph),
     /// One `pw-dump` snapshot whose hamspot slice changed.
-    AudioSnap(crate::audio::AudioLook),
+    /// The generation is the watcher that produced it. A reset starts a new
+    /// watcher, and a line from the one that died is ignored.
+    AudioSnap(u64, crate::audio::AudioLook),
     /// The Audio frame picked a computer-side source and sink.
     SetEndpoint(u64, String, String),
     /// Stop every child this program started and leave the supervisor loop.
@@ -242,6 +280,13 @@ enum HubCmd {
     SetFollow(u64, bool),
     /// Receiver stdin/stdout command. Does not restart `rigctld`.
     SetRxPipe(u64, String),
+    /// Channel vocoder for this radio. The command is a demod script path,
+    /// or empty for the radio's own pipe. `note` is set when the script is
+    /// missing. Neither value is stored on the radio.
+    SetVocoder(u64, String, String),
+    /// Polarity flag for the running demod. A change restarts that process.
+    /// A frequency hop does not. Not stored on the radio.
+    SetInvert(u64, bool),
     /// Transmitter stdin/stdout command. Does not key the radio and does not
     /// restart `rigctld`.
     SetTxPipe(u64, String),
@@ -251,6 +296,24 @@ enum HubCmd {
     SetCcVoice(u64, bool),
     /// Tune one radio the face is not driving. Does not key it.
     Tune(u64, f64),
+    /// Operator frequency for a HackRF radio. Follow off uses this as the center.
+    HackrfDial(u64, f64),
+    /// Follow on: capture center and the control frequencies inside the filter.
+    HackrfWatch(u64, f64, Vec<f64>),
+    /// Voice discriminator. 0 is silence. Does not restart the capture.
+    HackrfVoice(u64, u64),
+    /// Packed WACN, system id, and NAC for the HackRF voice decoder.
+    /// Does not restart the capture or the control decoders.
+    HackrfP2(u64, String),
+    /// Path of the private key CSV. Empty means no `-K`. A HackRF voice
+    /// decoder is replaced. A hamlib trunk pipe is not restarted.
+    SetKeyCsv(String),
+    /// LNA and VGA for a HackRF radio. Stored on the radio. The capture
+    /// restarts once so `hackrf_transfer` receives the new `-l` and `-g`.
+    HackrfGain(u64, u32, u32),
+    /// The desktop PipeWire session was reset. When `restarted` is set, drop
+    /// saved speaker and microphone pins so the cards follow the new default.
+    ResetDefaults(crate::audio::UserPipewireReset),
 }
 
 pub struct Hub {
@@ -266,6 +329,21 @@ pub struct Hub {
     done_wake: Condvar,
     /// Decoder lines waiting for the control follower, keyed by radio id.
     cc_log: Mutex<BTreeMap<u64, Vec<String>>>,
+    /// Decoder lines for the scanner glass. A channel vocoder writes here.
+    /// The follower never reads this map.
+    identity_log: Mutex<BTreeMap<u64, Vec<String>>>,
+    /// HackRF control decoders, one buffer per tower, and the voice decoder.
+    /// These stay out of `cc_log`. A control-channel terminator is not the
+    /// end of the voice call.
+    hackrf_log: Mutex<BTreeMap<u64, HackrfPending>>,
+    /// Latest HackRF spectrum. Copied when the capture thread publishes a
+    /// frame. Kept off `HubView` so a quiet poll does not clone the bins.
+    spectrum: Mutex<crate::hackrf::SpectrumSnap>,
+}
+
+struct HackrfPending {
+    controls: Vec<Vec<String>>,
+    voice: Vec<String>,
 }
 
 struct Slot {
@@ -307,6 +385,14 @@ struct Slot {
     /// Next start after a component exited. Same gap as a radio daemon.
     rx_pipe_retry_at: Option<Instant>,
     rx_pipe_status: String,
+    /// Demod script for the selected memory. Empty leaves `spec.rx_pipe`.
+    /// Not written back onto the radio.
+    vocoder: String,
+    /// Missing vocoder script. The analog path stays up while this is set.
+    vocoder_note: String,
+    /// `HAMSPOT_INVERT` for the demod that is running. The channel file
+    /// owns the flag. This copy is what the process was started with.
+    invert: bool,
     tx_pipe: Option<crate::rx_pipe::Running>,
     tx_pipe_failed: Option<String>,
     /// Microphone whose direct wire this pipe removed. Restored when the
@@ -321,6 +407,25 @@ struct Slot {
     cc_voice: bool,
     /// Frequency for a radio the drive loop is not polling.
     pending_tune: Option<f64>,
+    /// Direct HackRF capture. Absent on a hamlib or GQRX slot.
+    hackrf: Option<crate::hackrf::Session>,
+    /// Frequency the operator dial last asked for.
+    hackrf_dial: f64,
+    /// Center the capture should sit on. 0 means do not start.
+    hackrf_want_center: f64,
+    hackrf_want_controls: Vec<f64>,
+    /// Voice discriminator. 0 writes silence.
+    hackrf_voice: u64,
+    /// Site word for the next voice decoder. Empty until a control sync names it.
+    hackrf_p2: String,
+    /// Private key CSV for the next decoder start. Empty means no `-K`.
+    key_csv: String,
+    /// Last capture error. A second copy of the same text stops the retries.
+    hackrf_last_err: String,
+    hackrf_stuck: bool,
+    /// Serial already resolved for an empty device field. A restart must not
+    /// call `hackrf_info` while the dongle is still closing.
+    hackrf_resolved: String,
 }
 
 pub fn validate_spec(spec: &RadioSpec) -> Result<(), String> {
@@ -859,6 +964,8 @@ fn spawn_radio(spec: &mut RadioSpec, port: u16, id: u64) -> Result<Child, String
     match spec.driver {
         RadioDriver::Hamlib => spawn_rigctld(spec, port),
         RadioDriver::Gqrx => spawn_gqrx(spec, port, id),
+        RadioDriver::Hackrf => Err("hackrf has no rigctl port".into()),
+        RadioDriver::Tap => Err("an audio tap has no rigctl port".into()),
     }
 }
 
@@ -866,6 +973,8 @@ fn open_rig(spec: &RadioSpec, port: u16) -> Result<LiveRig, rigctl::RigError> {
     match spec.driver {
         RadioDriver::Hamlib => LiveRig::connect("127.0.0.1", port),
         RadioDriver::Gqrx => LiveRig::connect_classic("127.0.0.1", port),
+        RadioDriver::Hackrf => Err(rigctl::RigError::Io("hackrf has no rigctl port".into())),
+        RadioDriver::Tap => Err(rigctl::RigError::Io("an audio tap has no rigctl port".into())),
     }
 }
 
@@ -957,6 +1066,9 @@ impl Hub {
             done: Mutex::new(false),
             done_wake: Condvar::new(),
             cc_log: Mutex::new(BTreeMap::new()),
+            identity_log: Mutex::new(BTreeMap::new()),
+            hackrf_log: Mutex::new(BTreeMap::new()),
+            spectrum: Mutex::new(crate::hackrf::SpectrumSnap::default()),
         });
         let thread_hub = Arc::clone(&hub);
         thread::spawn(move || supervise(thread_hub, face, kick, ctx));
@@ -965,6 +1077,12 @@ impl Hub {
 
     pub fn view(&self) -> HubView {
         self.view.lock().expect("cat view").clone()
+    }
+
+    /// Latest spectrum from the selected HackRF capture. Empty when that
+    /// radio is not running.
+    pub fn spectrum(&self) -> crate::hackrf::SpectrumSnap {
+        self.spectrum.lock().expect("hackrf spectrum").clone()
     }
 
     pub fn add(&self, spec: RadioSpec) {
@@ -995,6 +1113,11 @@ impl Hub {
         self.send(HubCmd::SetEndpoint(id, input, output));
     }
 
+    /// Forget this station's saved wires after a PipeWire session reset.
+    pub fn reset_pipewire_defaults(&self, reset: crate::audio::UserPipewireReset) {
+        self.send(HubCmd::ResetDefaults(reset));
+    }
+
     /// Record Gpredict follow. The running `rigctld` stays up.
     pub fn set_follow(&self, id: u64, follow: bool) {
         self.send(HubCmd::SetFollow(id, follow));
@@ -1003,6 +1126,17 @@ impl Hub {
     /// Receiver pipe command. The running `rigctld` stays up.
     pub fn set_rx_pipe(&self, id: u64, command: String) {
         self.send(HubCmd::SetRxPipe(id, command));
+    }
+
+    /// Channel vocoder. Does not change the radio's saved receive pipe.
+    /// An empty command puts that pipe, or the raw speaker, back.
+    /// `note` is a missing-script status. The analog path stays up.
+    pub fn set_vocoder(&self, id: u64, command: String, note: String) {
+        self.send(HubCmd::SetVocoder(id, command, note));
+    }
+
+    pub fn set_invert(&self, id: u64, invert: bool) {
+        self.send(HubCmd::SetInvert(id, invert));
     }
 
     /// Transmitter pipe command. The running `rigctld` stays up. PTT is unchanged.
@@ -1031,11 +1165,72 @@ impl Hub {
         self.send(HubCmd::Tune(id, hz));
     }
 
+    /// Operator dial for a direct HackRF radio. Follow off parks the center here.
+    pub fn hackrf_dial(&self, id: u64, hz: f64) {
+        self.send(HubCmd::HackrfDial(id, hz));
+    }
+
+    /// Follow on. The center and the control list are the capture. A voice
+    /// grant does not come through here.
+    pub fn hackrf_watch(&self, id: u64, center: f64, controls: Vec<f64>) {
+        self.send(HubCmd::HackrfWatch(id, center, controls));
+    }
+
+    /// Move the voice discriminator. 0 is silence. The capture stays up.
+    pub fn hackrf_voice(&self, id: u64, hz: u64) {
+        self.send(HubCmd::HackrfVoice(id, hz));
+    }
+
+    /// Site word for the voice decoder. The control decoders stay up.
+    pub fn hackrf_p2(&self, id: u64, word: &str) {
+        self.send(HubCmd::HackrfP2(id, word.to_string()));
+    }
+
+    /// Key CSV for every radio. Empty drops `-K`. HackRF voice is replaced.
+    /// A hamlib trunk pipe keeps running.
+    pub fn set_key_csv(&self, path: &str) {
+        self.send(HubCmd::SetKeyCsv(path.to_string()));
+    }
+
+    /// Store LNA and VGA on a HackRF radio. The capture restarts once.
+    pub fn hackrf_gain(&self, id: u64, lna_db: u32, vga_db: u32) {
+        self.send(HubCmd::HackrfGain(id, lna_db, vga_db));
+    }
+
+    /// Control-decoder lines since the last take, one buffer per tower.
+    pub fn take_hackrf_controls(&self, id: u64) -> Vec<Vec<String>> {
+        self.hackrf_log
+            .lock()
+            .expect("hackrf log")
+            .get_mut(&id)
+            .map(|pending| std::mem::take(&mut pending.controls))
+            .unwrap_or_default()
+    }
+
+    /// Voice-decoder lines since the last take. This is the call-end source.
+    pub fn take_hackrf_voice(&self, id: u64) -> Vec<String> {
+        self.hackrf_log
+            .lock()
+            .expect("hackrf log")
+            .get_mut(&id)
+            .map(|pending| std::mem::take(&mut pending.voice))
+            .unwrap_or_default()
+    }
+
     /// Decoder lines collected for `id` since the last take.
     pub fn take_cc_events(&self, id: u64) -> Vec<String> {
         self.cc_log
             .lock()
             .expect("cc log")
+            .remove(&id)
+            .unwrap_or_default()
+    }
+
+    /// Identity lines for `id` since the last take. Not a grant log.
+    pub fn take_identity(&self, id: u64) -> Vec<String> {
+        self.identity_log
+            .lock()
+            .expect("identity log")
             .remove(&id)
             .unwrap_or_default()
     }
@@ -1121,12 +1316,17 @@ fn supervise(
     let mut wanted = crate::audio::AudioGraph::default();
     let mut links_pending = false;
     let mut audio_note = String::new();
-    match watch_dump(Arc::clone(&hub)) {
+    let mut dump_generation = 1u64;
+    match watch_dump(Arc::clone(&hub), dump_generation) {
         Some(pid) => *hub.audio_pid.lock().expect("audio pid") = Some(pid),
         None => audio_note = "pw-dump is not available".into(),
     }
     let watch = DevWatch::open();
     let mut list_gen = 0u64;
+    let spectrum_wake: Arc<dyn Fn() + Send + Sync> = {
+        let hub = Arc::clone(&hub);
+        Arc::new(move || hub.poke())
+    };
     publish(
         &hub,
         &slots,
@@ -1158,14 +1358,48 @@ fn supervise(
                         slot.spec.rx_pipe = command;
                         slot.rx_pipe_failed = None;
                         slot.rx_pipe_retry_at = None;
-                        if slot
-                            .rx_pipe
-                            .as_ref()
-                            .is_some_and(|pipe| pipe.command != slot.spec.rx_pipe)
+                        // A channel vocoder owns the process. Changing the
+                        // radio's pipe must not stop that demod.
+                        if slot.vocoder.trim().is_empty()
+                            && slot
+                                .rx_pipe
+                                .as_ref()
+                                .is_some_and(|pipe| pipe.command != slot.spec.rx_pipe)
                         {
                             release_rx_pipe(slot);
                         }
                         slot.status_dirty = true;
+                    }
+                }
+                HubCmd::SetVocoder(id, command, note) => {
+                    if let Some(slot) = slots.iter_mut().find(|slot| slot.id == id) {
+                        let command = command.trim().to_string();
+                        if slot.vocoder == command && slot.vocoder_note == note {
+                            continue;
+                        }
+                        slot.vocoder = command;
+                        slot.vocoder_note = note;
+                        slot.rx_pipe_failed = None;
+                        slot.rx_pipe_retry_at = None;
+                        let want = active_rx_command(slot);
+                        if slot
+                            .rx_pipe
+                            .as_ref()
+                            .is_some_and(|pipe| pipe.command != want)
+                        {
+                            release_rx_pipe(slot);
+                        }
+                        slot.status_dirty = true;
+                    }
+                }
+                HubCmd::SetInvert(id, invert) => {
+                    if let Some(slot) = slots.iter_mut().find(|slot| slot.id == id) {
+                        if slot.invert != invert {
+                            slot.invert = invert;
+                            slot.rx_pipe_failed = None;
+                            slot.rx_pipe_retry_at = None;
+                            slot.status_dirty = true;
+                        }
                     }
                 }
                 HubCmd::SetTxPipe(id, command) => {
@@ -1216,6 +1450,13 @@ fn supervise(
                         }
                         slot.spec = spec;
                         slot.park_pending = park;
+                        if slot.spec.driver == RadioDriver::Hackrf {
+                            // The edit picked a board. A capture error from
+                            // the previous serial must not stay stuck.
+                            slot.hackrf_stuck = false;
+                            slot.hackrf_last_err.clear();
+                            slot.retry_at = None;
+                        }
                         slot.status = "starting".into();
                         slot.status_dirty = true;
                     }
@@ -1223,6 +1464,17 @@ fn supervise(
                 HubCmd::SetCc(id, on) => {
                     if let Some(slot) = slots.iter_mut().find(|slot| slot.id == id) {
                         slot.cc_events = on;
+                        if slot.spec.driver == RadioDriver::Hackrf && !on {
+                            slot.hackrf_want_controls.clear();
+                            slot.hackrf_want_center = slot.hackrf_dial;
+                            slot.hackrf_voice = if slot.hackrf_dial >= 1_000_000.0 {
+                                slot.hackrf_dial.round() as u64
+                            } else {
+                                0
+                            };
+                            slot.hackrf_stuck = false;
+                            slot.status_dirty = true;
+                        }
                     }
                 }
                 HubCmd::SetCcVoice(id, on) => {
@@ -1242,8 +1494,98 @@ fn supervise(
                         }
                     }
                 }
+                HubCmd::HackrfDial(id, hz) => {
+                    if let Some(slot) = slots.iter_mut().find(|slot| slot.id == id) {
+                        if slot.spec.driver == RadioDriver::Hackrf && hz.is_finite() && hz > 0.0 {
+                            slot.hackrf_dial = hz;
+                            if !slot.cc_events {
+                                slot.hackrf_want_controls.clear();
+                                slot.hackrf_want_center = hz;
+                                slot.hackrf_voice = hz.round() as u64;
+                                slot.hackrf_stuck = false;
+                                slot.status_dirty = true;
+                            }
+                        }
+                    }
+                }
+                HubCmd::HackrfWatch(id, center, controls) => {
+                    if let Some(slot) = slots.iter_mut().find(|slot| slot.id == id) {
+                        if slot.spec.driver != RadioDriver::Hackrf || !slot.cc_events {
+                            continue;
+                        }
+                        let changed = (slot.hackrf_want_center - center).abs() > 1.0
+                            || !same_hz(&slot.hackrf_want_controls, &controls);
+                        slot.hackrf_want_center = center;
+                        slot.hackrf_want_controls = controls;
+                        if changed {
+                            slot.hackrf_stuck = false;
+                            slot.status_dirty = true;
+                        }
+                    }
+                }
+                HubCmd::HackrfVoice(id, hz) => {
+                    if let Some(slot) = slots.iter_mut().find(|slot| slot.id == id) {
+                        if slot.spec.driver == RadioDriver::Hackrf {
+                            slot.hackrf_voice = hz;
+                            if let Some(session) = &slot.hackrf {
+                                session.set_voice(hz);
+                            }
+                        }
+                    }
+                }
+                HubCmd::HackrfGain(id, lna, vga) => {
+                    if let Some(slot) = slots.iter_mut().find(|slot| slot.id == id) {
+                        if slot.spec.driver != RadioDriver::Hackrf {
+                            continue;
+                        }
+                        let lna = crate::hackrf::snap_lna(lna);
+                        let vga = crate::hackrf::snap_vga(vga);
+                        if slot.spec.lna_db == Some(lna) && slot.spec.vga_db == Some(vga) {
+                            continue;
+                        }
+                        slot.spec.lna_db = Some(lna);
+                        slot.spec.vga_db = Some(vga);
+                        // A gain the operator just set has to reach the
+                        // dongle. A stuck or delayed capture would keep the
+                        // previous argv.
+                        slot.hackrf_stuck = false;
+                        slot.hackrf_last_err.clear();
+                        slot.retry_at = None;
+                        slot.status_dirty = true;
+                    }
+                }
+                HubCmd::SetKeyCsv(path) => {
+                    for slot in slots.iter_mut() {
+                        if slot.key_csv == path {
+                            continue;
+                        }
+                        slot.key_csv = path.clone();
+                        if let Some(session) = slot.hackrf.as_mut() {
+                            if let Err(err) = session.set_keys(&path) {
+                                slot.status = err;
+                                slot.status_dirty = true;
+                            }
+                        }
+                    }
+                }
+                HubCmd::HackrfP2(id, word) => {
+                    if let Some(slot) = slots.iter_mut().find(|slot| slot.id == id) {
+                        if slot.spec.driver != RadioDriver::Hackrf || slot.hackrf_p2 == word {
+                            continue;
+                        }
+                        slot.hackrf_p2 = word.clone();
+                        if let Some(session) = slot.hackrf.as_mut() {
+                            if let Err(err) = session.set_p2_site(&word) {
+                                slot.status = err;
+                                slot.status_dirty = true;
+                            }
+                        }
+                    }
+                }
                 HubCmd::Remove(id) => {
                     hub.cc_log.lock().expect("cc log").remove(&id);
+                    hub.identity_log.lock().expect("identity log").remove(&id);
+                    hub.hackrf_log.lock().expect("hackrf log").remove(&id);
                     if let Some(pos) = slots.iter().position(|slot| slot.id == id) {
                         let mut slot = slots.remove(pos);
                         stop_slot(&mut slot);
@@ -1271,15 +1613,39 @@ fn supervise(
                     let live = crate::audio::dump_once().unwrap_or_else(|| look.graph.clone());
                     restore_extra_devices(&wanted, &live, &slots, &mut audio_note);
                 }
-                HubCmd::AudioSnap(snap) => {
-                    note_audio(&mut slots, &snap.graph);
-                    look = snap;
+                HubCmd::AudioSnap(generation, snap) => {
+                    if generation == dump_generation {
+                        note_audio(&mut slots, &snap.graph);
+                        look = snap;
+                    }
                 }
                 HubCmd::SetEndpoint(id, input, output) => {
                     if let Some(slot) = slots.iter_mut().find(|slot| slot.id == id) {
                         retarget(slot, &input, &output, &look.graph);
                         slot.status_dirty = true;
                     }
+                }
+                HubCmd::ResetDefaults(reset) => {
+                    let mut dump_note = None;
+                    if reset.restarted {
+                        // The old monitor died with the daemon. A stale pid
+                        // must not be signaled if that number was reused.
+                        dump_generation = dump_generation.wrapping_add(1);
+                        if !restart_audio_watch(&hub, dump_generation) {
+                            dump_note = Some("pw-dump is not available".to_string());
+                        }
+                        wanted = crate::audio::AudioGraph::default();
+                        links_pending = false;
+                        look = crate::audio::AudioLook::default();
+                        for slot in &mut slots {
+                            forget_audio_pins(slot);
+                        }
+                    }
+                    audio_note = match (reset.error, dump_note) {
+                        (None, None) => "PipeWire reset to the desktop defaults.".into(),
+                        (Some(err), None) | (None, Some(err)) => err,
+                        (Some(err), Some(dump)) => format!("{err} {dump}"),
+                    };
                 }
                 HubCmd::Replace {
                     specs,
@@ -1363,24 +1729,36 @@ fn supervise(
         }
         for slot in &mut slots {
             service_audio(slot, &models, &wanted, &look.graph);
-            service_rx_pipe(slot, &look.graph, now, &hub);
+            service_rx_pipe(slot, &look.graph, &look.capture, now, &hub);
             service_tx_pipe(slot, &look.graph, now);
+            // A channel vocoder demodulates only. Its stderr is identity,
+            // not a grant, so it never enters the follower log.
             if let Some(pipe) = &slot.rx_pipe {
                 let lines = crate::rx_pipe::drain_events(pipe);
                 if !lines.is_empty() {
-                    let mut log = hub.cc_log.lock().expect("cc log");
-                    let entry = log.entry(slot.id).or_default();
-                    entry.extend(lines);
-                    // The window takes these for the follower and the log.
-                    // A stalled frame must not grow the queue without a bound.
-                    const CC_LOG_CAP: usize = 400;
-                    if entry.len() > CC_LOG_CAP {
-                        let extra = entry.len() - CC_LOG_CAP;
-                        entry.drain(0..extra);
+                    let log = if slot.vocoder.is_empty() {
+                        Some(&hub.cc_log)
+                    } else if pipe.identity {
+                        Some(&hub.identity_log)
+                    } else {
+                        None
+                    };
+                    if let Some(log) = log {
+                        let mut log = log.lock().expect("decoder log");
+                        let entry = log.entry(slot.id).or_default();
+                        entry.extend(lines);
+                        const CC_LOG_CAP: usize = 400;
+                        if entry.len() > CC_LOG_CAP {
+                            let extra = entry.len() - CC_LOG_CAP;
+                            entry.drain(0..extra);
+                        }
+                        drop(log);
+                        ctx.request_repaint();
                     }
-                    drop(log);
-                    ctx.request_repaint();
                 }
+            }
+            if let Some(session) = &slot.hackrf {
+                note_hackrf_lines(&hub, slot.id, session.drain_controls(), session.drain_voice());
             }
             tick_slot(
                 slot,
@@ -1392,9 +1770,11 @@ fn supervise(
                 kick.as_ref(),
                 now,
                 &look.graph,
+                &spectrum_wake,
             );
         }
         let ready = audio_settled(&slots, &look.graph);
+        publish_spectrum(&hub, &slots, selected, &ctx);
         if changed || slots.iter().any(|slot| slot.status_dirty) {
             publish(
                 &hub,
@@ -1454,6 +1834,9 @@ fn new_slot(id: u64, spec: RadioSpec) -> Slot {
         rx_pipe_owned: None,
         rx_pipe_retry_at: None,
         rx_pipe_status: String::new(),
+        vocoder: String::new(),
+        vocoder_note: String::new(),
+        invert: false,
         tx_pipe: None,
         tx_pipe_failed: None,
         tx_pipe_owned: None,
@@ -1462,7 +1845,309 @@ fn new_slot(id: u64, spec: RadioSpec) -> Slot {
         cc_events: false,
         cc_voice: false,
         pending_tune: None,
+        hackrf: None,
+        hackrf_dial: 0.0,
+        hackrf_want_center: 0.0,
+        hackrf_want_controls: Vec::new(),
+        hackrf_voice: 0,
+        hackrf_p2: String::new(),
+        key_csv: String::new(),
+        hackrf_last_err: String::new(),
+        hackrf_stuck: false,
+        hackrf_resolved: String::new(),
     }
+}
+
+fn same_hz(left: &[f64], right: &[f64]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| (left - right).abs() < 1.0)
+}
+
+fn note_hackrf_lines(hub: &Hub, id: u64, controls: Vec<Vec<String>>, voice: Vec<String>) {
+    if controls.iter().all(|lines| lines.is_empty()) && voice.is_empty() {
+        return;
+    }
+    let mut log = hub.hackrf_log.lock().expect("hackrf log");
+    let entry = log.entry(id).or_insert_with(|| HackrfPending {
+        controls: Vec::new(),
+        voice: Vec::new(),
+    });
+    if entry.controls.len() != controls.len() {
+        entry.controls = controls;
+    } else {
+        for (dst, src) in entry.controls.iter_mut().zip(controls) {
+            dst.extend(src);
+            cap_lines(dst);
+        }
+    }
+    if !voice.is_empty() {
+        entry.voice.extend(voice);
+        cap_lines(&mut entry.voice);
+    }
+}
+
+fn cap_lines(lines: &mut Vec<String>) {
+    const CAP: usize = 400;
+    if lines.len() > CAP {
+        let extra = lines.len() - CAP;
+        lines.drain(0..extra);
+    }
+}
+
+/// LNA, VGA, and RF amp for this HackRF. A slider value on the radio wins.
+/// Otherwise the GQRX document supplies the stage. A missing map leaves
+/// that stage unset so `hackrf_transfer` keeps its own default.
+pub fn resolved_rx_gain(spec: &RadioSpec) -> crate::hackrf::RxGain {
+    let mut gain = stored_rx_gain(spec);
+    if let Some(lna) = spec.lna_db {
+        gain.lna_db = Some(crate::hackrf::snap_lna(lna));
+    }
+    if let Some(vga) = spec.vga_db {
+        gain.vga_db = Some(crate::hackrf::snap_vga(vga));
+    }
+    gain
+}
+
+fn stored_rx_gain(spec: &RadioSpec) -> crate::hackrf::RxGain {
+    if let Some(gain) = gain_from_config(&spec.gqrx) {
+        return gain;
+    }
+    let paths = [
+        gqrx_conf_for_name(&spec.name),
+        legacy_gqrx_conf(&config_home(), &spec.name),
+    ];
+    for path in paths {
+        let Ok(Some(config)) = read_gqrx_file(&path) else {
+            continue;
+        };
+        if let Some(gain) = gain_from_config(&config) {
+            return gain;
+        }
+    }
+    crate::hackrf::RxGain::default()
+}
+
+fn gain_from_config(config: &GqrxConfig) -> Option<crate::hackrf::RxGain> {
+    let text = config.get("input").and_then(|group| group.get("gains"))?;
+    let gain = crate::hackrf::parse_gqrx_gains(text);
+    if gain.lna_db.is_none() && gain.vga_db.is_none() && gain.amp.is_none() {
+        None
+    } else {
+        Some(gain)
+    }
+}
+
+fn p25_demod_script() -> Option<String> {
+    crate::rx_pipe::modem_scripts()
+        .into_iter()
+        .find(|script| script.name == "commander-demod-p25.rxpipe")
+        .map(|script| script.command)
+}
+
+fn hackrf_listed() -> Vec<String> {
+    let Ok(out) = Command::new("hackrf_info").output() else {
+        return Vec::new();
+    };
+    let mut listed = crate::hackrf::serials(&String::from_utf8_lossy(&out.stdout));
+    if listed.is_empty() {
+        listed.extend(crate::hackrf::serials(&String::from_utf8_lossy(&out.stderr)));
+    }
+    listed
+}
+
+/// Direct HackRF. No `rigctld`, no GQRX, no rigctl port. The dongle stays
+/// with whoever already has it: a busy open is reported and that process
+/// is left running.
+fn tick_hackrf(
+    slot: &mut Slot,
+    selected: bool,
+    demo: bool,
+    face: &Mutex<FaceGate>,
+    kick: &dyn Fn(),
+    now: Instant,
+    graph: &crate::audio::AudioGraph,
+    wake: &Arc<dyn Fn() + Send + Sync>,
+) {
+    if selected && !demo {
+        let mut gate = face.lock().expect("face");
+        if gate.face_port.is_some() || gate.connect.is_some() || !gate.face_down {
+            gate.connect = None;
+            gate.face_port = None;
+            gate.face_down = true;
+            gate.connect_classic = false;
+            gate.connect_failed = false;
+            drop(gate);
+            kick();
+        }
+    }
+    if let Some(session) = slot.hackrf.as_mut() {
+        if !session.alive() {
+            let mut dead = slot.hackrf.take().expect("hackrf session");
+            let printed = dead.stop();
+            let err = if printed.trim().is_empty() {
+                "hackrf_transfer exited".to_string()
+            } else {
+                printed
+            };
+            if slot.hackrf_last_err == err {
+                slot.hackrf_stuck = true;
+            }
+            slot.hackrf_last_err = err.clone();
+            slot.status = err;
+            slot.status_dirty = true;
+            slot.retry_at = Some(now + RETRY_AFTER);
+        }
+    }
+    if slot.hackrf_stuck {
+        return;
+    }
+    // The speaker node is not the capture. A missing card used to return
+    // here, so the control decoders never started and the face stayed on
+    // "waiting for hamspot_N_rx".
+    let rx_node = crate::audio::rx_name(slot.id);
+    let play_ready = !slot.spec.audio.rx || crate::audio::has_device(graph, &rx_node);
+    let (center, controls) = if slot.cc_events {
+        (slot.hackrf_want_center, slot.hackrf_want_controls.clone())
+    } else {
+        let dial = slot.hackrf_dial;
+        slot.hackrf_voice = if dial >= 1_000_000.0 {
+            dial.round() as u64
+        } else {
+            0
+        };
+        (dial, Vec::new())
+    };
+    let gain = resolved_rx_gain(&slot.spec);
+    let running = slot.hackrf.as_ref().map(|session| {
+        (
+            session.center,
+            session.control_hz.clone(),
+            session.serial.clone(),
+            session.gain,
+        )
+    });
+    let wanted_serial = slot.spec.device.trim();
+    let same = running.as_ref().is_some_and(|(have, have_controls, have_serial, have_gain)| {
+        (have - center).abs() < 1.0
+            && same_hz(have_controls, &controls)
+            && (wanted_serial.is_empty() || have_serial == wanted_serial)
+            && *have_gain == gain
+            && slot.hackrf.as_ref().is_some_and(|session| session.playing()) == play_ready
+    });
+    if same {
+        if let Some(session) = &slot.hackrf {
+            session.set_voice(slot.hackrf_voice);
+        }
+        let mut status = format!("up  {:.0}", center);
+        if !play_ready {
+            status.push_str("  waiting for ");
+            status.push_str(&rx_node);
+        }
+        if slot.status != status && !slot.status.starts_with(&format!("{status}  (")) {
+            slot.status = status;
+            slot.status_dirty = true;
+        }
+        return;
+    }
+    if slot.retry_at.is_some_and(|at| now < at) {
+        return;
+    }
+    if !center.is_finite() || center < 1_000_000.0 {
+        if let Some(mut session) = slot.hackrf.take() {
+            let _ = session.stop();
+        }
+        if slot.status != "tune a frequency" {
+            slot.status = "tune a frequency".into();
+            slot.status_dirty = true;
+        }
+        return;
+    }
+    if let Some(mut session) = slot.hackrf.take() {
+        let _ = session.stop();
+    }
+    let serial = if !slot.spec.device.trim().is_empty() {
+        slot.hackrf_resolved.clear();
+        slot.spec.device.trim().to_string()
+    } else if !slot.hackrf_resolved.trim().is_empty() {
+        slot.hackrf_resolved.trim().to_string()
+    } else {
+        match crate::hackrf::resolve_serial("", &hackrf_listed()) {
+            Ok(serial) => {
+                slot.hackrf_resolved = serial.clone();
+                serial
+            }
+            Err(err) => {
+                note_hackrf_fail(slot, err, now);
+                return;
+            }
+        }
+    };
+    let script = if controls.is_empty() {
+        None
+    } else {
+        p25_demod_script()
+    };
+    let p2 = if slot.hackrf_p2.is_empty() {
+        None
+    } else {
+        Some(slot.hackrf_p2.as_str())
+    };
+    // The voice decoder already has the discriminator and the site word.
+    // Its synthesized audio goes to the speaker the operator picked. The
+    // card node stays the raw tap and is not that speaker.
+    let speaker_name = slot.spec.audio.output.trim().to_string();
+    let speaker = if speaker_name.is_empty() {
+        None
+    } else {
+        Some(speaker_name.as_str())
+    };
+    match crate::hackrf::start(
+        &serial,
+        center,
+        &controls,
+        play_ready.then_some(rx_node.as_str()),
+        speaker,
+        script.as_deref(),
+        p2,
+        if slot.key_csv.is_empty() {
+            None
+        } else {
+            Some(slot.key_csv.as_str())
+        },
+        gain,
+        Arc::clone(wake),
+    ) {
+        Ok(session) => {
+            session.set_voice(slot.hackrf_voice);
+            slot.hackrf = Some(session);
+            slot.hackrf_last_err.clear();
+            let mut status = format!("up  {:.0}", center);
+            if !play_ready {
+                status.push_str("  waiting for ");
+                status.push_str(&rx_node);
+            }
+            if !controls.is_empty() && script.is_none() {
+                status.push_str("  (P25 script missing)");
+            }
+            slot.status = status;
+            slot.status_dirty = true;
+            slot.retry_at = None;
+        }
+        Err(err) => note_hackrf_fail(slot, err, now),
+    }
+}
+
+fn note_hackrf_fail(slot: &mut Slot, err: String, now: Instant) {
+    if slot.hackrf_last_err == err {
+        slot.hackrf_stuck = true;
+    }
+    slot.hackrf_last_err = err.clone();
+    slot.status = err;
+    slot.status_dirty = true;
+    slot.retry_at = Some(now + RETRY_AFTER);
 }
 
 fn release_held(slot: &mut Slot) {
@@ -1481,7 +2166,29 @@ fn tick_slot(
     kick: &dyn Fn(),
     now: Instant,
     graph: &crate::audio::AudioGraph,
+    wake: &Arc<dyn Fn() + Send + Sync>,
 ) {
+    if slot.spec.driver == RadioDriver::Tap {
+        // The external radio is tuned by hand. This row only feeds its
+        // discriminator into the receive pipe.
+        if let Some(child) = slot.child.as_mut() {
+            stop_child(child);
+        }
+        slot.child = None;
+        slot.idle = None;
+        release_held(slot);
+        slot.port = None;
+        slot.assigned = None;
+        if slot.status != "audio tap" {
+            slot.status = "audio tap".into();
+            slot.status_dirty = true;
+        }
+        return;
+    }
+    if slot.spec.driver == RadioDriver::Hackrf {
+        tick_hackrf(slot, selected, demo, face, kick, now, graph, wake);
+        return;
+    }
     if let Some(child) = slot.child.as_mut() {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -1827,15 +2534,22 @@ fn publish(
             model_label: slot.model_label.clone(),
             audio_status: slot.audio_status.clone(),
             rx_pipe_status: slot.rx_pipe_status.clone(),
+            rx_chain: active_rx_command(slot),
             rx_pipe_diverted: slot.rx_pipe.as_ref().is_some_and(|pipe| pipe.diverted),
             tx_pipe_status: slot.tx_pipe_status.clone(),
             tx_pipe_diverted: slot.tx_pipe.as_ref().is_some_and(|pipe| pipe.diverted),
+            center_hz: slot.hackrf.as_ref().map(|session| session.center).unwrap_or(0.0),
         })
         .collect();
     let mut pids = Vec::new();
     for slot in slots {
         if let Some(child) = &slot.child {
             pids.push(child.id() as i32);
+        }
+        if let Some(session) = &slot.hackrf {
+            for pid in session.child_ids() {
+                pids.push(pid as i32);
+            }
         }
         if let Some(child) = &slot.rx_audio {
             pids.push(child.id() as i32);
@@ -1865,6 +2579,9 @@ fn publish(
 }
 
 fn stop_slot(slot: &mut Slot) {
+    if let Some(mut session) = slot.hackrf.take() {
+        let _ = session.stop();
+    }
     let adopt = slot.port.is_some();
     slot.idle = None;
     if let Some(child) = slot.child.as_mut() {
@@ -1884,6 +2601,26 @@ fn stop_slot(slot: &mut Slot) {
     stop_audio(slot);
     release_rx_pipe(slot);
     release_tx_pipe(slot);
+}
+
+/// Copy a new spectrum frame onto the hub. A capture that has stopped
+/// clears the previous frame so the Tune page does not keep a stale trace.
+fn publish_spectrum(hub: &Hub, slots: &[Slot], selected: u64, ctx: &egui::Context) {
+    let next = slots
+        .iter()
+        .find(|slot| slot.id == selected && slot.hackrf.is_some())
+        .and_then(|slot| slot.hackrf.as_ref().map(|session| session.spectrum()))
+        .unwrap_or_default();
+    let mut held = hub.spectrum.lock().expect("hackrf spectrum");
+    if next.seq == held.seq
+        && (next.center_hz - held.center_hz).abs() < 1.0
+        && next.db.len() == held.db.len()
+    {
+        return;
+    }
+    *held = next;
+    drop(held);
+    ctx.request_repaint();
 }
 
 fn park_until(hub: &Hub, watch: &Option<DevWatch>, wait: Duration) {
@@ -1971,6 +2708,8 @@ fn radio_make_model(
 ) -> (String, String) {
     match driver {
         RadioDriver::Gqrx => ("GQRX".into(), name.trim().to_string()),
+        RadioDriver::Hackrf => ("HackRF".into(), name.trim().to_string()),
+        RadioDriver::Tap => ("Audio".into(), name.trim().to_string()),
         RadioDriver::Hamlib => {
             if let Some(row) = rows.iter().find(|row| row.id == model) {
                 (row.mfg.clone(), row.model.clone())
@@ -1981,7 +2720,48 @@ fn radio_make_model(
     }
 }
 
-fn watch_dump(hub: Arc<Hub>) -> Option<i32> {
+/// Start `pw-dump -m` again. The previous watcher is signaled only when
+/// `/proc` still says that pid is `pw-dump`.
+fn restart_audio_watch(hub: &Arc<Hub>, generation: u64) -> bool {
+    if let Some(pid) = hub.audio_pid.lock().expect("audio pid").take() {
+        if proc_is_pw_dump(pid) {
+            unsafe {
+                libc::kill(-pid, libc::SIGTERM);
+            }
+        }
+    }
+    match watch_dump(Arc::clone(hub), generation) {
+        Some(pid) => {
+            *hub.audio_pid.lock().expect("audio pid") = Some(pid);
+            true
+        }
+        None => false,
+    }
+}
+
+fn proc_is_pw_dump(pid: i32) -> bool {
+    let Ok(bytes) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    String::from_utf8_lossy(&bytes).contains("pw-dump")
+}
+
+/// Drop saved speaker and microphone names and bring both cards back.
+/// The next audio pass wires them to the desktop default devices.
+fn forget_audio_pins(slot: &mut Slot) {
+    stop_audio(slot);
+    slot.spec.audio.input.clear();
+    slot.spec.audio.output.clear();
+    slot.spec.audio.rx = true;
+    slot.spec.audio.tx = true;
+    slot.saw_rx = false;
+    slot.saw_tx = false;
+    slot.audio_wired = false;
+    slot.audio_status.clear();
+    slot.status_dirty = true;
+}
+
+fn watch_dump(hub: Arc<Hub>, generation: u64) -> Option<i32> {
     let mut child = Command::new("pw-dump")
         .args(["-m", "-N", "-R", "-i", "0"])
         .stdin(Stdio::null())
@@ -2008,7 +2788,7 @@ fn watch_dump(hub: Arc<Hub>) -> Option<i32> {
                         let key = crate::audio::look_key(&look);
                         if key != last {
                             last = key;
-                            hub.send(HubCmd::AudioSnap(look));
+                            hub.send(HubCmd::AudioSnap(generation, look));
                         }
                     }
                 }
@@ -2021,6 +2801,11 @@ fn watch_dump(hub: Arc<Hub>) -> Option<i32> {
 
 fn note_audio(slots: &mut [Slot], graph: &crate::audio::AudioGraph) {
     for slot in slots {
+        // A tap has no hamspot card. A leftover node of the same id must
+        // not turn the cards on or replace the discriminator and speaker.
+        if slot.spec.driver == RadioDriver::Tap {
+            continue;
+        }
         let rx = crate::audio::rx_name(slot.id);
         let tx = crate::audio::tx_name(slot.id);
         let seen_rx = crate::audio::has_device(graph, &rx);
@@ -2075,6 +2860,10 @@ fn service_audio(
     wanted: &crate::audio::AudioGraph,
     live: &crate::audio::AudioGraph,
 ) {
+    if slot.spec.driver == RadioDriver::Tap {
+        slot.spec.audio.rx = false;
+        slot.spec.audio.tx = false;
+    }
     let (make, model_label) =
         radio_make_model(slot.spec.driver, &slot.spec.name, slot.spec.model, models);
     if slot.make != make || slot.model_label != model_label {
@@ -2088,23 +2877,38 @@ fn service_audio(
         if slot.rx_audio.is_some() {
             stop_audio_end(&mut slot.rx_audio);
         }
-    } else if slot.rx_audio.is_none()
-        && !crate::audio::has_device(live, &crate::audio::rx_name(slot.id))
-    {
-        let description = crate::audio::describe(&slot.make, &slot.model_label, slot.id, "RX");
-        match spawn_loopback(&crate::audio::rx_loopback_args(slot.id, &description)) {
-            Ok(child) => {
-                slot.rx_audio = Some(child);
-                slot.audio_wired = false;
-                if slot.audio_status.starts_with("pw-loopback") {
-                    slot.audio_status.clear();
-                    slot.status_dirty = true;
+    } else if slot.rx_audio.is_none() {
+        // A saved station restores hamspot_{id}_rx as a lingering null-sink.
+        // That node has the loopback's name and no output.hamspot stream, so
+        // the receive pipe waits on a speaker link that can never appear.
+        let name = crate::audio::rx_name(slot.id);
+        let stream_ready =
+            crate::audio::stream_ports_ready(true, &crate::audio::rx_stream(slot.id));
+        if !stream_ready {
+            if crate::audio::linger_occupies(crate::audio::has_device(live, &name), stream_ready)
+            {
+                if let Err(err) = crate::audio::destroy_named_node(&name) {
+                    if slot.audio_status != err {
+                        slot.audio_status = err;
+                        slot.status_dirty = true;
+                    }
                 }
             }
-            Err(err) => {
-                if slot.audio_status != err {
-                    slot.audio_status = err;
-                    slot.status_dirty = true;
+            let description = crate::audio::describe(&slot.make, &slot.model_label, slot.id, "RX");
+            match spawn_loopback(&crate::audio::rx_loopback_args(slot.id, &description)) {
+                Ok(child) => {
+                    slot.rx_audio = Some(child);
+                    slot.audio_wired = false;
+                    if slot.audio_status.starts_with("pw-") {
+                        slot.audio_status.clear();
+                        slot.status_dirty = true;
+                    }
+                }
+                Err(err) => {
+                    if slot.audio_status != err {
+                        slot.audio_status = err;
+                        slot.status_dirty = true;
+                    }
                 }
             }
         }
@@ -2113,19 +2917,38 @@ fn service_audio(
         if slot.tx_audio.is_some() {
             stop_audio_end(&mut slot.tx_audio);
         }
-    } else if slot.tx_audio.is_none()
-        && !crate::audio::has_device(live, &crate::audio::tx_name(slot.id))
-    {
-        let description = crate::audio::describe(&slot.make, &slot.model_label, slot.id, "TX");
-        match spawn_loopback(&crate::audio::tx_loopback_args(slot.id, &description)) {
-            Ok(child) => {
-                slot.tx_audio = Some(child);
-                slot.audio_wired = false;
+    } else if slot.tx_audio.is_none() {
+        // Same linger collision as the receiver. A missing transmit stream
+        // keeps wire_slot from ever marking the card wired, so the RX pipe
+        // stays on "waiting for the speaker link" even after the sink is up.
+        let name = crate::audio::tx_name(slot.id);
+        let stream_ready =
+            crate::audio::stream_ports_ready(false, &crate::audio::tx_stream(slot.id));
+        if !stream_ready {
+            if crate::audio::linger_occupies(crate::audio::has_device(live, &name), stream_ready)
+            {
+                if let Err(err) = crate::audio::destroy_named_node(&name) {
+                    if slot.audio_status != err {
+                        slot.audio_status = err;
+                        slot.status_dirty = true;
+                    }
+                }
             }
-            Err(err) => {
-                if slot.audio_status != err {
-                    slot.audio_status = err;
-                    slot.status_dirty = true;
+            let description = crate::audio::describe(&slot.make, &slot.model_label, slot.id, "TX");
+            match spawn_loopback(&crate::audio::tx_loopback_args(slot.id, &description)) {
+                Ok(child) => {
+                    slot.tx_audio = Some(child);
+                    slot.audio_wired = false;
+                    if slot.audio_status.starts_with("pw-") {
+                        slot.audio_status.clear();
+                        slot.status_dirty = true;
+                    }
+                }
+                Err(err) => {
+                    if slot.audio_status != err {
+                        slot.audio_status = err;
+                        slot.status_dirty = true;
+                    }
                 }
             }
         }
@@ -2137,7 +2960,13 @@ fn service_audio(
     // A later pass puts that wire in. A configured receive pipe owns the
     // speaker, including the moment before its process is up. Linking the
     // raw stream in that gap is the digital audio on the speakers.
-    if slot.rx_pipe.is_none() && slot.spec.rx_pipe.trim().is_empty() {
+    // A vocoder that failed, or is waiting out a restart, leaves that wire.
+    let radio_owns =
+        slot.vocoder.trim().is_empty() && !slot.spec.rx_pipe.trim().is_empty();
+    let vocoder_owns = !slot.vocoder.trim().is_empty()
+        && slot.rx_pipe_failed.is_none()
+        && slot.rx_pipe_retry_at.is_none();
+    if slot.rx_pipe.is_none() && !radio_owns && !vocoder_owns {
         ensure_rx_link(slot, live);
     }
 }
@@ -2327,6 +3156,17 @@ fn wire_default(slot: &mut Slot, outputs: &[String], inputs: &[String]) {
 }
 
 fn retarget(slot: &mut Slot, input: &str, output: &str, live: &crate::audio::AudioGraph) {
+    if slot.spec.driver == RadioDriver::Tap {
+        // The receive pipe records this capture itself. Linking it into a
+        // transmit stream would look for a card this radio does not have.
+        if output != slot.spec.audio.output {
+            slot.spec.audio.output = output.to_string();
+        }
+        if input != slot.spec.audio.input {
+            slot.spec.audio.input = input.to_string();
+        }
+        return;
+    }
     let outputs = crate::audio::pw_ports(true).unwrap_or_default();
     let inputs = crate::audio::pw_ports(false).unwrap_or_default();
     if output != slot.spec.audio.output {
@@ -2334,7 +3174,9 @@ fn retarget(slot: &mut Slot, input: &str, output: &str, live: &crate::audio::Aud
         // An empty name is the bay dropping a wire on bare canvas.
         // A receive pipe plays the decoder to this speaker. The raw stream
         // stays unlinked so the undecoded signal is not mixed in.
-        let piped = slot.rx_pipe.is_some() || !slot.spec.rx_pipe.trim().is_empty();
+        let piped = slot.rx_pipe.is_some()
+            || !slot.spec.rx_pipe.trim().is_empty()
+            || !slot.vocoder.trim().is_empty();
         if !output.is_empty() && !piped {
             let from = crate::audio::ports_of(&outputs, &crate::audio::rx_stream(slot.id));
             let to = crate::audio::ports_of(&inputs, output);
@@ -2361,36 +3203,70 @@ fn retarget(slot: &mut Slot, input: &str, output: &str, live: &crate::audio::Aud
     }
 }
 
+/// Script the receive chain should run. A channel vocoder wins over the
+/// radio pipe. Empty means the raw speaker.
+fn active_rx_command(slot: &Slot) -> String {
+    if !slot.vocoder.trim().is_empty() {
+        slot.vocoder.trim().to_string()
+    } else {
+        slot.spec.rx_pipe.trim().to_string()
+    }
+}
+
 fn service_rx_pipe(
     slot: &mut Slot,
     graph: &crate::audio::AudioGraph,
+    captures: &[crate::audio::AudioNode],
     now: Instant,
     hub: &Arc<Hub>,
 ) {
-    let command = slot.spec.rx_pipe.trim().to_string();
+    let command = active_rx_command(slot);
+    let vocoder = !slot.vocoder.trim().is_empty();
+    if !vocoder && !slot.vocoder_note.is_empty() {
+        let note = slot.vocoder_note.clone();
+        set_rx_pipe_status(slot, &note);
+    }
     if command.is_empty() {
         release_rx_pipe(slot);
         set_rx_pipe_status(slot, "");
         return;
     }
-    // Every P25 pipe keeps stderr and installs the speaker gate. Follow
+    // Every trunking pipe keeps stderr and installs the speaker gate. Follow
     // only changes the gate, through `cc_voice`. Tying the log to follow
     // restarted dsd-fme and dropped the identifier table.
-    let capture = crate::rx_pipe::is_p25_rx(&command);
+    // A channel vocoder keeps stderr for the glass only. Those lines are
+    // not grants. Invert is part of the start key because the decoder reads
+    // it once. A frequency hop does not change this key.
+    // An audio tap records the sound card, not the hamspot monitor, and the
+    // speaker stays open. The external radio is already on a voice channel.
+    let tap = slot.spec.driver == RadioDriver::Tap;
+    let source_key = if tap {
+        tap_record_key(&slot.spec.audio.input, captures)
+    } else {
+        String::new()
+    };
+    let capture = !tap && !vocoder && crate::rx_pipe::is_trunk_rx(&command);
+    let identity = vocoder && crate::rx_pipe::keeps_identity(&command);
+    let invert = slot.invert;
+    let what = if vocoder { "vocoder" } else { "rx pipe" };
     let restart = slot.rx_pipe.as_ref().is_some_and(|pipe| {
         pipe.command != command
             || pipe.output != slot.spec.audio.output
+            || pipe.source != source_key
             || pipe.events != capture
+            || pipe.identity != identity
+            || pipe.invert != invert
     });
     if restart {
         release_rx_pipe(slot);
     }
     if let Some(note) = slot.rx_pipe.as_mut().and_then(crate::rx_pipe::poll) {
-        // One dead component ends the group. The speaker wire stays taken
-        // so the next start does not play the undecoded signal in between.
-        halt_rx_pipe(slot, false);
+        // One dead component ends the group. A radio pipe keeps the speaker
+        // wire so the undecoded signal stays off. A channel vocoder puts the
+        // analog wire back until the next start.
+        halt_rx_pipe(slot, vocoder);
         slot.rx_pipe_retry_at = Some(now + RETRY_AFTER);
-        set_rx_pipe_status(slot, &format!("rx pipe restarting ({note})"));
+        set_rx_pipe_status(slot, &format!("{what} restarting ({note})"));
         return;
     }
     if slot.rx_pipe.is_some() {
@@ -2411,47 +3287,76 @@ fn service_rx_pipe(
     if slot.rx_pipe_retry_at.is_some_and(|at| now < at) {
         return;
     }
+    if tap && source_key.is_empty() {
+        set_rx_pipe_status(slot, &format!("{what} waiting for an audio input"));
+        return;
+    }
     let output = slot.spec.audio.output.trim();
     if !slot.audio_wired || output.is_empty() {
-        set_rx_pipe_status(slot, "rx pipe waiting for the speaker link");
+        set_rx_pipe_status(slot, &format!("{what} waiting for the speaker link"));
         return;
     }
     let Some(program) = crate::rx_pipe::program_name(&command).map(str::to_string) else {
         slot.rx_pipe_failed = Some(command);
-        set_rx_pipe_status(slot, "rx pipe command is empty");
+        set_rx_pipe_status(slot, &format!("{what} command is empty"));
         return;
     };
     if !crate::rx_pipe::on_path(&program) {
         slot.rx_pipe_failed = Some(command);
         slot.rx_pipe_retry_at = None;
-        set_rx_pipe_status(slot, &format!("rx pipe: {program} is not on PATH"));
+        set_rx_pipe_status(slot, &format!("{what}: {program} is not on PATH"));
         return;
     }
-    let on_line = if capture {
+    let on_line = if capture || identity {
         let hub = Arc::clone(hub);
         Some(Arc::new(move || hub.wake()) as Arc<dyn Fn() + Send + Sync>)
     } else {
         None
     };
-    match crate::rx_pipe::spawn(slot.id, output, &command, capture, on_line) {
+    let tap_source = if tap {
+        match tap_source_parts(&source_key) {
+            Some(parts) => Some(parts),
+            None => {
+                set_rx_pipe_status(slot, &format!("{what} waiting for an audio input"));
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    match crate::rx_pipe::spawn(
+        slot.id,
+        output,
+        &command,
+        capture,
+        identity,
+        invert,
+        on_line,
+        tap_source,
+        if slot.key_csv.is_empty() {
+            None
+        } else {
+            Some(slot.key_csv.as_str())
+        },
+    ) {
         Ok(mut pipe) => {
             if slot.rx_pipe_owned.as_deref() == Some(output) {
                 pipe.diverted = true;
             }
-            let status = rx_pipe_live_status(&pipe);
+            let status = rx_pipe_live_status(&pipe, vocoder);
             slot.rx_pipe = Some(pipe);
             slot.rx_pipe_retry_at = None;
             if slot.rx_pipe_owned.is_some() {
                 set_rx_pipe_status(slot, &status);
             } else if let Some(port) = slot.rx_pipe.as_ref().and_then(|pipe| pipe.port) {
-                set_rx_pipe_status(slot, &format!("rx pipe starting · udp {port}"));
+                set_rx_pipe_status(slot, &format!("{what} starting · udp {port}"));
             } else {
-                set_rx_pipe_status(slot, "rx pipe starting");
+                set_rx_pipe_status(slot, &format!("{what} starting"));
             }
         }
         Err(err) => {
             slot.rx_pipe_retry_at = Some(now + RETRY_AFTER);
-            set_rx_pipe_status(slot, &format!("rx pipe restarting ({err})"));
+            set_rx_pipe_status(slot, &format!("{what} restarting ({err})"));
         }
     }
 }
@@ -2512,15 +3417,20 @@ fn divert_rx_pipe(slot: &mut Slot, graph: &crate::audio::AudioGraph) {
     if let Some(output) = owned {
         slot.rx_pipe_owned = Some(output);
     }
-    if let Some(pipe) = slot.rx_pipe.as_ref() {
-        set_rx_pipe_status(slot, &rx_pipe_live_status(pipe));
+    let status = slot.rx_pipe.as_ref().map(|pipe| {
+        let vocoder = !slot.vocoder.trim().is_empty();
+        rx_pipe_live_status(pipe, vocoder)
+    });
+    if let Some(status) = status {
+        set_rx_pipe_status(slot, &status);
     }
 }
 
-fn rx_pipe_live_status(pipe: &crate::rx_pipe::Running) -> String {
+fn rx_pipe_live_status(pipe: &crate::rx_pipe::Running, vocoder: bool) -> String {
+    let name = if vocoder { "vocoder" } else { "rx pipe" };
     match pipe.port {
-        Some(port) => format!("rx pipe {} · udp {port}", crate::rx_pipe::FORMAT),
-        None => format!("rx pipe {}", crate::rx_pipe::FORMAT),
+        Some(port) => format!("{name} {} · udp {port}", crate::rx_pipe::FORMAT),
+        None => format!("{name} {}", crate::rx_pipe::FORMAT),
     }
 }
 
@@ -2563,13 +3473,60 @@ fn restore_rx_link(id: u64, output: &str) {
 }
 
 fn set_rx_pipe_status(slot: &mut Slot, text: &str) {
+    // A missing channel vocoder keeps its status line. The analog path is
+    // still serviced above, and that path must not replace this note.
+    let pinned = if slot.vocoder.is_empty() && !slot.vocoder_note.is_empty() {
+        Some(slot.vocoder_note.clone())
+    } else {
+        None
+    };
+    let text = pinned.as_deref().unwrap_or(text);
     if slot.rx_pipe_status != text {
         slot.rx_pipe_status = text.to_string();
         slot.status_dirty = true;
     }
 }
 
+/// `node:capture_FL` or `node:capture_MONO`. Empty until a tap has an input.
+/// Capture nodes live on the audio menu, not in the hamspot-only graph.
+fn tap_record_key(input: &str, captures: &[crate::audio::AudioNode]) -> String {
+    let node = input.trim();
+    if node.is_empty() {
+        return String::new();
+    }
+    let description = captures
+        .iter()
+        .find(|device| device.name == node)
+        .map(|device| device.description.as_str())
+        .unwrap_or("");
+    let leaf = crate::rx_pipe::capture_channel(node, description);
+    format!("{node}:{leaf}")
+}
+
+/// Split a key from [`tap_record_key`]. The leaf is matched from the end so
+/// a node name may contain `:`.
+fn tap_source_parts(key: &str) -> Option<(&str, &str)> {
+    for leaf in ["capture_MONO", "capture_FL"] {
+        let suffix = format!(":{leaf}");
+        if let Some(node) = key.strip_suffix(&suffix) {
+            if !node.is_empty() {
+                return Some((node, leaf));
+            }
+        }
+    }
+    None
+}
+
 fn service_tx_pipe(slot: &mut Slot, graph: &crate::audio::AudioGraph, now: Instant) {
+    if slot.spec.driver == RadioDriver::Tap {
+        if !slot.spec.tx_pipe.is_empty() {
+            slot.spec.tx_pipe.clear();
+            slot.status_dirty = true;
+        }
+        release_tx_pipe(slot);
+        set_tx_pipe_status(slot, "");
+        return;
+    }
     let command = slot.spec.tx_pipe.trim().to_string();
     if command.is_empty() {
         release_tx_pipe(slot);
@@ -2895,6 +3852,9 @@ mod tests {
             gqrx: GqrxConfig::new(),
             rx_pipe: String::new(),
             tx_pipe: String::new(),
+            sample_rate: default_sample_rate(),
+            lna_db: None,
+            vga_db: None,
         };
         let args = hamlib_argv(&spec, 4534);
         assert_eq!(
@@ -3087,9 +4047,86 @@ mod tests {
             gqrx: gqrx_chooser_config(),
             rx_pipe: String::new(),
             tx_pipe: String::new(),
+            sample_rate: default_sample_rate(),
+            lna_db: None,
+            vga_db: None,
         };
         assert!(validate_spec(&spec).is_ok());
         assert_eq!(driver_name(RadioDriver::Gqrx), "gqrx");
+    }
+
+    #[test]
+    fn hackrf_spec_does_not_need_a_model() {
+        let mut spec = RadioSpec::dummy();
+        spec.driver = RadioDriver::Hackrf;
+        spec.name = "HackRF".into();
+        spec.model = 0;
+        spec.park = false;
+        assert!(validate_spec(&spec).is_ok());
+        assert_eq!(driver_name(RadioDriver::Hackrf), "hackrf");
+        assert_eq!(spec.sample_rate, crate::hackrf::SAMPLE_RATE);
+    }
+
+    #[test]
+    fn an_audio_tap_round_trips_and_an_old_radio_stays_hamlib() {
+        let mut spec = RadioSpec::dummy();
+        spec.driver = RadioDriver::Tap;
+        spec.name = "Desk".into();
+        spec.model = 0;
+        spec.park = false;
+        spec.audio.rx = false;
+        spec.audio.tx = false;
+        spec.audio.input = "line".into();
+        spec.audio.output = "spk".into();
+        spec.rx_pipe = "commander-demod-p25.rxpipe".into();
+        assert!(validate_spec(&spec).is_ok());
+        let text = serde_json::to_string(&spec).expect("tap json");
+        assert!(text.contains("\"driver\":\"tap\""));
+        let back: RadioSpec = serde_json::from_str(&text).expect("tap radio");
+        assert_eq!(back.driver, RadioDriver::Tap);
+        assert_eq!(driver_name(back.driver), "tap");
+        assert!(!back.audio.rx);
+        assert!(!back.audio.tx);
+        assert_eq!(back.audio.input, "line");
+        assert_eq!(back.rx_pipe, "commander-demod-p25.rxpipe");
+        let old = serde_json::to_string(&RadioSpec::dummy()).expect("dummy json");
+        assert!(!old.contains("tap"));
+        let loaded: RadioSpec = serde_json::from_str(&old).expect("old radio");
+        assert_eq!(loaded.driver, RadioDriver::Hamlib);
+        let key = tap_record_key(
+            &back.audio.input,
+            &[crate::audio::AudioNode {
+                name: "line".into(),
+                description: "USB Mono".into(),
+                class: "Audio/Source".into(),
+            }],
+        );
+        assert_eq!(key, "line:capture_MONO");
+        assert_eq!(tap_source_parts(&key), Some(("line", "capture_MONO")));
+    }
+
+    #[test]
+    fn a_slider_gain_overrides_the_document_and_an_old_radio_omits_it() {
+        let mut spec = RadioSpec::dummy();
+        spec.driver = RadioDriver::Hackrf;
+        spec.name = "no-such-radio-gain-test".into();
+        spec.lna_db = Some(39);
+        spec.vga_db = Some(3);
+        let gain = resolved_rx_gain(&spec);
+        assert_eq!(gain.lna_db, Some(32));
+        assert_eq!(gain.vga_db, Some(2));
+        assert!(gain.amp.is_none());
+        let old = r#"{"driver":"hackrf","name":"HackRF","model":0,"device":"","serial_speed":"","civ":"","ptt_type":"","ptt_file":"","conf":"","park":false,"follow":false}"#;
+        let loaded: RadioSpec = serde_json::from_str(old).expect("old radio");
+        assert_eq!(loaded.lna_db, None);
+        assert_eq!(loaded.vga_db, None);
+        let text = serde_json::to_string(&spec).unwrap();
+        assert!(text.contains("\"lna_db\":39"));
+        assert!(text.contains("\"vga_db\":3"));
+        let plain = RadioSpec::dummy();
+        let plain_text = serde_json::to_string(&plain).unwrap();
+        assert!(!plain_text.contains("lna_db"));
+        assert!(!plain_text.contains("vga_db"));
     }
 
     #[test]
@@ -3183,6 +4220,9 @@ mod tests {
             gqrx: GqrxConfig::new(),
             rx_pipe: String::new(),
             tx_pipe: String::new(),
+            sample_rate: default_sample_rate(),
+            lna_db: None,
+            vga_db: None,
         };
         let path = prepare_gqrx_document_in(&data, Some(&root.join("config")), &mut spec).unwrap();
         assert!(gqrx_needs_chooser(&spec.gqrx));
@@ -3235,6 +4275,9 @@ mod tests {
             gqrx: GqrxConfig::new(),
             rx_pipe: String::new(),
             tx_pipe: String::new(),
+            sample_rate: default_sample_rate(),
+            lna_db: None,
+            vga_db: None,
         };
         let path = prepare_gqrx_document_in(&data, Some(&root.join("config")), &mut spec).unwrap();
         assert_eq!(path, data.join("gqrx").join("HackRF.conf"));

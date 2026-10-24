@@ -1,6 +1,6 @@
 [package]
 name = "rigctl"
-version = "0.6.6"
+version = "0.8.0"
 description = "Hamlib rigctld client and an in-process demo rig"
 edition.workspace = true
 license.workspace = true

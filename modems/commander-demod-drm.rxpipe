@@ -1,0 +1,60 @@
+#!/bin/bash
+# Digital Radio Mondiale for a Hamspot Commander channel vocoder.
+#
+# stdin and stdout are 48 kHz mono signed 16-bit little-endian. sox writes
+# a WAV stream that decdrm reads as real receiver audio. decdrm finds the
+# signal. HAMSPOT_DRM_STDOUT makes that build write 48 kHz mono speech on
+# stdout and put the service name and SNR on stderr. This script does not
+# tune and does not pass -T. stderr is kept only when HAMSPOT_IDENTITY=1.
+#
+# Broadcast DRM and amateur DRM are the same waveform. The radio passband
+# has to be wide enough for the signal, about 10 kHz.
+#
+# If the decoder or the voice pipeline exits, this script exits too.
+
+set -euo pipefail
+
+for program in decdrm sox; do
+    if ! command -v "$program" >/dev/null 2>&1; then
+        echo "commander-demod-drm: ${program} is not on PATH" >&2
+        exit 1
+    fi
+done
+
+feed=""
+decoder=""
+audio=""
+cleanup() {
+    if [[ -n "$feed" ]]; then
+        kill "$feed" 2>/dev/null || true
+    fi
+    if [[ -n "$decoder" ]]; then
+        kill "$decoder" 2>/dev/null || true
+    fi
+    if [[ -n "$audio" ]]; then
+        rm -f "$audio"
+    fi
+}
+trap cleanup EXIT
+
+audio="$(mktemp -u /tmp/hamspot-rxpipe.XXXXXX).wav"
+mkfifo -m 600 "$audio"
+
+# Without job control a bare background command loses stdin. <&0 is the
+# RX audio. The wav fifo is what decdrm opens.
+sox -q -t raw -r 48000 -e signed -b 16 -c 1 - -t wav "$audio" <&0 &
+feed=$!
+
+export HAMSPOT_DRM_STDOUT=1
+if [[ "${HAMSPOT_IDENTITY:-}" == "1" ]]; then
+    decdrm rx "$audio" --realtime --status-every 1 &
+else
+    decdrm rx "$audio" --realtime --status-every 1 2>/dev/null &
+fi
+decoder=$!
+
+set +e
+wait -n
+status=$?
+set -e
+exit "$status"

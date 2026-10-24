@@ -610,6 +610,146 @@ pub fn scale(
     }
 }
 
+/// Height of the HackRF spectrum glass. Four bandspread rows.
+pub const SPECTRUM_H: f32 = 112.0;
+
+/// HackRF capture under the tuner. The glass matches the fine scale: dark
+/// fill, a left label, edge frequencies, and a needle. `db` is one bin per
+/// column across `rate_hz`, low edge first. An empty slice draws the glass
+/// with no trace. A click or drag returns a frequency in that window.
+pub fn spectrum_plot(
+    ui: &mut egui::Ui,
+    label: &str,
+    center_hz: f64,
+    rate_hz: f64,
+    usable_hz: f64,
+    db: &[f32],
+    needle_hz: f64,
+    height: f32,
+) -> Option<f64> {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), height),
+        egui::Sense::click_and_drag(),
+    );
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(
+        rect,
+        egui::CornerRadius::same(4),
+        ui.visuals().extreme_bg_color,
+    );
+    let label_w = (label.chars().count() as f32 * 7.2 + 10.0).clamp(52.0, 96.0);
+    let band = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + label_w, rect.top() + 4.0),
+        egui::pos2(rect.right() - 4.0, rect.bottom() - 4.0),
+    );
+    let rate = if rate_hz.is_finite() && rate_hz > 0.0 {
+        rate_hz
+    } else {
+        1.0
+    };
+    let center = if center_hz.is_finite() { center_hz } else { 0.0 };
+    let lo = center - rate / 2.0;
+    let hi = center + rate / 2.0;
+    if db.len() >= 2 {
+        let mut top = f32::MIN;
+        for value in db {
+            if value.is_finite() && *value > top {
+                top = *value;
+            }
+        }
+        if top > f32::MIN / 2.0 {
+            let floor = top - 70.0;
+            let span = 70.0f32;
+            for step in 1..4 {
+                let y = band.bottom() - band.height() * (step as f32 / 4.0);
+                painter.line_segment(
+                    [egui::pos2(band.left(), y), egui::pos2(band.right(), y)],
+                    egui::Stroke::new(1.0, ui.visuals().faint_bg_color),
+                );
+            }
+            let mut points = Vec::with_capacity(db.len());
+            for (i, value) in db.iter().enumerate() {
+                let sample = if value.is_finite() { *value } else { floor };
+                let t = ((sample - floor) / span).clamp(0.0, 1.0);
+                let x = band.left() + (i as f32 + 0.5) / db.len() as f32 * band.width();
+                let y = band.bottom() - t * band.height();
+                points.push(egui::pos2(x, y));
+            }
+            painter.add(egui::Shape::line(
+                points,
+                egui::Stroke::new(1.5, HAM),
+            ));
+        }
+    } else {
+        painter.text(
+            band.center(),
+            egui::Align2::CENTER_CENTER,
+            "no capture",
+            egui::FontId::monospace(12.0),
+            ui.visuals().weak_text_color(),
+        );
+    }
+    if usable_hz.is_finite() && usable_hz > 0.0 && usable_hz < rate {
+        let inset = ((rate - usable_hz) / 2.0 / rate).clamp(0.0, 0.5) as f32 * band.width();
+        let shade = egui::Color32::from_black_alpha(80);
+        painter.rect_filled(
+            egui::Rect::from_min_max(band.left_top(), egui::pos2(band.left() + inset, band.bottom())),
+            egui::CornerRadius::ZERO,
+            shade,
+        );
+        painter.rect_filled(
+            egui::Rect::from_min_max(egui::pos2(band.right() - inset, band.top()), band.right_bottom()),
+            egui::CornerRadius::ZERO,
+            shade,
+        );
+    }
+    if needle_hz.is_finite() && needle_hz >= lo && needle_hz <= hi {
+        let t = ((needle_hz - lo) / rate).clamp(0.0, 1.0) as f32;
+        let x = band.left() + t * band.width();
+        painter.line_segment(
+            [egui::pos2(x, rect.top() + 2.0), egui::pos2(x, rect.bottom() - 2.0)],
+            egui::Stroke::new(2.0, ui.visuals().strong_text_color()),
+        );
+    }
+    painter.text(
+        egui::pos2(rect.left() + 4.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::monospace(12.0),
+        ui.visuals().text_color(),
+    );
+    painter.text(
+        egui::pos2(band.left() + 4.0, band.bottom() - 1.0),
+        egui::Align2::LEFT_BOTTOM,
+        edge(lo),
+        egui::FontId::monospace(10.0),
+        ui.visuals().weak_text_color(),
+    );
+    painter.text(
+        egui::pos2(band.right() - 4.0, band.bottom() - 1.0),
+        egui::Align2::RIGHT_BOTTOM,
+        edge(hi),
+        egui::FontId::monospace(10.0),
+        ui.visuals().weak_text_color(),
+    );
+    if let Some(pos) = response.hover_pos() {
+        if band.contains(pos) {
+            let frac = ((pos.x - band.left()) / band.width()).clamp(0.0, 1.0) as f64;
+            response.clone().on_hover_text(format!("{:.6} MHz", (lo + frac * rate) / 1_000_000.0));
+        }
+    }
+    if response.clicked() || response.dragged() {
+        let pos = response.interact_pointer_pos()?;
+        if !band.contains(pos) {
+            return None;
+        }
+        let frac = ((pos.x - band.left()) / band.width()).clamp(0.0, 1.0) as f64;
+        Some(lo + frac * rate)
+    } else {
+        None
+    }
+}
+
 fn edge(hz: f64) -> String {
     format!("{:.3}", hz / 1_000_000.0)
 }

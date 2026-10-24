@@ -1,11 +1,26 @@
 #!/bin/bash
-# P25 Phase 1 for a Hamspot Commander RX pipe.
+# P25 control and Phase 2 voice for a Hamspot Commander RX pipe.
 #
 # stdin and stdout are 48 kHz mono signed 16-bit little-endian. dsd-fme
-# reads that stream and sends 8 kHz mono voice to UDP. socat and sox turn
-# the voice back into the format the pipe plays. The first argument is the
-# UDP port. Commander passes a free one so each radio can run this script.
-# A manual run with no argument uses 23469.
+# reads that stream. -ft keeps Phase 1 control and also decodes Phase 2
+# voice. It emits 8 kHz stereo signed 16-bit, one slot on each channel.
+# sox mixes both into the mono stream the pipe plays. The first argument
+# is the UDP port. Commander passes a free one so each radio can run this
+# script. A manual run with no argument uses 23469.
+#
+# -ft also accepts DMR frames on this pipe. The follower still reads only
+# P25 lines. This script does not pass -T. Commander tunes. The identifier
+# table lives in this dsd-fme, so a hop must not restart it. The search
+# counter stays 204000 bytes because the control channel is still Phase 1.
+#
+# HAMSPOT_P25_X is dsd-fme -X. It is WACN, the system id, and the NAC packed
+# into one hex word. Phase 2 voice prints "P2 Missing Parameters" and stays
+# muted until those three are set. The voice decoder never hears the control
+# channel, so Commander passes the word it already learned. This is not a key.
+#
+# HAMSPOT_P25_K is the path of a dsd-fme hex key CSV. It is passed as -K.
+# An empty value passes nothing. A path that is not a file is a start error,
+# because dsd-fme quits when -K names a file it cannot open.
 #
 # If the decoder or the voice pipeline exits, this script exits too. The
 # supervisor then stops the whole pipe group and starts it again.
@@ -62,6 +77,28 @@ trap cleanup EXIT
 voice="$(mktemp -u /tmp/hamspot-rxpipe.XXXXXX)"
 mkfifo -m 600 "$voice"
 
+# Empty when the control channel has not named the site yet.
+p2x=()
+if [[ -n "${HAMSPOT_P25_X:-}" ]]; then
+    case "$HAMSPOT_P25_X" in
+        *[!0-9A-Fa-f]*)
+            echo "commander-demod-p25: site parameter is not hex" >&2
+            exit 1
+            ;;
+    esac
+    p2x=(-X "$HAMSPOT_P25_X")
+fi
+
+# A key list. Absent when every row is still a placeholder.
+p2k=()
+if [[ -n "${HAMSPOT_P25_K:-}" ]]; then
+    if [[ ! -f "$HAMSPOT_P25_K" ]]; then
+        echo "commander-demod-p25: key file is missing" >&2
+        exit 1
+    fi
+    p2k=(-K "$HAMSPOT_P25_K")
+fi
+
 # Without job control, bash connects a bare background command's stdin
 # to /dev/null. dsd-fme would see EOF, exit, and the recorder would die
 # with SIGPIPE. <&0 keeps this script's stdin, which is the RX audio.
@@ -75,7 +112,8 @@ mkfifo -m 600 "$voice"
 # counts one search of audio and prints "hamspot: search". dsd walks
 # 10200 symbols before it resets (dsd_frame_sync.c). Phase 1 is 4800
 # symbols/s and this pipe is 48 kHz s16, 10 samples per symbol, so one
-# search is 204000 bytes. The line is that audio arriving. There is no sleep.
+# search is 204000 bytes. -ft does not change samples per symbol on the
+# control, so that count stays. The line is that audio arriving. There is no sleep.
 if [[ "${HAMSPOT_CC_EVENTS:-}" == "1" ]]; then
     audio="$(mktemp -u /tmp/hamspot-rxpipe-audio.XXXXXX)"
     mkfifo -m 600 "$audio"
@@ -119,15 +157,20 @@ exit 0;
 PERL
     perl "$search" <&0 >"$audio" &
     feed=$!
-    dsd-fme -f1 -i - -o "udp:127.0.0.1:${port}" <"$audio" >/dev/null &
+    dsd-fme -ft "${p2x[@]}" "${p2k[@]}" -i - -o "udp:127.0.0.1:${port}" <"$audio" >/dev/null &
+    decoder=$!
+elif [[ "${HAMSPOT_IDENTITY:-}" == "1" ]]; then
+    dsd-fme -ft "${p2x[@]}" "${p2k[@]}" -i - -o "udp:127.0.0.1:${port}" <&0 >/dev/null &
     decoder=$!
 else
-    dsd-fme -f1 -i - -o "udp:127.0.0.1:${port}" <&0 >/dev/null 2>&1 &
+    dsd-fme -ft "${p2x[@]}" "${p2k[@]}" -i - -o "udp:127.0.0.1:${port}" <&0 >/dev/null 2>&1 &
     decoder=$!
 fi
 socat -u "udp-listen:${port}" - </dev/null >"$voice" &
 listener=$!
-sox -q -t raw -r 8000 -e signed -b 16 -c 1 "$voice" -t raw -r 48000 -e signed -b 16 -c 1 - </dev/null &
+# -m sums the two slots without the default 1/n cut, so a call on one slot
+# stays at full level while the idle slot is silence.
+sox -q -t raw -r 8000 -e signed -b 16 -c 2 "$voice" -t raw -r 48000 -e signed -b 16 -c 1 - remix -m 1,2 </dev/null &
 player=$!
 
 # One exit is the crash. The trap stops the other two on the way out.

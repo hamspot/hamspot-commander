@@ -2,9 +2,11 @@
 
 A station console for amateur radio. Phase 1 is the rig-control face: frequency, S-meter, VFO and RIT keys, the ham-band scales, and the level sliders.
 
-The layout kinda follows the rig screen in the Ham Radio Deluxe 5.21 preliminary user guide (11 May 2012). That guide is the behavior reference for this screen. Logbook, Digital Modes are not in this tree. Ham Radio Deluxe is a trademark of its owner. This project does not copy its icons, bitmaps, or manual text.
+The layout kinda follows the rig screen in the Ham Radio Deluxe 5.21 preliminary user guide (11 May 2012). That guide is the behavior reference for this screen. Ham Radio Deluxe is a trademark of its owner. This project does not copy its icons, bitmaps, or manual text, and it does not include that program's logbook.
 
-The window is a Rust [`egui`](https://github.com/emilk/egui) app in the same spirit as the RT-950 CPS: dark groups, a large frequency, and a click-to-tune bandspread. Radio I/O goes through Hamlib's `rigctld` extended response protocol (`+\` commands, `RPRT` replies). GQRX uses the short rigctl commands on the same client. The program does not link `libhamlib`.
+The window is a Rust [`egui`](https://github.com/emilk/egui) app in the same spirit as the RT-950 CPS: dark groups, a large frequency, and a click-to-tune bandspread. Radio I/O goes through Hamlib's `rigctld` extended response protocol (`+\` commands, `RPRT` replies). GQRX uses the short rigctl commands on the same client. The program does not link `libhamlib`. Digital voice is an RX pipe around `dsd-fme`, not a mode in the menu.
+
+The operator manual is `docs/UserGuide.md`. `docs/AGENT-HSCommander.md` is the field map for turning a listing into a `.HSCommander` station and the `.HSKeys` file beside it.
 
 ## Run
 

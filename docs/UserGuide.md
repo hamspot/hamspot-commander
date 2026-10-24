@@ -2,13 +2,13 @@
 
 **User Guide**
 
-Version 0.6.6
+Version 0.8.0
 
-10 October 2026
+24 October 2026
 
 Hamspot
 
-This guide tells you how to run Hamspot Commander, tune a radio from the window, save a station file, and keep a portable copy on an Ubuntu live USB. It describes the program that ships in release 0.6.6. It does not describe a later build.
+This guide tells you how to run Hamspot Commander, tune a radio from the window, save a station file, and keep a portable copy on an Ubuntu live USB. It describes the program that ships in release 0.8.0. It does not describe a later build.
 
 Ham Radio Deluxe is a trademark of its owner. This project does not copy that program's icons, pictures, or manual text. The chapter order of this guide follows the same kind of operator manual: what the program is, how to start it, how the face works, then how to configure it.
 
@@ -42,17 +42,17 @@ The printed pages number the chapters. In this Markdown master the same headings
 
 Hamspot Commander is a station face for a radio you can reach with Hamlib, and for a GQRX receiver the program starts itself. You use it to read the frequency, change the VFO, set the mode, key the transmitter when the radio allows it, and keep a band plan and a local channel file.
 
-The window is a dark set of grouped frames: a top bar, a row of page tabs, the page, and a status line. The pages are Tune, Plan, Channels, Meters, Levels, and Config.
+The window is a dark set of grouped frames: a top bar, a row of page tabs, the page, and a status line. The standing pages are Tune, Plan, Channels, Meters, Levels, Keys, and Config. Keys sits immediately left of Config. A radio that can follow a trunked system adds a Talkgroups tab after Channels, and a Radio IDs tab when that system has named radios.
 
 Radio traffic uses Hamlib's `rigctld` text protocol. Commander does not link the Hamlib library. A GQRX row uses the short rigctl commands on the same kind of client. Commander starts those programs. It does not attach to a `rigctld` or a GQRX that some other program already started, and it stops only the processes it started.
 
 ## 1.2 What this release does not do
 
-Logbook, digital-mode decoding, satellite tracking, and rotator control are not in this release. There is no DX cluster, no ADIF import, and no contest logger.
+Logbook, ADIF import, a contest logger, and a DX cluster are not in this release. Commander is not itself a satellite tracker. A radio row can still follow Gpredict when that row's Gpredict box is on. That box is not talkgroup Follow.
 
-The Channels page is a file on this computer. It is not the memory bank inside the radio. The buttons `A > Mem` and `Mem > A` use one frequency held in the window, not that file and not the radio's memories.
+Digital voice is an RX pipe that runs `dsd-fme`. It is not a mode in the Mode menu. Rotators have their own rows on the Config page. A HackRF row captures one dongle. An audio tap takes a discriminator or line input and plays a demodulator. It does not tune.
 
-Favorite is kept until you close the window. It is not written into the station file.
+The Channels page is a file on this computer. It is not the memory bank inside the radio. The buttons `A > Mem` and `Mem > A` use one frequency held in the window, not that file and not the radio's memories. Favorite and that one-slot frequency are written in the station file.
 
 Some buttons on the Tune page stay dark on every radio. Section 13.4 lists them. A button that the connected radio cannot perform also stays dark, even when a different radio would light it.
 
@@ -64,7 +64,7 @@ Button names are printed as they appear on the window, for example `Add hamlib` 
 
 ## 1.4 Computer
 
-Release 0.6.6 of the portable build is a 64-bit Linux program. The install script in the source tree accepts only Ubuntu 26.04. The portable folder can be copied onto another Ubuntu machine of the same kind. It still needs the packages in the next section. Those packages are not inside the zip.
+Release 0.8.0 of the portable build is a 64-bit Linux program. The install script in the source tree accepts only Ubuntu 26.04. The portable folder can be copied onto another Ubuntu machine of the same kind. It still needs the packages in the next section. Those packages are not inside the zip.
 
 You need a graphical session. The window uses the desktop's display. Audio uses the session's PipeWire socket. Do not point the launcher at a different runtime directory. The start script leaves that socket alone on purpose.
 
@@ -99,9 +99,9 @@ GQRX is a receiver on this face. Its caps are one VFO, no transmit, no RIT, and 
 
 The portable zip for this guide is attached to the GitHub release:
 
-https://github.com/hamspot/hamspot-commander/releases/tag/v0.6.6
+https://github.com/hamspot/hamspot-commander/releases/tag/v0.8.0
 
-The file name is `hamspot-commander-0.6.6-portable-linux-x86_64.zip`. Unzipping it produces one folder, `HamSpotCommander`. Chapter 11 is the procedure for a USB stick.
+The file name is `hamspot-commander-0.8.0-portable-linux-x86_64.zip`. Unzipping it produces one folder, `HamSpotCommander`. Chapter 11 is the procedure for a USB stick.
 
 ---
 
@@ -161,7 +161,7 @@ The top bar holds `Demo`, `Favorite`, and `Full screen`.
 
 ## 3.2 Pages
 
-The tab row is `Tune`, `Plan`, `Channels`, `Meters`, `Levels`, and `Config`. The wheel over the frequency display is handled by Tune. The band scales sit outside the scroll area so the wheel is not stolen by the list.
+The tab row is `Tune`, `Plan`, `Channels`, then any Talkgroups or Radio IDs tabs, then `Meters`, `Levels`, `Keys`, and `Config`. The wheel over the frequency display is handled by Tune. The band scales sit outside the scroll area so the wheel is not stolen by the list.
 
 ## 3.3 Status line
 
@@ -332,7 +332,7 @@ Overlapping bands are an error. Bands that only touch at an edge are valid. The 
 
 ## 6.1 A memory file, not the radio
 
-The Channels page stores named frequencies on disk. A file is version 1: zones of channels, and each channel is a name, a frequency in hertz, and a mode. The page starts with one empty zone named Memories.
+The Channels page stores named frequencies on disk. A file is version 1: zones of channels. Each channel has a name, a frequency in hertz, and a mode, and may be marked control or encrypted. A vocoder name selects a digital demodulator for that memory. The page starts with one empty zone named Memories.
 
 This does not read or write the memories in the radio.
 
@@ -342,7 +342,7 @@ The buttons are `Load` and `Save`. The dialogs are titled "Load channels" and "S
 
 The list shows slot, megahertz, and name. Click a row to recall it. Recall tunes only inside the receive ranges, and it sends the mode when the radio can set mode.
 
-The editor has Name, Frequency, Mode, `Add`, and `Delete`. `Add` uses the current VFO frequency and mode. `Delete` removes the selected channel.
+The editor has Name, Frequency, Mode, Vocoder, Control, Encrypted, `Add`, and `Delete`. Invert is shown for DMR, NXDN, and dPMR. `Add` uses the current VFO frequency and mode. `Delete` removes the selected channel.
 
 A file with unknown fields, a missing channel list, a band-plan document, or a frequency that is not a finite number above zero is refused. The previous memories stay.
 
@@ -351,6 +351,14 @@ A file with unknown fields, a missing channel list, a band-plan document, or a f
 The strip is the loaded band plan, drawn across the span of the channels in the selected zone, padded on each side. It is decoration and a place to look. Loading a channel file does not change the band plan. If the plan has no segment in that window, the built-in ham plan is used for the colors. A window outside both stays unmarked.
 
 Channel zones and band-plan zones are different lists. They are not matched by name.
+
+## 6.4 Control, encryption, and scan
+
+`Control` marks a trunked control channel. The follower uses the control channels in the zone you have open, and it skips one that is also marked encrypted.
+
+`Encrypted` marks a memory the listing calls encrypted. With no filled key on the Keys page, scan skips it and a click does not tune it. The editor still opens. A filled key lets an encrypted grant play. The click still does not tune that memory.
+
+`SCAN` and `DWELL` themselves are not stored. A double-click marks a zone for the limited scan, and those marks are stored. An empty mark list scans the zone you have open.
 
 ---
 
@@ -405,7 +413,7 @@ Levels that the radio lists are written into the station file. PTT is not.
 
 The Config page `Load` and `Save` buttons store one version-1 JSON file. The dialog remembers the folder. The label next to the buttons is `No file` until you save or load.
 
-The file holds the band plan, the plan's file name, the channel file, the Tune face (frequency, mode, split, RIT, and the VFO selection the face can store), the settable levels, the radio list, and the audio graph. Unknown fields fail the load and leave the running face unchanged.
+The file holds the band plan, the plan's file name, the channel file, the talkgroup directory, the Tune face (frequency, mode, split, RIT, Favorite, the one-slot memory, and the VFO selection the face can store), the settable levels, the radio list, the audio graph, and the rotator list. Unknown fields fail the load and leave the running face unchanged. Key text is not in this file. Section 8.4 is the key file beside it.
 
 `Save` does not write the `bsp` directory by itself except as described in the next section, and it does not send CAT until you open a file onto a radio that is already online.
 
@@ -419,9 +427,25 @@ The channel path is cleared on open, so a later Channels `Save` does not overwri
 
 ## 8.3 What you must save yourself
 
-Favorite, the one-slot `A > Mem` frequency, the meter readings, and PTT are not in the file.
+Live meter needles and PTT are not in the file. `SCAN` and `DWELL` being on or off is not stored. The marked scan zones are.
 
 PipeWire changes are written only when a station file is already open. The Audio frame says "Open a station file to keep PipeWire changes." when none is open. Commander does not restore a wire that another program moved. The live graph is the source of truth, and the open file is updated to match it.
+
+## 8.4 Keys
+
+The Keys tab is immediately left of Config. Until the station has been saved, the page says so and does not write a key file. The line under the buttons names the key file. A station `City.HSCommander` keeps its keys in `City.HSKeys`, in the same folder. The mode of that file is 0600.
+
+The list columns are Key ID, Algorithm, Status, and Name. A missing key is amber under Status. The key text is only in the editor on the right.
+
+`Add` appends the next free id, from 0001 upward, as DES with blank text. `Remove` deletes the selected row. `Import` reads a dsd-fme hex CSV. The first line is the header and is skipped. `Export` writes that same CSV, mode 0600. Names are not in the CSV. `Generate` replaces the selected key text with random hex for the algorithm in the editor and saves the key file. An empty list starts as one DES key. Generate is for a radio you program yourself. It is not a fill from a system key loader. `Save` writes the editor into the key file. It does not save the station.
+
+A key id the decoder prints, when that id is not already listed, is added with blank text. The row stays until you remove it.
+
+With no filled key, an encrypted talkgroup or channel is not scanned or played. DES, RC4, and AES-256 are the algorithms this page can fill. A filled row of one of those lets an encrypted grant play. The air still picks the algorithm. Hytera, TYT, and DMR privacy flags are not sent.
+
+## 8.5 What stays out of the station JSON
+
+Do not paste key hex into the station file. Do not add a field the program does not already know. A later save from the window rewrites the station and will not invent those fields back. The key file is the only place for key text.
 
 ---
 
@@ -565,7 +589,7 @@ The live user is the one the Ubuntu image logs in as. Commands below use that us
 
 ## 11.4 Copy the zip onto the stick
 
-From any computer, copy `hamspot-commander-0.6.6-portable-linux-x86_64.zip` onto the `usbdata` partition, or download the release onto the live session after you have confirmed persistence.
+From any computer, copy `hamspot-commander-0.8.0-portable-linux-x86_64.zip` onto the `usbdata` partition, or download the release onto the live session after you have confirmed persistence.
 
 The release page is chapter 1.7.
 
@@ -574,7 +598,7 @@ The release page is chapter 1.7.
 On the persistent live session:
 
 ```bash
-ZIP=/media/$USER/usbdata/hamspot-commander-0.6.6-portable-linux-x86_64.zip
+ZIP=/media/$USER/usbdata/hamspot-commander-0.8.0-portable-linux-x86_64.zip
 mkdir -p "$HOME/Applications"
 unzip "$ZIP" -d "$HOME/Applications"
 ```
@@ -746,6 +770,8 @@ Radios and the GQRX object may be absent. An older file still loads. An empty ra
 
 The plan is stored in the file, and `bsp_name` says which file name under `bsp/` to write only when that file is not already there.
 
+Talkgroups are inside the station file. Key text is not. The matching `HSKeys` file sits beside the station. `docs/AGENT-HSCommander.md` is the field map for building a new station from a listing.
+
 ## 13.3 Frequency entry
 
 | You type | Meaning |
@@ -774,4 +800,4 @@ The first free TCP port at or above 4532 on 127.0.0.1 is the listen port. Nothin
 
 ## 13.6 Further reading in the source tree
 
-`README.md` is the short project readme. `docs/AudioGraph.md` names the PipeWire nodes for a Hamlib dummy wired to a USB sound device. This user guide is the operator manual. Where the readme still speaks of an older screen layout, trust the window and this guide.
+`README.md` is the short project readme. `docs/AudioGraph.md` names the PipeWire nodes for a Hamlib dummy wired to a USB sound device. `docs/AGENT-HSCommander.md` tells another session how to turn a listing into a station file and, when the operator supplies key ids, the key file beside it. This user guide is the operator manual. Where the readme still speaks of an older screen layout, trust the window and this guide.

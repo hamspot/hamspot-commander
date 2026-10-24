@@ -50,6 +50,12 @@ pub struct Running {
     pub tapped: bool,
     /// Decoder stderr is kept for the control-channel follower.
     pub events: bool,
+    /// Decoder stderr is kept for the scanner glass. Never set with `events`.
+    /// Those lines are not grants and do not tune.
+    pub identity: bool,
+    /// `HAMSPOT_INVERT` was set. The script appends the one polarity flag
+    /// this decoder implements for that mode. A change restarts the process.
+    pub invert: bool,
     /// `false` writes silence to the speaker. The decoder is not restarted.
     voice: Option<Arc<AtomicBool>>,
     /// stderr lines from the decoder, oldest first. Capped so a stalled
@@ -68,6 +74,18 @@ pub fn tap_ports(id: u64) -> (String, String) {
         format!("{}:monitor_FL", crate::audio::rx_name(id)),
         format!("{}:input_FL", tap_node(id)),
     )
+}
+
+/// Capture port a discriminator tap records. A node whose name or
+/// description says mono has one channel. Everything else uses the left
+/// channel, the same rule as the patch bay.
+pub fn capture_channel(name: &str, description: &str) -> &'static str {
+    let blob = format!("{name} {description}").to_ascii_lowercase();
+    if blob.contains("mono") {
+        "capture_MONO"
+    } else {
+        "capture_FL"
+    }
 }
 
 /// Arguments for a record `pw-cat` that does not autoconnect. Stdout is
@@ -96,6 +114,25 @@ pub fn routed_record_args(node: &str, channel_map: &str) -> Vec<String> {
 /// Arguments for the receive-pipe recorder.
 pub fn record_args(id: u64) -> Vec<String> {
     routed_record_args(&tap_node(id), "FL")
+}
+
+/// Play 48 kHz mono s16le to a speaker node. Stdin is the stream.
+pub fn speaker_play_args(speaker: &str) -> Vec<String> {
+    vec![
+        "-p".into(),
+        "--target".into(),
+        speaker.to_string(),
+        "--rate".into(),
+        "48000".into(),
+        "--channels".into(),
+        "1".into(),
+        "--channel-map".into(),
+        "MONO".into(),
+        "--format".into(),
+        "s16".into(),
+        "-a".into(),
+        "-".into(),
+    ]
 }
 
 /// Playback that does not autoconnect. Stdin is 48 kHz mono s16le.
@@ -362,10 +399,12 @@ pub fn release_voice_port(port: u16) {
     VOICE_PORTS.lock().expect("voice ports").remove(&port);
 }
 
-/// True when `command` is a P25 Phase 1 receive script.
+/// True when `command` is the P25 trunk receive script.
 ///
-/// The trace script is the same pipe with a crash log. Follow, the speaker
-/// gate, and decoder stderr stay on for both.
+/// That script is `-ft`: Phase 1 control and Phase 2 voice in one process.
+/// The trace script is the same pipe with a crash log and stays Phase 1.
+/// Follow, the speaker gate, and decoder stderr stay on for both. A DMR
+/// script, and the conventional Phase 2 vocoder, are not this.
 pub fn is_p25_rx(command: &str) -> bool {
     matches!(
         Path::new(command)
@@ -375,24 +414,172 @@ pub fn is_p25_rx(command: &str) -> bool {
     )
 }
 
-/// Record `hamspot_{id}_rx`, run `command`, play to `speaker`.
-/// The three processes share the record process group.
+/// True when `command` is the DMR Tier III receive script.
+pub fn is_dmr_rx(command: &str) -> bool {
+    matches!(
+        Path::new(command)
+            .file_name()
+            .and_then(|name| name.to_str()),
+        Some("commander-demod-dmr.rxpipe")
+    )
+}
+
+/// True when `command` is an NXDN Type-C / Type-D trunk script.
 ///
-/// `events` asks a P25 script to keep decoder stderr, and gates the speaker
-/// until [`set_voice`] is set. The decoder process is the same either way.
+/// The conventional NXDN48 and NXDN96 vocoders are not this. They demodulate
+/// and do not follow.
+pub fn is_nxdn_trunk(command: &str) -> bool {
+    matches!(
+        Path::new(command)
+            .file_name()
+            .and_then(|name| name.to_str()),
+        Some("commander-demod-nxdn48-trunk.rxpipe" | "commander-demod-nxdn96-trunk.rxpipe")
+    )
+}
+
+/// P25, DMR, or NXDN trunk. Each keeps decoder stderr, the speaker gate,
+/// and FOLLOW. A conventional vocoder is none of these.
+pub fn is_trunk_rx(command: &str) -> bool {
+    is_p25_rx(command) || is_dmr_rx(command) || is_nxdn_trunk(command)
+}
+
+/// Channel-vocoder scripts that can keep stderr for the scanner glass.
+/// Trunk follow uses [`is_trunk_rx`] instead, and the two are not combined.
+pub fn keeps_identity(command: &str) -> bool {
+    matches!(
+        Path::new(command)
+            .file_name()
+            .and_then(|name| name.to_str()),
+        Some(
+            "commander-demod-p25.rxpipe"
+                | "commander-demod-p25-trace.rxpipe"
+                | "commander-demod-dmr.rxpipe"
+                | "commander-demod-dstar.rxpipe"
+                | "commander-demod-ysf.rxpipe"
+                | "commander-demod-nxdn48.rxpipe"
+                | "commander-demod-nxdn96.rxpipe"
+                | "commander-demod-dpmr.rxpipe"
+                | "commander-demod-m17.rxpipe"
+                | "commander-demod-p25p2.rxpipe"
+                | "commander-demod-provoice.rxpipe"
+                | "commander-demod-edacs.rxpipe"
+                | "commander-demod-edacs-esk.rxpipe"
+                | "commander-demod-edacs-344.rxpipe"
+                | "commander-demod-edacs-434.rxpipe"
+                | "commander-demod-edacs-ea.rxpipe"
+                | "commander-demod-edacs-ea-esk.rxpipe"
+                | "commander-demod-x2tdma.rxpipe"
+                | "commander-demod-freedv1600.rxpipe"
+                | "commander-demod-freedv700c.rxpipe"
+                | "commander-demod-freedv700d.rxpipe"
+                | "commander-demod-freedv700e.rxpipe"
+                | "commander-demod-freedv800xa.rxpipe"
+                | "commander-demod-freedv2400a.rxpipe"
+                | "commander-demod-freedv2400b.rxpipe"
+                | "commander-demod-drm.rxpipe"
+        )
+    )
+}
+
+/// The selected memory's invert flag applies to this running script.
+/// P25, Phase 2, ProVoice, EDACS, X2-TDMA, D-STAR, Fusion, and M17 have
+/// no polarity switch. X2-TDMA stays at the decoder default: `-xx` means
+/// non-inverted, which is the opposite of this flag.
+pub fn invert_applies(command: &str, kind: &str) -> bool {
+    let name = Path::new(command)
+        .file_name()
+        .and_then(|name| name.to_str());
+    matches!(
+        (name, kind),
+        (Some("commander-demod-dmr.rxpipe"), "dmr")
+            | (
+                Some(
+                    "commander-demod-nxdn48.rxpipe" | "commander-demod-nxdn48-trunk.rxpipe"
+                ),
+                "nxdn48"
+            )
+            | (
+                Some(
+                    "commander-demod-nxdn96.rxpipe" | "commander-demod-nxdn96-trunk.rxpipe"
+                ),
+                "nxdn96"
+            )
+            | (Some("commander-demod-dpmr.rxpipe"), "dpmr")
+    )
+}
+
+/// Absolute path of the demod script for a channel vocoder.
+///
+/// An empty or unknown kind is analog and returns an empty command.
+/// `Err` means the kind is real and that script is not installed. The caller
+/// leaves the analog path up and shows the error.
+pub fn vocoder_command(kind: &str) -> Result<String, String> {
+    let file = match kind {
+        "p25" => "commander-demod-p25.rxpipe",
+        "p25p2" => "commander-demod-p25p2.rxpipe",
+        "dmr" => "commander-demod-dmr.rxpipe",
+        "dstar" => "commander-demod-dstar.rxpipe",
+        "ysf" => "commander-demod-ysf.rxpipe",
+        "nxdn48" => "commander-demod-nxdn48.rxpipe",
+        "nxdn96" => "commander-demod-nxdn96.rxpipe",
+        "dpmr" => "commander-demod-dpmr.rxpipe",
+        "m17" => "commander-demod-m17.rxpipe",
+        "provoice" => "commander-demod-provoice.rxpipe",
+        "edacs" => "commander-demod-edacs.rxpipe",
+        "edacs-esk" => "commander-demod-edacs-esk.rxpipe",
+        "edacs-344" => "commander-demod-edacs-344.rxpipe",
+        "edacs-434" => "commander-demod-edacs-434.rxpipe",
+        "edacs-ea" => "commander-demod-edacs-ea.rxpipe",
+        "edacs-ea-esk" => "commander-demod-edacs-ea-esk.rxpipe",
+        "x2tdma" => "commander-demod-x2tdma.rxpipe",
+        "freedv1600" => "commander-demod-freedv1600.rxpipe",
+        "freedv700c" => "commander-demod-freedv700c.rxpipe",
+        "freedv700d" => "commander-demod-freedv700d.rxpipe",
+        "freedv700e" => "commander-demod-freedv700e.rxpipe",
+        "freedv800xa" => "commander-demod-freedv800xa.rxpipe",
+        "freedv2400a" => "commander-demod-freedv2400a.rxpipe",
+        "freedv2400b" => "commander-demod-freedv2400b.rxpipe",
+        "drm" => "commander-demod-drm.rxpipe",
+        _ => return Ok(String::new()),
+    };
+    modem_scripts()
+        .into_iter()
+        .find(|script| script.name == file)
+        .map(|script| script.command)
+        .ok_or_else(|| format!("vocoder: {file} is not installed"))
+}
+
+/// Record the radio monitor, or `source` when this is an audio tap, run
+/// `command`, and play to `speaker`. The three processes share the record
+/// process group.
+///
+/// `source` is `(node, leaf)` with leaf `capture_FL` or `capture_MONO`.
+/// `None` records `hamspot_{id}_rx:monitor_FL`.
+///
+/// `events` asks a trunk script to keep decoder stderr, and gates the speaker
+/// until [`set_voice`] is set. `identity` keeps that stderr for the scanner
+/// glass without the gate and without the hunt counter. The two are never
+/// both set. `invert` is `HAMSPOT_INVERT=1`. The decoder process is the same
+/// shape either way.
 pub fn spawn(
     id: u64,
     speaker: &str,
     command: &str,
     events: bool,
+    identity: bool,
+    invert: bool,
     on_line: Option<Arc<dyn Fn() + Send + Sync>>,
+    source: Option<(&str, &str)>,
+    key_csv: Option<&str>,
 ) -> Result<Running, String> {
     let port = if script_takes_port(command.trim()) {
         Some(claim_voice_port()?)
     } else {
         None
     };
-    match spawn_group(id, speaker, command, port, events, on_line) {
+    match spawn_group(
+        id, speaker, command, port, events, identity, invert, on_line, source, key_csv,
+    ) {
         Ok(running) => Ok(running),
         Err(err) => {
             if let Some(port) = port {
@@ -409,10 +596,24 @@ fn spawn_group(
     command: &str,
     port: Option<u16>,
     events: bool,
+    identity: bool,
+    invert: bool,
     on_line: Option<Arc<dyn Fn() + Send + Sync>>,
+    source: Option<(&str, &str)>,
+    key_csv: Option<&str>,
 ) -> Result<Running, String> {
     let args = record_args(id);
-    let (tap_output, tap_input) = tap_ports(id);
+    let (tap_output, tap_input, source_text) = match source {
+        Some((node, leaf)) => (
+            format!("{node}:{leaf}"),
+            format!("{}:input_FL", tap_node(id)),
+            format!("{node}:{leaf}"),
+        ),
+        None => {
+            let (output, input) = tap_ports(id);
+            (output, input, String::new())
+        }
+    };
     let mut record = Command::new("pw-cat");
     record
         .args(&args)
@@ -447,21 +648,34 @@ fn spawn_group(
     })?;
 
     let argv = command_argv(command, port.unwrap_or(VOICE_START));
+    let keep_stderr = events || identity;
     let mut filter = Command::new(&argv[0]);
     filter
         .args(&argv[1..])
         .stdin(Stdio::from(rec_out))
         .stdout(Stdio::piped())
-        .stderr(if events {
+        .stderr(if keep_stderr {
             Stdio::piped()
         } else {
             Stdio::null()
         })
         .process_group(group);
     if events {
-        // The script keeps dsd-fme stderr only when this is set. Unset, the
-        // voice pipe discards it, which is the path a normal receive uses.
+        // The script keeps dsd-fme stderr and starts the hunt counter only
+        // when this is set. Identity uses a different variable so a vocoder
+        // cannot feed the follower.
         filter.env("HAMSPOT_CC_EVENTS", "1");
+    } else if identity {
+        filter.env("HAMSPOT_IDENTITY", "1");
+    }
+    if invert {
+        filter.env("HAMSPOT_INVERT", "1");
+    }
+    if let Some(path) = key_csv.map(str::trim).filter(|path| !path.is_empty()) {
+        // dsd-fme -K. The P25 scripts read this. Other scripts ignore it.
+        // A hamlib trunk pipe is also the control decoder, so a later key
+        // edit does not restart it. The next start of this pipe picks it up.
+        filter.env("HAMSPOT_P25_K", path);
     }
     let mut filter = match filter.spawn() {
         Ok(child) => child,
@@ -493,26 +707,21 @@ fn spawn_group(
             thread::spawn(move || collect_events(stderr, sink, on_line));
         }
         (Stdio::from(OwnedFd::from(play_side)), Some(voice), Some(log))
+    } else if identity {
+        // Same stderr capture as a trunk pipe. The speaker is not gated,
+        // and the lines go to the identity log rather than the follower.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        if let Some(stderr) = filter.stderr.take() {
+            let sink = Arc::clone(&log);
+            thread::spawn(move || collect_events(stderr, sink, on_line));
+        }
+        (Stdio::from(filt_out), None, Some(log))
     } else {
         (Stdio::from(filt_out), None, None)
     };
 
     let mut play = Command::new("pw-cat");
-    play.args([
-        "-p",
-        "--target",
-        speaker,
-        "--rate",
-        "48000",
-        "--channels",
-        "1",
-        "--channel-map",
-        "MONO",
-        "--format",
-        "s16",
-        "-a",
-        "-",
-    ])
+    play.args(speaker_play_args(speaker))
     .stdin(play_in)
     .stdout(Stdio::null())
     .stderr(Stdio::null())
@@ -531,13 +740,15 @@ fn spawn_group(
         play,
         command: command.to_string(),
         output: speaker.to_string(),
-        source: String::new(),
+        source: source_text,
         diverted: false,
         raw_muted: false,
         port,
         links,
         tapped,
         events,
+        identity: identity && !events,
+        invert,
         voice,
         log,
     })
@@ -581,6 +792,9 @@ fn collect_events(
         let Ok(line) = line else {
             return;
         };
+        if crate::keys::is_key_dump(&line) {
+            continue;
+        }
         let mut queue = sink.lock().expect("cc events");
         if queue.len() >= EVENT_CAP {
             let drop_n = queue.len() - EVENT_CAP + 1;
@@ -751,6 +965,8 @@ fn spawn_tx_group(
         links,
         tapped,
         events: false,
+        identity: false,
+        invert: false,
         voice: None,
         log: None,
     })
@@ -912,6 +1128,14 @@ mod tests {
         assert!(!tap_node(3).starts_with("hamspot_"));
         assert!(!tx_record_node(3).starts_with("hamspot_"));
         assert!(!tx_play_node(3).starts_with("hamspot_"));
+        let speaker = speaker_play_args("bluez_output.example");
+        assert!(speaker.windows(2).any(|pair| {
+            pair[0] == "--target" && pair[1] == "bluez_output.example"
+        }));
+        assert!(speaker
+            .windows(2)
+            .any(|pair| pair[0] == "--channel-map" && pair[1] == "MONO"));
+        assert!(!speaker.iter().any(|arg| arg.starts_with("node.name=")));
         assert_eq!(pipeline_label("commander-mod-am.txpipe"), "am");
         assert_eq!(
             tap_ports(3),
@@ -927,6 +1151,13 @@ mod tests {
         assert_eq!(program_name("  dsdccx -i - -o - "), Some("dsdccx"));
         assert_eq!(program_name("\"/usr/bin/cat\" -"), Some("/usr/bin/cat"));
         assert_eq!(program_name("   "), None);
+    }
+
+    #[test]
+    fn a_mono_capture_is_the_one_channel_and_a_line_uses_the_left() {
+        assert_eq!(capture_channel("alsa_input.usb.mono-fallback", ""), "capture_MONO");
+        assert_eq!(capture_channel("line", "USB Mono"), "capture_MONO");
+        assert_eq!(capture_channel("line-in", "Analog Stereo"), "capture_FL");
     }
 
     #[test]
@@ -967,6 +1198,72 @@ mod tests {
         ));
         assert!(is_p25_rx("commander-demod-p25.rxpipe"));
         assert!(!is_p25_rx("commander-demod-dmr.rxpipe"));
+        assert!(is_dmr_rx("commander-demod-dmr.rxpipe"));
+        assert!(is_dmr_rx("/opt/modems/commander-demod-dmr.rxpipe"));
+        assert!(!is_dmr_rx("commander-demod-p25.rxpipe"));
+        assert!(!is_dmr_rx("commander-demod-p25-trace.rxpipe"));
+        assert!(is_trunk_rx("commander-demod-p25.rxpipe"));
+        assert!(is_trunk_rx("commander-demod-dmr.rxpipe"));
+        assert!(!is_trunk_rx("commander-demod-fm.rxpipe"));
+        assert!(!is_trunk_rx("commander-demod-dstar.rxpipe"));
+        assert!(!is_trunk_rx("commander-demod-ysf.rxpipe"));
+        assert!(!is_trunk_rx("commander-demod-nxdn48.rxpipe"));
+        assert!(!is_trunk_rx("commander-demod-nxdn96.rxpipe"));
+        assert!(is_nxdn_trunk("commander-demod-nxdn48-trunk.rxpipe"));
+        assert!(is_nxdn_trunk(
+            "/opt/modems/commander-demod-nxdn96-trunk.rxpipe"
+        ));
+        assert!(!is_nxdn_trunk("commander-demod-nxdn96.rxpipe"));
+        assert!(is_trunk_rx("commander-demod-nxdn48-trunk.rxpipe"));
+        assert!(is_trunk_rx("commander-demod-nxdn96-trunk.rxpipe"));
+        assert!(!is_trunk_rx("commander-demod-dpmr.rxpipe"));
+        assert!(!is_trunk_rx("commander-demod-m17.rxpipe"));
+        assert!(!is_trunk_rx("commander-demod-p25p2.rxpipe"));
+        assert!(!is_trunk_rx("commander-demod-provoice.rxpipe"));
+        assert!(!is_trunk_rx("commander-demod-edacs.rxpipe"));
+        assert!(!is_trunk_rx("commander-demod-edacs-esk.rxpipe"));
+        assert!(!is_trunk_rx("commander-demod-edacs-344.rxpipe"));
+        assert!(!is_trunk_rx("commander-demod-edacs-434.rxpipe"));
+        assert!(!is_trunk_rx("commander-demod-edacs-ea.rxpipe"));
+        assert!(!is_trunk_rx("commander-demod-edacs-ea-esk.rxpipe"));
+        assert!(!is_trunk_rx("commander-demod-x2tdma.rxpipe"));
+        assert!(!is_trunk_rx("commander-demod-freedv700d.rxpipe"));
+        assert!(!is_trunk_rx("commander-demod-freedv2400a.rxpipe"));
+        assert!(!is_trunk_rx("commander-demod-drm.rxpipe"));
+        assert!(keeps_identity("commander-demod-dstar.rxpipe"));
+        assert!(keeps_identity("commander-demod-dmr.rxpipe"));
+        assert!(keeps_identity("commander-demod-p25p2.rxpipe"));
+        assert!(keeps_identity("commander-demod-provoice.rxpipe"));
+        assert!(keeps_identity("commander-demod-edacs-ea-esk.rxpipe"));
+        assert!(keeps_identity("commander-demod-x2tdma.rxpipe"));
+        assert!(keeps_identity("commander-demod-freedv1600.rxpipe"));
+        assert!(keeps_identity("commander-demod-freedv2400b.rxpipe"));
+        assert!(keeps_identity("commander-demod-drm.rxpipe"));
+        assert!(!keeps_identity("commander-demod-nxdn48-trunk.rxpipe"));
+        assert!(invert_applies("commander-demod-dmr.rxpipe", "dmr"));
+        assert!(invert_applies(
+            "commander-demod-nxdn48-trunk.rxpipe",
+            "nxdn48"
+        ));
+        assert!(invert_applies("commander-demod-nxdn96.rxpipe", "nxdn96"));
+        assert!(invert_applies("commander-demod-dpmr.rxpipe", "dpmr"));
+        assert!(!invert_applies("commander-demod-p25.rxpipe", "p25"));
+        assert!(!invert_applies("commander-demod-p25p2.rxpipe", "p25p2"));
+        assert!(!invert_applies("commander-demod-provoice.rxpipe", "provoice"));
+        assert!(!invert_applies("commander-demod-edacs.rxpipe", "edacs"));
+        assert!(!invert_applies("commander-demod-x2tdma.rxpipe", "x2tdma"));
+        assert!(!invert_applies("commander-demod-freedv700e.rxpipe", "freedv700e"));
+        assert!(!invert_applies("commander-demod-drm.rxpipe", "drm"));
+        assert!(!invert_applies("commander-demod-dstar.rxpipe", "dstar"));
+        assert!(!invert_applies("commander-demod-ysf.rxpipe", "ysf"));
+        assert!(!invert_applies("commander-demod-m17.rxpipe", "m17"));
+        assert!(!invert_applies("commander-demod-dmr.rxpipe", "nxdn48"));
+        assert!(!invert_applies(
+            "commander-demod-nxdn48-trunk.rxpipe",
+            "nxdn96"
+        ));
+        assert_eq!(vocoder_command("").unwrap(), "");
+        assert_eq!(vocoder_command("nxdn").unwrap(), "");
         assert_eq!(
             pipeline_label("commander-demod-p25-trace.rxpipe"),
             "p25-trace"
@@ -974,6 +1271,44 @@ mod tests {
         assert_eq!(pipeline_label("custom.rxpipe"), "custom");
         assert_eq!(choice_text("", &scripts), "none");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_channel_vocoder_resolves_to_the_demod_script() {
+        let p25 = vocoder_command("p25").expect("p25 script");
+        assert!(p25.ends_with("commander-demod-p25.rxpipe"), "{p25}");
+        assert!(!p25.contains("trace"), "{p25}");
+        let dmr = vocoder_command("dmr").expect("dmr script");
+        assert!(dmr.ends_with("commander-demod-dmr.rxpipe"), "{dmr}");
+        for (kind, file) in [
+            ("dstar", "commander-demod-dstar.rxpipe"),
+            ("ysf", "commander-demod-ysf.rxpipe"),
+            ("nxdn48", "commander-demod-nxdn48.rxpipe"),
+            ("nxdn96", "commander-demod-nxdn96.rxpipe"),
+            ("dpmr", "commander-demod-dpmr.rxpipe"),
+            ("m17", "commander-demod-m17.rxpipe"),
+            ("p25p2", "commander-demod-p25p2.rxpipe"),
+            ("provoice", "commander-demod-provoice.rxpipe"),
+            ("edacs", "commander-demod-edacs.rxpipe"),
+            ("edacs-esk", "commander-demod-edacs-esk.rxpipe"),
+            ("edacs-344", "commander-demod-edacs-344.rxpipe"),
+            ("edacs-434", "commander-demod-edacs-434.rxpipe"),
+            ("edacs-ea", "commander-demod-edacs-ea.rxpipe"),
+            ("edacs-ea-esk", "commander-demod-edacs-ea-esk.rxpipe"),
+            ("x2tdma", "commander-demod-x2tdma.rxpipe"),
+            ("freedv1600", "commander-demod-freedv1600.rxpipe"),
+            ("freedv700c", "commander-demod-freedv700c.rxpipe"),
+            ("freedv700d", "commander-demod-freedv700d.rxpipe"),
+            ("freedv700e", "commander-demod-freedv700e.rxpipe"),
+            ("freedv800xa", "commander-demod-freedv800xa.rxpipe"),
+            ("freedv2400a", "commander-demod-freedv2400a.rxpipe"),
+            ("freedv2400b", "commander-demod-freedv2400b.rxpipe"),
+            ("drm", "commander-demod-drm.rxpipe"),
+        ] {
+            let path = vocoder_command(kind).unwrap_or_else(|err| panic!("{kind}: {err}"));
+            assert!(path.ends_with(file), "{path}");
+            assert!(!is_trunk_rx(&path), "{path}");
+        }
     }
 
     #[test]

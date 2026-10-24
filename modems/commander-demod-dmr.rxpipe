@@ -1,0 +1,149 @@
+#!/bin/bash
+# DMR Tier III for a Hamspot Commander RX pipe.
+#
+# stdin and stdout are 48 kHz mono signed 16-bit little-endian. dsd-fme
+# reads that stream. -fs is DMR only, and its voice UDP is 8 kHz stereo
+# signed 16-bit: one timeslot on each channel. sox mixes both slots into
+# the mono stream the pipe plays. The first argument is the UDP port.
+# Commander passes a free one so each radio can run this script.
+# A manual run with no argument uses 23469.
+#
+# If the decoder or the voice pipeline exits, this script exits too. The
+# supervisor then stops the whole pipe group and starts it again.
+#
+# This script does not pass -T. Commander tunes. The channel map stays in
+# this dsd-fme process, so a hop must not restart it.
+
+set -euo pipefail
+
+port="${1:-23469}"
+case "$port" in
+    ''|*[!0-9]*)
+        echo "commander-demod-dmr: port must be a number" >&2
+        exit 1
+        ;;
+esac
+
+for program in dsd-fme socat sox; do
+    if ! command -v "$program" >/dev/null 2>&1; then
+        echo "commander-demod-dmr: ${program} is not on PATH" >&2
+        exit 1
+    fi
+done
+
+decoder=""
+feed=""
+listener=""
+player=""
+voice=""
+audio=""
+search=""
+cleanup() {
+    if [[ -n "$decoder" ]]; then
+        kill "$decoder" 2>/dev/null || true
+    fi
+    if [[ -n "$feed" ]]; then
+        kill "$feed" 2>/dev/null || true
+    fi
+    if [[ -n "$listener" ]]; then
+        kill "$listener" 2>/dev/null || true
+    fi
+    if [[ -n "$player" ]]; then
+        kill "$player" 2>/dev/null || true
+    fi
+    if [[ -n "$voice" ]]; then
+        rm -f "$voice"
+    fi
+    if [[ -n "$audio" ]]; then
+        rm -f "$audio"
+    fi
+    if [[ -n "$search" ]]; then
+        rm -f "$search"
+    fi
+}
+trap cleanup EXIT
+
+voice="$(mktemp -u /tmp/hamspot-rxpipe.XXXXXX)"
+mkfifo -m 600 "$voice"
+
+# Without job control, bash connects a bare background command's stdin
+# to /dev/null. dsd-fme would see EOF, exit, and the recorder would die
+# with SIGPIPE. <&0 keeps this script's stdin, which is the RX audio.
+# HAMSPOT_CC_EVENTS=1 keeps dsd-fme's stderr. Commander reads the trunking
+# lines from it. The voice UDP path is the same either way.
+#
+# dsd-fme prints "Sync: no sync" only after a carrier has already been
+# seen. A control channel that never locks is silent. The perl process
+# counts one search of audio and prints "hamspot: search". dsd walks
+# 10200 symbols before it resets (dsd_frame_sync.c). -fs leaves
+# samplesPerSymbol at 10. This pipe is 48 kHz s16, so one search is
+# 204000 bytes. The line is that audio arriving. There is no sleep.
+extra=()
+if [[ "${HAMSPOT_INVERT:-}" == "1" ]]; then
+    extra+=(-xr)
+fi
+if [[ "${HAMSPOT_CC_EVENTS:-}" == "1" ]]; then
+    audio="$(mktemp -u /tmp/hamspot-rxpipe-audio.XXXXXX)"
+    mkfifo -m 600 "$audio"
+    search="$(mktemp /tmp/hamspot-rxpipe-search.XXXXXX)"
+    cat >"$search" <<'PERL'
+use strict;
+use warnings;
+use IO::Handle;
+use Errno qw(EINTR);
+binmode STDIN;
+binmode STDOUT;
+STDERR->autoflush(1);
+STDOUT->autoflush(1);
+my $limit = 204000;
+my $n = 0;
+while (1) {
+    my $buf;
+    my $got = sysread(STDIN, $buf, 8192);
+    if (!defined $got) {
+        next if $! == EINTR;
+        exit 1;
+    }
+    last if $got == 0;
+    my $off = 0;
+    while ($off < $got) {
+        my $wrote = syswrite(STDOUT, $buf, $got - $off, $off);
+        if (!defined $wrote) {
+            next if $! == EINTR;
+            exit 1;
+        }
+        exit 1 if $wrote == 0;
+        $off += $wrote;
+    }
+    $n += $got;
+    while ($n >= $limit) {
+        $n -= $limit;
+        print STDERR "hamspot: search\n";
+    }
+}
+exit 0;
+PERL
+    perl "$search" <&0 >"$audio" &
+    feed=$!
+    dsd-fme -fs "${extra[@]}" -i - -o "udp:127.0.0.1:${port}" <"$audio" >/dev/null &
+    decoder=$!
+elif [[ "${HAMSPOT_IDENTITY:-}" == "1" ]]; then
+    dsd-fme -fs "${extra[@]}" -i - -o "udp:127.0.0.1:${port}" <&0 >/dev/null &
+    decoder=$!
+else
+    dsd-fme -fs "${extra[@]}" -i - -o "udp:127.0.0.1:${port}" <&0 >/dev/null 2>&1 &
+    decoder=$!
+fi
+socat -u "udp-listen:${port}" - </dev/null >"$voice" &
+listener=$!
+# -m sums the two slots without the default 1/n cut, so a call on one slot
+# stays at full level while the idle slot is silence.
+sox -q -t raw -r 8000 -e signed -b 16 -c 2 "$voice" -t raw -r 48000 -e signed -b 16 -c 1 - remix -m 1,2 </dev/null &
+player=$!
+
+# One exit is the crash. The trap stops the other two on the way out.
+set +e
+wait -n
+status=$?
+set -e
+exit "$status"

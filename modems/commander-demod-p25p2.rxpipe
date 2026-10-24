@@ -1,0 +1,105 @@
+#!/bin/bash
+# P25 Phase 2 for a Hamspot Commander channel vocoder.
+#
+# stdin and stdout are 48 kHz mono signed 16-bit little-endian. dsd-fme
+# reads that stream and sends 8 kHz stereo signed 16-bit, one slot on each channel. sox mixes
+# both slots into the mono stream the pipe plays. The first argument is the
+# UDP port. Commander passes a free one so each radio can run this script.
+# A manual run with no argument uses 23469.
+#
+# P25 Phase 2 only. The decoder flag is -f2. This is not a control channel and is not a trunk pipe.
+# Voice synthesis uses the MBE already linked into dsd-fme.
+# This script does not tune and does not pass -T. stderr is kept only when HAMSPOT_IDENTITY=1.
+# HAMSPOT_P25_X is dsd-fme -X: WACN, system id, and NAC. Without it, Phase 2
+# prints "P2 Missing Parameters" and mutes the voice. This is not a key.
+# HAMSPOT_P25_K is a dsd-fme hex key CSV passed as -K. Empty passes nothing.
+# A missing decoder or a dead voice pipeline ends the script so the
+# supervisor can start it again.
+#
+# If the decoder or the voice pipeline exits, this script exits too.
+
+set -euo pipefail
+
+port="${1:-23469}"
+case "$port" in
+    ''|*[!0-9]*)
+        echo "commander-demod-p25p2: port must be a number" >&2
+        exit 1
+        ;;
+esac
+
+for program in dsd-fme socat sox; do
+    if ! command -v "$program" >/dev/null 2>&1; then
+        echo "commander-demod-p25p2: ${program} is not on PATH" >&2
+        exit 1
+    fi
+done
+
+decoder=""
+listener=""
+player=""
+voice=""
+cleanup() {
+    if [[ -n "$decoder" ]]; then
+        kill "$decoder" 2>/dev/null || true
+    fi
+    if [[ -n "$listener" ]]; then
+        kill "$listener" 2>/dev/null || true
+    fi
+    if [[ -n "$player" ]]; then
+        kill "$player" 2>/dev/null || true
+    fi
+    if [[ -n "$voice" ]]; then
+        rm -f "$voice"
+    fi
+}
+trap cleanup EXIT
+
+voice="$(mktemp -u /tmp/hamspot-rxpipe.XXXXXX)"
+mkfifo -m 600 "$voice"
+
+p2x=()
+if [[ -n "${HAMSPOT_P25_X:-}" ]]; then
+    case "$HAMSPOT_P25_X" in
+        *[!0-9A-Fa-f]*)
+            echo "commander-demod-p25p2: site parameter is not hex" >&2
+            exit 1
+            ;;
+    esac
+    p2x=(-X "$HAMSPOT_P25_X")
+fi
+
+p2k=()
+if [[ -n "${HAMSPOT_P25_K:-}" ]]; then
+    if [[ ! -f "$HAMSPOT_P25_K" ]]; then
+        echo "commander-demod-p25p2: key file is missing" >&2
+        exit 1
+    fi
+    p2k=(-K "$HAMSPOT_P25_K")
+fi
+
+# Without job control, bash connects a bare background command's stdin
+# to /dev/null. dsd-fme would see EOF and exit. <&0 keeps this script's
+# stdin, which is the RX audio.
+# HAMSPOT_IDENTITY=1 keeps decoder stderr for the scanner glass.
+# It does not count searches and it does not tune.
+if [[ "${HAMSPOT_IDENTITY:-}" == "1" ]]; then
+    dsd-fme -f2 "${p2x[@]}" "${p2k[@]}" -i - -o "udp:127.0.0.1:${port}" <&0 >/dev/null &
+else
+    dsd-fme -f2 "${p2x[@]}" "${p2k[@]}" -i - -o "udp:127.0.0.1:${port}" <&0 >/dev/null 2>&1 &
+fi
+decoder=$!
+socat -u "udp-listen:${port}" - </dev/null >"$voice" &
+listener=$!
+
+# -m sums the two slots without the default 1/n cut, so a call on one slot
+# stays at full level while the idle slot is silence.
+sox -q -t raw -r 8000 -e signed -b 16 -c 2 "$voice" -t raw -r 48000 -e signed -b 16 -c 1 - remix -m 1,2 </dev/null &
+player=$!
+
+# One exit is the crash. The trap stops the other two on the way out.
+set +e
+wait -n
+status=$?
+set -e
+exit "$status"

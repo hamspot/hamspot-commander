@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "zones": [
+    {
+      "name": "UHF",
+      "color": [
+        92,
+        120,
+        96
+      ],
+      "bands": [
+        {
+          "name": "UHF Business",
+          "chip": "uhf",
+          "lo_hz": 450000000.0,
+          "hi_hz": 470000000.0,
+          "home_hz": 451100000.0,
+          "mode": "FM",
+          "segments": [
+            {
+              "lo_hz": 450000000.0,
+              "hi_hz": 470000000.0,
+              "use": "voice",
+              "service": "utility"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "800",
+      "color": [
+        110,
+        110,
+        110
+      ],
+      "bands": [
+        {
+          "name": "800 Business",
+          "chip": "800",
+          "lo_hz": 851000000.0,
+          "hi_hz": 866000000.0,
+          "home_hz": 855537500.0,
+          "mode": "FM",
+          "segments": [
+            {
+              "lo_hz": 851000000.0,
+              "hi_hz": 866000000.0,
+              "use": "voice",
+              "service": "utility"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

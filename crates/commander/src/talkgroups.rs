@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 pub struct Talkgroup {
     pub name: String,
     pub tg: u32,
-    /// Transcribed from a listing. The follower does not read this flag.
+    /// Transcribed from a listing. With no filled key, follow does not play it.
     #[serde(default)]
     pub encrypted: bool,
 }
@@ -115,6 +115,17 @@ pub fn note_seen(file: &mut TalkgroupFile, tg: u32, encrypted: bool) -> bool {
     true
 }
 
+/// True when any zone row for this talkgroup is marked encrypted.
+/// A talkgroup that appears in more than one zone is encrypted when any
+/// of those rows says so. The caller decides whether a filled key plays it.
+pub fn is_encrypted(file: &TalkgroupFile, tg: u32) -> bool {
+    file.zones.iter().any(|zone| {
+        zone.talkgroups
+            .iter()
+            .any(|row| row.tg == tg && row.encrypted)
+    })
+}
+
 /// Name stored for this talkgroup, if the directory has one.
 pub fn name_of(file: &TalkgroupFile, tg: u32) -> Option<String> {
     for zone in &file.zones {
@@ -176,6 +187,10 @@ mod tests {
             encrypted: false,
         });
         assert!(!note_seen(&mut file, 100, true));
+        assert!(!is_encrypted(&file, 100));
+        assert!(!is_encrypted(&file, 4400));
+        file.zones[1].talkgroups[0].encrypted = true;
+        assert!(is_encrypted(&file, 4400));
         assert!(note_seen(&mut file, 77, true));
         assert_eq!(file.zones[1].talkgroups.len(), 2);
         assert!(file.zones[1].talkgroups[1].encrypted);

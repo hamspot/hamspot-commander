@@ -1,0 +1,55 @@
+#!/bin/bash
+# FreeDV 2400A for a Hamspot Commander channel vocoder.
+#
+# stdin and stdout are 48 kHz mono signed 16-bit little-endian. freedv_rx
+# reads real modem samples and writes 8 kHz speech. sox puts that speech
+# back at 48 kHz. The modem sample rate for this mode is 48000 Hz.
+# This script does not tune and does not pass -T. stderr is kept only when
+# HAMSPOT_IDENTITY=1. A missing decoder ends the script so the supervisor
+# can start it again.
+#
+# If the decoder or the voice pipeline exits, this script exits too.
+
+set -euo pipefail
+
+for program in freedv_rx sox; do
+    if ! command -v "$program" >/dev/null 2>&1; then
+        echo "commander-demod-freedv2400a: ${program} is not on PATH" >&2
+        exit 1
+    fi
+done
+
+decoder=""
+player=""
+speech=""
+cleanup() {
+    if [[ -n "$decoder" ]]; then
+        kill "$decoder" 2>/dev/null || true
+    fi
+    if [[ -n "$player" ]]; then
+        kill "$player" 2>/dev/null || true
+    fi
+    if [[ -n "$speech" ]]; then
+        rm -f "$speech"
+    fi
+}
+trap cleanup EXIT
+
+speech="$(mktemp -u /tmp/hamspot-rxpipe.XXXXXX)"
+mkfifo -m 600 "$speech"
+
+# HAMSPOT_IDENTITY=1 keeps the verbose sync and SNR lines.
+if [[ "${HAMSPOT_IDENTITY:-}" == "1" ]]; then
+    freedv_rx -v 2400A - "$speech" <&0 >/dev/null &
+else
+    freedv_rx 2400A - "$speech" <&0 >/dev/null 2>&1 &
+fi
+decoder=$!
+sox -q -t raw -r 8000 -e signed -b 16 -c 1 "$speech" -t raw -r 48000 -e signed -b 16 -c 1 - </dev/null &
+player=$!
+
+set +e
+wait -n
+status=$?
+set -e
+exit "$status"

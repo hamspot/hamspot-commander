@@ -17,6 +17,12 @@
 /// Clear-mode algorithm id printed by the Phase 1 voice header.
 pub const CLEAR_ALG: u16 = 0x80;
 
+/// A grant is heard only when the air says it is clear and neither the
+/// talkgroup nor the channel is marked encrypted. No key is stored.
+pub fn hear_clear(alg: u16, talkgroup_encrypted: bool, channel_encrypted: bool) -> bool {
+    alg == CLEAR_ALG && !talkgroup_encrypted && !channel_encrypted
+}
+
 /// How long a control that has signal is kept before the others are measured.
 /// The decoder has no "scan now" event. This interval is the scan.
 pub const SCAN_PERIOD: std::time::Duration = std::time::Duration::from_secs(3 * 60);
@@ -853,6 +859,564 @@ impl DsdFeed {
     }
 }
 
+/// Turns DMR Tier III stderr into the same events the P25 follower already
+/// applies. Connect Plus, Capacity Plus, and Hytera lines are ignored.
+/// The logical-channel map stays inside `dsd-fme`; this feed only believes a
+/// `Frequency:` line, and only after a `Chan_Freq` announcement has armed it.
+#[derive(Clone, Debug, Default)]
+pub struct DmrFeed {
+    open: Option<DmrOpen>,
+    /// A data grant's frequency line is not a voice channel.
+    ignore_freq: bool,
+}
+
+#[derive(Clone, Debug)]
+struct DmrOpen {
+    tg: Option<u32>,
+    source: Option<u32>,
+    emergency: bool,
+    reported: bool,
+}
+
+impl DmrFeed {
+    pub fn push_line(&mut self, raw: &str) -> Vec<CcEvent> {
+        let line = strip_ansi(raw);
+        let line = line.trim().to_string();
+        if line.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        if line.contains("hamspot: search") {
+            out.push(CcEvent::Search);
+        }
+        if line.contains("Sync: no sync") {
+            out.push(CcEvent::SyncLost);
+        } else if line.contains("Sync: +DMR") || line.contains("Sync: -DMR") {
+            out.push(CcEvent::Sync);
+        }
+        if line.contains("(Chan_Freq)") {
+            out.push(CcEvent::Iden);
+            self.open = None;
+        }
+        if is_dmr_data_grant(&line) {
+            self.open = None;
+            self.ignore_freq = true;
+            return out;
+        }
+        if is_dmr_voice_grant(&line) {
+            self.ignore_freq = false;
+            self.open = Some(DmrOpen {
+                tg: None,
+                source: None,
+                emergency: line.contains("Emergency"),
+                reported: false,
+            });
+        }
+        if line.contains("Invalid Channel") {
+            self.open = None;
+            return out;
+        }
+        if let Some(open) = self.open.as_mut() {
+            if open.tg.is_none() {
+                open.tg = dec_after(&line, "Target: ");
+            }
+            if open.source.is_none() {
+                open.source = dec_after(&line, "Source: ");
+            }
+            if line.contains("Emergency") {
+                open.emergency = true;
+            }
+            if let (Some(tg), Some(src)) = (open.tg, open.source) {
+                if !open.reported && tg != 0 {
+                    open.reported = true;
+                    push_unit(&mut out, src, Some(tg), None, open.emergency, false);
+                }
+            }
+        }
+        if line.contains("Frequency Not Found") {
+            self.open = None;
+            self.ignore_freq = false;
+            return out;
+        }
+        if let Some(hz) = dmr_frequency_hz(&line) {
+            if self.ignore_freq {
+                self.ignore_freq = false;
+                return out;
+            }
+            if let Some(open) = self.open.take() {
+                if let Some(tg) = open.tg {
+                    if tg != 0 && hz > 0.0 {
+                        out.push(CcEvent::Grant {
+                            hz,
+                            tg,
+                            alg: CLEAR_ALG,
+                        });
+                    }
+                }
+            }
+        }
+        // `Clear (P_CLEAR)` is not an end. The slot decision is printed only
+        // while dsd-fme trunk-tune is on, and this pipe leaves that off.
+        // Encryption is a later voice-channel line. A value other than the
+        // clear id sends the follower back. No key id is kept.
+        if dmr_encrypted(&line) {
+            out.push(CcEvent::Alg(0));
+        }
+        out
+    }
+}
+
+fn is_dmr_voice_grant(line: &str) -> bool {
+    if line.contains("Connect Plus") || line.contains("Data Channel Grant") {
+        return false;
+    }
+    line.contains("(TV_GRANT)")
+        || line.contains("(BTV_GRANT)")
+        || line.contains("(PV_GRANT)")
+        || line.contains("(PV_GRANT_DX)")
+}
+
+fn is_dmr_data_grant(line: &str) -> bool {
+    line.contains("Data Channel Grant")
+}
+
+/// Turns NXDN Type-C and Type-D stderr into the same events the P25 follower
+/// already applies. A channel number is not a frequency. Only a
+/// `Frequency [` or `DFA Frequency [` line in megahertz can grant, and only
+/// after a clear voice assignment on an earlier line of this process.
+/// `Custom DFA` and a missing import do not tune. No key is stored.
+#[derive(Clone, Debug, Default)]
+pub struct NxdnFeed {
+    open: Option<NxdnOpen>,
+}
+
+#[derive(Clone, Debug)]
+struct NxdnOpen {
+    tg: u32,
+    encrypted: bool,
+}
+
+impl NxdnFeed {
+    pub fn push_line(&mut self, raw: &str) -> Vec<CcEvent> {
+        let line = strip_ansi(raw);
+        let line = line.trim().to_string();
+        if line.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        if line.contains("hamspot: search") {
+            out.push(CcEvent::Search);
+        }
+        if line.contains("Sync: no sync") {
+            out.push(CcEvent::SyncLost);
+        } else if line.contains("Sync:")
+            && (line.contains("NXDN48") || line.contains("NXDN96") || line.contains("IDAS D"))
+        {
+            out.push(CcEvent::Sync);
+        }
+        if nxdn_release(&line) {
+            self.open = None;
+            out.push(CcEvent::End);
+            return out;
+        }
+        if line.contains("Channel not found in import file")
+            || line.contains("Custom DFA Settings")
+        {
+            self.open = None;
+            return out;
+        }
+        if line.contains("Data Call Assignment") {
+            self.open = None;
+            return out;
+        }
+        if let Some(open) = self.open.as_mut() {
+            if nxdn_encrypted(&line) {
+                open.encrypted = true;
+            }
+        } else if nxdn_encrypted(&line) {
+            // Cipher text with no assignment still marks a voice call the
+            // radio has already joined. The follower leaves that channel.
+            out.push(CcEvent::Alg(0));
+        }
+        if line.contains("Channel Update") {
+            if line.contains("Termination") || nxdn_channel(&line) == Some(31) {
+                self.open = None;
+                out.push(CcEvent::End);
+                return out;
+            }
+            if line.contains("Group Call") || line.contains("Private Call") {
+                if let Some(tg) = dec_after(&line, "TGT: ") {
+                    if tg != 0 {
+                        self.open = Some(NxdnOpen {
+                            tg,
+                            encrypted: nxdn_encrypted(&line),
+                        });
+                    }
+                }
+            }
+        } else if line.contains("Src=") && line.contains("Dst/TG=") {
+            if let Some(tg) = dec_after(&line, "Dst/TG=") {
+                if tg != 0 {
+                    self.open = Some(NxdnOpen {
+                        tg,
+                        encrypted: nxdn_encrypted(&line),
+                    });
+                }
+            }
+        }
+        if let Some(hz) = frequency_hz(&line) {
+            if let Some(open) = self.open.take() {
+                let alg = if open.encrypted { 0 } else { CLEAR_ALG };
+                if alg == CLEAR_ALG {
+                    // The printed megahertz is the map. The follower will not
+                    // tune a grant until an identifier update has been seen.
+                    out.push(CcEvent::Iden);
+                }
+                out.push(CcEvent::Grant {
+                    hz,
+                    tg: open.tg,
+                    alg,
+                });
+            }
+        }
+        out
+    }
+}
+
+fn nxdn_channel(line: &str) -> Option<u32> {
+    dec_after(line, "CH: ")
+}
+
+fn nxdn_release(line: &str) -> bool {
+    line.contains("Transmission Release")
+        || line.contains("TX_REL")
+        || line.split_whitespace().any(|word| word == "DISC")
+}
+
+fn nxdn_encrypted(line: &str) -> bool {
+    if line.contains("No Encrypted") {
+        return false;
+    }
+    nxdn_enc_word(line) || line.contains("Scrambler") || line.contains("Unknown Cipher Type")
+}
+
+/// ` Enc` on a call, not the letters inside `Encoded`.
+fn nxdn_enc_word(line: &str) -> bool {
+    let mut rest = line;
+    while let Some(pos) = rest.find(" Enc") {
+        let after = &rest[pos + 4..];
+        if !after.starts_with("od") {
+            return true;
+        }
+        rest = &rest[pos + 4..];
+    }
+    line.contains(" DES") || line.contains(" AES")
+}
+
+/// One decoder line folded into the scanner glass. Fields that this line
+/// does not carry stay as they were. A CRC or FEC error is not an identity.
+/// Nothing here is a tune.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AirIdentity {
+    pub src: String,
+    pub dst: String,
+    pub tg: Option<u32>,
+    pub code_label: String,
+    pub code: String,
+    pub rpt1: String,
+    pub rpt2: String,
+    pub encrypted: bool,
+}
+
+pub fn note_identity(id: &mut AirIdentity, raw: &str) {
+    let line = strip_ansi(raw);
+    let line = line.trim();
+    if line.is_empty() || line.contains("(CRC ERR)") || line.contains("(FEC ERR)") {
+        return;
+    }
+    if let Some(value) = text_field(line, "RPT 1: ", &["RPT 2:", "DST:", "SRC:"]) {
+        id.rpt1 = value;
+    }
+    if let Some(value) = text_field(line, "RPT 2: ", &["RPT 1:", "DST:", "SRC:"]) {
+        id.rpt2 = value;
+    }
+    if let Some(value) = text_field(line, "DST RID: ", &["SRC RID:", "SRC:", "DST:"]) {
+        id.dst = value;
+    } else if let Some(value) = text_field(line, "DST: ", &["SRC:", "RPT 1:", "RPT 2:"]) {
+        id.dst = value;
+    }
+    if let Some(value) = text_field(line, "SRC RID: ", &["DST RID:", "DST:", "SRC:"]) {
+        id.src = value;
+    } else if let Some(value) = text_field(line, "SRC: ", &["DST:", "RPT 1:", "RPT 2:"]) {
+        id.src = value;
+    }
+    if let Some(n) = dec_after(line, "Src=") {
+        if n != 0 {
+            id.src = n.to_string();
+        }
+    } else if let Some(n) = dec_after(line, "SRC=") {
+        if n != 0 {
+            id.src = n.to_string();
+        }
+    }
+    if let Some(n) = dec_after(line, "Dst/TG=") {
+        if n != 0 {
+            id.tg = Some(n);
+        }
+    } else if let Some(n) = dec_after(line, "TGT=") {
+        if n != 0 {
+            id.tg = Some(n);
+        }
+    } else if let Some(n) = dec_after(line, "TGT: ") {
+        if n != 0 {
+            id.tg = Some(n);
+        }
+    } else if let Some(n) = bounded_dec(line, "TG=") {
+        if n != 0 {
+            id.tg = Some(n);
+        }
+    } else if let Some(n) = dec_after(line, "TGT [") {
+        if n != 0 {
+            id.tg = Some(n);
+        }
+    } else if let Some(n) = dec_after(line, "Group: ").or_else(|| dec_after(line, "Target: ")) {
+        if n != 0 {
+            id.tg = Some(n);
+        }
+    }
+    if id.tg.is_none() {
+        if let Some(afs) = edacs_afs(line) {
+            id.dst = afs;
+        }
+    }
+    if let Some(n) = dec_after(line, "Source: ") {
+        if n != 0 {
+            id.src = n.to_string();
+        }
+    }
+    if let Some(n) = color_code(line) {
+        id.code_label = "CC".into();
+        id.code = format!("{n:02}");
+    } else if let Some(n) = dec_after(line, "Channel Code=") {
+        id.code_label = "Code".into();
+        id.code = format!("{n:02}");
+    } else if let Some(n) = dec_after(line, "RAN ") {
+        id.code_label = "RAN".into();
+        id.code = format!("{n:02}");
+    } else if line.contains("SQL ") {
+        if let Some(n) = dec_after(line, "CODE: ") {
+            id.code_label = "SQL".into();
+            id.code = format!("{n:03}");
+        }
+    } else if let Some(n) = dec_after(line, "CAN: ") {
+        id.code_label = "CAN".into();
+        id.code = n.to_string();
+    }
+    if nxdn_encrypted(line) || (line.contains("Encrypted") && !line.contains("No Encrypted")) {
+        id.encrypted = true;
+    }
+    if let Some(snr) = freedv_sync_snr(line) {
+        id.code_label = "SNR".into();
+        id.code = snr;
+    }
+    if let Some(name) = drm_service(line) {
+        id.dst = name;
+    }
+    if let Some(snr) = drm_snr(line) {
+        id.code_label = "SNR".into();
+        id.code = snr;
+    }
+}
+
+/// Digits after `marker` when the character before it is not a slash.
+/// `Dst/TG=` must not be read as a dPMR `TG=`.
+fn bounded_dec(line: &str, marker: &str) -> Option<u32> {
+    let start = line.find(marker)?;
+    if start > 0 && line.as_bytes()[start - 1] == b'/' {
+        return None;
+    }
+    dec_after(line, marker)
+}
+
+/// FreeDV verbose level 1: `sync: 1` and `snr: -1.50 dB`. An unsynced line
+/// is not a measurement.
+fn freedv_sync_snr(line: &str) -> Option<String> {
+    let sync = dec_after(line, "sync: ")?;
+    if sync == 0 {
+        return None;
+    }
+    let start = line.find("snr: ")? + "snr: ".len();
+    signed_decimal(line[start..].trim_start())
+}
+
+/// DecDRM status: `SNR 12.4 dB` on the reception line.
+fn drm_snr(line: &str) -> Option<String> {
+    let start = line.find(" SNR ")? + " SNR ".len();
+    signed_decimal(line[start..].trim_start())
+}
+
+/// DecDRM `service 0 id D0D000 BBC World Service ...`. A missing label is skipped.
+fn drm_service(line: &str) -> Option<String> {
+    let start = line.find("service ")?;
+    let rest = &line[start..];
+    let id_at = rest.find(" id ")? + " id ".len();
+    let after_id = rest[id_at..].trim_start();
+    let hex_end = after_id.find(' ')?;
+    let name = after_id[hex_end..].trim();
+    if name.is_empty() || name.starts_with("(no label yet)") {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+fn signed_decimal(rest: &str) -> Option<String> {
+    let mut chars = rest.chars().peekable();
+    let mut out = String::new();
+    if matches!(chars.peek(), Some('+') | Some('-')) {
+        out.push(chars.next()?);
+    }
+    let mut digits = 0usize;
+    let mut dot = false;
+    for ch in chars {
+        if ch.is_ascii_digit() {
+            digits += 1;
+            out.push(ch);
+        } else if ch == '.' && !dot {
+            dot = true;
+            out.push(ch);
+        } else {
+            break;
+        }
+    }
+    if digits == 0 { None } else { Some(out) }
+}
+
+/// `AFS [003] [02-041]` from an EDACS line that has no decimal target.
+fn edacs_afs(line: &str) -> Option<String> {
+    let start = line.find("AFS [")? + "AFS ".len();
+    let rest = line[start..].trim_start();
+    let first = rest.find(']')?;
+    let second_open = rest[first + 1..].find('[')? + first + 1;
+    let second = rest[second_open..].find(']')? + second_open;
+    let text = rest[..=second].trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
+    }
+}
+
+fn color_code(line: &str) -> Option<u32> {
+    let start = line.find("Color Code=")? + "Color Code=".len();
+    let rest = line[start..].trim_start();
+    if rest.starts_with("XX") {
+        return None;
+    }
+    let digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
+    }
+}
+
+fn text_field(line: &str, key: &str, next_keys: &[&str]) -> Option<String> {
+    let start = line.find(key)? + key.len();
+    let rest = &line[start..];
+    let mut end = rest.len();
+    for next in next_keys {
+        if let Some(pos) = rest.find(next) {
+            end = end.min(pos);
+        }
+    }
+    let value = rest[..end].trim();
+    if value.is_empty() || value.contains("CRC ERR") {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+/// What the scanner glass may take from a decoded identity.
+///
+/// `None` means the caller keeps the trunk text it already has. An active
+/// talkgroup owns the headline, the talkgroup row, and the detail. The
+/// access code is still returned so the bottom row can show it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GlassRows {
+    pub headline: Option<String>,
+    pub tgid: Option<u32>,
+    pub detail: Option<String>,
+    pub facts: Option<String>,
+    pub code_line: Option<String>,
+    pub encrypted: bool,
+}
+
+pub fn glass_rows(active_tg: Option<u32>, ident: &AirIdentity) -> GlassRows {
+    let mut rows = GlassRows::default();
+    if active_tg.is_none() {
+        if !ident.src.is_empty() {
+            rows.headline = Some(ident.src.clone());
+        }
+        rows.tgid = ident.tg;
+        if !ident.dst.is_empty() {
+            rows.detail = Some(ident.dst.clone());
+        }
+        rows.encrypted = ident.encrypted;
+        if !ident.rpt1.is_empty() || !ident.rpt2.is_empty() {
+            let rpt1 = if ident.rpt1.is_empty() {
+                "—"
+            } else {
+                ident.rpt1.as_str()
+            };
+            let rpt2 = if ident.rpt2.is_empty() {
+                "—"
+            } else {
+                ident.rpt2.as_str()
+            };
+            rows.facts = Some(format!("RPT1 {rpt1}   RPT2 {rpt2}"));
+        }
+    }
+    if !ident.code.is_empty() {
+        rows.code_line = Some(format!("{} {}", ident.code_label, ident.code));
+    }
+    rows
+}
+
+fn dmr_encrypted(line: &str) -> bool {
+    if line.contains("No Encrypted") {
+        return false;
+    }
+    if line.contains("DMR PI") && line.contains("Encryption") {
+        return true;
+    }
+    line.contains("Encrypted")
+}
+
+/// `Frequency: 453.125000 MHz`. `RX Freq:` is the channel map, not a grant.
+/// `TS:` on the grant line is the timeslot of this same carrier, so it is
+/// not read as a frequency.
+fn dmr_frequency_hz(line: &str) -> Option<f64> {
+    if line.contains("Frequency Not Found") || line.contains("RX Freq:") {
+        return None;
+    }
+    let start = line.find("Frequency:")? + "Frequency:".len();
+    let rest = line[start..].trim_start();
+    let token: String = rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit() || *ch == '.')
+        .collect();
+    if token.is_empty() {
+        return None;
+    }
+    let mhz: f64 = token.parse().ok()?;
+    if !mhz.is_finite() || mhz <= 0.0 {
+        return None;
+    }
+    Some(mhz * 1_000_000.0)
+}
+
 fn is_tdu(line: &str) -> bool {
     // ` TDU` and ` TDULC` are the terminator frames. A longer word that
     // merely contains those letters is not.
@@ -866,6 +1430,43 @@ fn alg_id(line: &str) -> Option<u16> {
     let rest = &line[start + marker.len()..];
     let hex: String = rest.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
     if hex.is_empty() {
+        return None;
+    }
+    u16::from_str_radix(&hex, 16).ok()
+}
+
+/// Algorithm and key id printed by dsd-fme. Clear (`0x80`) and key id 0 are
+/// not a request. `alg_id` is unchanged: a clear line is still an Alg event.
+pub fn key_on_line(line: &str) -> Option<(u16, u16)> {
+    let alg = hex_field(line, &["ALG ID:", "ALG:"])?;
+    let kid = hex_field(line, &["KEY ID:", "KEY:"])?;
+    if alg == CLEAR_ALG || kid == 0 {
+        return None;
+    }
+    Some((alg, kid))
+}
+
+/// First marker in `markers` wins when two start at the same column, so
+/// `KEY ID:` is not read as `KEY:`.
+fn hex_field(line: &str, markers: &[&str]) -> Option<u16> {
+    let mut at: Option<(usize, &str)> = None;
+    for marker in markers {
+        if let Some(pos) = line.find(marker) {
+            if at.is_none_or(|(have, _)| pos < have) {
+                at = Some((pos, marker));
+            }
+        }
+    }
+    let (pos, marker) = at?;
+    let mut rest = line[pos + marker.len()..].trim_start();
+    if let Some(stripped) = rest
+        .strip_prefix("0x")
+        .or_else(|| rest.strip_prefix("0X"))
+    {
+        rest = stripped;
+    }
+    let hex: String = rest.chars().take_while(|ch| ch.is_ascii_hexdigit()).collect();
+    if hex.is_empty() || hex.len() > 4 {
         return None;
     }
     u16::from_str_radix(&hex, 16).ok()
@@ -1132,6 +1733,22 @@ pub fn site_banner(line: &str) -> Option<SiteBanner> {
     }
 }
 
+/// dsd-fme `-X` value. Phase 2 voice is muted, and stderr says
+/// `P2 Missing Parameters`, until WACN, system id, and NAC are all set.
+/// The voice decoder does not hear the control channel that carries them.
+pub fn p2_parameter_word(banner: &SiteBanner) -> Option<String> {
+    let wacn = u64::from_str_radix(banner.wacn.trim(), 16).ok()?;
+    let sys = u64::from_str_radix(banner.sys.trim(), 16).ok()?;
+    let nac = u64::from_str_radix(banner.nac.trim(), 16).ok()?;
+    if wacn == 0 || sys == 0 || nac == 0 {
+        return None;
+    }
+    if wacn > 0xF_FFFF || sys > 0xFFF || nac > 0xFFF {
+        return None;
+    }
+    Some(format!("{:X}", (wacn << 24) | (sys << 12) | nac))
+}
+
 fn strip_ansi(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut chars = line.chars();
@@ -1171,6 +1788,13 @@ mod tests {
         assert_eq!(banner.rfss, "001");
         assert_eq!(banner.site, "037");
         assert!(site_banner("Unit Registration Response - WACN: BEE00; SYS: 2A1; SRC: 99").is_none());
+        assert_eq!(
+            p2_parameter_word(&banner).as_deref(),
+            Some("BEE006BD6B5")
+        );
+        let mut missing = banner.clone();
+        missing.nac.clear();
+        assert!(p2_parameter_word(&missing).is_none());
     }
 
     #[test]
@@ -1204,6 +1828,10 @@ mod tests {
         assert_eq!(follow.target_hz(), Some(851_012_500.0));
         assert!(follow.status().contains("encrypted"));
         assert_eq!(follow.voice_hz(), None);
+        assert!(!hear_clear(0, false, false));
+        assert!(!hear_clear(CLEAR_ALG, true, false));
+        assert!(!hear_clear(CLEAR_ALG, false, true));
+        assert!(hear_clear(CLEAR_ALG, false, false));
     }
 
     #[test]
@@ -1729,5 +2357,528 @@ mod tests {
         assert_eq!(follow.target_hz(), Some(859_962_500.0));
         assert_eq!(follow.control_hz(), Some(859_962_500.0));
         assert_eq!(follow.sent(), Some(859_962_500.0));
+    }
+
+    #[test]
+    fn a_dmr_talkgroup_grant_is_not_a_p25_grant() {
+        let mut feed = DsdFeed::default();
+        let events = lines_of(
+            &mut feed,
+            &[
+                " Talkgroup Voice Channel Grant (TV_GRANT)",
+                "  LPCN: 0004; TS: 1; LPCN+TS: 0007; Target: 00001216 - Source: 00000101 ",
+                "  Frequency: 453.125000 MHz",
+                " Connect Plus Group Voice Channel Grant; Target: 1216; Source: 113114; LCN: 2; TS: 1;",
+            ],
+        );
+        assert!(events
+            .iter()
+            .all(|event| !matches!(event, CcEvent::Grant { .. })));
+    }
+
+    fn drive(follow: &mut Follower, feed: &mut DmrFeed, lines: &[&str]) {
+        for line in lines {
+            for event in feed.push_line(line) {
+                follow.push(event);
+            }
+        }
+    }
+
+    #[test]
+    fn a_tier3_grant_tunes_after_chan_freq_and_notes_the_target() {
+        let mut feed = DmrFeed::default();
+        let mut follow = Follower::new(vec![453_000_000.0]);
+        drive(
+            &mut follow,
+            &mut feed,
+            &[
+                " Announce Logical Channel/Frequency Relationship (Chan_Freq)",
+                " Talkgroup Voice Channel Grant (TV_GRANT)",
+                "  LPCN: 0004; TS: 2; LPCN+TS: 0008; Target: 00001216 - Source: 00000101 Emergency;",
+                "  Frequency: 453.125000 MHz",
+            ],
+        );
+        assert_eq!(follow.target_hz(), Some(453_125_000.0));
+        assert_eq!(follow.status(), "voice talkgroup 1216");
+        let heard = follow.heard().expect("heard");
+        assert_eq!(heard.tg, 1216);
+        assert_eq!(heard.alg, CLEAR_ALG);
+    }
+
+    #[test]
+    fn a_tier3_grant_before_chan_freq_does_not_tune() {
+        let mut feed = DmrFeed::default();
+        let mut follow = Follower::new(vec![453_000_000.0]);
+        drive(
+            &mut follow,
+            &mut feed,
+            &[
+                " Talkgroup Voice Channel Grant (TV_GRANT)",
+                "  LPCN: 0004; TS: 1; LPCN+TS: 0007; Target: 00001216 - Source: 00000101 ",
+                "  Frequency: 453.125000 MHz",
+            ],
+        );
+        assert_eq!(follow.target_hz(), Some(453_000_000.0));
+        assert_eq!(follow.status(), "waiting for a channel map");
+    }
+
+    #[test]
+    fn a_missing_tier3_channel_map_does_not_tune() {
+        let mut feed = DmrFeed::default();
+        let mut follow = Follower::new(vec![453_000_000.0]);
+        drive(
+            &mut follow,
+            &mut feed,
+            &[
+                " Announce Logical Channel/Frequency Relationship (Chan_Freq)",
+                " Talkgroup Voice Channel Grant (TV_GRANT)",
+                "  LPCN: 0004; TS: 1; LPCN+TS: 0007; Target: 00001216 - Source: 00000101 ",
+                "  Frequency Not Found in Channel Map;",
+            ],
+        );
+        assert_eq!(follow.target_hz(), Some(453_000_000.0));
+        assert_eq!(follow.active_tg(), None);
+    }
+
+    #[test]
+    fn a_tier3_data_grant_does_not_tune() {
+        let mut feed = DmrFeed::default();
+        let mut follow = Follower::new(vec![453_000_000.0]);
+        drive(
+            &mut follow,
+            &mut feed,
+            &[
+                " Announce Logical Channel/Frequency Relationship (Chan_Freq)",
+                " Private Data Channel Grant: Single Item (PD_GRANT)",
+                "  LPCN: 0004; TS: 1; LPCN+TS: 0007; Target: 00000099 - Source: 00000003 ",
+                "  Frequency: 453.200000 MHz",
+                " Talkgroup Data Channel Grant: Single Item (TD_GRANT)",
+                "  Frequency: 453.250000 MHz",
+            ],
+        );
+        assert_eq!(follow.target_hz(), Some(453_000_000.0));
+        assert_eq!(follow.active_tg(), None);
+    }
+
+    #[test]
+    fn a_private_voice_grant_notes_the_called_radio() {
+        let mut feed = DmrFeed::default();
+        let events = lines_of_dmr(
+            &mut feed,
+            &[
+                " Announce Logical Channel/Frequency Relationship (Chan_Freq)",
+                " Private Voice Channel Grant (PV_GRANT)",
+                "  LPCN: 0002; TS: 1; LPCN+TS: 0003; Target: 00000042 - Source: 00000007 ",
+                "  Frequency: 453.125000 MHz",
+            ],
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            CcEvent::Grant {
+                tg: 42,
+                alg: CLEAR_ALG,
+                ..
+            }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            CcEvent::Unit(UnitSight { id: 7, last_tg: Some(42), .. })
+        )));
+        let mut follow = Follower::new(vec![453_000_000.0]);
+        for event in events {
+            follow.push(event);
+        }
+        assert_eq!(follow.target_hz(), Some(453_125_000.0));
+    }
+
+    #[test]
+    fn dmr_encryption_returns_to_the_control_channel() {
+        let mut feed = DmrFeed::default();
+        let mut follow = Follower::new(vec![453_000_000.0]);
+        drive(
+            &mut follow,
+            &mut feed,
+            &[
+                " Announce Logical Channel/Frequency Relationship (Chan_Freq)",
+                " Broadcast Voice Channel Grant (BTV_GRANT)",
+                "  LPCN: 0004; TS: 1; LPCN+TS: 0007; Target: 00001000 - Source: 00000008 ",
+                "  Frequency: 453.125000 MHz",
+            ],
+        );
+        follow.note_sent(453_125_000.0);
+        assert_eq!(follow.role(), Role::Voice);
+        let marked = feed.push_line(" SLOT 1 TGT=1000 SRC=8 Encrypted ");
+        assert!(marked
+            .iter()
+            .any(|event| matches!(event, CcEvent::Alg(0))));
+        for event in marked {
+            follow.push(event);
+        }
+        assert_eq!(follow.target_hz(), Some(453_000_000.0));
+        assert!(follow.status().starts_with("encrypted"));
+        let pi = feed.push_line(
+            " DMR PI H- ALG ID: 21; KEY ID: 01; MI(32): 00000000; Encryption;",
+        );
+        assert!(pi.iter().any(|event| matches!(event, CcEvent::Alg(0))));
+        assert!(pi.iter().all(|event| !matches!(
+            event,
+            CcEvent::Unit(_) | CcEvent::Grant { .. }
+        )));
+    }
+
+    #[test]
+    fn dmr_sync_loss_on_voice_returns_and_a_held_control_stays() {
+        let mut feed = DmrFeed::default();
+        let mut follow = Follower::new(vec![453_000_000.0, 453_500_000.0]);
+        drive(
+            &mut follow,
+            &mut feed,
+            &[
+                " Announce Logical Channel/Frequency Relationship (Chan_Freq)",
+                " Duplex Private Voice Channel Grant (PV_GRANT_DX)",
+                "  LPCN: 0005; TS: 2; LPCN+TS: 0010; Target: 00000015 - Source: 00000004 ",
+                "  Frequency: 453.125000 MHz",
+            ],
+        );
+        assert_eq!(follow.status(), "voice talkgroup 15");
+        assert_eq!(follow.target_hz(), Some(453_125_000.0));
+        follow.note_sent(453_125_000.0);
+        assert_eq!(follow.role(), Role::Voice);
+        for event in feed.push_line("Sync: no sync") {
+            follow.push(event);
+        }
+        assert_eq!(follow.role(), Role::Watch);
+        assert_eq!(follow.target_hz(), Some(453_000_000.0));
+
+        let start = std::time::Instant::now();
+        let mut held = Follower::new(vec![453_000_000.0, 453_500_000.0]);
+        scan_levels(&mut held, start, &[-18.0, -40.0]);
+        assert_eq!(held.status(), "locked");
+        assert_eq!(held.control_hz(), Some(453_000_000.0));
+        for event in feed.push_line("Sync: no sync") {
+            held.push(event);
+        }
+        assert_eq!(held.control_hz(), Some(453_000_000.0));
+    }
+
+    #[test]
+    fn a_bare_p_clear_does_not_end_the_hop() {
+        let mut feed = DmrFeed::default();
+        let mut follow = Follower::new(vec![453_000_000.0]);
+        drive(
+            &mut follow,
+            &mut feed,
+            &[
+                " Announce Logical Channel/Frequency Relationship (Chan_Freq)",
+                " Talkgroup Voice Channel Grant (TV_GRANT)",
+                "  LPCN: 0004; TS: 1; LPCN+TS: 0007; Target: 00001216 - Source: 00000101 ",
+                "  Frequency: 453.125000 MHz",
+            ],
+        );
+        follow.note_sent(453_125_000.0);
+        let events = feed.push_line(" Clear (P_CLEAR) ");
+        assert!(events.iter().all(|event| !matches!(event, CcEvent::End)));
+        for event in events {
+            follow.push(event);
+        }
+        assert_eq!(follow.role(), Role::Voice);
+        assert_eq!(follow.target_hz(), Some(453_125_000.0));
+    }
+
+    #[test]
+    fn dmr_sync_lines_and_a_p25_grant_stay_in_their_lanes() {
+        let mut feed = DmrFeed::default();
+        let events = lines_of_dmr(
+            &mut feed,
+            &[
+                "Sync: +DMR  ",
+                "Sync: +DMR MS/DM MODE/MONO ",
+                "Sync: -DMR  ",
+                "Sync: +P25p1 ",
+                " Group Voice Channel Grant",
+                "  Frequency [851.500000] MHz",
+                "  RX Freq: 453125000;",
+                "hamspot: search",
+            ],
+        );
+        assert_eq!(
+            events,
+            vec![
+                CcEvent::Sync,
+                CcEvent::Sync,
+                CcEvent::Sync,
+                CcEvent::Search,
+            ]
+        );
+    }
+
+    fn lines_of_dmr(feed: &mut DmrFeed, lines: &[&str]) -> Vec<CcEvent> {
+        let mut events = Vec::new();
+        for line in lines {
+            events.extend(feed.push_line(line));
+        }
+        events
+    }
+
+    fn lines_of_nxdn(feed: &mut NxdnFeed, lines: &[&str]) -> Vec<CcEvent> {
+        let mut events = Vec::new();
+        for line in lines {
+            events.extend(feed.push_line(line));
+        }
+        events
+    }
+
+    #[test]
+    fn nxdn_dfa_and_import_frequencies_grant_and_unknowns_do_not() {
+        let mut feed = NxdnFeed::default();
+        let dfa = lines_of_nxdn(
+            &mut feed,
+            &[
+                " Src=12 - Dst/TG=400 - DFA Channel [0001][00001] ",
+                "  DFA Frequency [453.012500] MHz",
+            ],
+        );
+        assert!(dfa.iter().any(|event| matches!(event, CcEvent::Iden)));
+        assert!(dfa.iter().any(|event| matches!(
+            event,
+            CcEvent::Grant {
+                hz,
+                tg: 400,
+                alg: CLEAR_ALG,
+            } if (*hz - 453_012_500.0).abs() < 1.0
+        )));
+        let imported = lines_of_nxdn(
+            &mut feed,
+            &[
+                " Src=3 - Dst/TG=8 - Channel [003][0003] ",
+                "  Frequency [451.100000] MHz",
+            ],
+        );
+        assert!(imported.iter().any(|event| matches!(
+            event,
+            CcEvent::Grant { tg: 8, alg: CLEAR_ALG, .. }
+        )));
+        let unknown = lines_of_nxdn(
+            &mut feed,
+            &[
+                " Src=3 - Dst/TG=8 - DFA Channel [0001][00001] ",
+                "    Custom DFA Settings -- Unknown Freq;",
+                "  DFA Frequency [453.012500] MHz",
+            ],
+        );
+        assert!(unknown.iter().all(|event| !matches!(event, CcEvent::Grant { .. })));
+        let missing = lines_of_nxdn(
+            &mut feed,
+            &[
+                " Src=3 - Dst/TG=8 - Channel [003][0003] ",
+                "    Channel not found in import file",
+                "  Frequency [451.100000] MHz",
+            ],
+        );
+        assert!(missing.iter().all(|event| !matches!(event, CcEvent::Grant { .. })));
+    }
+
+    #[test]
+    fn nxdn_data_encryption_termination_and_ran_do_not_tune() {
+        let mut feed = NxdnFeed::default();
+        let data = lines_of_nxdn(
+            &mut feed,
+            &[
+                " Data Call Assignment (00) - Src=1 - Dst/TG=2 ",
+                "  Frequency [450.000000] MHz",
+            ],
+        );
+        assert!(data.iter().all(|event| !matches!(event, CcEvent::Grant { .. })));
+        let enc = lines_of_nxdn(
+            &mut feed,
+            &[
+                " Src=1 - Dst/TG=9  Enc - Channel [001][0001] ",
+                "  Frequency [451.100000] MHz",
+            ],
+        );
+        assert!(enc.iter().any(|event| matches!(
+            event,
+            CcEvent::Grant { tg: 9, alg: 0, .. }
+        )));
+        assert!(enc.iter().all(|event| !matches!(event, CcEvent::Iden)));
+        let scrambler = lines_of_nxdn(
+            &mut feed,
+            &[
+                " Src=1 - Dst/TG=9 - Channel [001][0001] ",
+                " Scrambler; ",
+                "  DFA Frequency [453.012500] MHz",
+            ],
+        );
+        assert!(scrambler.iter().any(|event| matches!(
+            event,
+            CcEvent::Grant { alg: 0, .. }
+        )));
+        let ran = feed.push_line("Sync: NXDN48  RDCH Voice  RAN 01");
+        assert!(ran.iter().any(|event| matches!(event, CcEvent::Sync)));
+        assert!(ran.iter().all(|event| !matches!(event, CcEvent::Grant { .. })));
+        let alias = feed.push_line(" Completed Alias Encoded: TEST");
+        assert!(alias.iter().all(|event| !matches!(event, CcEvent::Alg(0) | CcEvent::Grant { .. })));
+        let end = lines_of_nxdn(
+            &mut feed,
+            &[
+                " Channel Update - CH: 4 - TGT: 15 Group Call ",
+                "  Frequency [460.025000] MHz",
+            ],
+        );
+        assert!(end.iter().any(|event| matches!(
+            event,
+            CcEvent::Grant { tg: 15, alg: CLEAR_ALG, .. }
+        )));
+        let stop = lines_of_nxdn(
+            &mut feed,
+            &[
+                " Channel Update - CH: 31 - TGT: 15 Group Call Termination ",
+                "  Transmission Release  - ",
+                " TX_REL_EX",
+                " DISC",
+            ],
+        );
+        assert!(stop.iter().filter(|event| matches!(event, CcEvent::End)).count() >= 3);
+        assert!(stop.iter().all(|event| !matches!(event, CcEvent::Grant { .. })));
+        let mut follow = Follower::new(vec![460_025_000.0]);
+        for event in lines_of_nxdn(
+            &mut NxdnFeed::default(),
+            &[
+                " Src=4 - Dst/TG=15 - Channel [004][0004] ",
+                "  Frequency [460.100000] MHz",
+            ],
+        ) {
+            follow.push(event);
+        }
+        follow.note_sent(460_100_000.0);
+        assert_eq!(follow.role(), Role::Voice);
+        let during = lines_of_nxdn(
+            &mut NxdnFeed::default(),
+            &[
+                " Src=4 - Dst/TG=99 - Channel [005][0005] ",
+                "  Frequency [460.200000] MHz",
+            ],
+        );
+        for event in during {
+            follow.push(event);
+        }
+        assert_eq!(follow.target_hz(), Some(460_100_000.0));
+    }
+
+    #[test]
+    fn identity_lines_fill_the_glass_and_a_trunk_talkgroup_keeps_the_headline() {
+        let mut ident = AirIdentity::default();
+        note_identity(&mut ident, "Sync: +DMR  | Color Code=03 | VC6");
+        note_identity(&mut ident, " Color Code=XX ");
+        note_identity(&mut ident, " TGT=1216 SRC=101 ");
+        assert_eq!(ident.code_label, "CC");
+        assert_eq!(ident.code, "03");
+        assert_eq!(ident.tg, Some(1216));
+        assert_eq!(ident.src, "101");
+        note_identity(&mut ident, "Sync: NXDN96  RCCH  RAN 07 ");
+        assert_eq!(ident.code, "07");
+        assert_eq!(ident.code_label, "RAN");
+        let mut dpmr = AirIdentity::default();
+        note_identity(&mut dpmr, " TG=(CRC ERR)");
+        note_identity(&mut dpmr, " Src=(CRC ERR) Channel Code =(CRC ERR)");
+        assert_eq!(dpmr, AirIdentity::default());
+        note_identity(&mut dpmr, " TG=44 Src=9 Channel Code=12");
+        assert_eq!(dpmr.tg, Some(44));
+        assert_eq!(dpmr.src, "9");
+        assert_eq!(dpmr.code_label, "Code");
+        assert_eq!(dpmr.code, "12");
+        let mut ysf = AirIdentity::default();
+        note_identity(&mut ysf, "Repeater HC CC FN: 1/8 ");
+        assert!(ysf.code.is_empty());
+        note_identity(&mut ysf, "Repeater SQL  CODE: 009 DST: K9ABC     SRC: N9DEF    ");
+        assert_eq!(ysf.code_label, "SQL");
+        assert_eq!(ysf.code, "009");
+        assert_eq!(ysf.dst, "K9ABC");
+        assert_eq!(ysf.src, "N9DEF");
+        let mut m17 = AirIdentity::default();
+        note_identity(&mut m17, " DST: BROADCAST");
+        note_identity(&mut m17, " SRC: N0CALL");
+        note_identity(&mut m17, " CAN: 7");
+        assert_eq!(m17.dst, "BROADCAST");
+        assert_eq!(m17.src, "N0CALL");
+        assert_eq!(m17.code_label, "CAN");
+        assert_eq!(m17.code, "7");
+        let mut dstar = AirIdentity::default();
+        note_identity(
+            &mut dstar,
+            " RPT 2: WW8IND B RPT 1: WW8IND G DST: CQCQCQ   SRC: N9ABC ",
+        );
+        assert_eq!(dstar.rpt2, "WW8IND B");
+        assert_eq!(dstar.rpt1, "WW8IND G");
+        assert_eq!(dstar.dst, "CQCQCQ");
+        assert_eq!(dstar.src, "N9ABC");
+        let mut edacs = AirIdentity::default();
+        note_identity(&mut edacs, " TGT [00001234] LCN [02]");
+        assert_eq!(edacs.tg, Some(1234));
+        note_identity(&mut edacs, " AFS [003] [02-041] LCN [02]");
+        assert!(edacs.dst.is_empty());
+        let mut edacs_afs = AirIdentity::default();
+        note_identity(&mut edacs_afs, " TGT [ SYSTEM ] LCN [02]");
+        note_identity(&mut edacs_afs, " AFS [003] [02-041] LCN [02]");
+        assert!(edacs_afs.tg.is_none());
+        assert_eq!(edacs_afs.dst, "[003] [02-041]");
+        let mut provoice = AirIdentity::default();
+        note_identity(&mut provoice, " Site: 1 Group: 12 Source: 34 LCN: 2 ");
+        assert_eq!(provoice.tg, Some(12));
+        assert_eq!(provoice.src, "34");
+        note_identity(&mut provoice, " Site: 1 Target: 8 Source: 3 LCN: 2 ");
+        assert_eq!(provoice.tg, Some(8));
+        assert_eq!(provoice.src, "3");
+        let mut freedv = AirIdentity::default();
+        note_identity(
+            &mut freedv,
+            "frame: 3  sync: 0  nin: 640 snr: 1.00 dB  bit errors: 0 clock_off: 0.00 foff: 0.00",
+        );
+        assert!(freedv.code.is_empty());
+        note_identity(
+            &mut freedv,
+            "frame: 4  sync: 1  nin: 640 snr: -1.50 dB  bit errors: 0 clock_off: 0.10 foff: 2.00",
+        );
+        assert_eq!(freedv.code_label, "SNR");
+        assert_eq!(freedv.code, "-1.50");
+        let mut drm = AirIdentity::default();
+        note_identity(
+            &mut drm,
+            "[   5.0s] Tracking mode B 10 DC 350.0 Hz SNR 12.4 dB MER 18.0 dB",
+        );
+        assert_eq!(drm.code_label, "SNR");
+        assert_eq!(drm.code, "12.4");
+        note_identity(&mut drm, "service 0 id D0D000 (no label yet) audio, News");
+        assert!(drm.dst.is_empty());
+        note_identity(
+            &mut drm,
+            "service 0 id D0D000 BBC World Service xHE-AAC stereo",
+        );
+        assert_eq!(drm.dst, "BBC World Service xHE-AAC stereo");
+        let rows = glass_rows(None, &dstar);
+        assert_eq!(rows.headline.as_deref(), Some("N9ABC"));
+        assert_eq!(rows.detail.as_deref(), Some("CQCQCQ"));
+        assert_eq!(rows.facts.as_deref(), Some("RPT1 WW8IND G   RPT2 WW8IND B"));
+        let busy = glass_rows(Some(5), &dstar);
+        assert!(busy.headline.is_none());
+        assert!(busy.tgid.is_none());
+        assert!(busy.detail.is_none());
+        let coded = glass_rows(Some(5), &ident);
+        assert_eq!(coded.code_line.as_deref(), Some("RAN 07"));
+        assert!(coded.headline.is_none());
+    }
+
+    #[test]
+    fn a_decoder_line_names_a_missing_key() {
+        assert_eq!(
+            key_on_line(" HDU  ALG ID: 0x81 KEY ID: 0x1A2B MI: 0x11"),
+            Some((0x81, 0x1A2B))
+        );
+        assert_eq!(
+            key_on_line(" DMR PI H- ALG ID: 21; KEY ID: 01; MI(32): 00000000; Encryption;"),
+            Some((0x21, 0x01))
+        );
+        assert_eq!(key_on_line(" ALG ID: 0x80 KEY ID: 0x0000"), None);
+        assert_eq!(key_on_line("  SG: 1; KEY: 1A2B; WGID: 100; "), None);
     }
 }

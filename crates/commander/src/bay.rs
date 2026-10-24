@@ -90,6 +90,9 @@ pub struct BayRadio {
     pub tx_pipe_live: bool,
     /// Program name drawn in the transmit-pipe block.
     pub tx_pipe_label: String,
+    /// Discriminator tap. The left jack is a sound-card capture and the
+    /// right jack is the demodulator. There is no virtual mic or speaker.
+    pub tap: bool,
 }
 
 pub struct BayIn<'a> {
@@ -404,6 +407,57 @@ pub fn layout(width: f32, input: &BayIn<'_>) -> Scene {
     let mut y_mid = 8.0;
     let mut fixed = Vec::new();
     for radio in input.radios {
+        if radio.tap {
+            let leaf = recorded_capture(radio, input.captures);
+            let row = row_height(1).max(78.0);
+            let x0 = 8.0 + col;
+            let (_, radio_x, _) = radio_icon_xs(x0, col);
+            icons.push(IconSpot {
+                x: radio_x,
+                y: y_mid,
+                kind: IconKind::Radio,
+                xdg: String::new(),
+                label: radio.title.clone(),
+                hit: None,
+            });
+            let mid_y = y_mid + ICON * 0.5;
+            push_port(
+                &mut ports,
+                PortSpot {
+                    end: End::RadioTx { id: radio.id },
+                    port: leaf.to_string(),
+                    at: [radio_x - 28.0, mid_y],
+                    label: channel_label(leaf).to_string(),
+                    label_right: false,
+                },
+            );
+            push_port(
+                &mut ports,
+                PortSpot {
+                    end: End::RadioRx { id: radio.id },
+                    port: "output_FL".into(),
+                    at: [radio_x + ICON + 28.0, mid_y],
+                    label: "FL".into(),
+                    label_right: true,
+                },
+            );
+            if radio.rx_pipe_live && !radio.output.is_empty() {
+                let speaker_ports =
+                    shown_ports(input.ports, &radio.output, &["playback_FL", "playback_FR"]);
+                place_rx_pipe(
+                    &mut icons,
+                    &mut ports,
+                    radio,
+                    &["output_FL"],
+                    &speaker_ports,
+                    y_mid,
+                    radio_x + ICON + 28.0,
+                    playback_port_x(8.0 + 2.0 * col, col),
+                );
+            }
+            y_mid += row;
+            continue;
+        }
         let tx_ports = shown_ports(
             input.ports,
             &audio::tx_stream(radio.id),
@@ -412,7 +466,7 @@ pub fn layout(width: f32, input: &BayIn<'_>) -> Scene {
         let rx_ports = shown_ports(
             input.ports,
             &audio::rx_stream(radio.id),
-            &["output_FL", "output_FR"],
+            radio_rx_fallback(radio),
         );
         let row = row_height(tx_ports.len().max(rx_ports.len())).max(78.0);
         let x0 = 8.0 + col;
@@ -829,6 +883,75 @@ fn wires_of(input: &BayIn<'_>, ports: &[PortSpot]) -> Vec<WireSpot> {
             });
         }
     }
+    // A tap has no hamspot card, so the saved capture is the wire.
+    for radio in input.radios {
+        if !radio.tap || radio.input.is_empty() {
+            continue;
+        }
+        let leaf = recorded_capture(radio, input.captures);
+        let from = port_at(
+            ports,
+            &End::Capture {
+                device: radio.input.clone(),
+            },
+            leaf,
+        );
+        let to = port_at(ports, &End::RadioTx { id: radio.id }, leaf);
+        let (Some(from), Some(to)) = (from, to) else {
+            continue;
+        };
+        wires.push(WireSpot {
+            from,
+            to,
+            from_grab: Grab::Capture {
+                device: radio.input.clone(),
+                radio: Some(radio.id),
+            },
+            to_grab: Grab::RadioTx { id: radio.id },
+        });
+    }
+    // The stored speaker is drawn before the pipe process diverts. A drop
+    // onto a speaker has nowhere to show until that process is up, because
+    // a configured pipe does not link the raw stream.
+    for radio in input.radios {
+        if radio.rx_pipe_live || radio.output.is_empty() {
+            continue;
+        }
+        if wires.iter().any(|wire| {
+            matches!(wire.from_grab, Grab::RadioRx { id } if id == radio.id)
+        }) {
+            continue;
+        }
+        let rx_ports = shown_ports(
+            input.ports,
+            &audio::rx_stream(radio.id),
+            radio_rx_fallback(radio),
+        );
+        let speaker_ports =
+            shown_ports(input.ports, &radio.output, &["playback_FL", "playback_FR"]);
+        for (rx_leaf, speaker_leaf) in pipe_pairs(&rx_ports, &speaker_ports) {
+            let from = port_at(ports, &End::RadioRx { id: radio.id }, &rx_leaf);
+            let to = port_at(
+                ports,
+                &End::Playback {
+                    device: radio.output.clone(),
+                },
+                &speaker_leaf,
+            );
+            let (Some(from), Some(to)) = (from, to) else {
+                continue;
+            };
+            wires.push(WireSpot {
+                from,
+                to,
+                from_grab: Grab::RadioRx { id: radio.id },
+                to_grab: Grab::Playback {
+                    device: radio.output.clone(),
+                    radio: Some(radio.id),
+                },
+            });
+        }
+    }
     for radio in input.radios {
         if !radio.rx_pipe_live || radio.output.is_empty() {
             continue;
@@ -836,7 +959,7 @@ fn wires_of(input: &BayIn<'_>, ports: &[PortSpot]) -> Vec<WireSpot> {
         let rx_ports = shown_ports(
             input.ports,
             &audio::rx_stream(radio.id),
-            &["output_FL", "output_FR"],
+            radio_rx_fallback(radio),
         );
         let speaker_ports =
             shown_ports(input.ports, &radio.output, &["playback_FL", "playback_FR"]);
@@ -1230,6 +1353,21 @@ fn shown_ports<'a>(
     fallback.to_vec()
 }
 
+fn recorded_capture(radio: &BayRadio, captures: &[AudioNode]) -> &'static str {
+    match captures.iter().find(|device| device.name == radio.input) {
+        Some(device) => crate::rx_pipe::capture_channel(&device.name, &device.description),
+        None => "capture_FL",
+    }
+}
+
+fn radio_rx_fallback(radio: &BayRadio) -> &'static [&'static str] {
+    if radio.tap {
+        &["output_FL"]
+    } else {
+        &["output_FL", "output_FR"]
+    }
+}
+
 fn fallback_capture(device: &AudioNode) -> &'static [&'static str] {
     let blob = format!("{} {}", device.name, device.description).to_ascii_lowercase();
     if blob.contains("mono") {
@@ -1370,6 +1508,7 @@ mod tests {
             rx_pipe_label: "dsd-fme".into(),
             tx_pipe_live: false,
             tx_pipe_label: String::new(),
+            tap: false,
         }
     }
 
@@ -1450,6 +1589,101 @@ mod tests {
             pipe.y + ICON * 0.5
         ));
         assert!(grab_at(&scene, inputs[0].at[0], inputs[0].at[1]).is_none());
+    }
+
+    #[test]
+    fn a_chosen_speaker_is_drawn_before_the_rx_pipe_is_up() {
+        let scene = sample_scene(false, &[]);
+        assert!(scene.icons.iter().all(|icon| icon.kind != IconKind::Pipe));
+        assert!(scene.wires.iter().any(|wire| {
+            matches!(wire.from_grab, Grab::RadioRx { id: 1 })
+                && matches!(
+                    &wire.to_grab,
+                    Grab::Playback { device, radio: Some(1) } if device == "spk"
+                )
+        }));
+    }
+
+    fn tap_scene(live: bool, mono: bool) -> Scene {
+        let mut radio = sample_radio(live);
+        radio.tap = true;
+        radio.input = "line".into();
+        radio.output = "spk".into();
+        radio.title = "1 Audio Desk".into();
+        let capture = [AudioNode {
+            name: "line".into(),
+            description: if mono { "USB Mono".into() } else { "Line".into() },
+            class: "Audio/Source".into(),
+        }];
+        let playback = [AudioNode {
+            name: "spk".into(),
+            description: "RCA".into(),
+            class: "Audio/Sink".into(),
+        }];
+        let radios = [radio];
+        layout(
+            900.0,
+            &BayIn {
+                captures: &capture,
+                playbacks: &playback,
+                radios: &radios,
+                links: &[],
+                ports: &std::collections::BTreeMap::new(),
+            },
+        )
+    }
+
+    #[test]
+    fn an_audio_tap_draws_the_capture_into_the_demodulator() {
+        let quiet = tap_scene(false, false);
+        assert!(quiet.fixed.is_empty());
+        assert!(quiet
+            .icons
+            .iter()
+            .all(|icon| icon.kind != IconKind::Mic && icon.kind != IconKind::Speaker));
+        assert!(quiet.icons.iter().any(|icon| icon.kind == IconKind::Radio));
+        assert!(quiet.icons.iter().all(|icon| icon.kind != IconKind::Pipe));
+        assert!(quiet
+            .ports
+            .iter()
+            .all(|port| !port.port.contains("hamspot") && !port.label.contains("hamspot")));
+        let leaf = "capture_FL";
+        let from = port_at(
+            &quiet.ports,
+            &End::Capture {
+                device: "line".into(),
+            },
+            leaf,
+        )
+        .expect("capture");
+        let into = port_at(&quiet.ports, &End::RadioTx { id: 1 }, leaf).expect("tap in");
+        assert!(quiet.wires.iter().any(|wire| wire.from == from && wire.to == into));
+        assert!(quiet.wires.iter().any(|wire| {
+            matches!(wire.from_grab, Grab::RadioRx { id: 1 })
+                && matches!(wire.to_grab, Grab::Playback { radio: Some(1), .. })
+        }));
+
+        let live = tap_scene(true, false);
+        assert!(live.icons.iter().any(|icon| icon.kind == IconKind::Pipe));
+        assert!(live.wires.iter().any(|wire| {
+            matches!(
+                &wire.from_grab,
+                Grab::Capture {
+                    device,
+                    radio: Some(1)
+                } if device == "line"
+            ) && matches!(wire.to_grab, Grab::RadioTx { id: 1 })
+        }));
+        assert!(!live.wires.iter().any(|wire| {
+            matches!(wire.from_grab, Grab::RadioRx { id: 1 })
+                && matches!(wire.to_grab, Grab::Playback { .. })
+        }));
+
+        let mono = tap_scene(false, true);
+        assert!(port_at(&mono.ports, &End::RadioTx { id: 1 }, "capture_MONO").is_some());
+        assert!(mono.wires.iter().any(|wire| {
+            matches!(wire.to_grab, Grab::RadioTx { id: 1 })
+        }));
     }
 
     #[test]
