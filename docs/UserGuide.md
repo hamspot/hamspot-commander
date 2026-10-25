@@ -520,6 +520,14 @@ Select the row. The Tune page follows that row after the port is up. Opening a s
 
 Demo leaves the selected radio running and shows the in-process radio instead. Press Demo again to return.
 
+## 9.5 Amplifiers
+
+Config → Automation has an Amplifiers grid under Rotators. Add opens the Amplifier window: name, a model from `ampctld -l` (or Hamlib 4.6.5's list when that fails), device, serial speed and extra `-C` settings. Commander starts one `ampctld` for each row on 127.0.0.1, on the first free port from 4534, and restarts it two seconds after it exits. A row whose serial device is unplugged shows "device missing".
+
+Each second the row shows frequency, power state (OFF, ON, STBY, OPER), SWR and forward power when the backend reports them. The line under the keys lists every level the backend reports. Standby, Operate, Off and Reset act on the selected amplifier. Commander sends them only when you click. Opening a station file or restarting a daemon never puts an amplifier in Operate.
+
+Use the Dummy (model 1) to try the screen. Amplifier rows are saved in the station file as `amplifiers`.
+
 ---
 
 # 10. Audio
