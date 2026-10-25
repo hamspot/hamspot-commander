@@ -288,6 +288,8 @@ struct App {
     pulse_on: bool,
     /// Seconds for one brightness cycle.
     pulse_secs: f64,
+    /// Trunk voice hang in milliseconds, from the station file.
+    voice_hang_ms: u32,
     /// RF patch bay on Config (#98). Visual only.
     patchbay: patchbay::PatchBay,
     patchbay_ui: patchbay::UiState,
@@ -1872,6 +1874,7 @@ impl App {
             voice_pulse: pulse::Pulse::new(),
             pulse_on: true,
             pulse_secs: pulse::PERIOD_DEFAULT,
+            voice_hang_ms: follow::VOICE_HANG_DEFAULT.as_millis() as u32,
             patchbay: Default::default(),
             patchbay_ui: Default::default(),
             reduced_motion: pulse::system_reduced_motion(),
@@ -4025,6 +4028,17 @@ impl App {
                 let on = (self.pulse_secs - secs).abs() < 0.05;
                 if ui.selectable_label(on, label).clicked() && !on {
                     self.pulse_secs = secs;
+                    self.store_pulse(snap);
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Trunk voice hang")
+                .on_hover_text("How long a followed call is held after the talker stops, so butt-keys and dead carriers do not drop the audio.");
+            for (label, ms) in [("1.5 s", 1500), ("2.5 s", 2500), ("4 s", 4000), ("6 s", 6000)] {
+                let on = self.voice_hang_ms == ms;
+                if ui.selectable_label(on, label).clicked() && !on {
+                    self.voice_hang_ms = ms;
                     self.store_pulse(snap);
                 }
             }
@@ -6456,6 +6470,7 @@ impl App {
             nanovna: self.tools.lock().expect("tools").nanovna_face(),
             pulse: self.pulse_on,
             pulse_secs: self.pulse_secs,
+            voice_hang_ms: self.voice_hang_ms,
             patchbay: self.patchbay.clone(),
         })
     }
@@ -6523,6 +6538,7 @@ impl App {
             nanovna,
             pulse,
             pulse_secs,
+            voice_hang_ms,
             patchbay,
             ..
         } = file;
@@ -6530,6 +6546,7 @@ impl App {
         self.patchbay_ui = Default::default();
         self.pulse_on = pulse;
         self.pulse_secs = pulse_secs;
+        self.voice_hang_ms = voice_hang_ms;
         self.plan = bsp;
         self.channels = channels;
         self.talkgroups = talkgroups;
@@ -8338,6 +8355,10 @@ impl App {
                     .insert(id, follow::Follower::new(control_hz.clone()));
             }
             if let Some(follower) = self.followers.get_mut(&id) {
+                let hang = std::time::Duration::from_millis(u64::from(self.voice_hang_ms));
+                if follower.hang() != hang {
+                    follower.set_hang(hang);
+                }
                 if !follower.controls_match(&control_hz) {
                     follower.set_controls(control_hz.clone());
                 }
@@ -8410,9 +8431,12 @@ impl App {
                 })
                 .collect();
             if let Some(follower) = self.followers.get_mut(&id) {
+                let now = std::time::Instant::now();
                 for event in parsed {
-                    follower.push(event);
+                    follower.push_at(event, now);
                 }
+                // The hang runs out on time even when the decoder is silent.
+                follower.tick(now);
             }
             // The S-meter on the snapshot is the selected radio only.
             // A scan of any other radio would rank channels it is not hearing.

@@ -110,6 +110,11 @@ pub struct ConfigFile {
     /// Seconds for one brightness cycle. Absent means two seconds.
     #[serde(default = "default_pulse_secs", skip_serializing_if = "is_default_pulse_secs")]
     pub pulse_secs: f64,
+    /// Milliseconds a trunk follower stays on a voice channel after the call
+    /// looks finished (terminator, dead carrier, sync loss), so butt-keys and
+    /// push-to-talk gaps do not drop the audio. Absent means 2500.
+    #[serde(default = "default_voice_hang_ms", skip_serializing_if = "is_default_voice_hang_ms")]
+    pub voice_hang_ms: u32,
     /// RF patch bay (#95): devices, panel positions and cables. Visual only.
     /// Absent in a station written before the patch bay existed.
     #[serde(default, skip_serializing_if = "crate::patchbay::PatchBay::is_empty")]
@@ -126,6 +131,14 @@ fn is_pulse_on(value: &bool) -> bool {
 
 fn default_pulse_secs() -> f64 {
     crate::pulse::PERIOD_DEFAULT
+}
+
+fn default_voice_hang_ms() -> u32 {
+    crate::follow::VOICE_HANG_DEFAULT.as_millis() as u32
+}
+
+fn is_default_voice_hang_ms(value: &u32) -> bool {
+    *value == default_voice_hang_ms()
 }
 
 fn is_default_pulse_secs(value: &f64) -> bool {
@@ -428,6 +441,9 @@ pub fn validate(file: &ConfigFile) -> Result<(), String> {
     if !file.pulse_secs.is_finite() || file.pulse_secs < 0.4 || file.pulse_secs > 8.0 {
         return Err("pulse speed is not a usable number".into());
     }
+    if file.voice_hang_ms > crate::follow::VOICE_HANG_MAX_MS {
+        return Err("voice hang is longer than 15 seconds".into());
+    }
     for (name, value) in &file.levels {
         if name.trim().is_empty() || !value.is_finite() {
             return Err(format!("level {name} is not a number"));
@@ -641,6 +657,7 @@ mod tests {
             nanovna: crate::tools::nanovna::Face::default(),
             pulse: true,
             pulse_secs: crate::pulse::PERIOD_DEFAULT,
+            voice_hang_ms: default_voice_hang_ms(),
             patchbay: Default::default(),
         }
     }
@@ -661,6 +678,20 @@ mod tests {
         let back = parse(&text).unwrap();
         assert!(!back.pulse);
         assert!((back.pulse_secs - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn voice_hang_defaults_and_a_set_value_round_trips() {
+        let text = to_string(&sample()).unwrap();
+        assert!(!text.contains("voice_hang_ms"));
+        assert_eq!(parse(&text).unwrap().voice_hang_ms, 2500);
+        let mut file = sample();
+        file.voice_hang_ms = 4000;
+        let text = to_string(&file).unwrap();
+        assert!(text.contains("\"voice_hang_ms\": 4000"));
+        assert_eq!(parse(&text).unwrap().voice_hang_ms, 4000);
+        file.voice_hang_ms = 60_000;
+        assert!(validate(&file).is_err());
     }
 
     #[test]
