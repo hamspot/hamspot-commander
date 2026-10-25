@@ -1,8 +1,9 @@
 //! RF patch bay on the Config tab (#98). Visual only: nothing here drives hardware.
 
+pub mod bind;
 pub mod geom;
 pub mod model;
 mod view;
 
 pub use model::PatchBay;
-pub use view::{show, UiState};
+pub use view::{show, Action, AmpLink, UiState};

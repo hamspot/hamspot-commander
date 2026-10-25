@@ -223,6 +223,9 @@ struct App {
     amplifiers: Arc<amp::Hub>,
     amp_models: Vec<amp::AmpModel>,
     amp_edit: Option<AmpDraft>,
+    amp_follow: std::collections::HashMap<u64, amp::FollowRig>,
+    amp_freq_text: String,
+    amp_level_vals: std::collections::HashMap<String, u8>,
     /// Apply was sent. The station file is written once the hub has that command.
     rx_pipe_pending: Option<(u64, String)>,
     tx_pipe_pending: Option<(u64, String)>,
@@ -1832,6 +1835,9 @@ impl App {
             amplifiers,
             amp_models: Vec::new(),
             amp_edit: None,
+            amp_follow: Default::default(),
+            amp_freq_text: String::new(),
+            amp_level_vals: Default::default(),
             rx_pipe_pending: None,
             tx_pipe_pending: None,
             favorite: None,
@@ -2466,6 +2472,7 @@ impl eframe::App for App {
         self.drain_identity();
         self.apply_channel_vocoder();
         self.sync_gpredict();
+        self.follow_amplifiers(&snap, ui.ctx());
         let follow = self.following();
         self.face.lock().expect("face").follow = follow;
         if follow {
@@ -4043,7 +4050,26 @@ impl App {
             .iter()
             .map(|row| (row.spec.name.clone(), patch_radio_tx(&row.spec)))
             .collect();
-        patchbay::show(ui, &mut self.patchbay, &mut self.patchbay_ui, &radios);
+        if self.amp_models.is_empty() {
+            self.amp_models = amp::model_list();
+        }
+        let amps = self.amplifiers.view();
+        let link = patchbay::AmpLink { rows: &amps.rows, models: &self.amp_models };
+        patchbay::show(ui, &mut self.patchbay, &mut self.patchbay_ui, &radios, &link);
+        for action in self.patchbay_ui.take_actions() {
+            match action {
+                patchbay::Action::AddAmplifier(spec) => {
+                    if amp::validate_spec(&spec).is_ok() {
+                        self.amplifiers.add(spec);
+                    }
+                }
+                // An explicit Standby/Operate click on a bound box. The id
+                // is resolved now; a missing or ambiguous id sends nothing.
+                patchbay::Action::Control(amp_id, cmd) => {
+                    self.send_amp(&amp_id, cmd);
+                }
+            }
+        }
     }
 
     fn sync_gpredict(&mut self) {
@@ -5673,11 +5699,14 @@ impl App {
                 };
                 if ui.add_enabled(live.is_some(), egui::Button::new(text)).clicked() {
                     if let Some(row) = live {
-                        self.amplifiers.control(row.id, cmd);
+                        self.send_amp(&row.spec.id, cmd);
                     }
                 }
             }
         });
+        if let Some(row) = live {
+            self.amp_set_controls(ui, row);
+        }
         if let Some(row) = selected {
             if !row.state.levels.is_empty() {
                 let text = row
@@ -5693,6 +5722,85 @@ impl App {
         ui.label("Commander never sends Operate on its own. Test with the Dummy (model 1).");
         if let Some(id) = select {
             self.amplifiers.select(id);
+        }
+    }
+
+    /// Send one command to the amplifier with this fixed id, looked up now.
+    /// A missing or ambiguous id sends nothing (#96).
+    fn send_amp(&self, amp_id: &str, cmd: amp::Control) -> bool {
+        let rows = self.amplifiers.view().rows;
+        match patchbay::bind::resolve(amp_id, &rows) {
+            Some(row) => {
+                self.amplifiers.control(row.id, cmd);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Mirror the active rig's frequency to amplifiers with "follow rig
+    /// frequency" ticked (#103). Opt-in per amplifier, debounced, and only
+    /// `set_freq`: never power or levels.
+    fn follow_amplifiers(&mut self, snap: &Snapshot, ctx: &egui::Context) {
+        let rig_hz = snap.online().then_some(snap.freq_hz);
+        let now = std::time::Instant::now();
+        let rows = self.amplifiers.view().rows;
+        self.amp_follow.retain(|id, _| rows.iter().any(|r| r.id == *id));
+        let mut pending = false;
+        for row in &rows {
+            let f = self.amp_follow.entry(row.id).or_default();
+            let on = row.spec.follow_rig && row.port.is_some();
+            if let Some(hz) = f.step(on, rig_hz, now) {
+                self.send_amp(&row.spec.id, amp::Control::SetFreq(hz));
+            }
+            pending |= on;
+        }
+        if pending {
+            ctx.request_repaint_after(amp::FOLLOW_SETTLE);
+        }
+    }
+
+    /// Frequency entry, follow-rig opt-in and settable levels for the
+    /// selected live amplifier (#103). Each sends only on its own click.
+    fn amp_set_controls(&mut self, ui: &mut egui::Ui, row: &amp::AmplifierRow) {
+        ui.horizontal(|ui| {
+            ui.label("Freq MHz");
+            ui.add(egui::TextEdit::singleline(&mut self.amp_freq_text).hint_text("14.200").desired_width(90.0));
+            let hz = amp::parse_mhz(&self.amp_freq_text);
+            if ui.add_enabled(hz.is_some(), egui::Button::new("Set")).clicked() {
+                if let Some(hz) = hz {
+                    self.send_amp(&row.spec.id, amp::Control::SetFreq(hz));
+                }
+            }
+            let mut follow = row.spec.follow_rig;
+            if ui
+                .checkbox(&mut follow, "Follow rig frequency")
+                .on_hover_text("Sends the active rig's frequency to this amplifier (set_freq only) after it settles. Saved per amplifier.")
+                .changed()
+            {
+                self.amplifiers.update(row.id, amp::AmplifierSpec { follow_rig: follow, ..row.spec.clone() });
+            }
+        });
+        if row.settable.is_empty() {
+            ui.label("No settable levels reported (set_level ?). The readouts are meters.");
+            return;
+        }
+        for name in &row.settable {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(name).monospace());
+                let raw = row.state.level(name).and_then(|v| v.trim().parse::<f64>().ok());
+                let current = amp::step_from_level(raw.unwrap_or(0.0));
+                let value = self.amp_level_vals.entry(format!("{}/{name}", row.spec.id)).or_insert(current);
+                ui.add(egui::Slider::new(value, 1..=10).text("1–10")).on_hover_text(format!(
+                    "Sends {:.1} to Hamlib (step ÷ 10). Amplifier reads {}.",
+                    amp::level_from_step(*value),
+                    raw.map(|v| format!("{v:.3} (step {current})")).unwrap_or_else(|| "—".into())
+                ));
+                let send = amp::level_from_step(*value);
+                if ui.button("Set").clicked() {
+                    self.send_amp(&row.spec.id, amp::Control::SetLevel(name.clone(), format!("{send:.1}")));
+                }
+            });
         }
     }
 
@@ -5816,12 +5924,19 @@ impl App {
         let Some(edit) = self.amp_edit.clone() else {
             return;
         };
+        let old = edit
+            .id
+            .and_then(|id| self.amplifiers.view().rows.into_iter().find(|r| r.id == id))
+            .map(|r| r.spec);
         let spec = amp::AmplifierSpec {
+            // Kept across edits; a new row gets a fresh random id.
+            id: old.as_ref().map(|s| s.id.clone()).filter(|id| !id.is_empty()).unwrap_or_else(amp::new_id),
             name: edit.name.trim().to_string(),
             model: edit.model,
             device: edit.device.trim().to_string(),
             serial_speed: edit.serial_speed.trim().to_string(),
             conf: edit.conf.trim().to_string(),
+            follow_rig: old.as_ref().is_some_and(|s| s.follow_rig),
         };
         if let Err(err) = amp::validate_spec(&spec) {
             if let Some(edit) = &mut self.amp_edit {
@@ -6505,7 +6620,7 @@ impl App {
             radios,
             audio,
             rotators,
-            amplifiers,
+            mut amplifiers,
             selected,
             page,
             tabs,
@@ -6523,9 +6638,13 @@ impl App {
             nanovna,
             pulse,
             pulse_secs,
-            patchbay,
+            mut patchbay,
             ..
         } = file;
+        // Every amplifier gets a unique fixed id; bindings to a duplicated
+        // id or an ambiguous old name are dropped with a note (#96).
+        let dup = amp::repair_ids(&mut amplifiers);
+        patchbay::bind::migrate(&mut patchbay, &amplifiers, &dup);
         self.patchbay = patchbay;
         self.patchbay_ui = Default::default();
         self.pulse_on = pulse;

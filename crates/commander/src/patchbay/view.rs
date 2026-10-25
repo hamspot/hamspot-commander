@@ -1,7 +1,9 @@
 //! Painter and pointer handling for the RF patch bay (#92, #93).
 
 use super::geom::{self, JACK_R, SNAP, TITLE_H};
-use super::model::{self, Cable, Dir, Jack, Kind, PatchBay, Role, Signal, HAMLIB_AMPS};
+use super::bind::{self, Binding};
+use super::model::{self, Cable, Dir, Jack, Kind, PatchBay, Role, Signal};
+use crate::amp::{self, AmpModel, AmplifierRow, AmplifierSpec, Control, Power};
 use egui::{pos2, vec2, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke};
 
 #[derive(Default)]
@@ -11,6 +13,39 @@ pub struct UiState {
     selected_dev: Option<u32>,
     note: String,
     amp_pick: usize,
+    actions: Vec<Action>,
+}
+
+impl UiState {
+    /// Operator requests from this frame, for the caller to carry out.
+    pub fn take_actions(&mut self) -> Vec<Action> {
+        std::mem::take(&mut self.actions)
+    }
+}
+
+/// What the patch bay asks the app to do. Each comes from one click.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Action {
+    /// "Add to Automation list": a new configured amplifier row.
+    AddAmplifier(AmplifierSpec),
+    /// Standby / Operate key on a bound box, by amplifier id. The caller
+    /// resolves the id at send time and sends nothing if it is missing.
+    Control(String, Control),
+}
+
+/// Configured amplifiers (live rows) and the single-sourced model list.
+pub struct AmpLink<'a> {
+    pub rows: &'a [AmplifierRow],
+    pub models: &'a [AmpModel],
+}
+
+fn power_led(power: Option<Power>) -> Color32 {
+    match power {
+        Some(Power::Operate) => TX,
+        Some(Power::Standby) => Color32::from_rgb(90, 200, 110),
+        Some(Power::On) => Color32::from_rgb(150, 190, 255),
+        _ => Color32::from_rgb(70, 70, 76),
+    }
 }
 
 enum Drag {
@@ -40,7 +75,7 @@ fn kind_color(kind: Kind) -> Color32 {
 
 /// Draw the frame. `radios` are the station's radio rows (name, can transmit).
 /// Returns true when the stored layout changed.
-pub fn show(ui: &mut egui::Ui, bay: &mut PatchBay, st: &mut UiState, radios: &[(String, bool)]) -> bool {
+pub fn show(ui: &mut egui::Ui, bay: &mut PatchBay, st: &mut UiState, radios: &[(String, bool)], link: &AmpLink) -> bool {
     let before = bay.clone();
     bay.sync_radios(radios);
     egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -52,30 +87,30 @@ pub fn show(ui: &mut egui::Ui, bay: &mut PatchBay, st: &mut UiState, radios: &[(
                     .strong(),
             );
         });
-        toolbar(ui, bay, st);
-        canvas(ui, bay, st);
-        status(ui, bay, st);
+        toolbar(ui, bay, st, link);
+        canvas(ui, bay, st, link);
+        status(ui, bay, st, link);
     });
     bay.prune();
     *bay != before
 }
 
-fn toolbar(ui: &mut egui::Ui, bay: &mut PatchBay, st: &mut UiState) {
+fn toolbar(ui: &mut egui::Ui, bay: &mut PatchBay, st: &mut UiState, link: &AmpLink) {
+    let models = link.models;
     let at = [220.0 + 30.0 * (bay.devices.len() % 6) as f32, 20.0 + 24.0 * (bay.devices.len() % 6) as f32];
     ui.horizontal_wrapped(|ui| {
         ui.label("Add:");
         egui::ComboBox::from_id_salt("patchbay_amp")
-            .selected_text(HAMLIB_AMPS.get(st.amp_pick).map(|a| a.1).unwrap_or("Other amplifier"))
+            .selected_text(models.get(st.amp_pick).map(model_name).unwrap_or_else(|| "Other amplifier".into()))
             .show_ui(ui, |ui| {
-                for (i, (model, name, beta)) in HAMLIB_AMPS.iter().enumerate() {
-                    let tag = if *beta { format!("{name} ({model}, Beta)") } else { format!("{name} ({model})") };
-                    ui.selectable_value(&mut st.amp_pick, i, tag);
+                for (i, m) in models.iter().enumerate() {
+                    ui.selectable_value(&mut st.amp_pick, i, amp::model_button_label(m));
                 }
-                ui.selectable_value(&mut st.amp_pick, HAMLIB_AMPS.len(), "Other amplifier");
+                ui.selectable_value(&mut st.amp_pick, models.len(), "Other amplifier");
             });
         if ui.button("Amplifier").clicked() {
-            let (model, name) = HAMLIB_AMPS.get(st.amp_pick).map(|a| (a.0, a.1)).unwrap_or((0, "Amplifier"));
-            let id = bay.add(Kind::Amplifier, name, at);
+            let (model, name) = models.get(st.amp_pick).map(|m| (m.id, model_name(m))).unwrap_or((0, "Amplifier".into()));
+            let id = bay.add(Kind::Amplifier, &name, at);
             if let Some(d) = bay.devices.iter_mut().find(|d| d.id == id) {
                 d.model = model;
             }
@@ -107,6 +142,9 @@ fn toolbar(ui: &mut egui::Ui, bay: &mut PatchBay, st: &mut UiState) {
         if dev.kind == Kind::Amplifier && dev.model != 0 {
             ui.label(format!("hamlib model {}", dev.model));
         }
+        if dev.kind == Kind::Amplifier {
+            amp_controls(ui, dev, st, link);
+        }
         if dev.kind == Kind::Switch {
             ui.label("Ways");
             ui.add(egui::DragValue::new(&mut dev.ways).range(1..=8));
@@ -128,7 +166,103 @@ fn toolbar(ui: &mut egui::Ui, bay: &mut PatchBay, st: &mut UiState) {
     }
 }
 
-fn canvas(ui: &mut egui::Ui, bay: &mut PatchBay, st: &mut UiState) {
+fn model_name(m: &AmpModel) -> String {
+    format!("{} {}", m.mfg, m.model).trim().to_string()
+}
+
+/// Binding picker, Add to Automation list, and the explicit power keys for
+/// the selected amplifier box. Nothing here sends on its own.
+fn amp_controls(ui: &mut egui::Ui, dev: &mut model::Device, st: &mut UiState, link: &AmpLink) {
+    ui.label("Configured amplifier");
+    let label = |row: &AmplifierRow| format!("{}  [{}]", row.spec.name, &row.spec.id[..row.spec.id.len().min(6)]);
+    let shown = match bind::binding(dev, link.rows) {
+        Binding::Unbound => "unbound (visual only)".to_string(),
+        Binding::Missing => "amplifier missing".to_string(),
+        Binding::Bound(row) => label(row),
+    };
+    let before = dev.amp_id.clone();
+    egui::ComboBox::from_id_salt(("patchbay_bind", dev.id)).selected_text(shown).show_ui(ui, |ui| {
+        ui.selectable_value(&mut dev.amp_id, String::new(), "unbound (visual only)");
+        for row in link.rows {
+            ui.selectable_value(&mut dev.amp_id, row.spec.id.clone(), label(row))
+                .on_hover_text(format!("amplifier id {}", row.spec.id));
+        }
+    });
+    if dev.amp_id != before {
+        dev.note.clear();
+    }
+    if !dev.note.is_empty() {
+        ui.label(egui::RichText::new(format!("⚠ {}", dev.note)).color(TX));
+    }
+    match bind::binding(dev, link.rows) {
+        Binding::Unbound => {
+            if ui
+                .button("Add to Automation list")
+                .on_hover_text("Adds this amplifier to Config → Automation → Amplifiers and binds this box to it. Nothing is sent to the amplifier.")
+                .clicked()
+            {
+                let taken: Vec<String> = link.rows.iter().map(|r| r.spec.name.clone()).collect();
+                let spec = bind::spec_for(dev, &taken, amp::new_id());
+                dev.amp_id = spec.id.clone();
+                dev.note.clear();
+                st.actions.push(Action::AddAmplifier(spec));
+            }
+        }
+        Binding::Missing => {
+            ui.label(egui::RichText::new("⚠ amplifier missing: its configured amplifier was removed. Nothing is sent.").color(TX));
+        }
+        Binding::Bound(row) => {
+            let live = row.port.is_some();
+            if ui.add_enabled(live, egui::Button::new("Standby")).clicked() {
+                st.actions.push(Action::Control(row.spec.id.clone(), Control::SetPower(Power::Standby)));
+            }
+            if ui
+                .add_enabled(live, egui::Button::new(egui::RichText::new("Operate").color(TX)))
+                .on_hover_text("Sends set_powerstat Operate to this amplifier. Only on this click.")
+                .clicked()
+            {
+                st.actions.push(Action::Control(row.spec.id.clone(), Control::SetPower(Power::Operate)));
+            }
+        }
+    }
+}
+
+/// Live readout under a bound box's jacks: LED and words for power state,
+/// connection, frequency, SWR, forward power and fault.
+fn draw_amp_status(p: &egui::Painter, dev: &model::Device, r: Rect, link: &AmpLink) {
+    let ports = dev.ports();
+    let ins = ports.iter().filter(|p| p.dir == Dir::In).count();
+    let rows = ins.max(ports.len() - ins).max(1) as f32;
+    let top = r.min.y + TITLE_H + geom::ROW_H * rows + 6.0;
+    let font = FontId::monospace(10.5);
+    let (line1, line2, power) = match bind::binding(dev, link.rows) {
+        Binding::Bound(row) => {
+            let st = &row.state;
+            let power = if row.port.is_some() { st.power } else { None };
+            let word = power.map(|p| p.label()).unwrap_or("—");
+            let freq = st.freq_hz.map(|hz| format!("{:.3}M", hz / 1e6)).unwrap_or_else(|| "—".into());
+            let lv = |n: &str| st.level(n).map(amp::format_level).unwrap_or_else(|| "—".into());
+            let fault = match st.level("FAULT").map(str::trim) {
+                Some(f) if !f.is_empty() && f != "0" && f != "0.000000" => format!(" FAULT {f}"),
+                _ => String::new(),
+            };
+            (
+                format!("{word:<4} {freq}  {}", bind::link_text(row)),
+                format!("SWR {}  Fwd {}{fault}", lv("SWR"), lv("PWRFORWARD")),
+                power,
+            )
+        }
+        Binding::Missing => ("?    amplifier missing".to_string(), "sends nothing".to_string(), None),
+        Binding::Unbound => return,
+    };
+    let led = pos2(r.min.x + 12.0, top + 7.0);
+    p.circle_filled(led, 5.0, power_led(power));
+    p.circle_stroke(led, 5.0, Stroke::new(1.0, Color32::from_rgb(10, 10, 10)));
+    p.text(pos2(r.min.x + 22.0, top + 7.0), Align2::LEFT_CENTER, line1, font.clone(), LABEL);
+    p.text(pos2(r.min.x + 8.0, top + 7.0 + geom::ROW_H), Align2::LEFT_CENTER, line2, font, LABEL);
+}
+
+fn canvas(ui: &mut egui::Ui, bay: &mut PatchBay, st: &mut UiState, link: &AmpLink) {
     let width = ui.available_width().max(400.0);
     let bottom = bay
         .devices
@@ -256,6 +390,9 @@ fn canvas(ui: &mut egui::Ui, bay: &mut PatchBay, st: &mut UiState) {
             let (dx, align) = if dir == Dir::In { (JACK_R + 5.0, Align2::LEFT_CENTER) } else { (-JACK_R - 5.0, Align2::RIGHT_CENTER) };
             painter.text(c + vec2(dx, 0.0), align, &name, FontId::proportional(11.0), LABEL);
         }
+        if dev.is_bound_amp() {
+            draw_amp_status(&painter, dev, r, link);
+        }
     }
     let rep = model::trace(bay);
     let roles = model::roles(bay, &rep);
@@ -360,15 +497,23 @@ fn draw_cable(p: &egui::Painter, curve: [[f32; 2]; 4], role: Role, lit: bool, ti
     p.text(mid, Align2::CENTER_CENTER, tag, FontId::monospace(10.0), tint);
 }
 
-fn status(ui: &mut egui::Ui, bay: &PatchBay, st: &UiState) {
+fn status(ui: &mut egui::Ui, bay: &PatchBay, st: &UiState, link: &AmpLink) {
     let rep = model::trace(bay);
+    let power = |id: &str| bind::resolve(id, link.rows).filter(|r| r.port.is_some()).and_then(|r| r.state.power);
+    let amp_warn = bind::amp_warnings(bay, &rep, power);
     if rep.lines.is_empty() {
         ui.label("Drag from a jack to another jack to patch a cable. Drag a plugged end to move or unplug it. Right-click a cable, or click it and press Delete, to remove it.");
     }
     for line in &rep.lines {
         ui.label(egui::RichText::new(line).color(LABEL));
     }
-    for w in &rep.warnings {
+    let notes: Vec<String> = bay
+        .devices
+        .iter()
+        .filter(|d| !d.note.is_empty())
+        .map(|d| format!("{}: {}", d.name, d.note))
+        .collect();
+    for w in rep.warnings.iter().chain(&amp_warn).chain(&notes) {
         ui.label(egui::RichText::new(format!("⚠ {w}")).color(TX));
     }
     if !st.note.is_empty() {

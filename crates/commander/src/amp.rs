@@ -40,6 +40,11 @@ const COL_MACRO: usize = 85;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AmplifierSpec {
+    /// Stable unique id (32 hex digits, random at creation, never derived
+    /// from the name). Patch bay boxes bind to this. Old files without it
+    /// get one on load (`repair_ids`).
+    #[serde(default)]
+    pub id: String,
     pub name: String,
     pub model: i32,
     #[serde(default)]
@@ -48,17 +53,27 @@ pub struct AmplifierSpec {
     pub serial_speed: String,
     #[serde(default)]
     pub conf: String,
+    /// Mirror the active rig's frequency to this amplifier with `set_freq`.
+    /// Off unless the operator ticks it (#103).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub follow_rig: bool,
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 impl AmplifierSpec {
     #[cfg(test)]
     pub fn dummy() -> Self {
         Self {
+            id: "0123456789abcdef0123456789abcdef".into(),
             name: "Dummy".into(),
             model: 1,
             device: String::new(),
             serial_speed: String::new(),
             conf: String::new(),
+            follow_rig: false,
         }
     }
 }
@@ -134,6 +149,8 @@ pub struct AmplifierRow {
     pub state: AmpState,
     pub make: String,
     pub model_label: String,
+    /// Levels `set_level ?` lists. Empty when the backend sets none.
+    pub settable: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -192,6 +209,7 @@ struct Slot {
     next_poll: Option<Instant>,
     state: AmpState,
     level_names: Vec<String>,
+    settable: Vec<String>,
     make: String,
     model_label: String,
     held: Option<u16>,
@@ -402,6 +420,122 @@ pub fn parse_level_names(lines: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// `set_level ?` answers the same way. The Dummy lists none.
+pub fn parse_set_level_names(lines: &[String]) -> Vec<String> {
+    values(lines, "set_level")
+        .iter()
+        .flat_map(|line| line.split_whitespace())
+        .filter(|name| *name != "?")
+        .map(str::to_string)
+        .collect()
+}
+
+/// A fresh 128-bit random id as 32 lowercase hex digits.
+pub fn new_id() -> String {
+    let mut buf = [0u8; 16];
+    let ok = std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf)).is_ok();
+    if !ok {
+        // Fallback: time and a counter through the std hasher. Still unique
+        // per process run; /dev/urandom is always there on Linux.
+        use std::collections::hash_map::RandomState;
+        use std::hash::{BuildHasher, Hasher};
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        for half in buf.chunks_mut(8) {
+            let mut h = RandomState::new().build_hasher();
+            h.write_u64(N.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+            h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
+            half.copy_from_slice(&h.finish().to_le_bytes());
+        }
+    }
+    buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Give every amplifier row a unique id. Rows with no id get one; a row
+/// whose id repeats an earlier row's gets a new one. Returns the ids that
+/// were duplicated, so bindings to them can be dropped.
+pub fn repair_ids(specs: &mut [AmplifierSpec]) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut dup = Vec::new();
+    for spec in specs.iter_mut() {
+        let id = spec.id.trim().to_string();
+        if id.is_empty() {
+            spec.id = new_id();
+        } else if !seen.insert(id.clone()) {
+            if !dup.contains(&id) {
+                dup.push(id);
+            }
+            spec.id = new_id();
+        }
+        seen.insert(spec.id.clone());
+    }
+    dup
+}
+
+/// Displayed level step 1..=10 to Hamlib's 0.0..=1.0 (10 is 1.0).
+pub fn level_from_step(n: u8) -> f64 {
+    f64::from(n.clamp(1, 10)) / 10.0
+}
+
+/// Hamlib 0.0..=1.0 to the displayed step, rounded and held to 1..=10.
+pub fn step_from_level(value: f64) -> u8 {
+    if !value.is_finite() {
+        return 1;
+    }
+    (value * 10.0).round().clamp(1.0, 10.0) as u8
+}
+
+/// A typed frequency in MHz, as Hz. Blank, zero, negative or junk is None.
+pub fn parse_mhz(text: &str) -> Option<f64> {
+    let mhz: f64 = text.trim().trim_end_matches("MHz").trim().parse().ok()?;
+    (mhz.is_finite() && mhz > 0.0 && mhz < 1.0e6).then(|| (mhz * 1.0e6).round())
+}
+
+/// Wait this long on a steady rig frequency before mirroring it, so a
+/// spinning VFO knob does not flood the amplifier with `set_freq`.
+pub const FOLLOW_SETTLE: Duration = Duration::from_millis(400);
+
+/// Follow-rig state for one amplifier (#103). Pure: the caller sends what
+/// `step` returns.
+#[derive(Clone, Debug, Default)]
+pub struct FollowRig {
+    sent: Option<f64>,
+    pending: Option<(f64, Instant)>,
+}
+
+impl FollowRig {
+    /// `rig_hz` is the active rig's frequency, None when no rig is online.
+    /// Returns a frequency to send, at most once per settled change.
+    pub fn step(&mut self, enabled: bool, rig_hz: Option<f64>, now: Instant) -> Option<f64> {
+        let Some(hz) = rig_hz.filter(|hz| enabled && *hz > 0.0) else {
+            self.pending = None;
+            if !enabled {
+                // Ticking it again sends the current frequency once.
+                self.sent = None;
+            }
+            return None;
+        };
+        let hz = hz.round();
+        if self.sent.is_some_and(|s| (s - hz).abs() < 1.0) {
+            self.pending = None;
+            return None;
+        }
+        match self.pending {
+            Some((p, since)) if (p - hz).abs() < 1.0 => {
+                if now.duration_since(since) >= FOLLOW_SETTLE {
+                    self.pending = None;
+                    self.sent = Some(hz);
+                    return Some(hz);
+                }
+                None
+            }
+            _ => {
+                self.pending = Some((hz, now));
+                None
+            }
+        }
+    }
+}
+
 /// A level value as shown: floats trimmed to two places.
 pub fn format_level(raw: &str) -> String {
     match raw.trim().parse::<f64>() {
@@ -444,6 +578,10 @@ impl AmpClient {
 
     fn level_names(&mut self) -> Result<Vec<String>, String> {
         Ok(parse_level_names(&self.ask("get_level ?")?))
+    }
+
+    fn settable_levels(&mut self) -> Result<Vec<String>, String> {
+        Ok(parse_set_level_names(&self.ask("set_level ?")?))
     }
 
     fn freq(&mut self) -> Result<f64, String> {
@@ -733,6 +871,7 @@ fn new_slot(id: u64, spec: AmplifierSpec, models: &[AmpModel]) -> Slot {
         next_poll: None,
         state: AmpState::default(),
         level_names: Vec::new(),
+        settable: Vec::new(),
         make: String::new(),
         model_label: String::new(),
         held: None,
@@ -810,6 +949,7 @@ fn tick_slot(slot: &mut Slot, now: Instant) {
                     let mut info = String::new();
                     if let Ok(mut client) = AmpClient::open(port) {
                         slot.level_names = client.level_names().unwrap_or_default();
+                        slot.settable = client.settable_levels().unwrap_or_default();
                         info = client.info().unwrap_or_default();
                     }
                     slot.state.info = info;
@@ -890,6 +1030,7 @@ fn publish(hub: &Hub, slots: &[Slot], selected: u64) {
             state: slot.state.clone(),
             make: slot.make.clone(),
             model_label: slot.model_label.clone(),
+            settable: slot.settable.clone(),
         })
         .collect();
     let pids = slots
@@ -925,11 +1066,13 @@ mod tests {
     #[test]
     fn argv_is_loopback_and_omits_empty_options() {
         let spec = AmplifierSpec {
+            id: new_id(),
             name: "KPA".into(),
             model: 201,
             device: "/dev/ttyUSB1".into(),
             serial_speed: "38400".into(),
             conf: "retry=2".into(),
+            follow_rig: false,
         };
         assert_eq!(
             ampctld_argv(&spec, 4534),
@@ -1018,6 +1161,10 @@ mod tests {
         let mut client = AmpClient::open(port).expect("client");
         assert_eq!(client.info().expect("get_info"), "Dummy amplifier");
         let names = client.level_names().expect("get_level ?");
+        // The Dummy's levels are read-only meters; set_level ? lists none
+        // and a refused set_level comes back as an error, not a panic.
+        assert!(client.settable_levels().expect("set_level ?").is_empty());
+        assert!(client.control(&Control::SetLevel("SWR".into(), "1.5".into())).is_err());
         assert!(names.iter().any(|name| name == "SWR"));
         // A fresh Dummy is off. Nothing here was sent on its own.
         assert_eq!(client.power().expect("get_powerstat"), Power::Off);
@@ -1036,5 +1183,98 @@ mod tests {
         release_port(port);
         let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
         assert!(TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_err());
+    }
+
+    #[test]
+    fn level_steps_convert_both_ways() {
+        assert_eq!(level_from_step(10), 1.0);
+        assert_eq!(level_from_step(1), 0.1);
+        assert_eq!(level_from_step(5), 0.5);
+        assert_eq!(level_from_step(0), 0.1);
+        assert_eq!(level_from_step(42), 1.0);
+        assert_eq!(step_from_level(1.0), 10);
+        assert_eq!(step_from_level(0.0), 1);
+        assert_eq!(step_from_level(0.34), 3);
+        assert_eq!(step_from_level(0.35), 4);
+        assert_eq!(step_from_level(2.0), 10);
+        assert_eq!(step_from_level(-1.0), 1);
+        assert_eq!(step_from_level(f64::NAN), 1);
+        for n in 1..=10 {
+            assert_eq!(step_from_level(level_from_step(n)), n);
+        }
+    }
+
+    #[test]
+    fn ids_are_random_and_repaired() {
+        let a = new_id();
+        assert_eq!(a.len(), 32);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, new_id());
+        let mut specs = vec![
+            AmplifierSpec { id: String::new(), ..AmplifierSpec::dummy() },
+            AmplifierSpec { id: "x".into(), ..AmplifierSpec::dummy() },
+            AmplifierSpec { id: "x".into(), name: "B".into(), ..AmplifierSpec::dummy() },
+        ];
+        assert_eq!(repair_ids(&mut specs), ["x"]);
+        assert_eq!(specs[0].id.len(), 32);
+        assert_eq!(specs[1].id, "x", "the first holder keeps its id");
+        assert_ne!(specs[2].id, "x", "the later row is regenerated");
+        let mut again = specs.clone();
+        assert!(repair_ids(&mut again).is_empty());
+        assert_eq!(again, specs);
+        // Old file without an id loads.
+        let old: AmplifierSpec = serde_json::from_str(r#"{"name":"A","model":1}"#).unwrap();
+        assert!(old.id.is_empty());
+    }
+
+    #[test]
+    fn set_level_list_and_mhz_parse() {
+        assert!(parse_set_level_names(&lines(&["set_level: ?", ""])).is_empty());
+        assert_eq!(parse_set_level_names(&lines(&["set_level: ?", "PWR NH"])), ["PWR", "NH"]);
+        assert_eq!(parse_mhz("14.2"), Some(14_200_000.0));
+        assert_eq!(parse_mhz(" 144.390 MHz"), Some(144_390_000.0));
+        assert_eq!(parse_mhz(""), None);
+        assert_eq!(parse_mhz("0"), None);
+        assert_eq!(parse_mhz("-7"), None);
+        assert_eq!(parse_mhz("abc"), None);
+    }
+
+    #[test]
+    fn follow_rig_waits_for_a_settled_frequency_and_never_sends_when_off() {
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        let mut f = FollowRig::default();
+        // Off: nothing, however long the rig sits still.
+        for n in [0, 500, 5000] {
+            assert_eq!(f.step(false, Some(14_200_000.0), ms(n)), None);
+        }
+        // On: first sight starts the settle timer.
+        assert_eq!(f.step(true, Some(14_200_000.0), ms(6000)), None);
+        assert_eq!(f.step(true, Some(14_200_000.0), ms(6200)), None);
+        assert_eq!(f.step(true, Some(14_200_000.0), ms(6400)), Some(14_200_000.0));
+        // Same frequency: not sent again.
+        assert_eq!(f.step(true, Some(14_200_000.0), ms(9000)), None);
+        // Spinning the knob restarts the timer each step.
+        assert_eq!(f.step(true, Some(14_201_000.0), ms(9100)), None);
+        assert_eq!(f.step(true, Some(14_202_000.0), ms(9300)), None);
+        assert_eq!(f.step(true, Some(14_203_000.0), ms(9500)), None);
+        assert_eq!(f.step(true, Some(14_203_000.0), ms(9900)), Some(14_203_000.0));
+        // Rig offline: nothing.
+        assert_eq!(f.step(true, None, ms(20000)), None);
+        // Turned off then on: the current frequency goes once after settling.
+        assert_eq!(f.step(false, Some(14_203_000.0), ms(21000)), None);
+        assert_eq!(f.step(true, Some(14_203_000.0), ms(21100)), None);
+        assert_eq!(f.step(true, Some(14_203_000.0), ms(21600)), Some(14_203_000.0));
+    }
+
+    #[test]
+    fn follow_rig_is_left_out_of_the_file_when_off() {
+        let text = serde_json::to_string(&AmplifierSpec::dummy()).unwrap();
+        assert!(!text.contains("follow_rig"));
+        let old: AmplifierSpec = serde_json::from_str(r#"{"name":"A","model":1}"#).unwrap();
+        assert!(!old.follow_rig);
+        let on = AmplifierSpec { follow_rig: true, ..AmplifierSpec::dummy() };
+        let back: AmplifierSpec = serde_json::from_str(&serde_json::to_string(&on).unwrap()).unwrap();
+        assert!(back.follow_rig);
     }
 }

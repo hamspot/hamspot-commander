@@ -13,7 +13,8 @@ pub fn box_size(dev: &Device) -> [f32; 2] {
     let ports = dev.ports();
     let ins = ports.iter().filter(|p| p.dir == Dir::In).count();
     let outs = ports.len() - ins;
-    [BOX_W, TITLE_H + ROW_H * ins.max(outs).max(1) as f32 + 8.0]
+    let rows = ins.max(outs).max(1) + if dev.is_bound_amp() { super::bind::STATUS_ROWS } else { 0 };
+    [BOX_W, TITLE_H + ROW_H * rows as f32 + 8.0]
 }
 
 /// Jack centres: inputs on the left edge, outputs on the right edge.
