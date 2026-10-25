@@ -236,7 +236,7 @@ class GuideDoc(BaseDocTemplate):
             pagesize=letter,
             title="Hamspot Commander User Guide",
             author="Hamspot",
-            subject="Operations manual for Hamspot Commander 0.6.6",
+            subject="Operations manual for Hamspot Commander 0.8.0",
         )
         self.guide_styles = story_styles
         self.chapter = ""
@@ -285,7 +285,7 @@ class GuideDoc(BaseDocTemplate):
         canv.setFont("Times-Roman", 9)
         canv.setFillColor(HEADER)
         canv.drawString(LEFT, 0.30 * inch, "Hamspot Commander")
-        canv.drawRightString(PAGE_W - RIGHT, 0.30 * inch, "User Guide 0.6.6")
+        canv.drawRightString(PAGE_W - RIGHT, 0.30 * inch, "User Guide 0.8.0")
         canv.restoreState()
 
     def draw_header(self, canv, doc) -> None:
@@ -296,7 +296,7 @@ class GuideDoc(BaseDocTemplate):
         canv.setFillColor(HEADER)
         canv.setFont("Times-Roman", 9)
         canv.drawString(LEFT, PAGE_H - 0.40 * inch, "Hamspot Commander")
-        canv.drawRightString(PAGE_W - RIGHT, PAGE_H - 0.40 * inch, "User Guide 0.6.6")
+        canv.drawRightString(PAGE_W - RIGHT, PAGE_H - 0.40 * inch, "User Guide 0.8.0")
         canv.restoreState()
 
     def draw_footer(self, canv, doc) -> None:
@@ -410,8 +410,8 @@ def build_story(blocks: list[dict], st: dict[str, ParagraphStyle]):
     story.append(Spacer(1, 0.15 * inch))
     story.append(HRFlowable(width="40%", thickness=0.8, color=RULE, spaceBefore=2, spaceAfter=10, hAlign="CENTER"))
     story.append(Paragraph("User Guide", st["cover_sub"]))
-    story.append(Paragraph("Version 0.6.6", st["cover_meta"]))
-    story.append(Paragraph("10 October 2026", st["cover_meta"]))
+    story.append(Paragraph("Version 0.8.0", st["cover_meta"]))
+    story.append(Paragraph("24 October 2026", st["cover_meta"]))
     story.append(Spacer(1, 0.45 * inch))
     story.append(Paragraph("Hamspot", st["cover_sub"]))
     story.append(NextPageTemplate("body"))
@@ -433,8 +433,8 @@ def build_story(blocks: list[dict], st: dict[str, ParagraphStyle]):
             plain = re.sub(r"[*_]", "", block.get("text", "")).strip()
             if block["kind"] == "para" and plain in {
                 "User Guide",
-                "Version 0.6.6",
-                "10 October 2026",
+                "Version 0.8.0",
+                "24 October 2026",
                 "Hamspot",
             }:
                 continue

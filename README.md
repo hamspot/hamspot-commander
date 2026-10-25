@@ -6,7 +6,9 @@ The layout kinda follows the rig screen in the Ham Radio Deluxe 5.21 preliminary
 
 The window is a Rust [`egui`](https://github.com/emilk/egui) app in the same spirit as the RT-950 CPS: dark groups, a large frequency, and a click-to-tune bandspread. Radio I/O goes through Hamlib's `rigctld` extended response protocol (`+\` commands, `RPRT` replies). GQRX uses the short rigctl commands on the same client. The program does not link `libhamlib`. Digital voice is an RX pipe around `dsd-fme`, not a mode in the menu.
 
-The operator manual is `docs/UserGuide.md`. `docs/AGENT-HSCommander.md` is the field map for turning a listing into a `.HSCommander` station and the `.HSKeys` file beside it.
+The operator manual is `docs/UserGuide.md`. `docs/AGENT-HSCommander.md` is the field map for turning a listing into a `.HSCommander` station and the `.HSKeys` file beside it. The Tools page mounts the rustcars example screens. The station log is `Name.HSLog` beside the station file.
+
+The face uses [rustcars](https://github.com/webaugur/rustcars) (MIT, `licenses/rustcars-MIT.txt`). The Antonio typeface is bundled by that crate under the SIL Open Font License 1.1. `licenses/Antonio-OFL.txt` and `licenses/Antonio-FONTS.md` travel with the program.
 
 ## Run
 
@@ -27,4 +29,4 @@ crates/commander/   the egui face
 
 ## License
 
-GPL-3.0-or-later. See `LICENSE`.
+GPL-3.0-or-later. See `LICENSE`. The rustcars widgets and the copied example screens are MIT (`licenses/rustcars-MIT.txt`). Antonio is OFL 1.1 (`licenses/Antonio-OFL.txt`).

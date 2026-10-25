@@ -1,0 +1,13 @@
+# NanoVNA V2 (S-A-A-2). USB id 04b4:0008, CDC-ACM.
+# ModemManager will grab the port unless this rule tells it to leave the
+# device alone. Install by hand, as root. Commander does not install it.
+#
+#   sudo install -m 644 docs/nanovna-v2.rules /etc/udev/rules.d/99-nanovna-v2.rules
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger
+#
+# The account that runs Commander also needs to be in the dialout group:
+#   sudo usermod -aG dialout "$USER"
+# Log out and back in after that.
+
+ACTION=="add", SUBSYSTEM=="tty", ATTRS{idVendor}=="04b4", ATTRS{idProduct}=="0008", ENV{ID_MM_DEVICE_IGNORE}="1", ENV{ID_MM_PORT_IGNORE}="1"

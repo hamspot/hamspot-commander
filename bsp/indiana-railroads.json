@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "zones": [
+    {
+      "name": "Railroad",
+      "color": [
+        110,
+        110,
+        110
+      ],
+      "bands": [
+        {
+          "name": "AAR",
+          "chip": "aar",
+          "lo_hz": 160170000.0,
+          "hi_hz": 161600000.0,
+          "home_hz": 161280000.0,
+          "mode": "FM",
+          "segments": [
+            {
+              "lo_hz": 160170000.0,
+              "hi_hz": 161600000.0,
+              "use": "voice",
+              "service": "utility"
+            }
+          ]
+        },
+        {
+          "name": "AAR UHF",
+          "chip": "aaru",
+          "lo_hz": 452000000.0,
+          "hi_hz": 453000000.0,
+          "home_hz": 452487500.0,
+          "mode": "FM",
+          "segments": [
+            {
+              "lo_hz": 452000000.0,
+              "hi_hz": 453000000.0,
+              "use": "voice",
+              "service": "utility"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

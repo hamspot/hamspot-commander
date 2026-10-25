@@ -174,6 +174,17 @@ impl Scanner {
         self.active.as_ref().map(|active| active.index)
     }
 
+    /// Memory the scan is holding because the carrier opened.
+    /// A hop, a seed pass, and an idle scanner are not a hold.
+    pub fn hold_memory(&self) -> Option<(usize, usize)> {
+        let active = self.active.as_ref()?;
+        if matches!(active.phase, Phase::Hold { .. }) {
+            Some((active.zone, active.index))
+        } else {
+            None
+        }
+    }
+
     /// Walk whatever list the caller passes, including zones other than the
     /// one on screen. The floor, the dwell, and the current memory stay.
     pub fn follow_list(&mut self) {

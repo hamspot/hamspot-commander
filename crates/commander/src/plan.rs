@@ -640,6 +640,7 @@ pub fn family_allowed(segment: Use, family: Use) -> bool {
 
 /// `20 m` plus Voice is `20 m Voice`. A name that already carries that use
 /// (`20 m Voice`) stays as it is.
+#[cfg(test)]
 fn label_with_use(name: &str, title: &str) -> String {
     let already = name
         .split_whitespace()
@@ -684,8 +685,7 @@ impl BandPlan {
         ))
     }
 
-    /// Zone-wide label. The face uses [`Self::reference_label`] so a shared
-    /// frequency stays on the clicked band.
+    /// Zone-wide label. [`Self::reference_label`] is the clicked-band form.
     #[cfg(test)]
     pub fn segment_label(&self, zone: usize, hz: f64) -> Option<String> {
         let zone = self.zones.get(zone)?;
@@ -697,6 +697,7 @@ impl BandPlan {
     /// Label for the band the operator clicked. A shared frequency does not
     /// switch to another band. Inside the band but outside every segment, the
     /// band name stands alone.
+    #[cfg(test)]
     pub fn reference_label(&self, zone: usize, band: usize, hz: f64) -> Option<String> {
         let band = self.zones.get(zone)?.bands.get(band)?;
         if !hz.is_finite() || hz < band.lo_hz || hz > band.hi_hz {

@@ -53,6 +53,11 @@ pub struct ConfigFile {
     /// Page that was open. Absent means Tune.
     #[serde(default, skip_serializing_if = "is_tune")]
     pub page: String,
+    /// Page-tab order. Each entry is a page name (`Tune`, `Talkgroups:3`,
+    /// `RadioIds:3`). Absent means the built-in order. A tab that is not
+    /// open yet stays in the list and is skipped until that radio exists.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tabs: Vec<String>,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub channel_zone: usize,
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -91,6 +96,32 @@ pub struct ConfigFile {
     /// Meter order, lock, and the torn-off window when its screen place is known.
     #[serde(default, skip_serializing_if = "MetersFace::is_default")]
     pub meters: MetersFace,
+    /// NanoVNA V2 port, sweep, and calibration. Absent means the built-in sweep.
+    #[serde(default, skip_serializing_if = "crate::tools::nanovna::Face::is_default")]
+    pub nanovna: crate::tools::nanovna::Face,
+    /// Brightness pulse on a tab that is receiving voice. Absent means on.
+    /// The speaker mark stays when this is off.
+    #[serde(default = "default_pulse", skip_serializing_if = "is_pulse_on")]
+    pub pulse: bool,
+    /// Seconds for one brightness cycle. Absent means two seconds.
+    #[serde(default = "default_pulse_secs", skip_serializing_if = "is_default_pulse_secs")]
+    pub pulse_secs: f64,
+}
+
+fn default_pulse() -> bool {
+    true
+}
+
+fn is_pulse_on(value: &bool) -> bool {
+    *value
+}
+
+fn default_pulse_secs() -> f64 {
+    crate::pulse::PERIOD_DEFAULT
+}
+
+fn is_default_pulse_secs(value: &f64) -> bool {
+    (*value - crate::pulse::PERIOD_DEFAULT).abs() < 1e-6
 }
 
 /// What one receiver does while Follow is on. A missing entry means Both.
@@ -385,6 +416,10 @@ pub fn validate(file: &ConfigFile) -> Result<(), String> {
         }
     }
     validate_window(&file.meters.window)?;
+    crate::tools::nanovna::validate(&file.nanovna)?;
+    if !file.pulse_secs.is_finite() || file.pulse_secs < 0.4 || file.pulse_secs > 8.0 {
+        return Err("pulse speed is not a usable number".into());
+    }
     for (name, value) in &file.levels {
         if name.trim().is_empty() || !value.is_finite() {
             return Err(format!("level {name} is not a number"));
@@ -438,7 +473,46 @@ pub fn validate(file: &ConfigFile) -> Result<(), String> {
         }
         seen_tg.push(*tg);
     }
+    let mut seen_tabs = Vec::new();
+    for name in &file.tabs {
+        if !known_tab(name) {
+            return Err(format!("tab {name} is not a page"));
+        }
+        if seen_tabs.contains(name) {
+            return Err(format!("tab {name} is listed twice"));
+        }
+        seen_tabs.push(name.clone());
+    }
     Ok(())
+}
+
+/// Page names the tab row can store. Fixed names match the standing pages.
+/// `Talkgroups:<id>` and `RadioIds:<id>` are one radio's tabs.
+fn known_tab(name: &str) -> bool {
+    const PAGES: &[&str] = &[
+        "Tune",
+        "Plan",
+        "Channels",
+        "Meters",
+        "Timers",
+        "Levels",
+        "Keys",
+        "Tools",
+        "Config",
+    ];
+    if PAGES.contains(&name) {
+        return true;
+    }
+    let Some(rest) = name
+        .strip_prefix("Talkgroups:")
+        .or_else(|| name.strip_prefix("RadioIds:"))
+    else {
+        return false;
+    };
+    let Ok(id) = rest.parse::<u64>() else {
+        return false;
+    };
+    rest == id.to_string()
 }
 
 /// One flag per radio. `indexes` are the radios whose talkgroup Follow box is on.
@@ -540,6 +614,7 @@ mod tests {
             rotators: Vec::new(),
             selected: 0,
             page: String::new(),
+            tabs: Vec::new(),
             channel_zone: 0,
             channel_sel: 0,
             talkgroup_zone: 0,
@@ -551,7 +626,28 @@ mod tests {
             monitor_zones: Vec::new(),
             monitor_talkgroups: Vec::new(),
             meters: MetersFace::default(),
+            nanovna: crate::tools::nanovna::Face::default(),
+            pulse: true,
+            pulse_secs: crate::pulse::PERIOD_DEFAULT,
         }
+    }
+
+    #[test]
+    fn pulse_defaults_on_and_a_slower_speed_round_trips() {
+        let text = to_string(&sample()).unwrap();
+        assert!(!text.contains("\"pulse\""));
+        let back = parse(&text).unwrap();
+        assert!(back.pulse);
+        assert!((back.pulse_secs - 2.0).abs() < 1e-9);
+        let mut off = sample();
+        off.pulse = false;
+        off.pulse_secs = 3.0;
+        let text = to_string(&off).unwrap();
+        assert!(text.contains("\"pulse\": false"));
+        assert!(text.contains("\"pulse_secs\": 3.0"));
+        let back = parse(&text).unwrap();
+        assert!(!back.pulse);
+        assert!((back.pulse_secs - 3.0).abs() < 1e-9);
     }
 
     #[test]
@@ -598,6 +694,76 @@ mod tests {
         assert!(to_string(&file).is_err());
         file.monitor_talkgroups = vec![10006, 10006];
         assert!(to_string(&file).is_err());
+    }
+
+    #[test]
+    fn tabs_round_trip_and_an_old_file_leaves_them_clear() {
+        let mut file = sample();
+        let text = to_string(&file).unwrap();
+        assert!(!text.contains("\"tabs\""));
+        file.tabs = vec!["Config".into(), "Tune".into(), "Talkgroups:3".into()];
+        let text = to_string(&file).unwrap();
+        assert!(text.contains("\"tabs\""));
+        let back = parse(&text).unwrap();
+        assert_eq!(
+            back.tabs,
+            vec!["Config".to_string(), "Tune".into(), "Talkgroups:3".into()]
+        );
+        let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        value.as_object_mut().unwrap().remove("tabs");
+        let loaded = parse(&value.to_string()).unwrap();
+        assert!(loaded.tabs.is_empty());
+        file.tabs = vec!["Nope".into()];
+        assert!(to_string(&file).is_err());
+        file.tabs = vec!["Tune".into(), "Tune".into()];
+        assert!(to_string(&file).is_err());
+        file.tabs = vec!["Talkgroups:03".into()];
+        assert!(to_string(&file).is_err());
+    }
+
+    #[test]
+    fn nanovna_is_omitted_until_the_port_or_a_calibration_is_set() {
+        let file = sample();
+        let text = to_string(&file).unwrap();
+        assert!(!text.contains("\"nanovna\""));
+        let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        value.as_object_mut().unwrap().remove("nanovna");
+        let loaded = parse(&value.to_string()).unwrap();
+        assert!(loaded.nanovna.port.is_empty());
+        assert!(loaded.nanovna.cals.is_empty());
+        let mut file = sample();
+        file.nanovna.port = "/dev/ttyACM0".into();
+        let text = to_string(&file).unwrap();
+        assert!(text.contains("\"nanovna\""));
+        assert!(text.contains("/dev/ttyACM0"));
+        let back = parse(&text).unwrap();
+        assert_eq!(back.nanovna.port, "/dev/ttyACM0");
+        file.nanovna.points = 1;
+        assert!(to_string(&file).is_err());
+    }
+
+    #[test]
+    fn a_partial_nanovna_calibration_round_trips_in_the_station_file() {
+        let mut file = sample();
+        file.nanovna.cals.push(crate::tools::nanovna::CalSet {
+            id: "device".into(),
+            zone: String::new(),
+            band: String::new(),
+            start_hz: 50_000_000.0,
+            step_hz: 1_000_000.0,
+            z0: 50.0,
+            open: vec![[1.0, 0.0], [0.8, 0.0]],
+            short: Vec::new(),
+            load: Vec::new(),
+            thru: Vec::new(),
+            isolation: Vec::new(),
+        });
+        let text = to_string(&file).unwrap();
+        assert!(text.contains("\"cals\""));
+        let back = parse(&text).unwrap();
+        assert_eq!(back.nanovna.cals.len(), 1);
+        assert!(back.nanovna.cals[0].short.is_empty());
+        assert_eq!(back.nanovna.cals[0].open.len(), 2);
     }
 
     #[test]

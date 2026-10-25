@@ -1,8 +1,8 @@
 //! Hamspot Commander, phase 1: the rig-control face.
 //!
-//! The window follows the RT-950 CPS shell: a page tab row at the top,
-//! grouped frames in the body, and a status line. The controls are the rig
-//! face (frequency, meters, VFO, band scales, levels).
+//! The window follows the RT-950 CPS shell: a page tab row at the top
+//! and grouped frames in the body. The frames reach the window edge.
+//! The controls are the rig face (frequency, meters, VFO, band scales, levels).
 
 mod audio;
 mod auto_bay;
@@ -18,11 +18,13 @@ mod gpredict_hw;
 mod hackrf;
 mod keys;
 mod plan;
+mod pulse;
 mod talkgroups;
 mod units;
 mod rot;
 mod rx_pipe;
 mod scan;
+mod tools;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -219,6 +221,14 @@ struct App {
     hold_pass: Option<i32>,
     fine_lock: Option<(f64, f64)>,
     page: Page,
+    /// Page to show when Tools is torn off. Clicking Tools then focuses that
+    /// window. This is never `Page::Tools`.
+    page_return: Page,
+    /// Saved page-tab order. Empty means the built-in order.
+    tab_order: Vec<String>,
+    /// Pointer held on a page tab. It becomes a move only after the pointer
+    /// is pulled off the row. Releasing before that selects the page.
+    tab_press: Option<TabPress>,
     plan: BandPlan,
     zone_sel: usize,
     band_sel: usize,
@@ -255,6 +265,14 @@ struct App {
     channel_list_follow: bool,
     /// Hops the zone on screen. Not written to the station file.
     memory_scan: scan::Scanner,
+    /// Voice marks on the page tabs. Not written except the two settings below.
+    voice_pulse: pulse::Pulse,
+    /// Brightness pulse. The speaker stays when this is off.
+    pulse_on: bool,
+    /// Seconds for one brightness cycle.
+    pulse_secs: f64,
+    /// Read once from the desktop. The sine stays off. The speaker stays.
+    reduced_motion: bool,
     /// Zones double-clicked into the scan list. Stored on the station file.
     /// While this is not empty, SCAN hops these zones in list order.
     scan_zones: BTreeSet<usize>,
@@ -409,6 +427,12 @@ struct App {
     meter_place: Option<egui::Pos2>,
     meter_size: Option<egui::Vec2>,
     meter_placed: bool,
+    /// Calculator, station log, and the other rustcars screens.
+    tools: Arc<Mutex<tools::Tools>>,
+    /// Position and size handed to the tools window when it opens.
+    tool_place: Option<egui::Pos2>,
+    tool_size: Option<egui::Vec2>,
+    tool_placed: bool,
 }
 
 /// Meter grid state. The main window and the detached window share one copy.
@@ -780,14 +804,14 @@ mod talkgroup_tab_tests {
         assert_eq!(talkgroup_radio_ids(&rows, true), vec![3]);
         let tabs = super::page_tabs(&rows, &file, &[]);
         assert!(tabs.iter().any(|(page, label)| {
-            *page == Page::Talkgroups(3) && label == "HackRF Talkgroups"
+            *page == Page::Talkgroups(3) && label == "HackRF TG"
         }));
         assert!(tabs.iter().all(|(page, _)| !matches!(page, Page::RadioIds(_))));
         let units = vec![crate::units::Unit::named(42)];
         let empty = crate::talkgroups::empty();
         let radio_tabs = super::page_tabs(&rows, &empty, &units);
         assert!(radio_tabs.iter().any(|(page, label)| {
-            *page == Page::RadioIds(3) && label == "HackRF Radio IDs"
+            *page == Page::RadioIds(3) && label == "HackRF ID"
         }));
         assert!(radio_tabs
             .iter()
@@ -802,15 +826,29 @@ mod talkgroup_tab_tests {
             .position(|(page, _)| *page == Page::RadioIds(3))
             .expect("radio ids");
         assert!(talk_at < radio_at);
+        let meters_at = both
+            .iter()
+            .position(|(page, _)| *page == Page::Meters)
+            .expect("meters");
+        let timers_at = both
+            .iter()
+            .position(|(page, _)| *page == Page::Timers)
+            .expect("timers");
+        assert_eq!(meters_at + 1, timers_at);
         let keys_at = both
             .iter()
             .position(|(page, _)| *page == Page::Keys)
             .expect("keys");
+        let tools_at = both
+            .iter()
+            .position(|(page, _)| *page == Page::Tools)
+            .expect("tools");
         let config_at = both
             .iter()
             .position(|(page, _)| *page == Page::Config)
             .expect("config");
-        assert_eq!(keys_at + 1, config_at);
+        assert_eq!(keys_at + 1, tools_at);
+        assert_eq!(tools_at + 1, config_at);
         let piped = [
             row(1, crate::cat::RadioDriver::Hamlib, "Dummy", "", false),
             row(
@@ -832,6 +870,52 @@ mod talkgroup_tab_tests {
         assert!(talkgroup_radio_ids(&tap, true).is_empty());
         assert!(talkgroup_radio_ids(&tap, false).is_empty());
     }
+
+    #[test]
+    fn tab_order_follows_the_station_and_inserts_a_new_tab() {
+        let rows = [
+            row(1, crate::cat::RadioDriver::Hamlib, "Dummy", "", true),
+            row(3, crate::cat::RadioDriver::Gqrx, "HackRF", "", false),
+        ];
+        let mut file = crate::talkgroups::empty();
+        file.zones[0].talkgroups.push(crate::talkgroups::Talkgroup {
+            name: "ISP".into(),
+            tg: 10006,
+            encrypted: false,
+        });
+        let units = vec![crate::units::Unit::named(42)];
+        let default_tabs = super::page_tabs(&rows, &file, &units);
+        let default_keys: Vec<_> = default_tabs
+            .iter()
+            .map(|(page, _)| super::page_name(*page))
+            .collect();
+        let same: Vec<_> = super::apply_tab_order(default_tabs.clone(), &[])
+            .iter()
+            .map(|(page, _)| super::page_name(*page))
+            .collect();
+        assert_eq!(same, default_keys);
+        let saved = vec!["Config".into(), "Tune".into(), "Channels".into()];
+        let ordered = super::apply_tab_order(default_tabs.clone(), &saved);
+        let keys: Vec<_> = ordered
+            .iter()
+            .map(|(page, _)| super::page_name(*page))
+            .collect::<Vec<_>>();
+        assert_eq!(keys[0], "Config");
+        assert_eq!(keys[1], "Tune");
+        let channels_at = keys.iter().position(|key| key == "Channels").unwrap();
+        let tg_at = keys.iter().position(|key| key == "Talkgroups:3").unwrap();
+        assert!(channels_at < tg_at);
+        assert!(keys.contains(&"Plan".to_string()));
+        let mut moved = default_keys.clone();
+        super::move_tab(&mut moved, "Tune", "Channels");
+        assert_eq!(moved[0], "Plan");
+        assert_eq!(moved[1], "Channels");
+        assert_eq!(moved[2], "Tune");
+        let mut left = default_keys;
+        super::move_tab(&mut left, "Config", "Tune");
+        assert_eq!(left[0], "Config");
+        assert_eq!(left[1], "Tune");
+    }
 }
 
 #[cfg(test)]
@@ -852,11 +936,12 @@ mod icon_tests {
 mod folder_tab_tests {
     #[test]
     fn neighboring_folder_colors_differ() {
-        let colors = super::FOLDER_TAB_COLORS;
-        let count = colors.len();
-        assert!(count >= 2);
+        let count = 6;
         for index in 0..count {
-            assert_ne!(colors[index], colors[(index + 1) % count]);
+            assert_ne!(
+                super::tab_color(index),
+                super::tab_color((index + 1) % count)
+            );
         }
     }
 }
@@ -996,6 +1081,10 @@ enum Page {
     Channels,
     /// Station key list. The bytes are not in the station JSON.
     Keys,
+    /// rustcars screens: NanoVNA, RF Calc, Calc, Smith, Hex, and Logbook.
+    Tools,
+    /// Station clocks. Drawn like Tools, on the page row beside Meters.
+    Timers,
     /// Talkgroup directory for one radio's control-channel follower.
     Talkgroups(u64),
     /// Radios named on that control channel.
@@ -1010,8 +1099,10 @@ const PAGES: &[(Page, &str)] = &[
     (Page::Plan, "Plan"),
     (Page::Channels, "Channels"),
     (Page::Meters, "Meters"),
+    (Page::Timers, "Timers"),
     (Page::Levels, "Levels"),
     (Page::Keys, "Keys"),
+    (Page::Tools, "Tools"),
     (Page::Config, "Config"),
 ];
 
@@ -1145,70 +1236,170 @@ fn talkgroup_zone_of(file: &talkgroups::TalkgroupFile, tg: u32) -> Option<usize>
         .position(|zone| zone.talkgroups.iter().any(|row| row.tg == tg))
 }
 
-/// Dark folder-card stock. Neighbors in this list differ, and the first
-/// color differs from the last, so a repeated cycle still changes at the join.
-const FOLDER_TAB_COLORS: [[u8; 3]; 8] = [
-    [124, 96, 58],
-    [58, 78, 102],
-    [86, 96, 58],
-    [112, 70, 62],
-    [52, 90, 84],
-    [96, 70, 102],
-    [110, 82, 52],
-    [64, 70, 102],
-];
-
-fn folder_tab_fill(index: usize, selected: bool, hovered: bool) -> egui::Color32 {
-    let [r, g, b] = FOLDER_TAB_COLORS[index % FOLDER_TAB_COLORS.len()];
-    let lift: u8 = match (selected, hovered) {
-        (true, true) => 48,
-        (true, false) => 32,
-        (false, true) => 14,
-        (false, false) => 0,
-    };
-    egui::Color32::from_rgb(
-        r.saturating_add(lift),
-        g.saturating_add(lift),
-        b.saturating_add(lift),
-    )
+fn tab_color(index: usize) -> egui::Color32 {
+    const COLORS: [egui::Color32; 6] = [
+        rustcars::palette::TAN,
+        rustcars::palette::SLATE,
+        rustcars::palette::OLIVE,
+        rustcars::palette::BRICK,
+        rustcars::palette::TEAL,
+        rustcars::palette::PLUM,
+    ];
+    COLORS[index % COLORS.len()]
 }
 
-/// A page or zone tab: flat bottom, rounded top, one folder color.
-///
-/// The open tab is the same stock, lifted. The label stays a warm paper color.
-fn folder_tab(ui: &mut egui::Ui, selected: bool, index: usize, label: &str) -> egui::Response {
-    let text = egui::Color32::from_rgb(248, 240, 226);
-    let font = egui::TextStyle::Button.resolve(ui.style());
-    let galley = ui.painter().layout_no_wrap(label.to_owned(), font, text);
-    let pad = egui::vec2(14.0, 6.0);
-    let size = galley.size() + pad * 2.0;
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
-    if ui.is_rect_visible(rect) {
-        let fill = folder_tab_fill(index, selected, response.hovered());
-        let edge = egui::Color32::from_rgb(
-            fill.r().saturating_sub(36),
-            fill.g().saturating_sub(36),
-            fill.b().saturating_sub(36),
-        );
-        ui.painter().rect(
-            rect,
-            egui::CornerRadius {
-                nw: 9,
-                ne: 9,
-                sw: 0,
-                se: 0,
-            },
-            fill,
-            egui::Stroke::new(1.0, edge),
-            egui::StrokeKind::Inside,
-        );
-        let pos = egui::pos2(
-            rect.center().x - galley.size().x * 0.5,
-            rect.center().y - galley.size().y * 0.5,
-        );
-        ui.painter().galley(pos, galley, text);
+/// Caution text. This is the theme alert, which is also the Meters bar.
+/// It is not a separate caution role. See the rustcars issue for that gap.
+fn caution() -> egui::Color32 {
+    rustcars::LcarsTheme::default().alert
+}
+
+/// A page or zone tab drawn as an LCARS segment. The open tab is lifted.
+fn folder_tab(
+    ui: &mut egui::Ui,
+    selected: bool,
+    index: usize,
+    label: &str,
+    lead: bool,
+) -> egui::Response {
+    folder_tab_colored(ui, selected, index, label, lead, None, None)
+}
+
+/// Same tab, with a fill that replaces the zone color. NanoVNA uses this
+/// while a zone sweep is running.
+pub(crate) fn folder_tab_colored(
+    ui: &mut egui::Ui,
+    selected: bool,
+    index: usize,
+    label: &str,
+    lead: bool,
+    fill: Option<egui::Color32>,
+    speaker: Option<f32>,
+) -> egui::Response {
+    let theme = rustcars::LcarsTheme::default();
+    let fill = fill.unwrap_or_else(|| {
+        if selected {
+            rustcars::tint(tab_color(index), 0.35)
+        } else {
+            tab_color(index)
+        }
+    });
+    let width = if speaker.is_some() {
+        voice_tab_width(ui.painter(), &theme, label)
+    } else {
+        label
+            .chars()
+            .map(|ch| if (ch as u32) >= 0x1F000 { 22.0 } else { 11.0 })
+            .sum::<f32>()
+            + 28.0
+    };
+    let width = width.max(72.0);
+    let cap = if lead {
+        rustcars::Cap::Left
+    } else {
+        rustcars::Cap::None
+    };
+    // The speaker is painted on the left of the name, with the button's
+    // own right inset removed. An empty label keeps that inset from drawing
+    // a second copy of the name.
+    let button_label = if speaker.is_some() { "" } else { label };
+    let resp = rustcars::lcars_button(
+        ui,
+        &theme,
+        button_label,
+        fill,
+        egui::vec2(width, theme.bar_thin),
+        cap,
+        true,
+    );
+    if let Some(alpha) = speaker {
+        paint_voice_caption(ui.painter(), resp.rect, &theme, label, fill, alpha);
     }
-    response
+    resp
+}
+
+/// Right inset used when a tab has no speaker. Matches `lcars_button`.
+fn tab_text_pad(theme: &rustcars::LcarsTheme) -> f32 {
+    (theme.bar_thin / 2.0).min(theme.main_gap)
+}
+
+fn voice_tab_width(painter: &egui::Painter, theme: &rustcars::LcarsTheme, label: &str) -> f32 {
+    let font = egui::FontId::proportional(theme.header_size);
+    let text = painter.layout_no_wrap(label.to_uppercase(), font, egui::Color32::WHITE);
+    // Emoji, a 2px gap, the name, and a 4px right inset. The usual 16px inset is left off.
+    text.rect.width() + 22.0 + 2.0 + 4.0
+}
+
+fn paint_voice_caption(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    theme: &rustcars::LcarsTheme,
+    label: &str,
+    fill: egui::Color32,
+    alpha: f32,
+) {
+    let font = egui::FontId::proportional(theme.header_size);
+    let upper = label.to_uppercase();
+    let galley = painter.layout_no_wrap(upper.clone(), font.clone(), rustcars::ink_on(fill));
+    let pad = 4.0;
+    let ink = rustcars::ink_on(fill);
+    painter.text(
+        egui::pos2(rect.right() - pad, rect.bottom() - theme.frame_gap),
+        egui::Align2::RIGHT_BOTTOM,
+        upper,
+        font.clone(),
+        ink,
+    );
+    painter.text(
+        egui::pos2(
+            rect.right() - pad - galley.rect.width() - 2.0,
+            rect.center().y,
+        ),
+        egui::Align2::RIGHT_CENTER,
+        pulse::SPEAKER,
+        font,
+        ink.gamma_multiply(alpha.clamp(0.0, 1.0)),
+    );
+}
+
+/// The tab being moved, drawn above the row. It uses the same fill, cap, and
+/// label as [`folder_tab`]. It does not take clicks.
+fn paint_floating_tab(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    selected: bool,
+    index: usize,
+    label: &str,
+    speaker: Option<f32>,
+) {
+    let theme = rustcars::LcarsTheme::default();
+    let fill = if selected {
+        rustcars::tint(tab_color(index), 0.35)
+    } else {
+        tab_color(index)
+    };
+    let cap = if index == 0 {
+        rustcars::Cap::Left
+    } else {
+        rustcars::Cap::None
+    };
+    let painter = ui.ctx().layer_painter(egui::LayerId::new(
+        egui::Order::Tooltip,
+        egui::Id::unique("tab-tear"),
+    ));
+    painter.rect_filled(rect, rustcars::cap_radius(cap, rect.height()), fill);
+    if let Some(alpha) = speaker {
+        paint_voice_caption(&painter, rect, &theme, label, fill, alpha);
+        return;
+    }
+    let pad = tab_text_pad(&theme);
+    painter.text(
+        egui::pos2(rect.right() - pad, rect.bottom() - theme.frame_gap),
+        egui::Align2::RIGHT_BOTTOM,
+        label.to_uppercase(),
+        egui::FontId::proportional(theme.header_size),
+        rustcars::ink_on(fill),
+    );
 }
 
 const LCD_ORANGE: egui::Color32 = egui::Color32::from_rgb(232, 128, 42);
@@ -1394,13 +1585,13 @@ fn page_tabs(
     let talk = radio_page_tabs(
         rows,
         talkgroup_radio_ids(rows, directory_has_talkgroups(talkgroups)),
-        "Talkgroups",
+        "TG",
         Page::Talkgroups,
     );
     let radios = radio_page_tabs(
         rows,
         talkgroup_radio_ids(rows, !units.is_empty()),
-        "Radio IDs",
+        "ID",
         Page::RadioIds,
     );
     let mut at = tabs
@@ -1413,6 +1604,81 @@ fn page_tabs(
         at += 1;
     }
     tabs
+}
+
+/// Place tabs named in `saved` in that order. A tab the station does not
+/// name keeps its place after the last already-placed tab that precedes
+/// it in the built-in order.
+fn apply_tab_order(
+    default_tabs: Vec<(Page, String)>,
+    saved: &[String],
+) -> Vec<(Page, String)> {
+    if saved.is_empty() {
+        return default_tabs;
+    }
+    let mut remaining = default_tabs.clone();
+    let mut out = Vec::new();
+    for key in saved {
+        if let Some(index) = remaining
+            .iter()
+            .position(|(page, _)| page_name(*page) == *key)
+        {
+            out.push(remaining.remove(index));
+        }
+    }
+    for tab in remaining {
+        let def_pos = default_tabs
+            .iter()
+            .position(|(page, _)| *page == tab.0)
+            .unwrap_or(default_tabs.len());
+        let mut insert_at = 0;
+        for (index, placed) in out.iter().enumerate() {
+            let placed_pos = default_tabs
+                .iter()
+                .position(|(page, _)| *page == placed.0)
+                .unwrap_or(0);
+            if placed_pos < def_pos {
+                insert_at = index + 1;
+            }
+        }
+        out.insert(insert_at, tab);
+    }
+    out
+}
+
+/// A page-tab press. `torn` is set only after the pointer travels at least
+/// one tab-height off the row. Until then the press is a click.
+struct TabPress {
+    page: Page,
+    name: String,
+    label: String,
+    index: usize,
+    selected: bool,
+    origin: egui::Pos2,
+    home: egui::Rect,
+    torn: bool,
+}
+
+/// Move `from` to the slot occupied by `to`. Dragging right lands after
+/// that tab. Dragging left lands on it, and the target shifts right.
+fn move_tab(tabs: &mut Vec<String>, from: &str, to: &str) {
+    if from == to {
+        return;
+    }
+    let Some(from_at) = tabs.iter().position(|name| name == from) else {
+        return;
+    };
+    let Some(to_at) = tabs.iter().position(|name| name == to) else {
+        return;
+    };
+    if from_at == to_at {
+        return;
+    }
+    let item = tabs.remove(from_at);
+    // A rightward remove shifts the target down by one, so the original
+    // target index is the slot just after it. A leftward remove leaves
+    // that index on the target.
+    tabs.insert(to_at, item);
 }
 
 fn radio_page_tabs(
@@ -1526,6 +1792,9 @@ impl App {
             hold_pass: None,
             fine_lock: None,
             page: Page::Tune,
+            page_return: Page::Tune,
+            tab_order: Vec::new(),
+            tab_press: None,
             plan,
             zone_sel: 0,
             band_sel,
@@ -1546,6 +1815,10 @@ impl App {
             channel_sel: 0,
             channel_list_follow: false,
             memory_scan: scan::Scanner::new(),
+            voice_pulse: pulse::Pulse::new(),
+            pulse_on: true,
+            pulse_secs: pulse::PERIOD_DEFAULT,
+            reduced_motion: pulse::system_reduced_motion(),
             scan_zones: BTreeSet::new(),
             monitor_zones: BTreeSet::new(),
             monitor_talkgroups: BTreeSet::new(),
@@ -1677,7 +1950,28 @@ impl App {
             meter_place: None,
             meter_size: None,
             meter_placed: false,
+            tools: Arc::new(Mutex::new(tools::Tools::new(&cc.egui_ctx))),
+            tool_place: None,
+            tool_size: None,
+            tool_placed: false,
         };
+        {
+            let mut tools = app.tools.lock().expect("tools");
+            tools.detached = cc
+                .storage
+                .and_then(|storage| storage.get_string("tool_detach"))
+                .is_some_and(|value| value == "1");
+            tools.saved_pos = cc
+                .storage
+                .and_then(|storage| storage.get_string("tool_win_pos"))
+                .as_deref()
+                .and_then(parse_point);
+            tools.saved_size = cc
+                .storage
+                .and_then(|storage| storage.get_string("tool_win_size"))
+                .as_deref()
+                .and_then(parse_size);
+        }
         app.open_startup_station();
         app
     }
@@ -2070,6 +2364,17 @@ impl eframe::App for App {
         if let Some(size) = meters.saved_size {
             storage.set_string("meter_win_size", format!("{},{}", size.x, size.y));
         }
+        let tools = self.tools.lock().expect("tools");
+        storage.set_string(
+            "tool_detach",
+            if tools.detached { "1" } else { "0" }.to_string(),
+        );
+        if let Some(pos) = tools.saved_pos {
+            storage.set_string("tool_win_pos", format!("{},{}", pos.x, pos.y));
+        }
+        if let Some(size) = tools.saved_size {
+            storage.set_string("tool_win_size", format!("{},{}", size.x, size.y));
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -2109,13 +2414,10 @@ impl eframe::App for App {
         // Tune follows the frequency the readout is showing, including a
         // set_freq that the radio has not confirmed yet. The Plan editor
         // keeps its own zone tab.
-        let face_hz = if self.page == Page::Tune {
+        if self.page == Page::Tune {
             let hz = self.shown_freq(&snap);
             self.follow_band(hz, &rx_pairs(&snap));
-            hz
-        } else {
-            snap.freq_hz
-        };
+        }
         if snap.online() {
             if let Some(band) = self
                 .plan
@@ -2163,61 +2465,258 @@ impl eframe::App for App {
         }
 
         // One row, at the top of the window. A later tab scrolls sideways instead of wrapping onto
-        // a second line and pushing the page body down.
-        egui::Panel::top("pages").show_inside(ui, |ui| {
-            egui::ScrollArea::horizontal()
-                .id_salt("page-tabs")
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        let rows = self.hub.view().rows;
-                        let tabs = page_tabs(&rows, &self.talkgroups, &self.units);
-                        let still_here = match self.page {
-                            Page::Talkgroups(id) => tabs
+        // a second line and pushing the page body down. On Tools, the right end of this same
+        // row is a square tab that tears the tools off. Closing that window docks them.
+        let tools_open = self.tools.lock().expect("tools").detached;
+        if tools_open && self.page == Page::Tools {
+            self.page = self.page_return;
+        }
+        let tab_side = rustcars::LcarsTheme::default().bar_thin;
+        egui::Panel::top("pages")
+            .show_separator_line(false)
+            .frame(tools::tab_row(rustcars::LcarsTheme::default().bg))
+            .show(ui, |ui| {
+            let gap = 4.0;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                let show_tear = self.page == Page::Tools && !tools_open;
+                let tabs_w = if show_tear {
+                    (ui.available_width() - tab_side - gap).max(0.0)
+                } else {
+                    ui.available_width()
+                };
+                egui::ScrollArea::horizontal()
+                    .id_salt("page-tabs")
+                    .max_width(tabs_w)
+                    .max_height(tab_side)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = gap;
+                            let rows = self.hub.view().rows;
+                            let default_tabs = page_tabs(&rows, &self.talkgroups, &self.units);
+                            let tabs = apply_tab_order(default_tabs.clone(), &self.tab_order);
+                            let still_here = match self.page {
+                                Page::Talkgroups(id) => {
+                                    tabs.iter().any(|(page, _)| *page == Page::Talkgroups(id))
+                                }
+                                Page::RadioIds(id) => {
+                                    tabs.iter().any(|(page, _)| *page == Page::RadioIds(id))
+                                }
+                                _ => true,
+                            };
+                            if !still_here {
+                                self.page = Page::Channels;
+                            }
+                            let shown_keys: Vec<String> =
+                                tabs.iter().map(|(page, _)| page_name(*page)).collect();
+                            let default_keys: Vec<String> = default_tabs
                                 .iter()
-                                .any(|(page, _)| *page == Page::Talkgroups(id)),
-                            Page::RadioIds(id) => {
-                                tabs.iter().any(|(page, _)| *page == Page::RadioIds(id))
+                                .map(|(page, _)| page_name(*page))
+                                .collect();
+                            let mut hits: Vec<(String, egui::Rect)> = Vec::new();
+                            // Keyboard activation has no pointer press. A pointer
+                            // press selects on release unless it has been torn off.
+                            let mut clicked_page: Option<Page> = None;
+                            let mut started = false;
+                            let torn = self.tab_press.as_ref().is_some_and(|press| press.torn);
+                            let now = std::time::Instant::now();
+                            self.note_voice(now);
+                            for (index, (page, label)) in tabs.into_iter().enumerate() {
+                                let name = page_name(page);
+                                let voice = self.tab_voice(page, now);
+                                let speaker = self.speaker_alpha(page, now);
+                                let lift = voice
+                                    .as_ref()
+                                    .map(|tab| {
+                                        self.voice_pulse.lift(
+                                            tab,
+                                            now,
+                                            self.pulse_secs,
+                                            self.pulse_on,
+                                            self.reduced_motion,
+                                        )
+                                    })
+                                    .unwrap_or(0.0);
+                                let fill = (lift > 0.0).then(|| {
+                                    let base = if self.page == page {
+                                        rustcars::tint(tab_color(index), 0.35)
+                                    } else {
+                                        tab_color(index)
+                                    };
+                                    pulse::brighten(base, lift)
+                                });
+                                let resp = folder_tab_colored(
+                                    ui,
+                                    self.page == page,
+                                    index,
+                                    &label,
+                                    index == 0,
+                                    fill,
+                                    speaker,
+                                );
+                                hits.push((name, resp.rect));
+                                if resp.clicked() {
+                                    clicked_page = Some(page);
+                                }
+                                if resp.is_pointer_button_down_on() && self.tab_press.is_none() {
+                                    if let Some(origin) = resp.interact_pointer_pos() {
+                                        started = true;
+                                        self.tab_press = Some(TabPress {
+                                            page,
+                                            name: page_name(page),
+                                            label: label.clone(),
+                                            index,
+                                            selected: self.page == page,
+                                            origin,
+                                            home: resp.rect,
+                                            torn: false,
+                                        });
+                                    }
+                                }
                             }
-                            _ => true,
-                        };
-                        if !still_here {
-                            self.page = Page::Channels;
-                        }
-                        for (index, (page, label)) in tabs.into_iter().enumerate() {
-                            if folder_tab(ui, self.page == page, index, &label).clicked() {
-                                self.page = page;
+                            let pointer = ui.input(|input| input.pointer.interact_pos());
+                            let down = ui.input(|input| input.pointer.primary_down());
+                            let released = ui.input(|input| input.pointer.any_released());
+                            if down {
+                                if let (Some(pos), Some(press)) = (pointer, self.tab_press.as_mut())
+                                {
+                                    let height = press.home.height().max(1.0);
+                                    // Off the row by a full tab. A sideways nudge stays a click.
+                                    if (pos.y - press.origin.y).abs() >= height {
+                                        press.torn = true;
+                                    }
+                                }
                             }
-                        }
-                        if self.unit_desc_dirty && !matches!(self.page, Page::RadioIds(_)) {
-                            self.save_unit_description(&snap);
-                        }
+                            if let Some(press) = self.tab_press.as_ref().filter(|press| press.torn)
+                            {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                                if let Some(pos) = pointer {
+                                    paint_floating_tab(
+                                        ui,
+                                        press.home.translate(pos - press.origin),
+                                        press.selected,
+                                        press.index,
+                                        &press.label,
+                                        self.speaker_alpha(press.page, now),
+                                    );
+                                }
+                            }
+                            // A press that began this frame stays until the button
+                            // comes up. Clearing it here would drop the gesture
+                            // before the next frame can measure the pull.
+                            let mut open_page: Option<Page> = None;
+                            if released || (!down && !started) {
+                                if let Some(press) = self.tab_press.take() {
+                                    if press.torn {
+                                        if let Some(pos) = pointer {
+                                            if let Some((target, _)) = hits.iter().find(|(_, rect)| {
+                                                pos.x >= rect.left() && pos.x <= rect.right()
+                                            }) {
+                                                if target != &press.name {
+                                                    let mut keys = shown_keys.clone();
+                                                    move_tab(&mut keys, &press.name, target);
+                                                    self.tab_order = if keys == default_keys {
+                                                        Vec::new()
+                                                    } else {
+                                                        keys
+                                                    };
+                                                    if self.station_saved.is_some()
+                                                        && !self.config_path.is_empty()
+                                                    {
+                                                        self.save_config(&snap);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        open_page = Some(press.page);
+                                    }
+                                } else if !torn {
+                                    open_page = clicked_page;
+                                }
+                            }
+                            if let Some(page) = open_page {
+                                if tools_open && page == Page::Tools {
+                                    let id = tools::viewport_id();
+                                    ui.ctx().send_viewport_cmd_to(
+                                        id,
+                                        egui::ViewportCommand::Minimized(false),
+                                    );
+                                    ui.ctx().send_viewport_cmd_to(
+                                        id,
+                                        egui::ViewportCommand::Focus,
+                                    );
+                                    ui.ctx().send_viewport_cmd_to(
+                                        id,
+                                        egui::ViewportCommand::RequestUserAttention(
+                                            egui::UserAttentionType::Informational,
+                                        ),
+                                    );
+                                } else {
+                                    if page != Page::Tools {
+                                        self.page_return = page;
+                                    }
+                                    self.page = page;
+                                }
+                            }
+                            if self.unit_desc_dirty && !matches!(self.page, Page::RadioIds(_)) {
+                                self.save_unit_description(&snap);
+                            }
+                        });
                     });
+                if show_tear && tools::tear_off_button(ui).clicked() {
+                    self.tools.lock().expect("tools").detached = true;
+                    self.page = self.page_return;
+                }
+            });
+        });
+        // The brightness sine is wall-clock. Nothing else signals the next
+        // frame. An idle station has no tab inside the hang, so it does not
+        // ask to be drawn again.
+        if self.voice_pulse.busy() {
+            ui.ctx().request_repaint_after(Duration::from_millis(50));
+        }
+        // Every page frame runs to the window edge. A status strip would
+        // leave text under the elbows.
+        self.refresh_tools(ui.ctx(), &snap);
+        if self.page == Page::Tools {
+            self.page_tools(ui);
+        } else if self.page == Page::Timers {
+            self.page_timers(ui);
+        } else {
+            // The stock central panel keeps an 8px margin on every side.
+            // The bottom one would lift the elbows off the window.
+            egui::CentralPanel::default()
+                .frame(egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin {
+                    left: 8,
+                    right: 8,
+                    top: 8,
+                    bottom: 0,
+                }))
+                .show(ui, |ui| {
+                // Tune owns the wheel. Plan and Channels own a bandspread click.
+                // A scroll area would take those pointers and move the page.
+                tools::frame(ui, |ui| {
+                    if self.page == Page::Tune {
+                        self.page_tune(ui, &mut snap);
+                    } else if self.page == Page::Plan {
+                        self.page_plan(ui, &mut snap);
+                    } else if self.page == Page::Channels {
+                        self.page_channels(ui, &mut snap);
+                    } else if let Page::Talkgroups(id) = self.page {
+                        self.page_talkgroups(ui, id, &snap);
+                    } else if let Page::RadioIds(id) = self.page {
+                        self.page_radio_ids(ui, id, &snap);
+                    } else {
+                        egui::ScrollArea::vertical()
+                            .id_salt("body")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| self.page_body(ui, &mut snap));
+                    }
                 });
-        });
-        egui::Panel::bottom("status").show_inside(ui, |ui| {
-            self.status_line(ui, &snap, face_hz);
-        });
-        egui::CentralPanel::default().show_inside(ui, |ui| {
-            // Tune owns the wheel. Plan and Channels own a bandspread click.
-            // A scroll area would take those pointers and move the page.
-            if self.page == Page::Tune {
-                self.page_tune(ui, &mut snap);
-            } else if self.page == Page::Plan {
-                self.page_plan(ui, &mut snap);
-            } else if self.page == Page::Channels {
-                self.page_channels(ui, &mut snap);
-            } else if let Page::Talkgroups(id) = self.page {
-                self.page_talkgroups(ui, id, &snap);
-            } else if let Page::RadioIds(id) = self.page {
-                self.page_radio_ids(ui, id, &snap);
-            } else {
-                egui::ScrollArea::vertical()
-                    .id_salt("body")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| self.page_body(ui, &mut snap));
-            }
-        });
+            });
+        }
 
         let cat_driver = self.cat_edit.as_ref().map(|edit| edit.driver.clone());
         match cat_driver {
@@ -2231,6 +2730,7 @@ impl eframe::App for App {
             self.rotator_window(&ctx);
         }
         self.show_meter_window(&ctx, &snap);
+        self.show_tools_window(&ctx);
         // Clicks in this frame already ran. A channel or zone pick stops
         // the scan before this hop, and service_cc has already stored any
         // neighbor announcement from the control channel we are held on.
@@ -2240,55 +2740,14 @@ impl eframe::App for App {
 }
 
 impl App {
-    fn status_line(&self, ui: &mut egui::Ui, snap: &Snapshot, face_hz: f64) {
-        let link = match snap.kind {
-            LinkKind::Demo => "Demo".to_string(),
-            LinkKind::Live => format!("{}  {}", snap.model, snap.endpoint),
-            LinkKind::Down => format!("Disconnected  {}", snap.message),
-        };
-        ui.horizontal(|ui| {
-            ui.label(link);
-            if !snap.message.is_empty() && snap.kind != LinkKind::Down {
-                ui.separator();
-                ui.label(
-                    egui::RichText::new(&snap.message).color(egui::Color32::from_rgb(220, 160, 80)),
-                );
-            }
-            if let Some(label) = self
-                .plan
-                .reference_label(self.zone_sel, self.band_sel, face_hz)
-            {
-                ui.separator();
-                ui.label(label);
-            }
-            if !self.plan_note.is_empty() {
-                ui.separator();
-                ui.label(
-                    egui::RichText::new(&self.plan_note)
-                        .color(egui::Color32::from_rgb(220, 160, 80)),
-                );
-            }
-            if !self.channel_note.is_empty() {
-                ui.separator();
-                ui.label(
-                    egui::RichText::new(&self.channel_note)
-                        .color(egui::Color32::from_rgb(220, 160, 80)),
-                );
-            }
-            if !snap.last_cat.is_empty() {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(egui::RichText::new(&snap.last_cat).monospace());
-                });
-            }
-        });
-    }
-
     fn page_body(&mut self, ui: &mut egui::Ui, snap: &mut Snapshot) {
         match self.page {
             Page::Tune => self.page_tune(ui, snap),
             Page::Plan => self.page_plan(ui, snap),
             Page::Channels => self.page_channels(ui, snap),
             Page::Keys => self.page_keys(ui),
+            Page::Tools => {}
+            Page::Timers => {}
             Page::Talkgroups(id) => self.page_talkgroups(ui, id, snap),
             Page::RadioIds(id) => self.page_radio_ids(ui, id, snap),
             Page::Meters => self.page_meters(ui, snap),
@@ -2737,7 +3196,7 @@ impl App {
             .collect();
         ui.horizontal_wrapped(|ui| {
             for (idx, name) in names.iter().enumerate() {
-                let response = folder_tab(ui, self.zone_sel == idx, idx, name);
+                let response = folder_tab(ui, self.zone_sel == idx, idx, name, idx == 0);
                 if response.clicked() || response.secondary_clicked() {
                     self.zone_sel = idx;
                     self.band_sel = 0;
@@ -3283,6 +3742,68 @@ impl App {
         }
     }
 
+    /// Conventional hold, or a clear voice grant. A control channel is not a mark.
+    fn note_voice(&mut self, now: std::time::Instant) {
+        self.voice_pulse.prune(now);
+        if let Some((zone, index)) = self.memory_scan.hold_memory() {
+            let control = self
+                .channels
+                .zones
+                .get(zone)
+                .and_then(|zone| zone.channels.get(index))
+                .is_some_and(|channel| channel.control);
+            if !control {
+                self.voice_pulse.hear_channel(zone, index, now);
+            }
+        }
+        let grants: Vec<(u64, u32)> = self
+            .followers
+            .iter()
+            .filter_map(|(id, follower)| follower.active_tg().map(|tg| (*id, tg)))
+            .collect();
+        for (id, tg) in grants {
+            self.voice_pulse.hear_talkgroup(id, tg, now);
+        }
+        let calls: Vec<(u64, u32)> = self
+            .hackrf_call
+            .iter()
+            .filter_map(|(id, call)| call.map(|(_, tg)| (*id, tg)))
+            .collect();
+        for (id, tg) in calls {
+            self.voice_pulse.hear_talkgroup(id, tg, now);
+        }
+    }
+
+    fn tab_voice(&self, page: Page, now: std::time::Instant) -> Option<pulse::VoiceTab> {
+        match page {
+            Page::Channels => self.voice_pulse.showing_channel(now),
+            Page::Talkgroups(id) => {
+                let tab = pulse::VoiceTab::Talkgroup { radio: id };
+                self.voice_pulse.marker(&tab, now).then_some(tab)
+            }
+            _ => None,
+        }
+    }
+
+    /// Channels and each TG tab always carry a speaker. Quiet is dim.
+    fn speaker_alpha(&self, page: Page, now: std::time::Instant) -> Option<f32> {
+        let presence = match page {
+            Page::Channels => self.voice_pulse.channel_presence(now),
+            Page::Talkgroups(id) => {
+                self.voice_pulse
+                    .presence(&pulse::VoiceTab::Talkgroup { radio: id }, now)
+            }
+            _ => return None,
+        };
+        Some(pulse::speaker_alpha(presence))
+    }
+
+    fn store_pulse(&mut self, snap: &Snapshot) {
+        if self.station_saved.is_some() && !self.config_path.is_empty() {
+            self.save_config(snap);
+        }
+    }
+
     fn page_config(&mut self, ui: &mut egui::Ui, snap: &mut Snapshot) {
         ui.horizontal(|ui| {
             if ui.button("Load").clicked() {
@@ -3300,13 +3821,29 @@ impl App {
         });
         if !self.config_note.is_empty() {
             ui.label(
-                egui::RichText::new(&self.config_note).color(egui::Color32::from_rgb(220, 160, 80)),
+                egui::RichText::new(&self.config_note).color(caution()),
             );
         }
         ui.add_space(8.0);
         ui.label(format!("Band plan: {}", file_label(&self.plan_path)));
         ui.label(format!("Channels: {} zones", self.channels.zones.len()));
         ui.label(format!("Talkgroups: {} zones", self.talkgroups.zones.len()));
+        ui.add_space(8.0);
+        let mut pulse_on = self.pulse_on;
+        if ui.checkbox(&mut pulse_on, "Pulse busy tabs").changed() {
+            self.pulse_on = pulse_on;
+            self.store_pulse(snap);
+        }
+        ui.horizontal(|ui| {
+            ui.label("Pulse speed");
+            for (label, secs) in [("Slow", 3.0), ("Normal", 2.0), ("Fast", 1.0)] {
+                let on = (self.pulse_secs - secs).abs() < 0.05;
+                if ui.selectable_label(on, label).clicked() && !on {
+                    self.pulse_secs = secs;
+                    self.store_pulse(snap);
+                }
+            }
+        });
         ui.add_space(8.0);
         self.cat_frame(ui);
         ui.add_space(8.0);
@@ -3580,7 +4117,7 @@ impl App {
             if !self.gpredict_note.is_empty() {
                 ui.label(
                     egui::RichText::new(&self.gpredict_note)
-                        .color(egui::Color32::from_rgb(220, 160, 80)),
+                        .color(caution()),
                 );
             }
             ui.label("Leave Gpredict device 2 at None. Downlink is VFO A and uplink is VFO B. Close Radio Control and open it again, then Engage. A wire does not move a radio that is already engaged.");
@@ -3845,7 +4382,7 @@ impl App {
             if !view.audio_note.is_empty() {
                 ui.label(
                     egui::RichText::new(&view.audio_note)
-                        .color(egui::Color32::from_rgb(220, 160, 80)),
+                        .color(caution()),
                 );
             }
             for row in &view.rows {
@@ -3898,7 +4435,7 @@ impl App {
                 if !row.audio_status.is_empty() {
                     ui.label(
                         egui::RichText::new(&row.audio_status)
-                            .color(egui::Color32::from_rgb(220, 160, 80)),
+                            .color(caution()),
                     );
                 }
                 ui.horizontal(|ui| {
@@ -3932,7 +4469,7 @@ impl App {
                 if !row.rx_pipe_status.is_empty() {
                     ui.label(
                         egui::RichText::new(&row.rx_pipe_status)
-                            .color(egui::Color32::from_rgb(220, 160, 80)),
+                            .color(caution()),
                     );
                 }
                 if !tap {
@@ -3967,7 +4504,7 @@ impl App {
                 if !row.tx_pipe_status.is_empty() {
                     ui.label(
                         egui::RichText::new(&row.tx_pipe_status)
-                            .color(egui::Color32::from_rgb(220, 160, 80)),
+                            .color(caution()),
                     );
                 }
                 }
@@ -4186,7 +4723,7 @@ impl App {
                 painter.rect_stroke(
                     icon_rect,
                     egui::CornerRadius::same(6),
-                    egui::Stroke::new(1.5, egui::Color32::from_rgb(220, 160, 80)),
+                    egui::Stroke::new(1.5, caution()),
                     egui::StrokeKind::Inside,
                 );
             }
@@ -4436,7 +4973,7 @@ impl App {
             );
             if !edit.error.is_empty() {
                 ui.label(
-                    egui::RichText::new(&edit.error).color(egui::Color32::from_rgb(220, 160, 80)),
+                    egui::RichText::new(&edit.error).color(caution()),
                 );
             }
             if ui.button("Save").clicked() {
@@ -4492,7 +5029,7 @@ impl App {
                 } else {
                     probe_note.clone()
                 };
-                ui.label(egui::RichText::new(note).color(egui::Color32::from_rgb(220, 160, 80)));
+                ui.label(egui::RichText::new(note).color(caution()));
             }
             for dongle in &seen {
                 let label = crate::hackrf::dongle_label(dongle);
@@ -4514,7 +5051,7 @@ impl App {
             ui.label("Listen  direct");
             if !edit.error.is_empty() {
                 ui.label(
-                    egui::RichText::new(&edit.error).color(egui::Color32::from_rgb(220, 160, 80)),
+                    egui::RichText::new(&edit.error).color(caution()),
                 );
             }
             if ui.button("Save").clicked() {
@@ -4555,7 +5092,7 @@ impl App {
             ui.label(format!("Listen  127.0.0.1:{}", edit.port_label));
             if !edit.error.is_empty() {
                 ui.label(
-                    egui::RichText::new(&edit.error).color(egui::Color32::from_rgb(220, 160, 80)),
+                    egui::RichText::new(&edit.error).color(caution()),
                 );
             }
             if ui.button("Save").clicked() {
@@ -4666,7 +5203,7 @@ impl App {
                 if !edit.error.is_empty() {
                     ui.label(
                         egui::RichText::new(&edit.error)
-                            .color(egui::Color32::from_rgb(220, 160, 80)),
+                            .color(caution()),
                     );
                 }
                 if ui.button("Save").clicked() {
@@ -4802,7 +5339,7 @@ impl App {
                 if !edit.error.is_empty() {
                     ui.label(
                         egui::RichText::new(&edit.error)
-                            .color(egui::Color32::from_rgb(220, 160, 80)),
+                            .color(caution()),
                     );
                 }
                 if ui.button("Save").clicked() {
@@ -5088,8 +5625,28 @@ impl App {
         match config::load_file(Path::new(&self.config_path)) {
             Ok(mut file) => {
                 file.scan_zones.sort_unstable();
-                self.station_saved = Some(file.clone());
-                self.apply_config(snap, file);
+                let station_path = Path::new(&self.config_path);
+                match crate::tools::nanovna::load_beside(station_path, &mut file.nanovna) {
+                    Ok(loaded) => {
+                        if loaded.stripped_station {
+                            if let Err(err) = config::save_file(station_path, &file) {
+                                self.config_note = err;
+                            }
+                        }
+                        self.station_saved = Some(file.clone());
+                        self.apply_config(snap, file);
+                        self.tools
+                            .lock()
+                            .expect("tools")
+                            .set_vna_archive(loaded.archive);
+                    }
+                    Err(err) => {
+                        self.config_note = err;
+                        self.station_saved = Some(file.clone());
+                        self.apply_config(snap, file);
+                        self.tools.lock().expect("tools").mark_vna_dirty();
+                    }
+                }
             }
             Err(err) => self.config_note = err,
         }
@@ -5188,6 +5745,21 @@ impl App {
             }
             Err(err) => self.config_note = err,
         }
+        self.save_vna();
+    }
+
+    /// Calibration and zone scans. The station file keeps the port and the
+    /// sweep settings. This file is `Name.HSVNA` beside that station.
+    fn save_vna(&mut self) {
+        if self.config_path.is_empty() {
+            return;
+        }
+        let archive = self.tools.lock().expect("tools").vna_archive();
+        let path = crate::tools::nanovna::path_beside(Path::new(&self.config_path));
+        if let Err(err) = crate::tools::nanovna::save_file(&path, &archive) {
+            self.config_note = err;
+            self.tools.lock().expect("tools").mark_vna_dirty();
+        }
     }
 
     /// True when the face differs from the station last loaded or written.
@@ -5232,12 +5804,12 @@ impl App {
         };
         let note = self.config_note.clone();
         let mut choice = None;
-        let response = egui::Modal::new(egui::Id::new("station-exit")).show(ctx, |ui| {
+        let response = egui::Modal::new(egui::Id::unique("station-exit")).show(ctx, |ui| {
             ui.set_min_width(320.0);
             ui.label(format!("Save changes to {name}?"));
             if !note.is_empty() {
                 ui.label(
-                    egui::RichText::new(&note).color(egui::Color32::from_rgb(220, 160, 80)),
+                    egui::RichText::new(&note).color(caution()),
                 );
             }
             ui.horizontal(|ui| {
@@ -5389,6 +5961,7 @@ impl App {
                 .position(|row| row.selected)
                 .unwrap_or(0),
             page: page_name(self.page),
+            tabs: self.tab_order.clone(),
             channel_zone: self.channel_zone,
             channel_sel: self.channel_sel,
             talkgroup_zone: self.talkgroup_zone,
@@ -5416,6 +5989,9 @@ impl App {
             monitor_zones: self.monitor_zones.iter().copied().collect(),
             monitor_talkgroups: self.monitor_talkgroups.iter().copied().collect(),
             meters: self.meters_face(),
+            nanovna: self.tools.lock().expect("tools").nanovna_face(),
+            pulse: self.pulse_on,
+            pulse_secs: self.pulse_secs,
         })
     }
 
@@ -5466,6 +6042,7 @@ impl App {
             rotators,
             selected,
             page,
+            tabs,
             channel_zone,
             channel_sel,
             talkgroup_zone,
@@ -5477,8 +6054,13 @@ impl App {
             monitor_zones,
             monitor_talkgroups,
             meters,
+            nanovna,
+            pulse,
+            pulse_secs,
             ..
         } = file;
+        self.pulse_on = pulse;
+        self.pulse_secs = pulse_secs;
         self.plan = bsp;
         self.channels = channels;
         self.talkgroups = talkgroups;
@@ -5519,6 +6101,10 @@ impl App {
         self.hub.apply_audio(audio);
         self.rotators.replace(rotators);
         self.page = page_from_name(&page);
+        if self.page != Page::Tools {
+            self.page_return = self.page;
+        }
+        self.tab_order = tabs;
         self.channel_zone = channel_zone;
         self.channel_sel = channel_sel;
         self.clear_scan_zones();
@@ -5541,6 +6127,10 @@ impl App {
         self.zone_list_follow = true;
         self.clamp_channel_selection();
         self.apply_meters(&meters);
+        self.tools
+            .lock()
+            .expect("tools")
+            .set_nanovna_face(nanovna);
         self.local_mem = tune.mem_hz;
         self.show_spread = tune.show_spread;
         self.step_hz = tune.step_hz;
@@ -6755,6 +7345,106 @@ impl App {
             &self.system_clock,
             false,
         );
+    }
+
+    fn refresh_tools(&mut self, ctx: &egui::Context, snap: &Snapshot) {
+        let radio = self
+            .hub
+            .view()
+            .rows
+            .iter()
+            .find(|row| row.selected)
+            .map(|row| row.spec.name.clone())
+            .unwrap_or_default();
+        let plan = self.plan.clone();
+        let (dock, nanovna_dirty, vna_dirty) = {
+            let mut tools = self.tools.lock().expect("tools");
+            let dock = tools.dock;
+            if dock {
+                tools.detached = false;
+                tools.dock = false;
+            }
+            // Detached tools still draw in their window. Any other page,
+            // including Timers, leaves NanoVNA so the next visit can connect.
+            if self.page != Page::Tools && !tools.detached {
+                tools.conceal_nanovna();
+            }
+            tools.set_dial(snap.freq_hz, &snap.mode, &radio);
+            let saved = self.station_saved.is_some() && !self.config_path.is_empty();
+            tools.follow_station(ctx, saved, &self.config_path);
+            // The plan copy is display-only. It is not part of the NanoVNA face.
+            tools.set_plan(&plan);
+            let nanovna_dirty = tools.nanovna_dirty();
+            let vna_dirty = tools.take_vna_dirty();
+            (dock, nanovna_dirty, vna_dirty)
+        };
+        if dock {
+            self.tool_placed = false;
+        }
+        let station_open = self.station_saved.is_some() && !self.config_path.is_empty();
+        // A finished sweep updates the VNA file only. The station file is
+        // rewritten when the port or the sweep settings change.
+        if vna_dirty && station_open {
+            self.save_vna();
+        }
+        if nanovna_dirty && station_open {
+            self.save_config(snap);
+        }
+    }
+
+    fn page_tools(&mut self, ui: &mut egui::Ui) {
+        if self.tools.lock().expect("tools").detached {
+            return;
+        }
+        // The example screens create their own top and central panels, so this
+        // call stays on the root ui.
+        self.tools.lock().expect("tools").ui(ui, false);
+    }
+
+    fn page_timers(&mut self, ui: &mut egui::Ui) {
+        self.tools.lock().expect("tools").draw_timers(ui);
+    }
+
+    /// Open the tools as a native window when they are torn off.
+    /// The builder's position is fixed for the life of that window.
+    fn show_tools_window(&mut self, ctx: &egui::Context) {
+        let viewport = tools::viewport_id();
+        let closing = ctx.input_for(viewport, |input| input.viewport().close_requested());
+        let mut tools = self.tools.lock().expect("tools");
+        if closing {
+            tools.detached = false;
+            tools.dock = false;
+            drop(tools);
+            self.tool_placed = false;
+            return;
+        }
+        let detached = tools.detached;
+        drop(tools);
+        if !detached {
+            self.tool_placed = false;
+            return;
+        }
+        if !self.tool_placed {
+            let tools = self.tools.lock().expect("tools");
+            self.tool_place = tools.saved_pos;
+            self.tool_size = tools.saved_size;
+            self.tool_placed = true;
+        }
+        let mut builder = egui::ViewportBuilder::default()
+            .with_title("Tools")
+            .with_app_id("hamspotcommander")
+            .with_inner_size(self.tool_size.unwrap_or(egui::vec2(1180.0, 760.0)))
+            .with_min_inner_size([720.0, 480.0])
+            .with_icon(Arc::clone(&self.icon));
+        if let Some(pos) = self.tool_place {
+            builder = builder.with_position(pos);
+        }
+        let tools = Arc::clone(&self.tools);
+        let viewport = tools::viewport_id();
+        ctx.show_viewport_deferred(viewport, builder, move |ui, _class| {
+            tools.lock().expect("tools").ui(ui, true);
+        });
+        ctx.request_repaint_of(viewport);
     }
 
     /// Open the meters as a native window when they are detached.
@@ -8209,7 +8899,7 @@ impl App {
                 if let Some(away) = self.hackrf_away.get(&row.id) {
                     ui.label(
                         egui::RichText::new(format!("on voice {:.4} MHz", away.hz / 1_000_000.0))
-                            .color(egui::Color32::from_rgb(220, 160, 80)),
+                            .color(caution()),
                     );
                 }
             });
@@ -8227,7 +8917,7 @@ impl App {
         ui.label(keys::path_beside(Path::new(&self.config_path)).display().to_string());
         if !self.key_note.is_empty() {
             ui.label(
-                egui::RichText::new(&self.key_note).color(egui::Color32::from_rgb(220, 160, 80)),
+                egui::RichText::new(&self.key_note).color(caution()),
             );
         }
         ui.horizontal(|ui| {
@@ -8387,7 +9077,7 @@ impl App {
         }
         let font = egui::FontId::monospace(14.0);
         let normal = ui.visuals().text_color();
-        let amber = egui::Color32::from_rgb(220, 160, 80);
+        let amber = caution();
         let filled = row.is_filled();
         let alg = keys::alg_label(&row.alg);
         let status = if filled { "key" } else { "missing" };
@@ -8463,7 +9153,7 @@ impl App {
         if !self.talkgroup_note.is_empty() {
             ui.label(
                 egui::RichText::new(&self.talkgroup_note)
-                    .color(egui::Color32::from_rgb(220, 160, 80)),
+                    .color(caution()),
             );
         }
         let active = if direct {
@@ -9010,7 +9700,7 @@ fn meter_window_ui(
             meters.saved_ppp = Some(ppp);
         }
     }
-    egui::CentralPanel::default().show_inside(ui, |ui| {
+    egui::CentralPanel::default().show(ui, |ui| {
         egui::ScrollArea::vertical()
             .id_salt("meter-window")
             .auto_shrink([false, false])
@@ -9396,7 +10086,7 @@ impl App {
             });
             ui.horizontal(|ui| {
                 let salt = if main { "main-freq" } else { "sub-freq" };
-                let id = ui.id().with(salt);
+                let id = ui.scope_id().with(salt);
                 if !ui.memory(|mem| mem.has_focus(id)) {
                     let shown = format_hz(freq);
                     if main {

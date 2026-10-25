@@ -42,13 +42,13 @@ The printed pages number the chapters. In this Markdown master the same headings
 
 Hamspot Commander is a station face for a radio you can reach with Hamlib, and for a GQRX receiver the program starts itself. You use it to read the frequency, change the VFO, set the mode, key the transmitter when the radio allows it, and keep a band plan and a local channel file.
 
-The window is a dark set of grouped frames: a top bar, a row of page tabs, the page, and a status line. The standing pages are Tune, Plan, Channels, Meters, Levels, Keys, and Config. Keys sits immediately left of Config. A radio that can follow a trunked system adds a Talkgroups tab after Channels, and a Radio IDs tab when that system has named radios.
+The window is a dark set of grouped frames: a top bar, a row of page tabs, and the page. The frames reach the bottom of the window. The standing pages are Tune, Plan, Channels, Meters, Timers, Levels, Keys, Tools, and Config. Timers sits immediately right of Meters. Keys sits immediately left of Tools. A radio that can follow a trunked system adds a TG tab after Channels, and an ID tab when that system has named radios. The label is the radio name plus TG or ID, for example `HackRF TG`. The Channels tab and each TG tab always show a speaker on the left of the name. It stays dim until voice is coming in, then it is solid, and it fades over about two seconds of silence. While that voice is up the tab also brightens and darkens. A control channel does not do this. The Config page can turn the pulse off or set it to Slow, Normal, or Fast. Turning animation off in the desktop settings leaves the speaker and holds the tab still.
 
 Radio traffic uses Hamlib's `rigctld` text protocol. Commander does not link the Hamlib library. A GQRX row uses the short rigctl commands on the same kind of client. Commander starts those programs. It does not attach to a `rigctld` or a GQRX that some other program already started, and it stops only the processes it started.
 
 ## 1.2 What this release does not do
 
-Logbook, ADIF import, a contest logger, and a DX cluster are not in this release. Commander is not itself a satellite tracker. A radio row can still follow Gpredict when that row's Gpredict box is on. That box is not talkgroup Follow.
+ADIF import, a contest logger, and a DX cluster are not in this release. The Tools page has a Logbook, which is a time-stamped diary beside the station file. It is not an ADIF log. Commander is not itself a satellite tracker. A radio row can still follow Gpredict when that row's Gpredict box is on. That box is not talkgroup Follow.
 
 Digital voice is an RX pipe that runs `dsd-fme`. It is not a mode in the Mode menu. Rotators have their own rows on the Config page. A HackRF row captures one dongle. An audio tap takes a discriminator or line input and plays a demodulator. It does not tune.
 
@@ -117,7 +117,7 @@ Both end at the same window. They put the station files in different places.
 
 ## 2.2 What you see first
 
-The window opens on the Tune page. If the station file has no radio list, Commander starts one Hamlib row named Dummy, model 1, with no serial device. The status line names the link. The right side of that line shows the last command you sent. Polls that the window sends on its own are not printed there.
+The window opens on the Tune page. If the station file has no radio list, Commander starts one Hamlib row named Dummy, model 1, with no serial device.
 
 Press `Demo` on the top bar to leave the live radio and use a small radio inside the process. Demo does not start `rigctld`. Press `Demo` again to return to the selected radio.
 
@@ -161,11 +161,11 @@ The top bar holds `Demo`, `Favorite`, and `Full screen`.
 
 ## 3.2 Pages
 
-The tab row is `Tune`, `Plan`, `Channels`, then any Talkgroups or Radio IDs tabs, then `Meters`, `Levels`, `Keys`, and `Config`. The wheel over the frequency display is handled by Tune. The band scales sit outside the scroll area so the wheel is not stolen by the list.
+The tab row starts as `Tune`, `Plan`, `Channels`, then any TG or ID tabs, then `Meters`, `Timers`, `Levels`, `Keys`, `Tools`, and `Config`. Timers is the station clocks. A TG tab reads like `HackRF TG`. An ID tab reads like `HackRF ID`. Click a tab to open that page. Pull a tab off the row, then drop it on another tab, to move it. A sideways nudge stays a click. The station file stores that order in `tabs` when it is not the built-in order. The wheel over the frequency display is handled by Tune. The band scales sit outside the scroll area so the wheel is not stolen by the list.
 
-## 3.3 Status line
+## 3.3 Page frame
 
-The left side is the link and the band label for the frequency on the readout. The right side is the last operator command, in a monospace face. Background reads are omitted, so a quiet radio leaves the last command you actually sent.
+Every page frame reaches the bottom of the window. There is no status line under the elbows.
 
 ## 3.4 Tune, from top to bottom
 
@@ -433,9 +433,9 @@ PipeWire changes are written only when a station file is already open. The Audio
 
 ## 8.4 Keys
 
-The Keys tab is immediately left of Config. Until the station has been saved, the page says so and does not write a key file. The line under the buttons names the key file. A station `City.HSCommander` keeps its keys in `City.HSKeys`, in the same folder. The mode of that file is 0600.
+The Keys tab is immediately left of Tools. Until the station has been saved, the page says so and does not write a key file. The line under the buttons names the key file. A station `City.HSCommander` keeps its keys in `City.HSKeys`, in the same folder. The mode of that file is 0600.
 
-The list columns are Key ID, Algorithm, Status, and Name. A missing key is amber under Status. The key text is only in the editor on the right.
+The list columns are Key ID, Algorithm, Status, and Name. A missing key uses the alert color under Status. The key text is only in the editor on the right.
 
 `Add` appends the next free id, from 0001 upward, as DES with blank text. `Remove` deletes the selected row. `Import` reads a dsd-fme hex CSV. The first line is the header and is skipped. `Export` writes that same CSV, mode 0600. Names are not in the CSV. `Generate` replaces the selected key text with random hex for the algorithm in the editor and saves the key file. An empty list starts as one DES key. Generate is for a radio you program yourself. It is not a fill from a system key loader. `Save` writes the editor into the key file. It does not save the station.
 
@@ -446,6 +446,26 @@ With no filled key, an encrypted talkgroup or channel is not scanned or played. 
 ## 8.5 What stays out of the station JSON
 
 Do not paste key hex into the station file. Do not add a field the program does not already know. A later save from the window rewrites the station and will not invent those fields back. The key file is the only place for key text.
+
+## 8.6 Tools
+
+The Tools tab sits between Keys and Config. On that tab, the right end of the tab row is a square the same height as the other tabs. The mark is a box with an arrow pointing out of it. That square opens the tools in their own window titled Tools. Hovering it says Tear off. Closing that window puts the tools back on the tab. While the window is open, clicking the Tools tab brings that window forward, and the main window stays on the page it was already showing. The screens are NanoVNA, RF Calc, Calc, Smith, Hex, and Logbook. One screen is open at a time. Timers is the page after Meters, not one of these screens.
+
+Logbook is the shack diary. Until the station has been saved, the page says so and does not write a file. A station `City.HSCommander` keeps the log in `City.HSLog`, in the same folder. `Log` stamps the selected radio's frequency, mode, and name onto the next entry and focuses the text. Enter still saves. A row click selects it, a double-click edits it, and a triple-click quotes it into a new entry. Delete asks first. `Undo delete` puts the last deleted entry back.
+
+Calc, RF Calc, Hex, and Smith are the rustcars example screens. Hex opens on a sample font until you press `Open`. That button is on the Hex Viewer row, to the right of the title. RF Calc is bench math for wavelength, antennas, coax, SWR, power, Ohm's law, LC, matching, path loss, and a US band list. It does not key the radio. The Timers page is the station clocks, with fixed offsets and no daylight saving time.
+
+Smith stays a manual calculator. It calculates gamma, SWR, return loss, mismatch loss, normalized impedance, admittance, and Zin from the load you type.
+
+NanoVNA talks to a NanoVNA V2 (the S-A-A-2, USB id `04b4:0008`) over its binary protocol. Other NanoVNA families are not on this screen. The chart fills the NanoVNA screen inside the same elbow frames as the other tools. Sweep controls and the selected marker's gamma, SWR, return loss, mismatch loss, normalized impedance, and admittance are in the left frame. The chart is in the right frame. When that screen is open and the station already names a port, Commander connects to that port once. Close in Setup holds that off until you leave the NanoVNA screen and open it again. The port list is USB serial only. A NanoVNA V2 is marked. Built-in serial ports are not listed. A missing device leaves the chart empty.
+
+Cal is the first tab and stays at the left. The tabs after it are the zones in the station band plan, such as HF, VHF, and UHF. Bands and subbands inside a zone are not listed. Click a zone tab to show the last scan stored for that zone. If that zone has no scan yet, the click measures it. Double-click a zone tab to measure it again. Press Scan to measure the selected zone. While that measurement is running, the zone tab is dark red. Run keeps sweeping that range until Stop. A sweep without open, short, and load for this device and those limits is not a valid scan, and the chart does not keep it. Scan and Run then open the calibration dialog instead of measuring the device under test. The point buttons are 11, 51, 101, 201, 301, 501, and 1023. Scan, Run or Stop, Setup, and M1 through M4 are a column on the left edge of the chart. The view buttons are at the top of the chart frame. The chart views are Smith (the same resistance and reactance circles as the Smith screen; Y adds the admittance grid), Polar, SWR, return loss, R and X, S21 in dB (the Bode magnitude), phase, unwrapped phase, group delay, and TDR. Click the chart to drop the selected marker. M1 through M4 each keep a point. Hover the Smith chart to read the impedance under the pointer. The connection status is the first line of the left frame. The selected marker's gamma, SWR, return loss, mismatch loss, and impedance are in the left frame. Setup also lists delta M1 minus M2, resonance, and the S21 peak (3 dB, 6 dB, and Q). On the TDR view, Setup shows the peak distance, the range limit, and the mean cable loss. Setup is the port, the sweep limits, and the trace options. Open, short, and load are measured from the Cal tab, not again in Setup. Velocity factor and port extension are in Setup. Smooth averages that many points on the trace. Host avg keeps that many sweeps and averages them. Both start at 1, which is off.
+
+Cal lists every zone and the open, short, 50 ohm, cable, and both-loads sweeps stored for it: point count, frequency span, and the first sample. A square reload button on the left of a line repeats that one step for that zone. Rescan all repeats every step for every zone, even when a set is already stored. The dialog closes when the last piece is stored or skipped. The chart button row does not insert a status line. The V2 does not store your calibration. Commander keeps one set per zone tab, from that zone's lowest frequency to its highest. If this device already has an open, a short, and a 50 ohm load for that span, Commander sweeps the stored grid and scans. If it does not, a dialog opens over the chart. The diagram marks the jacks S11 and S21, the same labels as on the device. It draws what is fitted on those jacks: nothing for the open, the short, the 50 ohm load, or a cable from S11 to S21. The open, the short, and the 50 ohm load do not have to be finished on one zone before the next. Each piece is fitted once, and every zone that still needs a calibration is swept before the next piece. Step 1 leaves S11 empty and S21 empty, then Measure open. Step 2 screws the short onto S11 once, then Measure short. Step 3 screws the 50 ohm load onto S11 once, then Measure load. A cable from S11 to S21 is optional: fit it once, Measure cable, or Skip cable. A load on each jack is optional: fit them once, Measure both, or Skip loads. A zone that already has all three pieces is left as it is. Scan beside the chart does not run during these steps. When the three pieces are stored, take them off, connect the antenna or the device, and press Scan on the zone. The set is stored for that zone in the VNA file, not in the station file. A station `City.HSCommander` keeps it at `City.HSVNA`, in the same folder. That file holds the same calibration records and the most recent scan of each zone. The station file keeps the port and the sweep settings. An older station that still has calibration inside it is copied into the VNA file the next time it is opened. The device is not given the coefficients. One piece is kept even before the other two are stored. Cancel drops the step you have not measured yet. Backup writes the sets to a JSON file. Restore loads that file into the VNA file. Clear cal drops the sets for the connected device.
+
+CSV, s1p, and s2p write the trace you see, including calibration and port extension. The s2p file says S12 and S22 were not measured. PNG is a picture of the current chart. Screen asks the device for its display. Pixel order follows the published Python example and has not been checked on this hardware.
+
+TX power and on-device averaging appear only when the firmware is 1.0.2 or newer and the sweep starts at or above 140 MHz. Below that, the screen says so. Commander does not flash the unit. A white screen after you hold the left button while switching on is the bootloader. Use `bootload_firmware.py` or NanoVNA-QT. Do not use a standard USB DFU tool. If ModemManager takes the port, install `docs/nanovna-v2.rules` by hand and add your user to the `dialout` group. Commander does not install that rule.
 
 ---
 
@@ -770,7 +790,7 @@ Radios and the GQRX object may be absent. An older file still loads. An empty ra
 
 The plan is stored in the file, and `bsp_name` says which file name under `bsp/` to write only when that file is not already there.
 
-Talkgroups are inside the station file. Key text is not. The matching `HSKeys` file sits beside the station. `docs/AGENT-HSCommander.md` is the field map for building a new station from a listing.
+Talkgroups are inside the station file. Key text is not. The matching `HSKeys` file sits beside the station. `tabs`, when present, is the page-tab order. Each entry is a page name such as `Tune` or `Talkgroups:3`. `nanovna`, when present, is the NanoVNA V2 port and sweep. Omit it unless you set one of those. Calibration and zone scans are not in the station file. They are in the matching `HSVNA` file beside it. `docs/AGENT-HSCommander.md` is the field map for building a new station from a listing.
 
 ## 13.3 Frequency entry
 
