@@ -64,6 +64,26 @@ impl RotatorSpec {
     }
 }
 
+/// Travel limits the hamlib driver reports in `\dump_state`. They include
+/// any `-C min_az=...` conf the user set.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RotLimits {
+    pub min_az: f64,
+    pub max_az: f64,
+    pub min_el: f64,
+    pub max_el: f64,
+}
+
+/// `\dump_state` lines: "Minimum Azimuth: -180.000000" and so on.
+pub fn parse_limits(lines: &[String]) -> Option<RotLimits> {
+    Some(RotLimits {
+        min_az: labeled(lines, "Minimum Azimuth")?,
+        max_az: labeled(lines, "Maximum Azimuth")?,
+        min_el: labeled(lines, "Minimum Elevation")?,
+        max_el: labeled(lines, "Maximum Elevation")?,
+    })
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct RotatorRow {
     pub id: u64,
@@ -73,6 +93,7 @@ pub struct RotatorRow {
     pub selected: bool,
     pub azimuth: Option<f64>,
     pub elevation: Option<f64>,
+    pub limits: Option<RotLimits>,
     pub make: String,
     pub model_label: String,
 }
@@ -152,6 +173,7 @@ struct Slot {
     next_pos: Option<Instant>,
     azimuth: Option<f64>,
     elevation: Option<f64>,
+    limits: Option<RotLimits>,
     make: String,
     model_label: String,
     held: Option<u16>,
@@ -342,6 +364,14 @@ impl PosClient {
             return Err(format!("{line}: RPRT {}", reply.0));
         }
         Ok(())
+    }
+
+    fn limits(&mut self) -> Result<RotLimits, String> {
+        let reply = transact(&mut self.stream, "dump_state")?;
+        if reply.0 != 0 {
+            return Err(format!("dump_state RPRT {}", reply.0));
+        }
+        parse_limits(&reply.1).ok_or_else(|| "dump_state had no limits".into())
     }
 
     fn position(&mut self) -> Result<(f64, f64), String> {
@@ -639,6 +669,7 @@ fn new_slot(id: u64, spec: RotatorSpec, models: &[RotModel]) -> Slot {
         next_pos: None,
         azimuth: None,
         elevation: None,
+        limits: None,
         make: String::new(),
         model_label: String::new(),
         held: None,
@@ -713,6 +744,7 @@ fn tick_slot(slot: &mut Slot, now: Instant) {
                     slot.port = Some(port);
                     slot.retry_at = None;
                     slot.next_pos = Some(now);
+                    slot.limits = PosClient::open(port).and_then(|mut c| c.limits()).ok();
                     slot.status = format!("up  127.0.0.1:{port}");
                     slot.status_dirty = true;
                 }
@@ -793,6 +825,7 @@ fn publish(hub: &Hub, slots: &[Slot], selected: u64) {
             selected: slot.id == selected,
             azimuth: slot.azimuth,
             elevation: slot.elevation,
+            limits: slot.limits,
             make: slot.make.clone(),
             model_label: slot.model_label.clone(),
         })
@@ -944,6 +977,27 @@ mod tests {
     }
 
     #[test]
+    fn dump_state_limits_parse() {
+        let lines: Vec<String> = [
+            "rotctld Protocol Ver: 1",
+            "Rotor Model: 1",
+            "Minimum Azimuth: -180.000000",
+            "Maximum Azimuth: 450.000000",
+            "Minimum Elevation: 0.000000",
+            "Maximum Elevation: 90.000000",
+            "South Zero: 0",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            parse_limits(&lines),
+            Some(RotLimits { min_az: -180.0, max_az: 450.0, min_el: 0.0, max_el: 90.0 })
+        );
+        assert_eq!(parse_limits(&lines[..3]), None);
+    }
+
+    #[test]
     fn control_lines_use_hamlib_long_names_and_codes() {
         assert_eq!(control_line(&Control::SetPos(-90.0, 0.0)), "set_pos -90.0 0.0");
         assert_eq!(control_line(&Control::Move(Spin::Ccw, 50)), "move 8 50");
@@ -977,6 +1031,11 @@ mod tests {
             return;
         }
         let mut client = PosClient::open(port).expect("client");
+        let limits = client.limits().expect("dump_state");
+        assert_eq!(
+            limits,
+            RotLimits { min_az: -180.0, max_az: 270.0, min_el: 0.0, max_el: 90.0 }
+        );
         assert!(client.control(&Control::SetPos(300.0, 0.0)).is_err());
         assert!(client.control(&Control::SetPos(250.0, 0.0)).is_ok());
         assert!(client.control(&Control::Move(Spin::Ccw, 50)).is_ok());
