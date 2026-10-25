@@ -18,6 +18,7 @@ mod gpredict_hw;
 mod hackrf;
 mod keys;
 mod plan;
+mod patchbay;
 mod pulse;
 mod talkgroups;
 mod units;
@@ -271,6 +272,9 @@ struct App {
     pulse_on: bool,
     /// Seconds for one brightness cycle.
     pulse_secs: f64,
+    /// RF patch bay on Config (#98). Visual only.
+    patchbay: patchbay::PatchBay,
+    patchbay_ui: patchbay::UiState,
     /// Read once from the desktop. The sine stays off. The speaker stays.
     reduced_motion: bool,
     /// Zones double-clicked into the scan list. Stored on the station file.
@@ -1274,6 +1278,12 @@ fn recent_bar(ui: &egui::Ui, rect: egui::Rect, level: f32) {
         .rect_filled(bar, egui::CornerRadius::ZERO, caution().gamma_multiply(alpha));
 }
 
+/// Whether a radio row can transmit in the patch bay. HackRF, GQRX and line
+/// taps are receive only in Commander today.
+fn patch_radio_tx(spec: &cat::RadioSpec) -> bool {
+    matches!(spec.driver, cat::RadioDriver::Hamlib)
+}
+
 fn caution() -> egui::Color32 {
     rustcars::LcarsTheme::default().alert
 }
@@ -1842,6 +1852,8 @@ impl App {
             voice_pulse: pulse::Pulse::new(),
             pulse_on: true,
             pulse_secs: pulse::PERIOD_DEFAULT,
+            patchbay: Default::default(),
+            patchbay_ui: Default::default(),
             reduced_motion: pulse::system_reduced_motion(),
             scan_zones: BTreeSet::new(),
             monitor_zones: BTreeSet::new(),
@@ -3999,6 +4011,15 @@ impl App {
         self.audio_frame(ui);
         ui.add_space(8.0);
         self.automation_frame(ui, snap);
+        ui.add_space(8.0);
+        let radios: Vec<(String, bool)> = self
+            .hub
+            .view()
+            .rows
+            .iter()
+            .map(|row| (row.spec.name.clone(), patch_radio_tx(&row.spec)))
+            .collect();
+        patchbay::show(ui, &mut self.patchbay, &mut self.patchbay_ui, &radios);
     }
 
     fn sync_gpredict(&mut self) {
@@ -6141,6 +6162,7 @@ impl App {
             nanovna: self.tools.lock().expect("tools").nanovna_face(),
             pulse: self.pulse_on,
             pulse_secs: self.pulse_secs,
+            patchbay: self.patchbay.clone(),
         })
     }
 
@@ -6206,8 +6228,11 @@ impl App {
             nanovna,
             pulse,
             pulse_secs,
+            patchbay,
             ..
         } = file;
+        self.patchbay = patchbay;
+        self.patchbay_ui = Default::default();
         self.pulse_on = pulse;
         self.pulse_secs = pulse_secs;
         self.plan = bsp;

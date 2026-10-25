@@ -106,6 +106,10 @@ pub struct ConfigFile {
     /// Seconds for one brightness cycle. Absent means two seconds.
     #[serde(default = "default_pulse_secs", skip_serializing_if = "is_default_pulse_secs")]
     pub pulse_secs: f64,
+    /// RF patch bay (#95): devices, panel positions and cables. Visual only.
+    /// Absent in a station written before the patch bay existed.
+    #[serde(default, skip_serializing_if = "crate::patchbay::PatchBay::is_empty")]
+    pub patchbay: crate::patchbay::PatchBay,
 }
 
 fn default_pulse() -> bool {
@@ -629,6 +633,7 @@ mod tests {
             nanovna: crate::tools::nanovna::Face::default(),
             pulse: true,
             pulse_secs: crate::pulse::PERIOD_DEFAULT,
+            patchbay: Default::default(),
         }
     }
 
@@ -1310,6 +1315,31 @@ mod tests {
         assert_eq!(keys.keys.len(), 1);
         assert!(keys.keys[0].text.is_empty());
         assert_eq!(keys.keys[0].alg, "84");
+    }
+
+    #[test]
+    fn a_file_without_patchbay_loads_and_a_patchbay_round_trips() {
+        use crate::patchbay::model::{Jack, Kind};
+        let text = to_string(&sample()).unwrap();
+        assert!(!text.contains("patchbay"), "an empty patch bay is not written");
+        let loaded = parse(&text).unwrap();
+        assert!(loaded.patchbay.is_empty());
+        let mut file = sample();
+        file.patchbay.sync_radios(&[("IC-9700".into(), true)]);
+        let amp = file.patchbay.add(Kind::Amplifier, "KPA1500", [200.0, 40.0]);
+        let ant = file.patchbay.add(Kind::Antenna, "Yagi", [400.0, 40.0]);
+        file.patchbay.devices[1].model = 201;
+        file.patchbay.devices[2].bands = "2m".into();
+        file.patchbay.connect(&Jack::new(1, "ANT1"), &Jack::new(amp, "INPUT")).unwrap();
+        file.patchbay.connect(&Jack::new(amp, "OUTPUT"), &Jack::new(ant, "FEED")).unwrap();
+        let back = parse(&to_string(&file).unwrap()).unwrap();
+        assert_eq!(back.patchbay, file.patchbay);
+        // The example station and the agent-guide station have no patch bay.
+        let example = parse(include_str!("../../../examples/Example-Satellite-EME.HSCommander")).unwrap();
+        assert!(example.patchbay.is_empty());
+        let mut value: serde_json::Value = serde_json::from_str(&to_string(&file).unwrap()).unwrap();
+        value["patchbay"]["bogus"] = serde_json::Value::Bool(true);
+        assert!(parse(&value.to_string()).is_err(), "unknown patch-bay fields are refused like the rest");
     }
 
     #[test]
