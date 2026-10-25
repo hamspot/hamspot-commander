@@ -341,6 +341,52 @@ pub(crate) fn title_block(
     );
 }
 
+/// A header key beside the tabs: tab size and tab label placement, a dark
+/// fill, and a thin amber border. It is for an action, not a tab choice.
+pub(crate) fn header_key(
+    ui: &mut egui::Ui,
+    theme: &LcarsTheme,
+    label: &str,
+    size: egui::Vec2,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    let colors = rustcars::Mode::Inactive.colors();
+    let mut fill = colors.fill;
+    if resp.is_pointer_button_down_on() {
+        fill = rustcars::tint(fill, -0.25);
+    } else if resp.hovered() {
+        fill = rustcars::tint(fill, 0.12);
+    }
+    let painter = ui.painter();
+    painter.rect_filled(rect, 0.0, fill);
+    painter.rect_stroke(
+        rect,
+        0.0,
+        egui::Stroke::new(1.0, palette::TAN),
+        egui::StrokeKind::Inside,
+    );
+    if resp.has_focus() {
+        painter.rect_stroke(
+            rect.shrink(3.0),
+            0.0,
+            egui::Stroke::new(1.0, theme.text_hi),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let pad = (rect.height() / 2.0).min(theme.main_gap);
+    painter.text(
+        egui::pos2(rect.right() - pad, rect.bottom() - theme.frame_gap),
+        egui::Align2::RIGHT_BOTTOM,
+        label.to_uppercase(),
+        egui::FontId::proportional(theme.header_size),
+        theme.text_hi,
+    );
+    let enabled = ui.is_enabled();
+    let l = label.to_owned();
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, &l));
+    resp
+}
+
 /// One list row, on every tool screen. Monospace at `data_size`.
 pub(crate) const LIST_ROW: f32 = 28.0;
 
