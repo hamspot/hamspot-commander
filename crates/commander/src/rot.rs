@@ -104,11 +104,14 @@ enum RotCmd {
     Shutdown,
 }
 
-/// Direction for a hamlib `move`. Hamlib codes: 8 = LEFT (CCW), 16 = RIGHT (CW).
+/// Direction for a hamlib `move`. Hamlib codes: 2 = UP, 4 = DOWN,
+/// 8 = LEFT (CCW), 16 = RIGHT (CW).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Spin {
     Ccw,
     Cw,
+    Up,
+    Down,
 }
 
 impl Spin {
@@ -116,6 +119,8 @@ impl Spin {
         match self {
             Spin::Ccw => 8,
             Spin::Cw => 16,
+            Spin::Up => 2,
+            Spin::Down => 4,
         }
     }
 }
@@ -944,6 +949,8 @@ mod tests {
         assert_eq!(control_line(&Control::Move(Spin::Ccw, 50)), "move 8 50");
         assert_eq!(control_line(&Control::Move(Spin::Cw, 500)), "move 16 100");
         assert_eq!(control_line(&Control::Stop), "stop");
+        assert_eq!(control_line(&Control::Move(Spin::Up, 10)), "move 2 10");
+        assert_eq!(control_line(&Control::Move(Spin::Down, 10)), "move 4 10");
     }
 
     /// The Dummy limited to a south-stop G-1000: -180..270 is 450 degrees.
@@ -975,6 +982,42 @@ mod tests {
         assert!(client.control(&Control::Move(Spin::Ccw, 50)).is_ok());
         assert!(client.control(&Control::Stop).is_ok());
         assert!(client.position().is_ok());
+        // Default elevation range is 0..90.
+        assert!(client.control(&Control::SetPos(0.0, 120.0)).is_err());
+        assert!(client.control(&Control::SetPos(0.0, 45.0)).is_ok());
+        assert!(client.control(&Control::Move(Spin::Up, 10)).is_ok());
+        assert!(client.control(&Control::Stop).is_ok());
+        drop(client);
+        stop_child(&mut child);
+        release_port(port);
+    }
+
+    /// A flip-capable elevation rotator: the Dummy with max_el=180.
+    #[test]
+    fn dummy_with_flip_elevation_accepts_past_ninety() {
+        let spec = RotatorSpec {
+            conf: "min_el=0,max_el=180".into(),
+            ..RotatorSpec::dummy()
+        };
+        let port = match claim_port(PORT_START) {
+            Ok(port) => port,
+            Err(_) => return,
+        };
+        let mut child = match spawn_rotctld(&spec, port) {
+            Ok(child) => child,
+            Err(_) => {
+                release_port(port);
+                return;
+            }
+        };
+        if wait_ready(port, &mut child).is_err() {
+            stop_child(&mut child);
+            release_port(port);
+            return;
+        }
+        let mut client = PosClient::open(port).expect("client");
+        assert!(client.control(&Control::SetPos(10.0, 150.0)).is_ok());
+        assert!(client.control(&Control::SetPos(10.0, 190.0)).is_err());
         drop(client);
         stop_child(&mut child);
         release_port(port);
