@@ -9,6 +9,9 @@ mod limits;
 mod markers;
 mod proto;
 mod rf;
+mod keys;
+#[cfg(test)]
+mod a11y;
 mod calstd;
 mod search;
 mod sweep;
@@ -741,6 +744,10 @@ pub struct NanoVna {
     cal_graph: Option<(CalSet, WizStep)>,
     /// Format, compare set (index into the stored sets) and error-term view of that window.
     cal_graph_view: View,
+    /// Keyboard click-mode presses waiting for their key group this frame. Issue 73.
+    kbd: Vec<(keys::Group, u8)>,
+    /// Arrow-key marker step waiting for the chart: -1 / +1.
+    kbd_step: i32,
     cal_compare: Option<usize>,
     cal_terms: bool,
 }
@@ -817,6 +824,8 @@ impl NanoVna {
             details_open: false,
             last_sweep: None,
             cal_graph_view: View::Smith,
+            kbd: Vec::new(),
+            kbd_step: 0,
             cal_compare: None,
             cal_terms: false,
             cal_graph: None,
@@ -902,6 +911,7 @@ impl NanoVna {
         let theme = LcarsTheme::default();
         let live = self.session.snapshot();
         GD_APERTURE.with(|a| a.set(self.face.gd_aperture.clamp(2, 200) as usize));
+        self.read_keys(ui);
         if live.generation != self.seen && !live.sweep.is_empty() {
             self.ingest(&live.sweep);
             self.seen = live.generation;
@@ -1330,6 +1340,24 @@ impl NanoVna {
         if let Some(code) = self.track {
             self.marker_search(code, trace.as_deref());
         }
+        if let Some(samples) = trace.as_deref().filter(|s| !s.is_empty()) {
+            // M / Shift+M / Ctrl+M: active marker, next marker, reference marker; ← → step it. Issue 73.
+            if let Some(op) = self.key_op(keys::Group::Marker) {
+                self.marker_on = match op {
+                    1 => self.marker_on,
+                    2 => (self.marker_on + 1) % markers::NORMAL,
+                    _ => markers::REF,
+                };
+                if self.markers[self.marker_on].is_none() {
+                    self.markers[self.marker_on] = Some(samples[samples.len() / 2].hz);
+                }
+            }
+            if self.kbd_step != 0 {
+                let at = self.marker_index(self.marker_on, samples).unwrap_or(samples.len() / 2) as i64;
+                let to = (at + self.kbd_step as i64).clamp(0, samples.len() as i64 - 1) as usize;
+                self.markers[self.marker_on] = Some(samples[to].hz);
+            }
+        }
         let placed = self.placed(trace.as_deref());
         let (cal, state) = match trace.as_deref() {
             Some(t) => self.cal_for(t, None),
@@ -1521,6 +1549,42 @@ impl NanoVna {
     }
 
     /// Per-trace menu opened from its header line. Issue 63.
+    /// Plain / Shift / Ctrl + letter = single / double / triple click on that key
+    /// group; ← → move the active marker. Ignored while a text field has focus. Issue 73.
+    fn read_keys(&mut self, ui: &Ui) {
+        self.kbd.clear();
+        self.kbd_step = 0;
+        if ui.ctx().egui_wants_keyboard_input() {
+            return;
+        }
+        let events = ui.input(|i| i.events.clone());
+        for e in events {
+            if let egui::Event::Key { key, pressed: true, modifiers, .. } = e {
+                if modifiers.alt {
+                    continue;
+                }
+                match key {
+                    egui::Key::ArrowLeft => self.kbd_step = -1,
+                    egui::Key::ArrowRight => self.kbd_step = 1,
+                    _ => {
+                        let name = key.name();
+                        if let (1, Some(c)) = (name.len(), name.chars().next()) {
+                            if let Some(g) = keys::group_of(c) {
+                                self.kbd.push((g, keys::mode(modifiers.shift, modifiers.ctrl || modifiers.command)));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Take a pending keyboard press for this key group.
+    fn key_op(&mut self, group: keys::Group) -> Option<u8> {
+        let at = self.kbd.iter().position(|(g, _)| *g == group)?;
+        Some(self.kbd.remove(at).1)
+    }
+
     fn trace_menu_dialog(&mut self, ui: &mut Ui, theme: &LcarsTheme, samples: Option<&[Sample]>) {
         let Some(t) = self.trace_menu else {
             return;
@@ -1942,16 +2006,17 @@ impl NanoVna {
             painter.rect_stroke(rect, 0.0, Stroke::new(1.0, palette::TAN), egui::StrokeKind::Inside);
         }
         // single = details, double = reconnect, triple = copy the status line.
-        if resp.triple_clicked() {
+        let key = self.key_op(keys::Group::Status);
+        if resp.triple_clicked() || key == Some(3) {
             ui.ctx().copy_text(status_line.clone());
             self.note = "Status line copied.".into();
-        } else if resp.double_clicked() {
+        } else if resp.double_clicked() || key == Some(2) {
             self.details_open = false;
             self.reconnect();
-        } else if resp.clicked() {
+        } else if resp.clicked() || key == Some(1) {
             self.details_open = !self.details_open;
         }
-        let resp = resp.on_hover_text("Click: device details · double: reconnect · triple: copy status line");
+        let resp = resp.on_hover_text(keys::hint(keys::Group::Status));
         let _ = resp;
         let font = egui::FontId::monospace(theme.data_size * 0.8);
         painter.text(
@@ -1966,7 +2031,7 @@ impl NanoVna {
             egui::Align2::RIGHT_CENTER,
             format!("{device}{time}"),
             font,
-            if live.connected { palette::TEXT } else if live.lost { palette::BRICK } else { palette::TEXT_MUTED },
+            if live.connected { palette::TEXT } else if live.lost { LOST_TEXT } else { palette::TEXT_MUTED },
         );
     }
 
@@ -1985,13 +2050,16 @@ impl NanoVna {
         ui.horizontal(|ui| {
             scan = softkey(ui, theme, "Scan", false, col4);
             // RUN: single = continuous, double = single sweep, triple = hold.
-            let resp = softkey_response(ui, theme, "Run", self.run && !self.single, col4, true);
+            let resp = softkey_response(ui, theme, "Run", self.run && !self.single, col4, true)
+                .on_hover_text(keys::hint(keys::Group::Run));
             if resp.triple_clicked() {
                 mode = Some(2);
             } else if resp.double_clicked() {
                 mode = Some(1);
             } else if resp.clicked() {
                 mode = Some(0);
+            } else if let Some(m) = self.key_op(keys::Group::Run) {
+                mode = Some(m - 1);
             }
             if softkey(ui, theme, "Hold", !self.run, col4) {
                 mode = Some(2);
@@ -2031,7 +2099,8 @@ impl NanoVna {
         ui.horizontal(|ui| {
             // LAYOUT: single = choose, double = swap pane order, triple = default four-pane set.
             for n in [1u8, 2, 4] {
-                let resp = softkey_response(ui, theme, &format!("Layout·{n}"), self.face.layout.panes == n, col3, true);
+                let resp = softkey_response(ui, theme, &format!("Layout·{n}"), self.face.layout.panes == n, col3, true)
+                    .on_hover_text(keys::hint(keys::Group::Layout));
                 if resp.triple_clicked() {
                     lay = Some((n, 3));
                 } else if resp.double_clicked() {
@@ -2041,6 +2110,12 @@ impl NanoVna {
                 }
             }
         });
+        if lay.is_none() {
+            if let Some(op) = self.key_op(keys::Group::Layout) {
+                let next = match self.face.layout.panes { 1 => 2, 2 => 4, _ => 1 };
+                lay = Some((next, op));
+            }
+        }
         match lay {
             Some((n, 1)) => {
                 if n == 4 && self.face.layout.traces.len() <= 1 {
@@ -2069,7 +2144,8 @@ impl NanoVna {
             for t in 0..n_tr {
                 let hidden = self.face.layout.traces.get(t).is_some_and(|c| c.hidden);
                 let label = if hidden { format!("TRC{} off", t + 1) } else { format!("TRC{}", t + 1) };
-                let resp = softkey_response(ui, theme, &label, t == self.active_trc, col4, true);
+                let resp = softkey_response(ui, theme, &label, t == self.active_trc, col4, true)
+                    .on_hover_text(keys::hint(keys::Group::Trace));
                 if resp.triple_clicked() {
                     tr_op = Some((t, 3));
                 } else if resp.double_clicked() {
@@ -2082,6 +2158,13 @@ impl NanoVna {
                 tr_op = Some((usize::MAX, 0));
             }
         });
+        if tr_op.is_none() {
+            if let Some(op) = self.key_op(keys::Group::Trace) {
+                let n = self.face.layout.traces.len().max(1);
+                let t = if op == 1 { (self.active_trc + 1) % n } else { self.active_trc };
+                tr_op = Some((t, op));
+            }
+        }
         match tr_op {
             Some((usize::MAX, _)) => {
                 let pane = (self.face.layout.traces.len() as u8) % self.face.layout.panes.max(1);
@@ -2172,12 +2255,14 @@ impl NanoVna {
         key_caption(ui, theme, "DISPLAY", width);
         ui.horizontal(|ui| {
             // STORE: single = store, double = toggle memory display, triple = cycle math.
-            let resp = softkey_response(ui, theme, "Store", false, col4, samples.is_some());
-            if resp.triple_clicked() {
+            let resp = softkey_response(ui, theme, "Store", false, col4, samples.is_some())
+                .on_hover_text(keys::hint(keys::Group::Store));
+            let key = if samples.is_some() { self.key_op(keys::Group::Store) } else { None };
+            if resp.triple_clicked() || key == Some(3) {
                 self.math = next_math(self.math);
-            } else if resp.double_clicked() {
+            } else if resp.double_clicked() || key == Some(2) {
                 self.show_memory = !self.show_memory;
-            } else if resp.clicked() {
+            } else if resp.clicked() || key == Some(1) {
                 if let Some(trace) = samples {
                     self.mems[self.mem_sel] = Some(trace.to_vec());
                     self.show_memory = true;
@@ -2233,13 +2318,16 @@ impl NanoVna {
         ui.horizontal(|ui| {
             // AUTO: single = auto-scale this trace, double = all traces in the
             // pane (one trace today), triple = reset every saved scale.
-            let resp = softkey_response(ui, theme, "Auto", cart && !manual, col4, cart);
+            let resp = softkey_response(ui, theme, "Auto", cart && !manual, col4, cart)
+                .on_hover_text(keys::hint(keys::Group::Auto));
             if resp.triple_clicked() {
                 scale_op = Some(3);
             } else if resp.double_clicked() {
                 scale_op = Some(2);
             } else if resp.clicked() {
                 scale_op = Some(1);
+            } else if cart {
+                scale_op = self.key_op(keys::Group::Auto);
             }
             if softkey_enabled(ui, theme, "/div ▲", false, col4, cart && shown.is_some()) {
                 scale_op = Some(10);
@@ -2299,13 +2387,16 @@ impl NanoVna {
         let mut lim_op = None;
         ui.horizontal(|ui| {
             // LIMITS: single = on/off, double = edit, triple = SWR 1.5 preset on this band.
-            let resp = softkey_response(ui, theme, if lim_on { "Limits on" } else { "Limits off" }, lim_on, col4, cart_lim);
+            let resp = softkey_response(ui, theme, if lim_on { "Limits on" } else { "Limits off" }, lim_on, col4, cart_lim)
+                .on_hover_text(keys::hint(keys::Group::Limits));
             if resp.triple_clicked() {
                 lim_op = Some(3);
             } else if resp.double_clicked() {
                 lim_op = Some(2);
             } else if resp.clicked() {
                 lim_op = Some(1);
+            } else if cart_lim {
+                lim_op = self.key_op(keys::Group::Limits);
             }
             if softkey_enabled(ui, theme, "Edit", self.limits_edit, col4, cart_lim) {
                 lim_op = Some(2);
@@ -4753,7 +4844,8 @@ const MARKER_COLORS: [Color32; markers::SLOTS] = [
     Color32::from_rgb(0xCC, 0xCC, 0x66),
     Color32::from_rgb(0xF0, 0xF0, 0xF0),
 ];
-const GRID: Color32 = Color32::from_rgb(0x4A, 0x55, 0x66);
+/// Major grid: 3:1 on the pane (WCAG 1.4.11). Issue 73.
+const GRID: Color32 = Color32::from_rgb(0x58, 0x64, 0x76);
 const GRID_FAINT: Color32 = Color32::from_rgb(0x2C, 0x33, 0x3D);
 const TRACE1: Color32 = Color32::from_rgb(0xF2, 0xC2, 0x6B);
 const TRACE2: Color32 = Color32::from_rgb(0x78, 0xAA, 0xD2);
@@ -4765,6 +4857,8 @@ const TRACE_COLORS: [Color32; 4] = [
     Color32::from_rgb(0xA0, 0xE0, 0x90),
 ];
 /// MATH label text: brick is too dark for text on the strip.
+/// Disconnected / lost text: brick fails 4.5:1 as text, this light red passes. Issue 73.
+const LOST_TEXT: Color32 = Color32::from_rgb(0xFF, 0x8A, 0x7A);
 const MATH_TEXT: Color32 = Color32::from_rgb(0xFF, 0x99, 0x88);
 /// Memory traces. Drawn dashed on Cartesian panes.
 const MEM_COLOR: Color32 = palette::TEAL;
@@ -5025,12 +5119,26 @@ fn softkey(ui: &mut Ui, theme: &LcarsTheme, label: &str, lit: bool, width: f32) 
 }
 
 fn softkey_enabled(ui: &mut Ui, theme: &LcarsTheme, label: &str, lit: bool, width: f32, enabled: bool) -> bool {
-    let resp = softkey_response(ui, theme, label, lit, width, enabled);
+    let resp = key_cap(ui, theme, label, lit, width, enabled);
     enabled && resp.clicked()
 }
 
-/// A key cap that hands back its response, for keys with double and triple click modes.
+/// A key cap that hands back its response, for keys with double and triple click
+/// modes. Three pips down the right edge in the shared click-mode colours
+/// (green single, orange double, purple triple) mark it as a multi-mode key. Issue 73.
 fn softkey_response(ui: &mut Ui, theme: &LcarsTheme, label: &str, lit: bool, width: f32, enabled: bool) -> egui::Response {
+    let resp = key_cap(ui, theme, label, lit, width, enabled);
+    if enabled {
+        let x = resp.rect.right() - 5.0;
+        let y = resp.rect.center().y;
+        for (k, mode) in [rustcars::Mode::Primary, rustcars::Mode::Alt1, rustcars::Mode::Alt2].into_iter().enumerate() {
+            ui.painter().circle_filled(Pos2::new(x, y + (k as f32 - 1.0) * 6.0), 2.0, mode.colors().border);
+        }
+    }
+    resp
+}
+
+fn key_cap(ui: &mut Ui, theme: &LcarsTheme, label: &str, lit: bool, width: f32, enabled: bool) -> egui::Response {
     // A key cap: centered label with padding on every side. The label steps
     // down in size before it is allowed to touch the edge of the cap.
     const PAD: f32 = 8.0;
@@ -6004,6 +6112,26 @@ mod tests {
         assert!(!device::unplugged("/dev/null"));
         assert!(!device::unplugged(""));
         assert!(!device::unplugged("COM3"));
+    }
+
+    /// WCAG 1.4.3 / 1.4.11: text 4.5:1, trace lines and marker glyphs 3:1. Issue 73.
+    #[test]
+    fn vna_colours_meet_wcag_contrast() {
+        use a11y::contrast;
+        let text = [("TEXT", palette::TEXT), ("TEXT_MUTED", palette::TEXT_MUTED), ("MATH_TEXT", MATH_TEXT), ("LOST_TEXT", LOST_TEXT)];
+        for bg in [PANE_BG, palette::STRIP] {
+            for (name, c) in text {
+                assert!(contrast(c, bg) >= 4.5, "{name} {:.2}", contrast(c, bg));
+            }
+        }
+        // Marker labels are text on the pane.
+        for (i, c) in MARKER_COLORS.iter().enumerate() {
+            assert!(contrast(*c, PANE_BG) >= 4.5, "marker {i} {:.2}", contrast(*c, PANE_BG));
+        }
+        let lines = TRACE_COLORS.iter().copied().chain([MEM_COLOR, IDEAL_COLOR, GRID]);
+        for c in lines {
+            assert!(contrast(c, PANE_BG) >= 3.0, "{c:?} {:.2}", contrast(c, PANE_BG));
+        }
     }
 
     #[test]
