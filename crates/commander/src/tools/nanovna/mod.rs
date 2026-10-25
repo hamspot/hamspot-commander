@@ -156,6 +156,9 @@ pub struct Face {
     pub smooth: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cals: Vec<CalSet>,
+    /// Manual scales by trace format key. A format with no entry auto-scales. Issue 69.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub scales: std::collections::BTreeMap<String, display::ManualScale>,
 }
 
 fn default_start() -> f64 {
@@ -211,6 +214,7 @@ impl Default for Face {
             host_average: 1,
             smooth: 1,
             cals: Vec::new(),
+            scales: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -1117,6 +1121,7 @@ impl NanoVna {
                 });
         });
         let mut clicked = None;
+        let mut scale_gesture = ScaleGesture::default();
         let placed = self.placed(trace.as_deref());
         let info = self.marker_info(trace.as_deref(), &placed);
         let cal = trace.as_deref().and_then(|t| self.matched_cal(t)).cloned();
@@ -1126,7 +1131,8 @@ impl NanoVna {
             let status_h = 26.0;
             let chart_h = (ui.available_height() - table_h - status_h - 8.0).max(120.0);
             ui.allocate_ui(vec2(ui.available_width(), chart_h), |ui| {
-                let (hit, _) = paint_chart(
+                let manual = self.face.scales.get(scale_key(self.view)).copied();
+                let (hit, _, gesture) = paint_chart(
                     ui,
                     self.view,
                     trace.as_deref(),
@@ -1138,14 +1144,24 @@ impl NanoVna {
                     theme.data_size,
                     &placed,
                     &info,
+                    manual,
                 );
                 clicked = hit;
+                scale_gesture = gesture;
             });
             if let Some(samples) = trace.as_deref() {
                 self.marker_table(ui, theme, samples, &placed);
             }
             self.status_bar(ui, theme, live, trace.as_deref(), cal.as_ref());
         });
+        if scale_gesture.ref_divs != 0.0 {
+            let by = scale_gesture.ref_divs as f64;
+            self.edit_scale(trace.as_deref(), |m| m.shifted(by, 10));
+        }
+        if scale_gesture.wheel != 0 {
+            let up = scale_gesture.wheel > 0;
+            self.edit_scale(trace.as_deref(), |m| m.stepped(up));
+        }
         if let (Some((index, clicks)), Some(samples)) = (clicked, trace.as_deref()) {
             let slot = markers::click_slot(self.marker_on, clicks);
             if let Some(sample) = samples.get(index) {
@@ -1154,6 +1170,40 @@ impl NanoVna {
                     self.marker_on = slot;
                 }
             }
+        }
+    }
+
+    /// The scale the Cartesian pane uses: (scale, reference value, manual). Issue 69.
+    fn shown_scale(&self, samples: Option<&[Sample]>) -> Option<(display::Scale, f64, bool)> {
+        if matches!(self.view, View::Smith | View::Polar) {
+            return None;
+        }
+        if let Some(m) = self.face.scales.get(scale_key(self.view)) {
+            return Some((m.to_scale(10), m.ref_value, true));
+        }
+        let samples = samples?;
+        let (_, mut ys) = series(self.view, samples, self.z0_value(), self.velocity_value());
+        ys.extend(second_series(self.view, samples, self.z0_value()));
+        let scale = display::auto_scale(&ys, 10);
+        Some((scale, display::auto_ref(&scale), false))
+    }
+
+    /// Change the manual scale of the shown format, starting from what is on screen.
+    fn edit_scale(&mut self, samples: Option<&[Sample]>, f: impl FnOnce(display::ManualScale) -> display::ManualScale) {
+        let Some((scale, ref_value, _)) = self.shown_scale(samples) else {
+            return;
+        };
+        let key = scale_key(self.view).to_string();
+        let base = self
+            .face
+            .scales
+            .get(&key)
+            .copied()
+            .unwrap_or_else(|| display::ManualScale::from_scale(&scale, ref_value));
+        let next = f(base);
+        if next.ref_value.is_finite() && next.per_div.is_finite() && next.per_div > 0.0 {
+            self.face.scales.insert(key, next);
+            self.dirty = true;
         }
     }
 
@@ -1223,14 +1273,7 @@ impl NanoVna {
     /// The R&S trace-list line over the pane: name, parameter chip, format, scale, channel, cal.
     fn trace_header(&self, ui: &mut Ui, theme: &LcarsTheme, samples: Option<&[Sample]>, cal: Option<&CalSet>) {
         let (param, format, unit) = view_meta(self.view);
-        let scale = match (self.view, samples) {
-            (View::Smith | View::Polar, _) | (_, None) => None,
-            (view, Some(samples)) => {
-                let (_, mut ys) = series(view, samples, self.z0_value(), self.velocity_value());
-                ys.extend(second_series(view, samples, self.z0_value()));
-                Some(display::auto_scale(&ys, 10))
-            }
-        };
+        let shown = self.shown_scale(samples);
         let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::hover());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, palette::STRIP);
@@ -1257,8 +1300,8 @@ impl NanoVna {
         );
         x = chip.right() + 14.0;
         put(&mut x, format, palette::TEXT);
-        if let Some(scale) = scale {
-            let ref_value = if scale.top >= 0.0 && scale.bottom() <= 0.0 { 0.0 } else { scale.top };
+        if let Some((scale, ref_value, manual)) = shown {
+            put(&mut x, if manual { "MAN" } else { "AUTO" }, palette::TEXT_MUTED);
             put(&mut x, &format!("{} {unit}/", display::fmt_tick(scale.per_div, scale.per_div / 10.0)), palette::TEXT);
             put(&mut x, &format!("REF {} {unit}", display::fmt_tick(ref_value, scale.per_div)), palette::TEXT);
         }
@@ -1479,6 +1522,73 @@ impl NanoVna {
                 self.show_diff = !self.show_diff;
             }
         });
+
+        key_caption(ui, theme, "SCALE", width);
+        let cart = !matches!(self.view, View::Smith | View::Polar);
+        let shown = self.shown_scale(samples);
+        let manual = shown.is_some_and(|s| s.2);
+        let mut scale_op: Option<u8> = None;
+        ui.horizontal(|ui| {
+            // AUTO: single = auto-scale this trace, double = all traces in the
+            // pane (one trace today), triple = reset every saved scale.
+            let resp = softkey_response(ui, theme, "Auto", cart && !manual, col4, cart);
+            if resp.triple_clicked() {
+                scale_op = Some(3);
+            } else if resp.double_clicked() {
+                scale_op = Some(2);
+            } else if resp.clicked() {
+                scale_op = Some(1);
+            }
+            if softkey_enabled(ui, theme, "/div ▲", false, col4, cart && shown.is_some()) {
+                scale_op = Some(10);
+            }
+            if softkey_enabled(ui, theme, "/div ▼", false, col4, cart && shown.is_some()) {
+                scale_op = Some(11);
+            }
+            if softkey_enabled(ui, theme, "Hold", manual, col4, cart && shown.is_some()) {
+                scale_op = Some(12);
+            }
+        });
+        if let Some((scale, ref_value, _)) = shown.filter(|_| cart) {
+            let (_, _, unit) = view_meta(self.view);
+            let mut r = ref_value;
+            let mut pos = self.face.scales.get(scale_key(self.view)).map(|m| m.ref_pos).unwrap_or_else(|| display::ManualScale::from_scale(&scale, ref_value).ref_pos);
+            let mut per = scale.per_div;
+            let (mut cr, mut cp, mut cd) = (false, false, false);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("REF").color(palette::TEXT_MUTED));
+                cr = ui.add(egui::DragValue::new(&mut r).speed(scale.per_div / 10.0).suffix(format!(" {unit}"))).changed();
+                ui.label(egui::RichText::new("POS").color(palette::TEXT_MUTED));
+                cp = ui.add(egui::DragValue::new(&mut pos).range(0.0..=10.0).speed(0.1).suffix(" div")).changed();
+                ui.label(egui::RichText::new("/DIV").color(palette::TEXT_MUTED));
+                cd = ui.add(egui::DragValue::new(&mut per).range(1e-12..=1e12).speed(scale.per_div / 20.0)).changed();
+            });
+            if cr || cp || cd {
+                self.edit_scale(samples, |m| display::ManualScale {
+                    ref_value: if cr { r } else { m.ref_value },
+                    ref_pos: if cp { pos } else { m.ref_pos },
+                    per_div: if cd { per } else { m.per_div },
+                });
+            }
+        }
+        match scale_op {
+            Some(1) | Some(2) => {
+                if self.face.scales.remove(scale_key(self.view)).is_some() {
+                    self.dirty = true;
+                }
+            }
+            Some(3) => {
+                if !self.face.scales.is_empty() {
+                    self.face.scales.clear();
+                    self.dirty = true;
+                }
+                self.note = "Every trace format is back on auto-scale.".into();
+            }
+            Some(10) => self.edit_scale(samples, |m| m.stepped(true)),
+            Some(11) => self.edit_scale(samples, |m| m.stepped(false)),
+            Some(12) => self.edit_scale(samples, |m| m),
+            _ => {}
+        }
 
         key_caption(ui, theme, "MARKER", width);
         for row in [[0usize, 1, 2, 3], [4, 5, 6, 7]] {
@@ -2374,7 +2484,7 @@ impl NanoVna {
                     let (rect, _) = ui.allocate_exact_size(vec2((w * 0.6).max(240.0), h), Sense::hover());
                     let painter = ui.painter_at(rect);
                     painter.rect_filled(rect, 0.0, PANE_BG);
-                    paint_cartesian(&painter, rect, View::S21, &xs, &[(&mag, TRACE1)], &[], theme.data_size);
+                    paint_cartesian(&painter, rect, View::S21, &xs, &[(&mag, TRACE1)], &[], theme.data_size, None);
                     let (rect, _) = ui.allocate_exact_size(vec2((w * 0.38).max(160.0), h), Sense::hover());
                     let painter = ui.painter_at(rect);
                     painter.rect_filled(rect, 0.0, PANE_BG);
@@ -3200,6 +3310,7 @@ fn paint_cartesian(
     traces: &[(&[f64], Color32)],
     markers: &[(usize, usize)],
     label_px: f32,
+    manual: Option<display::ManualScale>,
 ) {
     let plot = cart_plot(rect);
     let font = egui::FontId::monospace((label_px * 0.8).max(10.0));
@@ -3207,7 +3318,7 @@ fn paint_cartesian(
     for (ys, _) in traces {
         all.extend_from_slice(ys);
     }
-    let scale = display::auto_scale(&all, 10);
+    let scale = manual.map(|m| m.to_scale(10)).unwrap_or_else(|| display::auto_scale(&all, 10));
     for (i, value) in scale.lines().into_iter().enumerate() {
         let y = plot.top() + plot.height() * i as f32 / scale.divs as f32;
         painter.line_segment(
@@ -3250,7 +3361,7 @@ fn paint_cartesian(
     }
     painter.rect_stroke(plot, 0.0, Stroke::new(1.0, GRID), egui::StrokeKind::Inside);
     // Reference line and its triangle on the right edge, like the R&S ref marker.
-    let ref_value = if scale.top >= 0.0 && scale.bottom() <= 0.0 { 0.0 } else { scale.top };
+    let ref_value = manual.map(|m| m.ref_value).unwrap_or_else(|| display::auto_ref(&scale));
     let ry = plot.top() + scale.fraction(ref_value) as f32 * plot.height();
     let ref_stroke = Stroke::new(1.0, TRACE1);
     let mut x = plot.left();
@@ -3383,6 +3494,12 @@ fn softkey(ui: &mut Ui, theme: &LcarsTheme, label: &str, lit: bool, width: f32) 
 }
 
 fn softkey_enabled(ui: &mut Ui, theme: &LcarsTheme, label: &str, lit: bool, width: f32, enabled: bool) -> bool {
+    let resp = softkey_response(ui, theme, label, lit, width, enabled);
+    enabled && resp.clicked()
+}
+
+/// A key cap that hands back its response, for keys with double and triple click modes.
+fn softkey_response(ui: &mut Ui, theme: &LcarsTheme, label: &str, lit: bool, width: f32, enabled: bool) -> egui::Response {
     // A key cap: centered label with padding on every side. The label steps
     // down in size before it is allowed to touch the edge of the cap.
     const PAD: f32 = 8.0;
@@ -3418,7 +3535,7 @@ fn softkey_enabled(ui: &mut Ui, theme: &LcarsTheme, label: &str, lit: bool, widt
     }
     let at = rect.center() - galley.size() * 0.5;
     painter.galley(at, galley, ink);
-    enabled && resp.clicked()
+    resp
 }
 
 /// Height of one key cap in the left key panel.
@@ -3436,7 +3553,8 @@ fn paint_chart(
     label_px: f32,
     markers: &[(usize, usize)],
     info: &[(String, Color32)],
-) -> (Option<(usize, u8)>, Option<String>) {
+    manual: Option<display::ManualScale>,
+) -> (Option<(usize, u8)>, Option<String>, ScaleGesture) {
     let size = vec2(
         ui.available_width().max(240.0),
         ui.available_height().max(160.0),
@@ -3493,7 +3611,7 @@ fn paint_chart(
             if !delta.is_empty() {
                 traces.push((&delta, palette::BRICK));
             }
-            paint_cartesian(&painter, rect, view, &xs, &traces, markers, label_px);
+            paint_cartesian(&painter, rect, view, &xs, &traces, markers, label_px, manual);
             None
         }
     };
@@ -3526,7 +3644,45 @@ fn paint_chart(
     paint_marker_info(&painter, rect, info, label_px);
     // single = active marker, double = next marker, triple = R. A drag on a
     // Cartesian pane moves the active marker along the trace.
-    let clicks = if resp.triple_clicked() {
+    // Reference triangle drag and mouse wheel over the value axis. Issue 69.
+    let mut gesture = ScaleGesture::default();
+    let cart = !matches!(view, View::Smith | View::Polar);
+    let plot_c = cart_plot(rect);
+    let grab_id = resp.id.with("ref-grab");
+    if cart && resp.drag_started() {
+        let near = resp
+            .interact_pointer_pos()
+            .is_some_and(|p| p.x >= plot_c.right() - 4.0 && p.x <= rect.right());
+        ui.data_mut(|d| d.insert_temp(grab_id, near));
+    }
+    let grabbing = cart && resp.dragged() && ui.data(|d| d.get_temp::<bool>(grab_id)).unwrap_or(false);
+    if grabbing && plot_c.height() > 0.0 {
+        gesture.ref_divs = -resp.drag_delta().y / plot_c.height() * 10.0;
+    }
+    if cart {
+        if let Some(p) = resp.hover_pos() {
+            if p.x < plot_c.left() {
+                let dy: f32 = ui.input(|i| {
+                    i.raw
+                        .events
+                        .iter()
+                        .map(|e| match e {
+                            egui::Event::MouseWheel { delta, .. } => delta.y,
+                            _ => 0.0,
+                        })
+                        .sum()
+                });
+                if dy > 0.0 {
+                    gesture.wheel = -1;
+                } else if dy < 0.0 {
+                    gesture.wheel = 1;
+                }
+            }
+        }
+    }
+    let clicks = if grabbing {
+        None
+    } else if resp.triple_clicked() {
         Some(3)
     } else if resp.double_clicked() {
         Some(2)
@@ -3543,7 +3699,21 @@ fn paint_chart(
     if let Some(text) = &hover {
         resp.on_hover_text(text);
     }
-    (clicked, hover)
+    (clicked, hover, gesture)
+}
+
+/// What the operator did to the scale on the pane this frame. Issue 69.
+#[derive(Clone, Copy, Default)]
+struct ScaleGesture {
+    /// Divisions the reference triangle was dragged up (positive) or down.
+    ref_divs: f32,
+    /// +1 coarser, -1 finer per division, from the wheel over the value axis.
+    wheel: i32,
+}
+
+/// Key under which a trace format's manual scale is saved.
+fn scale_key(view: View) -> &'static str {
+    view_meta(view).1
 }
 
 /// The marker list in the top right of a pane, each line in its marker colour.
@@ -4130,6 +4300,21 @@ fn nearest_gamma(samples: &[Sample], pos: Pos2, center: Pos2, radius: f32) -> Op
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn a_manual_scale_is_saved_per_trace_format() {
+        let mut face = Face::default();
+        face.scales.insert(
+            scale_key(View::ReturnLoss).into(),
+            display::ManualScale { ref_value: 0.0, ref_pos: 10.0, per_div: 5.0 },
+        );
+        let text = serde_json::to_string(&face).unwrap();
+        assert!(text.contains("RETURN LOSS"));
+        let back: Face = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, face);
+        assert!(back.scales.get(scale_key(View::Swr)).is_none());
+        assert!(!serde_json::to_string(&Face::default()).unwrap().contains("scales"));
+    }
 
     #[test]
     fn a_default_face_is_the_one_the_station_file_omits() {
