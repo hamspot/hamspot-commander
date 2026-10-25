@@ -1281,6 +1281,7 @@ impl NanoVna {
             let chart_h = (ui.available_height() - table_h - status_h - 8.0).max(120.0);
             ui.allocate_ui(vec2(ui.available_width(), chart_h), |ui| {
                 let manual = self.face.scales.get(scale_key(self.view)).copied();
+                let edges = self.band_edges();
                 let (hit, _, gesture) = paint_chart(
                     ui,
                     self.view,
@@ -1294,6 +1295,7 @@ impl NanoVna {
                     &placed,
                     &info,
                     manual,
+                    &edges,
                 );
                 clicked = hit;
                 scale_gesture = gesture;
@@ -2209,6 +2211,10 @@ impl NanoVna {
             }
         }
         let z0 = self.z0_value();
+        if let Some(i) = display::search_min(&samples.iter().map(|s| rf::swr(s.s11)).collect::<Vec<_>>()) {
+            let s = &samples[i];
+            readout(ui, theme, &format!("Lowest SWR {} : 1 at {}", num(rf::swr(s.s11)), display::fmt_hz(s.hz)), false);
+        }
         for item in rf::x_resonances(samples, z0).into_iter().take(4) {
             readout(
                 ui,
@@ -2924,7 +2930,7 @@ impl NanoVna {
                     let (rect, _) = ui.allocate_exact_size(vec2((w * 0.6).max(240.0), h), Sense::hover());
                     let painter = ui.painter_at(rect);
                     painter.rect_filled(rect, 0.0, PANE_BG);
-                    paint_cartesian(&painter, rect, View::S21, &xs, &[(&mag, TRACE1)], &[], theme.data_size, None);
+                    paint_cartesian(&painter, rect, View::S21, &xs, &[(&mag, TRACE1)], &[], theme.data_size, None, &[]);
                     let (rect, _) = ui.allocate_exact_size(vec2((w * 0.38).max(160.0), h), Sense::hover());
                     let painter = ui.painter_at(rect);
                     painter.rect_filled(rect, 0.0, PANE_BG);
@@ -3364,6 +3370,20 @@ impl NanoVna {
                 Err(err) => err.to_string(),
             };
         }
+    }
+
+    /// Every zone edge of the station band plan, in Hz. Issue 53.
+    fn band_edges(&self) -> Vec<f64> {
+        let mut out: Vec<f64> = self
+            .plan
+            .zones
+            .iter()
+            .filter_map(zone_limits)
+            .flat_map(|(lo, hi)| [lo, hi])
+            .collect();
+        out.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        out.dedup_by(|a, b| (*a - *b).abs() < 1.0);
+        out
     }
 
     /// The selected memory trace. Issue 70.
@@ -3808,6 +3828,7 @@ fn paint_cartesian(
     markers: &[(usize, usize)],
     label_px: f32,
     manual: Option<display::ManualScale>,
+    edges: &[f64],
 ) {
     let plot = cart_plot(rect);
     let font = egui::FontId::monospace((label_px * 0.8).max(10.0));
@@ -3878,6 +3899,25 @@ fn paint_cartesian(
     ));
     if !(xmax > xmin) {
         return;
+    }
+    // Band-plan zone edges as dashed verticals, labelled with the frequency. Issue 53.
+    if view != View::Tdr {
+        let edge = Stroke::new(1.0, palette::TAN);
+        for hz in edges.iter().filter(|hz| **hz > xmin && **hz < xmax) {
+            let x = plot.left() + ((hz - xmin) / (xmax - xmin)) as f32 * plot.width();
+            let mut y = plot.top();
+            while y < plot.bottom() {
+                painter.line_segment([Pos2::new(x, y), Pos2::new(x, (y + 4.0).min(plot.bottom()))], edge);
+                y += 8.0;
+            }
+            painter.text(
+                Pos2::new(x + 2.0, plot.top() + 2.0),
+                egui::Align2::LEFT_TOP,
+                format!("EDGE {}", display::fmt_hz(*hz)),
+                egui::FontId::monospace((label_px * 0.65).max(9.0)),
+                palette::TAN,
+            );
+        }
     }
     let map = |x: f64, y: f64| {
         Pos2::new(
@@ -4059,6 +4099,7 @@ fn paint_chart(
     markers: &[(usize, usize)],
     info: &[(String, Color32)],
     manual: Option<display::ManualScale>,
+    edges: &[f64],
 ) -> (Option<(usize, u8)>, Option<String>, ScaleGesture) {
     // S21 polar draws the S21 points through the S11 polar painter.
     let as_s11 = |s: &[Sample]| -> Vec<Sample> { s.iter().map(|x| Sample { s11: x.s21, ..*x }).collect() };
@@ -4128,7 +4169,7 @@ fn paint_chart(
             if delta.len() == ys.len() && !delta.is_empty() {
                 traces.push((&delta, palette::BRICK));
             }
-            paint_cartesian(&painter, rect, view, &xs, &traces, markers, label_px, manual);
+            paint_cartesian(&painter, rect, view, &xs, &traces, markers, label_px, manual, edges);
             None
         }
     };
@@ -4213,6 +4254,23 @@ fn paint_chart(
             .and_then(|samples| hit(view, rect, samples, resp.interact_pointer_pos()?))
             .map(|i| (i, n))
     });
+    // Cursor readout on Cartesian panes: SWR, RL, R and X under the pointer. Issue 53.
+    let hover = match (hover, samples, resp.hover_pos()) {
+        (None, Some(samples), Some(pos)) if !is_disk(view) && view != View::Tdr => {
+            hit(view, rect, samples, pos).and_then(|i| samples.get(i)).map(|s| {
+                let d = rf::derive(s, z0);
+                format!(
+                    "{}  SWR {}  RL {} dB  R {} Ω  X {} Ω",
+                    display::fmt_hz(s.hz),
+                    num(rf::swr(s.s11)),
+                    num(rf::return_loss_db(s.s11)),
+                    num(d.r),
+                    num(d.x)
+                )
+            })
+        }
+        (h, _, _) => h,
+    };
     if let Some(text) = &hover {
         resp.on_hover_text(text);
     }
