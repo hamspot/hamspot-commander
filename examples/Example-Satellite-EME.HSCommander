@@ -1,0 +1,590 @@
+{
+  "version": 1,
+  "bsp_name": "satellite-eme.json",
+  "bsp": {
+    "version": 1,
+    "zones": [
+      {
+        "name": "HF 10 m",
+        "color": [
+          130,
+          136,
+          150
+        ],
+        "bands": [
+          {
+            "name": "10 m",
+            "chip": "10m",
+            "lo_hz": 28000000,
+            "hi_hz": 29700000,
+            "home_hz": 29400000,
+            "mode": "USB",
+            "segments": [
+              {
+                "lo_hz": 28000000,
+                "hi_hz": 28070000,
+                "use": "cw"
+              },
+              {
+                "lo_hz": 28070000,
+                "hi_hz": 28150000,
+                "use": "digital"
+              },
+              {
+                "lo_hz": 28150000,
+                "hi_hz": 28190000,
+                "use": "cw"
+              },
+              {
+                "lo_hz": 28300000,
+                "hi_hz": 29300000,
+                "use": "voice"
+              },
+              {
+                "lo_hz": 29300000,
+                "hi_hz": 29510000,
+                "use": "mixed"
+              },
+              {
+                "lo_hz": 29520000,
+                "hi_hz": 29700000,
+                "use": "voice"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "VHF 2 m",
+        "color": [
+          72,
+          140,
+          168
+        ],
+        "bands": [
+          {
+            "name": "2 m EME/Weak",
+            "chip": "2mw",
+            "lo_hz": 144000000,
+            "hi_hz": 144300000,
+            "home_hz": 144200000,
+            "mode": "USB",
+            "segments": [
+              {
+                "lo_hz": 144000000,
+                "hi_hz": 144050000,
+                "use": "cw"
+              },
+              {
+                "lo_hz": 144050000,
+                "hi_hz": 144100000,
+                "use": "cw"
+              },
+              {
+                "lo_hz": 144100000,
+                "hi_hz": 144275000,
+                "use": "voice"
+              },
+              {
+                "lo_hz": 144275000,
+                "hi_hz": 144300000,
+                "use": "cw"
+              }
+            ]
+          },
+          {
+            "name": "2 m New OSCAR",
+            "chip": "2mo",
+            "lo_hz": 144300000,
+            "hi_hz": 144500000,
+            "home_hz": 144400000,
+            "mode": "USB",
+            "segments": [
+              {
+                "lo_hz": 144300000,
+                "hi_hz": 144500000,
+                "use": "mixed"
+              }
+            ]
+          },
+          {
+            "name": "2 m Satellite",
+            "chip": "2ms",
+            "lo_hz": 145800000,
+            "hi_hz": 146000000,
+            "home_hz": 145800000,
+            "mode": "FM",
+            "segments": [
+              {
+                "lo_hz": 145800000,
+                "hi_hz": 146000000,
+                "use": "mixed"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "UHF 70 cm",
+        "color": [
+          92,
+          120,
+          96
+        ],
+        "bands": [
+          {
+            "name": "70 cm EME/Weak",
+            "chip": "70w",
+            "lo_hz": 432000000,
+            "hi_hz": 432400000,
+            "home_hz": 432100000,
+            "mode": "USB",
+            "segments": [
+              {
+                "lo_hz": 432000000,
+                "hi_hz": 432070000,
+                "use": "mixed"
+              },
+              {
+                "lo_hz": 432070000,
+                "hi_hz": 432100000,
+                "use": "cw"
+              },
+              {
+                "lo_hz": 432100000,
+                "hi_hz": 432300000,
+                "use": "voice"
+              },
+              {
+                "lo_hz": 432300000,
+                "hi_hz": 432400000,
+                "use": "cw"
+              }
+            ]
+          },
+          {
+            "name": "70 cm Satellite",
+            "chip": "70s",
+            "lo_hz": 435000000,
+            "hi_hz": 438000000,
+            "home_hz": 437800000,
+            "mode": "FM",
+            "segments": [
+              {
+                "lo_hz": 435000000,
+                "hi_hz": 438000000,
+                "use": "mixed"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "L 23 cm",
+        "color": [
+          168,
+          120,
+          72
+        ],
+        "bands": [
+          {
+            "name": "23 cm Sat Uplink",
+            "chip": "23s",
+            "lo_hz": 1260000000,
+            "hi_hz": 1270000000,
+            "home_hz": 1265000000,
+            "mode": "FM",
+            "segments": [
+              {
+                "lo_hz": 1260000000,
+                "hi_hz": 1270000000,
+                "use": "mixed"
+              }
+            ]
+          },
+          {
+            "name": "23 cm EME/Weak",
+            "chip": "23w",
+            "lo_hz": 1295800000,
+            "hi_hz": 1296400000,
+            "home_hz": 1296100000,
+            "mode": "USB",
+            "segments": [
+              {
+                "lo_hz": 1295800000,
+                "hi_hz": 1296080000,
+                "use": "mixed"
+              },
+              {
+                "lo_hz": 1296080000,
+                "hi_hz": 1296200000,
+                "use": "voice"
+              },
+              {
+                "lo_hz": 1296200000,
+                "hi_hz": 1296400000,
+                "use": "cw"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "S 13 cm",
+        "color": [
+          150,
+          100,
+          140
+        ],
+        "bands": [
+          {
+            "name": "13 cm EME/Weak",
+            "chip": "13w",
+            "lo_hz": 2303750000,
+            "hi_hz": 2304750000,
+            "home_hz": 2304100000,
+            "mode": "USB",
+            "segments": [
+              {
+                "lo_hz": 2303750000,
+                "hi_hz": 2304000000,
+                "use": "mixed"
+              },
+              {
+                "lo_hz": 2304000000,
+                "hi_hz": 2304100000,
+                "use": "mixed"
+              },
+              {
+                "lo_hz": 2304100000,
+                "hi_hz": 2304300000,
+                "use": "voice"
+              },
+              {
+                "lo_hz": 2304300000,
+                "hi_hz": 2304400000,
+                "use": "cw"
+              },
+              {
+                "lo_hz": 2304400000,
+                "hi_hz": 2304750000,
+                "use": "voice"
+              }
+            ]
+          },
+          {
+            "name": "13 cm Satellite",
+            "chip": "13s",
+            "lo_hz": 2400000000,
+            "hi_hz": 2410000000,
+            "home_hz": 2400500000,
+            "mode": "USB",
+            "segments": [
+              {
+                "lo_hz": 2400000000,
+                "hi_hz": 2410000000,
+                "use": "mixed"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "S 9 cm (not US)",
+        "color": [
+          120,
+          110,
+          170
+        ],
+        "bands": [
+          {
+            "name": "9 cm EME",
+            "chip": "9w",
+            "lo_hz": 3400000000,
+            "hi_hz": 3402000000,
+            "home_hz": 3400100000,
+            "mode": "USB",
+            "segments": [
+              {
+                "lo_hz": 3400000000,
+                "hi_hz": 3402000000,
+                "use": "mixed"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "C 5 cm",
+        "color": [
+          176,
+          96,
+          96
+        ],
+        "bands": [
+          {
+            "name": "5 cm Sat Uplink",
+            "chip": "5su",
+            "lo_hz": 5650000000,
+            "hi_hz": 5668000000,
+            "home_hz": 5659000000,
+            "mode": "USB",
+            "segments": [
+              {
+                "lo_hz": 5650000000,
+                "hi_hz": 5668000000,
+                "use": "mixed"
+              }
+            ]
+          },
+          {
+            "name": "5 cm EME/Weak",
+            "chip": "5w",
+            "lo_hz": 5760000000,
+            "hi_hz": 5760800000,
+            "home_hz": 5760100000,
+            "mode": "USB",
+            "segments": [
+              {
+                "lo_hz": 5760000000,
+                "hi_hz": 5760050000,
+                "use": "mixed"
+              },
+              {
+                "lo_hz": 5760050000,
+                "hi_hz": 5760150000,
+                "use": "mixed"
+              },
+              {
+                "lo_hz": 5760150000,
+                "hi_hz": 5760800000,
+                "use": "mixed"
+              }
+            ]
+          },
+          {
+            "name": "5 cm Sat Downlink",
+            "chip": "5sd",
+            "lo_hz": 5830000000,
+            "hi_hz": 5850000000,
+            "home_hz": 5840000000,
+            "mode": "USB",
+            "segments": [
+              {
+                "lo_hz": 5830000000,
+                "hi_hz": 5850000000,
+                "use": "mixed"
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "channels": {
+    "version": 1,
+    "zones": [
+      {
+        "name": "ISS",
+        "channels": [
+          {
+            "name": "ISS Voice DL 145.800",
+            "hz": 145800000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "ISS APRS 145.825",
+            "hz": 145825000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "ISS SSTV 437.550",
+            "hz": 437550000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "ISS Rptr DL 437.800",
+            "hz": 437800000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "ISS UHF Pkt 437.825",
+            "hz": 437825000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          }
+        ]
+      },
+      {
+        "name": "FM Sats (check AMSAT status)",
+        "channels": [
+          {
+            "name": "PO-101 DL 145.900",
+            "hz": 145900000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "AO-91 DL 145.960",
+            "hz": 145960000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "AO-123 DL 435.400",
+            "hz": 435400000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "IO-86 DL 435.880",
+            "hz": 435880000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "TEVEL2 DL 436.400",
+            "hz": 436400000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "SO-50 DL 436.795",
+            "hz": 436795000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "RS95S DL 436.950",
+            "hz": 436950000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "CAS-3H DL 437.200",
+            "hz": 437200000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          }
+        ]
+      },
+      {
+        "name": "Weak-signal / EME calling",
+        "channels": [
+          {
+            "name": "2m SSB call 144.200",
+            "hz": 144200000,
+            "mode": "USB",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "70cm call 432.100",
+            "hz": 432100000,
+            "mode": "USB",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "23cm call 1296.100",
+            "hz": 1296100000,
+            "mode": "USB",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "13cm call 2304.100",
+            "hz": 2304100000,
+            "mode": "USB",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "9cm EME 3400.100",
+            "hz": 3400100000,
+            "mode": "USB",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "5cm EME 5760.100",
+            "hz": 5760100000,
+            "mode": "USB",
+            "control": false,
+            "encrypted": false
+          }
+        ]
+      }
+    ]
+  },
+  "talkgroups": {
+    "version": 1,
+    "zones": [
+      {
+        "name": "Talkgroups",
+        "talkgroups": []
+      }
+    ]
+  },
+  "tune": {
+    "show_spread": true,
+    "step_hz": 100,
+    "zone_sel": 1,
+    "band_sel": 2,
+    "band_mem": {},
+    "host": "127.0.0.1",
+    "port": "4532",
+    "freq_hz": 145800000,
+    "mode": "FM",
+    "passband_hz": 15000,
+    "sub_freq_hz": 0,
+    "sub_mode": "",
+    "rit_hz": 0,
+    "split": false
+  },
+  "levels": {},
+  "radios": [
+    {
+      "driver": "hackrf",
+      "name": "HackRF",
+      "model": 0,
+      "device": "",
+      "park": false,
+      "follow": false,
+      "audio": {
+        "input": "",
+        "output": "",
+        "rx": true,
+        "tx": false
+      }
+    }
+  ],
+  "audio": {
+    "devices": [],
+    "links": []
+  },
+  "rotators": [
+    {
+      "name": "Dummy",
+      "model": 1
+    }
+  ],
+  "page": "Channels"
+}
