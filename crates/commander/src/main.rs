@@ -380,10 +380,22 @@ struct App {
     /// Last decoder stderr lines per radio. The hub queue is drained for
     /// the follower, so this is what the Automation frame shows.
     cc_tail: HashMap<u64, Vec<String>>,
+    /// Show registration, authentication, and other housekeeping lines in
+    /// the decoder log. Off at launch; the radio list keeps their facts.
+    show_housekeeping: bool,
+    /// Talkgroups with a recent grant or voice, for the TG list tint.
+    tg_recent: pulse::Recent,
+    /// Last direct call logged per radio, so grant updates do not repeat it.
+    direct_seen: HashMap<u64, (u32, u32, std::time::Instant)>,
+    /// Last decoded voice frame per radio (LDU1/LDU2, 4V/2V). A grant alone
+    /// is not voice.
+    voice_frames: HashMap<u64, std::time::Instant>,
     /// Last Phase 1 sync identity per radio, for the scanner face.
     cc_site: HashMap<u64, follow::SiteBanner>,
     /// Callsign, talkgroup, and access code from decoder text. Not a tune.
     cc_identity: HashMap<u64, follow::AirIdentity>,
+    /// Which trunking lines may reach `cc_identity`.
+    identity_gate: HashMap<u64, follow::IdentityGate>,
     /// Last invert flag sent per radio. The channel file owns the value.
     invert_sent: HashMap<u64, bool>,
     /// Trunking-system time as a skew from this machine's clock.
@@ -1250,6 +1262,18 @@ fn tab_color(index: usize) -> egui::Color32 {
 
 /// Caution text. This is the theme alert, which is also the Meters bar.
 /// It is not a separate caution role. See the rustcars issue for that gap.
+/// Steady amber edge on a talkgroup or zone row with recent traffic. It is
+/// the non-motion cue and fades with the traffic level.
+fn recent_bar(ui: &egui::Ui, rect: egui::Rect, level: f32) {
+    if level <= 0.0 {
+        return;
+    }
+    let bar = egui::Rect::from_min_size(rect.min, egui::vec2(3.0, rect.height()));
+    let alpha = 0.35 + 0.65 * level.clamp(0.0, 1.0);
+    ui.painter()
+        .rect_filled(bar, egui::CornerRadius::ZERO, caution().gamma_multiply(alpha));
+}
+
 fn caution() -> egui::Color32 {
     rustcars::LcarsTheme::default().alert
 }
@@ -1881,8 +1905,13 @@ impl App {
             hackrf_scan_center: 0.0,
             feeds: HashMap::new(),
             cc_tail: HashMap::new(),
+            show_housekeeping: false,
+            tg_recent: pulse::Recent::default(),
+            direct_seen: HashMap::new(),
+            voice_frames: HashMap::new(),
             cc_site: HashMap::new(),
             cc_identity: HashMap::new(),
+            identity_gate: HashMap::new(),
             invert_sent: HashMap::new(),
             system_clock: clock::SystemClock::default(),
             config_path: String::new(),
@@ -3742,9 +3771,124 @@ impl App {
         }
     }
 
+    /// Grants, direct calls, and radio sightings from one batch of decoder
+    /// events. `true` means the talkgroup or radio file gained something.
+    fn note_trunk_events(&mut self, id: u64, parsed: &[follow::CcEvent]) -> bool {
+        let now = std::time::Instant::now();
+        let mut added = false;
+        let mut direct: Vec<(f64, u32)> = Vec::new();
+        for event in parsed {
+            match event {
+                follow::CcEvent::Direct { src, tgt, hz, encrypted } => {
+                    if let Some(hz) = hz {
+                        direct.push((*hz, *tgt));
+                    }
+                    self.note_direct(id, *src, *tgt, *hz, *encrypted, now);
+                }
+                follow::CcEvent::Grant { hz, tg, alg } => {
+                    // A direct call's grant carries the called radio as its
+                    // "talkgroup". It is not a talkgroup.
+                    if direct.iter().any(|(dhz, dtg)| dtg == tg && (dhz - hz).abs() < 1.0) {
+                        continue;
+                    }
+                    // A grant alone is the weaker "granted" mark.
+                    self.tg_recent.grant(*tg, now);
+                    let encrypted = *alg != follow::CLEAR_ALG;
+                    if talkgroups::note_seen(&mut self.talkgroups, *tg, encrypted) {
+                        added = true;
+                    }
+                }
+                follow::CcEvent::Unit(sight) => {
+                    if units::note(&mut self.units, sight) {
+                        added = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        added
+    }
+
+    fn unit_label(&self, id: u32) -> String {
+        match self.units.iter().find(|unit| unit.id == id) {
+            Some(unit) if !unit.description.is_empty() && unit.description != id.to_string() => {
+                format!("{id} ({})", unit.description)
+            }
+            _ => id.to_string(),
+        }
+    }
+
+    /// Log a direct call once per pair, again after ten quiet seconds.
+    fn note_direct(
+        &mut self,
+        id: u64,
+        src: u32,
+        tgt: u32,
+        hz: Option<f64>,
+        encrypted: bool,
+        now: std::time::Instant,
+    ) {
+        if let Some((s, t, at)) = self.direct_seen.get(&id) {
+            if *s == src && *t == tgt && now.saturating_duration_since(*at).as_secs() < 10 {
+                self.direct_seen.insert(id, (src, tgt, now));
+                return;
+            }
+        }
+        self.direct_seen.insert(id, (src, tgt, now));
+        let line =
+            follow::direct_summary(&self.unit_label(src), &self.unit_label(tgt), hz, encrypted);
+        self.cc_tail.entry(id).or_default().push(line);
+    }
+
+    fn note_voice_frames(&mut self, id: u64, events: &[follow::CcEvent]) {
+        if events.iter().any(|event| matches!(event, follow::CcEvent::Voice)) {
+            self.voice_frames.insert(id, std::time::Instant::now());
+        }
+    }
+
+    /// Voice frames were decoded on this radio within the pulse hang.
+    fn hearing_voice(&self, id: u64, now: std::time::Instant) -> bool {
+        self.voice_frames
+            .get(&id)
+            .is_some_and(|at| now.saturating_duration_since(*at) <= pulse::HANG)
+    }
+
+    fn talkgroup_encrypted(&self, tg: u32) -> bool {
+        self.talkgroups
+            .zones
+            .iter()
+            .flat_map(|zone| zone.talkgroups.iter())
+            .any(|row| row.tg == tg && row.encrypted)
+    }
+
+    /// A followed call. The tab pulses and the row is fully lit only while
+    /// voice frames are decoded; a grant alone gets the weaker mark.
+    fn mark_call(&mut self, id: u64, tg: u32, now: std::time::Instant) {
+        let voice = self.hearing_voice(id, now);
+        if voice {
+            self.voice_pulse.hear_talkgroup(id, tg, now);
+        }
+        if self.is_direct_target(id, tg, now) {
+            return;
+        }
+        if voice {
+            self.tg_recent.note(tg, now);
+        } else {
+            self.tg_recent.grant(tg, now);
+        }
+    }
+
+    /// A followed direct call reports the called radio as its talkgroup.
+    fn is_direct_target(&self, radio: u64, tg: u32, now: std::time::Instant) -> bool {
+        self.direct_seen.get(&radio).is_some_and(|(_, t, at)| {
+            *t == tg && now.saturating_duration_since(*at).as_secs() < 30
+        })
+    }
+
     /// Conventional hold, or a clear voice grant. A control channel is not a mark.
     fn note_voice(&mut self, now: std::time::Instant) {
         self.voice_pulse.prune(now);
+        self.tg_recent.prune(now);
         if let Some((zone, index)) = self.memory_scan.hold_memory() {
             let control = self
                 .channels
@@ -3762,7 +3906,7 @@ impl App {
             .filter_map(|(id, follower)| follower.active_tg().map(|tg| (*id, tg)))
             .collect();
         for (id, tg) in grants {
-            self.voice_pulse.hear_talkgroup(id, tg, now);
+            self.mark_call(id, tg, now);
         }
         let calls: Vec<(u64, u32)> = self
             .hackrf_call
@@ -3770,7 +3914,7 @@ impl App {
             .filter_map(|(id, call)| call.map(|(_, tg)| (*id, tg)))
             .collect();
         for (id, tg) in calls {
-            self.voice_pulse.hear_talkgroup(id, tg, now);
+            self.mark_call(id, tg, now);
         }
     }
 
@@ -7554,7 +7698,9 @@ impl App {
                 plains.push(plain.to_string());
                 tail.push(plain.to_string());
             }
-            const CAP: usize = 80;
+            // Housekeeping lines are hidden at display time, so keep enough
+            // behind them for the visible tail.
+            const CAP: usize = 240;
             if tail.len() > CAP {
                 let extra = tail.len() - CAP;
                 tail.drain(0..extra);
@@ -7572,7 +7718,7 @@ impl App {
             }
             self.cc_site.insert(id, banner);
         }
-        self.note_identity(id, lines);
+        self.note_trunk_identity(id, lines);
         let now = clock::unix_now_ms();
         for plain in plains {
             self.system_clock.note_line(&plain, now);
@@ -7581,9 +7727,20 @@ impl App {
 
     /// Rolling stderr from the P25 decoder. Empty means the pipe has not
     /// written a line yet, not that the log was discarded.
-    fn decoder_log(&self, ui: &mut egui::Ui, id: u64, radio: &str) {
-        ui.label(format!("{radio} decoder"));
-        let lines = self.cc_tail.get(&id).cloned().unwrap_or_default();
+    fn decoder_log(&mut self, ui: &mut egui::Ui, id: u64, radio: &str) {
+        let all = self.cc_tail.get(&id).cloned().unwrap_or_default();
+        let (lines, hidden) = follow::visible_lines(&all, self.show_housekeeping, 80);
+        ui.horizontal(|ui| {
+            ui.label(format!("{radio} decoder"));
+            let label = if hidden > 0 {
+                format!("Show housekeeping ({hidden} hidden)")
+            } else {
+                "Show housekeeping".to_string()
+            };
+            ui.checkbox(&mut self.show_housekeeping, label).on_hover_text(
+                "Registrations, deregistrations, authentication, affiliation queries, status and acknowledgements. Their facts still go to the radio list.",
+            );
+        });
         egui::ScrollArea::vertical()
             .id_salt(("cc-log", id))
             .max_height(140.0)
@@ -7596,7 +7753,12 @@ impl App {
                     );
                 } else {
                     for line in &lines {
-                        ui.label(egui::RichText::new(line).monospace().size(11.0));
+                        let text = egui::RichText::new(*line).monospace().size(11.0);
+                        if line.starts_with("DIRECT ") {
+                            ui.label(text.color(caution()).strong());
+                        } else {
+                            ui.label(text);
+                        }
                     }
                 }
             });
@@ -7702,6 +7864,34 @@ impl App {
         }
     }
 
+    /// Trunking decoder lines. Only call evidence reaches the glass; a
+    /// terminator clears the last call so an idle control channel is idle.
+    fn note_trunk_identity(&mut self, id: u64, lines: &[String]) {
+        if lines.is_empty() {
+            return;
+        }
+        let gate = self.identity_gate.entry(id).or_default();
+        let mut admitted = Vec::new();
+        let mut ended = false;
+        for line in lines {
+            let plain = follow::plain_line(line);
+            if follow::is_call_end(&plain) {
+                ended = true;
+                admitted.clear();
+                continue;
+            }
+            if gate.admit(line) {
+                admitted.push(line.clone());
+            }
+        }
+        if ended {
+            if let Some(ident) = self.cc_identity.get_mut(&id) {
+                follow::clear_call(ident);
+            }
+        }
+        self.note_identity(id, &admitted);
+    }
+
     fn note_identity(&mut self, id: u64, lines: &[String]) {
         if lines.is_empty() {
             return;
@@ -7780,6 +7970,7 @@ impl App {
             if feed_reset {
                 self.cc_identity.remove(&id);
             }
+            self.note_voice_frames(id, &parsed);
             let mut added = false;
             if let Some(zone) = self.channels.zones.get_mut(self.channel_zone) {
                 for event in &parsed {
@@ -7790,21 +7981,8 @@ impl App {
                     }
                 }
             }
-            for event in &parsed {
-                match event {
-                    follow::CcEvent::Grant { tg, alg, .. } => {
-                        let encrypted = *alg != follow::CLEAR_ALG;
-                        if talkgroups::note_seen(&mut self.talkgroups, *tg, encrypted) {
-                            added = true;
-                        }
-                    }
-                    follow::CcEvent::Unit(sight) => {
-                        if units::note(&mut self.units, sight) {
-                            added = true;
-                        }
-                    }
-                    _ => {}
-                }
+            if self.note_trunk_events(id, &parsed) {
+                added = true;
             }
             // A crash never reaches the window close. A new memory is written
             // when it is inserted, or the next launch loses it.
@@ -8048,6 +8226,7 @@ impl App {
                     voice_events.extend(feed.push_line(line));
                 }
             }
+            self.note_voice_frames(id, &voice_events);
             let mut added = false;
             if let Some(zone) = self.channels.zones.get_mut(self.channel_zone) {
                 for event in &parsed {
@@ -8058,21 +8237,8 @@ impl App {
                     }
                 }
             }
-            for event in &parsed {
-                match event {
-                    follow::CcEvent::Grant { tg, alg, .. } => {
-                        let encrypted = *alg != follow::CLEAR_ALG;
-                        if talkgroups::note_seen(&mut self.talkgroups, *tg, encrypted) {
-                            added = true;
-                        }
-                    }
-                    follow::CcEvent::Unit(sight) => {
-                        if units::note(&mut self.units, sight) {
-                            added = true;
-                        }
-                    }
-                    _ => {}
-                }
+            if self.note_trunk_events(id, &parsed) {
+                added = true;
             }
             if added && !self.config_path.is_empty() {
                 self.save_config(snap);
@@ -8534,7 +8700,8 @@ impl App {
             } else {
                 "watching".to_string()
             };
-            (status, tg, live, false, hz)
+            let encrypted = tg.is_some_and(|tg| self.talkgroup_encrypted(tg));
+            (status, tg, live, encrypted, hz)
         } else if let Some(follower) = self.followers.get(&id) {
             let active = follower.active_tg();
             let heard = follower.heard().cloned();
@@ -8556,6 +8723,13 @@ impl App {
         } else {
             ("follow is off".to_string(), None, false, false, None)
         };
+        // A grant is not audio. Say so rather than look like live voice.
+        let status = follow::call_status(
+            status,
+            live,
+            encrypted,
+            self.hearing_voice(id, std::time::Instant::now()),
+        );
         let system = self
             .channels
             .zones
@@ -9232,6 +9406,11 @@ impl App {
         let list_w = (total_w - gap * 2.0 - zone_w - editor_w).max(220.0);
         let editor_w = (total_w - gap * 2.0 - zone_w - list_w).max(0.0);
         let height = ui.available_height().max(80.0);
+        let recent_now = std::time::Instant::now();
+        if self.tg_recent.any(recent_now) {
+            // The tint decays; repaint slowly so it fades without a busy loop.
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+        }
         ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
                 ui.set_width(zone_w);
@@ -9251,6 +9430,11 @@ impl App {
                                     .any(|row| row.tg == tg)
                             });
                             let listed = self.monitor_zones.contains(&idx);
+                            let recent = self.talkgroups.zones[idx]
+                                .talkgroups
+                                .iter()
+                                .map(|row| self.tg_recent.level(row.tg, recent_now))
+                                .fold(0.0_f32, f32::max);
                             let (rect, response) = ui.allocate_exact_size(
                                 egui::vec2(ui.available_width(), 26.0),
                                 egui::Sense::click(),
@@ -9292,6 +9476,9 @@ impl App {
                                     egui::CornerRadius::ZERO,
                                     ui.visuals().faint_bg_color,
                                 );
+                            }
+                            if !decoding {
+                                recent_bar(ui, rect, recent);
                             }
                             ui.painter().text(
                                 rect.left_center() + egui::vec2(8.0, 0.0),
@@ -9391,6 +9578,7 @@ impl App {
         let followed = active == Some(row.tg);
         let listed = self.monitor_talkgroups.contains(&row.tg);
         let open = self.talkgroup_sel == idx;
+        let recent = self.tg_recent.level(row.tg, std::time::Instant::now());
         let (rect, response) =
             ui.allocate_exact_size(egui::vec2(ui.available_width(), 26.0), egui::Sense::click());
         let color = if listed && !followed {
@@ -9424,12 +9612,21 @@ impl App {
                 egui::CornerRadius::same(4),
                 HAM.gamma_multiply(0.28),
             );
+        } else if recent > 0.0 {
+            ui.painter().rect_filled(
+                rect,
+                egui::CornerRadius::same(4),
+                pulse::recent_fill(ui.visuals().panel_fill, recent),
+            );
         } else if idx % 2 == 1 {
             ui.painter().rect_filled(
                 rect,
                 egui::CornerRadius::ZERO,
                 ui.visuals().faint_bg_color,
             );
+        }
+        if !followed {
+            recent_bar(ui, rect, recent);
         }
         ui.painter().text(
             rect.left_center() + egui::vec2(8.0, 0.0),

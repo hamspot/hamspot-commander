@@ -53,6 +53,9 @@ pub enum CcEvent {
     Alg(u16),
     /// P25 terminator.
     End,
+    /// A decoded voice frame: Phase 1 `LDU1`/`LDU2`, Phase 2 `4V`/`2V`.
+    /// This is the evidence that audio is on the air, not just a grant.
+    Voice,
     /// Phase 1 frame sync is present.
     Sync,
     /// The decoder reported that sync is gone.
@@ -62,6 +65,16 @@ pub enum CcEvent {
     Adjacent { hz: f64, rfss: u32, site: u32 },
     /// A radio named on this control channel. The follower does not tune it.
     Unit(UnitSight),
+    /// A radio-to-radio (unit-to-unit) call from `src` to `tgt`. `hz` is the
+    /// voice channel when the grant printed one. A grant with a frequency is
+    /// also sent as [`CcEvent::Grant`] with the target as `tg`, so following
+    /// works as before. Voice-channel link control lines carry no frequency.
+    Direct {
+        src: u32,
+        tgt: u32,
+        hz: Option<f64>,
+        encrypted: bool,
+    },
     /// One decoder search finished without a lock.
     ///
     /// `dsd-fme` prints `Sync: no sync` only after it has already seen a
@@ -495,7 +508,10 @@ impl Follower {
             }
             CcEvent::SyncLost => self.on_sync_lost(),
             CcEvent::Search => self.on_search(),
-            CcEvent::Adjacent { .. } | CcEvent::Unit(_) => {}
+            CcEvent::Adjacent { .. }
+            | CcEvent::Unit(_)
+            | CcEvent::Direct { .. }
+            | CcEvent::Voice => {}
         }
     }
 
@@ -655,6 +671,9 @@ pub struct DsdFeed {
     /// An adjacent-site advertisement whose control frequency has not been
     /// read yet. The next `Frequency` line is that site's outbound channel.
     adjacent: Option<OpenAdjacent>,
+    /// The direct call last named on a voice channel. Link control repeats
+    /// it every superframe, so only a change is reported.
+    voice_direct: Option<(u32, u32)>,
 }
 
 #[derive(Clone, Debug)]
@@ -699,11 +718,30 @@ impl DsdFeed {
         }
         if is_tdu(&line) {
             out.push(CcEvent::End);
+            self.voice_direct = None;
+        }
+        if is_voice_frame(&line) {
+            out.push(CcEvent::Voice);
         }
         if let Some(alg) = alg_id(&line) {
             out.push(CcEvent::Alg(alg));
         }
         out.extend(unit_admin_events(&line));
+        if let Some((src, tgt)) = direct_voice(&line) {
+            if self.voice_direct != Some((src, tgt)) {
+                self.voice_direct = Some((src, tgt));
+                push_unit(&mut out, src, None, Some(tgt), false, false);
+                if tgt != src {
+                    push_unit(&mut out, tgt, None, Some(src), false, false);
+                }
+                out.push(CcEvent::Direct {
+                    src,
+                    tgt,
+                    hz: None,
+                    encrypted: line.contains("Encrypted"),
+                });
+            }
+        }
         if is_grant_header(&line) {
             // A grant starts a different message. An advertisement that never
             // printed its frequency must not take this grant's frequency.
@@ -716,7 +754,7 @@ impl DsdFeed {
                 target: None,
                 encrypted: line.contains("Encrypted"),
                 emergency: line.contains("Emergency"),
-                unit: line.contains("Unit to Unit Channel Grant"),
+                unit: line.contains("Unit to Unit"),
                 reported: false,
             });
         }
@@ -767,9 +805,14 @@ impl DsdFeed {
             self.emit_open_units(&mut out);
             if self.open.is_some() && line.contains("Base Frequency Not Found") {
                 // The source was already recorded. There is no voice frequency.
-                self.open = None;
+                if let Some(grant) = self.open.take() {
+                    push_direct(&mut out, &grant, None);
+                }
             } else if let Some(hz) = frequency_hz(&line) {
                 if let Some(grant) = self.open.take() {
+                    if hz > 0.0 {
+                        push_direct(&mut out, &grant, Some(hz));
+                    }
                     if let Some(tg) = grant.tg {
                         if hz > 0.0 {
                             out.push(CcEvent::Grant {
@@ -1148,7 +1191,7 @@ pub fn note_identity(id: &mut AirIdentity, raw: &str) {
     if let Some(value) = text_field(line, "SRC RID: ", &["DST RID:", "DST:", "SRC:"]) {
         id.src = value;
     } else if let Some(value) = text_field(line, "SRC: ", &["DST:", "RPT 1:", "RPT 2:"]) {
-        id.src = value;
+        id.src = id_token(value);
     }
     if let Some(n) = dec_after(line, "Src=") {
         if n != 0 {
@@ -1225,6 +1268,108 @@ pub fn note_identity(id: &mut AirIdentity, raw: &str) {
     if let Some(snr) = drm_snr(line) {
         id.code_label = "SNR".into();
         id.code = snr;
+    }
+}
+
+/// A radio id printed with trailing text, as in `9313016 REG_ACCEPT;`, is
+/// only the id. A callsign or alias (not starting with a digit) is kept.
+fn id_token(value: String) -> String {
+    if value.starts_with(|ch: char| ch.is_ascii_digit()) {
+        value
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect()
+    } else {
+        value
+    }
+}
+
+/// P25 control-channel messages that are not a call. Built from the
+/// `fprintf` text in the installed `dsd-fme` (`p25p2_vpdu.c`, `p25p1_tsbk.c`,
+/// `p25p1_pdu_trunking.c`, `p25_lcw.c`). Their `SRC:`/`TGT:`/`Target:` fields
+/// name a radio being registered, paged, or granted data, not a talkgroup.
+pub fn is_non_call(line: &str) -> bool {
+    if is_housekeeping(line) {
+        return true;
+    }
+    const MARKERS: [&str; 34] = [
+        "Deny Response",
+        "Telephone Interconnect",
+        "SNDCP",
+        "Data Channel",
+        "PD_GRANT",
+        "MAC Release",
+        "Extended Function Command",
+        "Radio Check",
+        "Radio Inhibit",
+        "Radio Uninhibit",
+        "Call Alert",
+        "Message Update",
+        "Group Regroup Add",
+        "Group Regroup Delete",
+        "Group Regroup Bitmap",
+        "Group Regroup Explicit Encryption",
+        "Talker Alias",
+        "Talker EOT",
+        "Call Termination",
+        "Adjacent Status Broadcast",
+        "Adjacent Site Status Broadcast",
+        "RFSS Status Broadcast",
+        "Network Status Broadcast",
+        "Secondary Control Channel Broadcast",
+        "System Service Broadcast",
+        "Synchronization Broadcast",
+        "Identifier Update",
+        "Channel Identifier",
+        "Group Affiliation",
+        "Location Registration",
+        "Answer Request",
+        "Emergency Alarm",
+        "Patch",
+        "Full SUID",
+    ];
+    MARKERS.iter().any(|marker| line.contains(marker))
+}
+
+/// A terminator or the decoder losing sync: the last call is over.
+pub fn is_call_end(line: &str) -> bool {
+    is_tdu(line) || line.contains("Sync: no sync") || line.contains("Call Termination")
+}
+
+/// Forget the talker, talkgroup, and encryption of the last call. The
+/// access code (NAC, color code) describes the channel and stays.
+pub fn clear_call(id: &mut AirIdentity) {
+    id.src.clear();
+    id.dst.clear();
+    id.tg = None;
+    id.rpt1.clear();
+    id.rpt2.clear();
+    id.encrypted = false;
+}
+
+/// Decides which trunking decoder lines may feed [`note_identity`], the
+/// scanner-glass source and talkgroup readout. A message header that is not
+/// a call also blocks its indented detail lines (`  CHAN: …; Target: n;`).
+#[derive(Clone, Debug, Default)]
+pub struct IdentityGate {
+    blocked: bool,
+}
+
+impl IdentityGate {
+    pub fn admit(&mut self, raw: &str) -> bool {
+        let line = strip_ansi(raw);
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        let detail = line.starts_with("  ")
+            || ["CHAN:", "CHAN-T:", "DSO:", "SVC:", "SVC ["]
+                .iter()
+                .any(|lead| trimmed.starts_with(lead));
+        if !detail {
+            self.blocked = is_non_call(trimmed);
+        }
+        !(self.blocked || is_non_call(trimmed))
     }
 }
 
@@ -1505,7 +1650,130 @@ fn is_grant_header(line: &str) -> bool {
     if line.contains("Connect Plus") {
         return false;
     }
-    line.contains("Group Voice Channel Grant") || line.contains("Unit to Unit Channel Grant")
+    // "Unit to Unit Channel Grant" is the abbreviated TSBK/vPDU form, with
+    // " Update" or " Extended" on the same line. "Unit to Unit Voice Channel
+    // Grant Update - Extended" is the Phase 1 multi-block form.
+    line.contains("Group Voice Channel Grant")
+        || line.contains("Unit to Unit Channel Grant")
+        || line.contains("Unit to Unit Voice Channel Grant")
+}
+
+/// A direct call on an open unit-to-unit grant. Nothing when either radio
+/// id was not printed.
+fn push_direct(out: &mut Vec<CcEvent>, grant: &OpenGrant, hz: Option<f64>) {
+    if !grant.unit {
+        return;
+    }
+    if let (Some(src), Some(tgt)) = (grant.source, grant.target) {
+        if src != 0 && tgt != 0 {
+            out.push(CcEvent::Direct {
+                src,
+                tgt,
+                hz,
+                encrypted: grant.encrypted,
+            });
+        }
+    }
+}
+
+/// `dsd-fme` frame info for a voice frame (`dsd_frame.c`, `p25p2_frame.c`).
+pub fn is_voice_frame(line: &str) -> bool {
+    if line.contains("Ignoring LDU2") {
+        return false;
+    }
+    line.contains(" LDU1") || line.contains(" LDU2") || line.contains(" 4V ") || line.ends_with(" 4V")
+        || line.contains(" 2V")
+}
+
+/// Source and target of a direct call named on a voice channel.
+///
+/// Phase 1 link control: ` Unit to Unit Voice Channel User - Target 456 Source 123`.
+/// Phase 2 MAC: ` VCH 0 - TGT: 456; SRC 123;  Unit to Unit Voice`.
+fn direct_voice(line: &str) -> Option<(u32, u32)> {
+    if line.contains("Unit to Unit Voice Channel User") {
+        let tgt = dec_after(line, " - Target ")?;
+        let src = dec_after(line, " Source ")?;
+        return (src != 0 && tgt != 0).then_some((src, tgt));
+    }
+    if line.contains("VCH ") && line.contains("Unit to Unit Voice") {
+        let tgt = dec_after(line, "TGT: ")?;
+        let src = dec_after(line, "SRC ")?;
+        return (src != 0 && tgt != 0).then_some((src, tgt));
+    }
+    None
+}
+
+/// Readout status for a followed call. `live` is a grant being followed;
+/// `voice` means voice frames were decoded within the hang.
+pub fn call_status(status: String, live: bool, encrypted: bool, voice: bool) -> String {
+    if !live {
+        return status;
+    }
+    if encrypted {
+        format!("{status} · ENC")
+    } else if voice {
+        status
+    } else {
+        format!("{status} · NO AUDIO")
+    }
+}
+
+/// One decoder-log line for a direct call, as in
+/// `DIRECT 123 → 456 · 853.5000 MHz · encrypted`. `src` and `tgt` are
+/// already labelled by the caller.
+pub fn direct_summary(src: &str, tgt: &str, hz: Option<f64>, encrypted: bool) -> String {
+    let mut text = format!("DIRECT {src} → {tgt}");
+    if let Some(hz) = hz {
+        text.push_str(&format!(" · {:.4} MHz", hz / 1_000_000.0));
+    } else {
+        text.push_str(" · on voice");
+    }
+    if encrypted {
+        text.push_str(" · encrypted");
+    }
+    text
+}
+
+/// The newest `cap` decoder-log lines to show, and how many housekeeping
+/// lines in `lines` were left out. `show_all` keeps every line.
+pub fn visible_lines(lines: &[String], show_all: bool, cap: usize) -> (Vec<&str>, usize) {
+    let mut hidden = 0;
+    let mut shown: Vec<&str> = Vec::new();
+    for line in lines {
+        if !show_all && is_housekeeping(line) {
+            hidden += 1;
+        } else {
+            shown.push(line);
+        }
+    }
+    if shown.len() > cap {
+        shown.drain(0..shown.len() - cap);
+    }
+    (shown, hidden)
+}
+
+/// Control-channel housekeeping that says nothing about who is talking:
+/// registrations, deregistrations, authentication, affiliation queries,
+/// status and vendor acknowledgements. The decoder log hides these by
+/// default. Their facts still reach the radio list through [`DsdFeed`].
+pub fn is_housekeeping(line: &str) -> bool {
+    const MARKERS: [&str; 14] = [
+        "Unit Registration",
+        "Unit Deregistration",
+        "REG_ACCEPT",
+        "REG_FAIL",
+        "REG_DENY",
+        "REG_REFUSED",
+        "Authentication Demand",
+        "Authentication FNE Response",
+        "Unit Authentication Command",
+        "Group Affiliation Query",
+        "Status Query",
+        "Status Update",
+        "Acknowledge Response",
+        "Queued Response",
+    ];
+    MARKERS.iter().any(|marker| line.contains(marker))
 }
 
 fn is_unit_admin(line: &str) -> bool {
@@ -1946,6 +2214,287 @@ mod tests {
     }
 
     #[test]
+    fn housekeeping_lines_are_recognised_and_calls_are_not() {
+        for line in [
+            " Unit Registration Response - SITE: 025 SRC_ID: 1725 SRC: 610191 REG_ACCEPT;",
+            " Unit Registration Response - WACN: BEE00; SYS: 6BD; SRC: 99 REG_DENY; - Extended;",
+            " Unit Registration - SRC: 3; TGT: 8;",
+            " Unit Deregistration Acknowlegement - WACN: BEE00; SYS: 6BD; SRC: 5",
+            " Authentication Demand;",
+            " Authentication FNE Response;",
+            " MFID 90 (Moto) Acknowledge Response: ",
+            " MFID 90 (Moto) Queued Response: ",
+            " Group Affiliation Query",
+            " Status Update",
+        ] {
+            assert!(is_housekeeping(line), "{line}");
+        }
+        for line in [
+            " Group Voice Channel Grant",
+            " Unit to Unit Channel Grant",
+            "  CHAN: 0125; SRC: 1; TGT: 42;",
+            "  Frequency [851.987500] MHz",
+            "DIRECT 1 → 42 · 851.9875 MHz",
+            "Sync: +P25p1  LDU1  ",
+        ] {
+            assert!(!is_housekeeping(line), "{line}");
+        }
+    }
+
+    #[test]
+    fn the_log_hides_housekeeping_unless_asked_and_counts_it() {
+        let lines: Vec<String> = [
+            " Group Voice Channel Grant",
+            " Unit Registration Response - SITE: 025 SRC_ID: 1 SRC: 2 REG_ACCEPT;",
+            " Unit Deregistration Acknowlegement - WACN: BEE00; SYS: 6BD; SRC: 5",
+            "  Frequency [851.987500] MHz",
+            "DIRECT 1 → 42 · on voice",
+        ]
+        .iter()
+        .map(|line| line.to_string())
+        .collect();
+        let (shown, hidden) = visible_lines(&lines, false, 80);
+        assert_eq!(hidden, 2);
+        assert_eq!(
+            shown,
+            vec![" Group Voice Channel Grant", "  Frequency [851.987500] MHz", "DIRECT 1 → 42 · on voice"]
+        );
+        let (all, none) = visible_lines(&lines, true, 80);
+        assert_eq!((all.len(), none), (5, 0));
+        let (tail, _) = visible_lines(&lines, false, 2);
+        assert_eq!(tail, vec!["  Frequency [851.987500] MHz", "DIRECT 1 → 42 · on voice"]);
+    }
+
+    #[test]
+    fn a_grant_alone_does_not_read_as_live_voice() {
+        let s = || "voice talkgroup 10035".to_string();
+        assert_eq!(call_status(s(), true, false, true), "voice talkgroup 10035");
+        assert_eq!(call_status(s(), true, false, false), "voice talkgroup 10035 · NO AUDIO");
+        assert_eq!(call_status(s(), true, true, true), "voice talkgroup 10035 · ENC");
+        assert_eq!(call_status("watching".into(), false, false, false), "watching");
+    }
+
+    #[test]
+    fn voice_frames_are_evidence_and_other_frames_are_not() {
+        assert!(is_voice_frame("Sync: +P25p1  LDU1  e:"));
+        assert!(is_voice_frame("Sync: +P25p1  LDU2  e:"));
+        assert!(is_voice_frame("Sync: +P25p2  4V 1 "));
+        assert!(is_voice_frame("Sync: +P25p2  2V"));
+        assert!(!is_voice_frame(" Ignoring LDU2 not preceeded by LDU1"));
+        assert!(!is_voice_frame("Sync: +P25p1  TSBK"));
+        assert!(!is_voice_frame(" Group Voice Channel Grant"));
+        let mut feed = DsdFeed::default();
+        assert!(feed.push_line("Sync: +P25p1  LDU1  ").contains(&CcEvent::Voice));
+    }
+
+    #[test]
+    fn direct_calls_in_every_printed_form_name_both_radios() {
+        // Abbreviated / update / extended vPDU (p25p2_vpdu.c).
+        let mut feed = DsdFeed::default();
+        let events = lines_of(
+            &mut feed,
+            &[
+                " Unit to Unit Channel Grant Update",
+                "  CHAN: 0125; SRC: 610191; TGT: 610096; ",
+                "  Frequency [851.987500] MHz",
+            ],
+        );
+        assert!(events.contains(&CcEvent::Direct {
+            src: 610191,
+            tgt: 610096,
+            hz: Some(851_987_500.0),
+            encrypted: false,
+        }));
+        // Phase 1 multi-block extended (p25p1_pdu_trunking.c).
+        let mut feed = DsdFeed::default();
+        let events = lines_of(
+            &mut feed,
+            &[
+                "  Encrypted Unit to Unit Voice Channel Grant Update - Extended",
+                "  SVC: 40; CHAN-T: 0125; CHAN-R: 0000; SRC: 123; TGT: 456; FULL SRC: 00BEE006-00000123; FULL TGT: 00BEE006-00000456;",
+                "  Frequency [852.500000] MHz",
+            ],
+        );
+        assert!(events.contains(&CcEvent::Direct {
+            src: 123,
+            tgt: 456,
+            hz: Some(852_500_000.0),
+            encrypted: true,
+        }));
+        assert!(events.contains(&peers_enc(123, 456)));
+        // A grant without a channel map still names the call.
+        let mut feed = DsdFeed::default();
+        let events = lines_of(
+            &mut feed,
+            &[
+                " Unit to Unit Channel Grant",
+                "  CHAN: 0125; SRC: 7; TGT: 9; ",
+                "  Base Frequency Not Found - Iden [1]",
+            ],
+        );
+        assert!(events.contains(&CcEvent::Direct { src: 7, tgt: 9, hz: None, encrypted: false }));
+        // Voice-channel link control repeats; it is reported once per call.
+        let mut feed = DsdFeed::default();
+        let events = lines_of(
+            &mut feed,
+            &[
+                " Unit to Unit Voice Channel User - Target 456 Source 123",
+                " Unit to Unit Voice Channel User - Target 456 Source 123",
+                " TDU",
+                " VCH 0 - TGT: 456; SRC 123;  Unit to Unit Voice",
+            ],
+        );
+        let directs = events
+            .iter()
+            .filter(|event| matches!(event, CcEvent::Direct { src: 123, tgt: 456, hz: None, .. }))
+            .count();
+        assert_eq!(directs, 2);
+        assert_eq!(
+            direct_summary("123", "456 (Engine 4)", Some(851_987_500.0), true),
+            "DIRECT 123 → 456 (Engine 4) · 851.9875 MHz · encrypted"
+        );
+        assert_eq!(direct_summary("1", "2", None, false), "DIRECT 1 → 2 · on voice");
+    }
+
+    fn peers_enc(id: u32, peer: u32) -> CcEvent {
+        CcEvent::Unit(UnitSight {
+            id,
+            last_tg: None,
+            peer: Some(peer),
+            emergency: false,
+            encrypted: true,
+            site: None,
+            wacn: None,
+            sys: None,
+            reg: None,
+        })
+    }
+
+    /// Non-call lines as the installed dsd-fme prints them (format strings
+    /// from p25p2_vpdu.c, p25p1_tsbk.c, p25p1_pdu_trunking.c, p25_lcw.c,
+    /// with sample numbers filled in). Detail lines keep their indentation.
+    const NON_CALL: &[&str] = &[
+        " Unit Registration Response - SITE: 025 SRC_ID: 1725 SRC: 9313016 REG_ACCEPT;",
+        " Unit Registration Response - SITE: 025 SRC_ID: 1725 SRC: 9313016 REG_FAIL;",
+        " Unit Registration Response - WACN: BEE00; SYS: 6BD; SRC: 9313016 REG_DENY; - Extended;",
+        " Unit Registration Response - WACN: BEE00; SYS: 6BD; SRC: 9313016 REG_REFUSED; - Extended;",
+        " Unit Registration - SRC: 9313016; TGT: 3013428;",
+        " Unit Deregistration Acknowlegement - WACN: BEE00; SYS: 6BD; SRC: 9313016",
+        " Authentication Demand;",
+        " Authentication FNE Response; - Extended;",
+        " Group Affiliation Query",
+        " Status Query",
+        " Status Update",
+        " Call Alert",
+        " Message Update – Source ID Extension Required",
+        " MFID 90 (Moto) Acknowledge Response: ",
+        " MFID 90 (Moto) Queued Response: ",
+        " MFID 90 (Moto) Deny Response: ",
+        " Extended Function Command: Class: 00; Operand: 7F; Arg/Src: 8E1D18; Target: 3013428; Radio Check; ",
+        " Extended Function Command: Class: 00; Operand: 7F; Arg/Src: 8E1D18; Target: 3013428; Radio Inhibit; ",
+        " Extended Function Command: Class: 00; Operand: 7E; Arg/Src: 8E1D18; Target: 3013428; Radio Uninhibit; ",
+        " Telephone Interconnect Voice Channel Grant Explicit",
+        "  CHAN: 0125; Timer: 3.000000 Seconds; Target: 3013428;",
+        " Telephone Interconnect Answer Request",
+        " SNDCP Data Channel Grant - Explicit",
+        "  DSO: 00; CHAN-T: 0125; CHAN-R: 0125; Target: 3013428;",
+        " SNDCP Data Page Request ",
+        "  DSO: 00; DAC: 00; Target: 3013428;",
+        " MAC Release:  Unforced; Call Preemption; RES1: 0; RES2: 0; TGT: 3013428; ",
+        " MFID90 (Moto) Group Regroup Add Command ",
+        " MFID90 (Moto) Group Regroup Delete",
+        " MFID A4 (Harris) Group Regroup Bitmap: ",
+        " MFID A4 (Harris) Group Regroup Explicit Encryption Command",
+        " MFID90 (Moto) Talker Alias Header",
+        " MFID90 (Moto) Talker EOT; SRC: 9313016;",
+        " MFIDA4 (Harris) Data Channel; SRC: 9313016; TGT: 3013428;",
+        " Adjacent Status Broadcast - Abbreviated",
+        "  RFSS[001] SITE[037] CHAN[0125] SSC[30]",
+        " Adjacent Status Broadcast - Extended",
+        " RFSS Status Broadcast - Explicit ",
+        " Network Status Broadcast - Abbreviated ",
+        " Secondary Control Channel Broadcast - Explicit",
+        " System Service Broadcast - Abbreviated ",
+        " Synchronization Broadcast",
+        " Identifier Update (8.3.1.23)",
+        " Identifier Update for TDMA - Abbreviated",
+        " Channel Identifier Update VU; Iden: 1; Base: 851006250;",
+        " Full SUID: 00BEE006-09313016",
+    ];
+
+    #[test]
+    fn non_call_lines_never_reach_the_readout() {
+        let mut gate = IdentityGate::default();
+        let mut ident = AirIdentity::default();
+        for line in NON_CALL {
+            if gate.admit(line) {
+                note_identity(&mut ident, line);
+            }
+            assert!(ident.src.is_empty(), "src from {line:?}: {:?}", ident.src);
+            assert_eq!(ident.tg, None, "tg from {line:?}");
+            assert!(ident.dst.is_empty(), "dst from {line:?}");
+        }
+        // No grant and no direct call either.
+        let mut feed = DsdFeed::default();
+        for line in NON_CALL {
+            for event in feed.push_line(line) {
+                assert!(
+                    !matches!(event, CcEvent::Grant { .. } | CcEvent::Direct { .. } | CcEvent::Voice),
+                    "{line:?} made {event:?}"
+                );
+            }
+        }
+        // The glass stays idle: no headline, no TGID.
+        let rows = glass_rows(None, &ident);
+        assert_eq!(rows.headline, None);
+        assert_eq!(rows.tgid, None);
+    }
+
+    #[test]
+    fn without_the_gate_a_registration_fills_the_glass() {
+        // The bug David saw: "9313016 REG_ACCEPT;" as the headline and the
+        // registration command's target as the TGID.
+        let mut ident = AirIdentity::default();
+        note_identity(&mut ident, " Unit Registration - SRC: 9313016; TGT: 3013428;");
+        assert_eq!(ident.tg, Some(3013428));
+        let mut ident = AirIdentity::default();
+        note_identity(&mut ident, " Unit Registration Response - SITE: 025 SRC_ID: 1725 SRC: 9313016 REG_ACCEPT;");
+        // The id token guard keeps only the number even without the gate.
+        assert_eq!(ident.src, "9313016");
+    }
+
+    #[test]
+    fn call_lines_still_reach_the_readout_and_a_terminator_clears_them() {
+        let mut gate = IdentityGate::default();
+        let mut ident = AirIdentity::default();
+        for line in [
+            " Network Status Broadcast - Abbreviated ",
+            " VCH 0 - TG: 10035; SRC: 610191; ",
+        ] {
+            if gate.admit(line) {
+                note_identity(&mut ident, line);
+            }
+        }
+        // The glass reads the talker; the talkgroup comes from the grant.
+        assert_eq!(ident.src, "610191");
+        // A detail line after a call header is admitted.
+        assert!(gate.admit(" Unit to Unit Channel Grant"));
+        assert!(gate.admit("  CHAN: 0125; SRC: 1; TGT: 42; "));
+        // A detail line after a non-call header is not.
+        assert!(!gate.admit(" SNDCP Data Channel Grant - Explicit"));
+        assert!(!gate.admit("  DSO: 00; CHAN-T: 0125; CHAN-R: 0125; Target: 9;"));
+        assert!(is_call_end(" TDU"));
+        assert!(is_call_end("Sync: no sync"));
+        ident.code_label = "NAC".into();
+        ident.code = "6B5".into();
+        ident.tg = Some(10035);
+        clear_call(&mut ident);
+        assert_eq!(ident.tg, None);
+        assert!(ident.src.is_empty());
+        assert_eq!(ident.code, "6B5");
+    }
+
+    #[test]
     fn decoder_lines_become_events() {
         let mut feed = DsdFeed::default();
         let mut events = Vec::new();
@@ -1981,6 +2530,12 @@ mod tests {
                 },
                 peers(1, 42),
                 peers(42, 1),
+                CcEvent::Direct {
+                    src: 1,
+                    tgt: 42,
+                    hz: Some(853_500_000.0),
+                    encrypted: false,
+                },
                 CcEvent::Grant {
                     hz: 853_500_000.0,
                     tg: 42,

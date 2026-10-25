@@ -148,6 +148,80 @@ impl Pulse {
     }
 }
 
+/// How long a talkgroup keeps a "recent traffic" tint after its last grant
+/// or voice. The tint is steady and fades in steps of the repaint, not a pulse.
+pub const RECENT: Duration = Duration::from_secs(90);
+/// Strongest tint added to a recently busy talkgroup row.
+pub const RECENT_PEAK: f32 = 0.22;
+
+/// Talkgroups with traffic. A grant or a voice frame marks one; the mark is
+/// full for [`HANG`] and then decays to nothing across [`RECENT`].
+#[derive(Default)]
+pub struct Recent {
+    heard: HashMap<u32, Instant>,
+    granted: HashMap<u32, Instant>,
+}
+
+/// A grant with no decoded voice reaches only this share of the full tint.
+pub const GRANT_ONLY: f32 = 0.4;
+
+fn decay(at: Option<&Instant>, now: Instant) -> f32 {
+    let Some(at) = at else {
+        return 0.0;
+    };
+    let age = now.saturating_duration_since(*at);
+    if age <= HANG {
+        return 1.0;
+    }
+    let past = (age - HANG).as_secs_f64() / RECENT.as_secs_f64();
+    (1.0 - past.clamp(0.0, 1.0)) as f32
+}
+
+impl Recent {
+    /// Voice frames were decoded on this talkgroup.
+    pub fn note(&mut self, tg: u32, now: Instant) {
+        if tg == 0 {
+            return;
+        }
+        self.heard.insert(tg, now);
+    }
+
+    /// A grant was seen. Weaker than voice: the call may be encrypted,
+    /// out of reach, or never decoded.
+    pub fn grant(&mut self, tg: u32, now: Instant) {
+        if tg == 0 {
+            return;
+        }
+        self.granted.insert(tg, now);
+    }
+
+    /// 1 while voice is live or within [`HANG`], falling to 0 at
+    /// `HANG + RECENT`. A grant alone peaks at [`GRANT_ONLY`].
+    pub fn level(&self, tg: u32, now: Instant) -> f32 {
+        let voice = decay(self.heard.get(&tg), now);
+        let grant = decay(self.granted.get(&tg), now) * GRANT_ONLY;
+        voice.max(grant)
+    }
+
+    pub fn any(&self, now: Instant) -> bool {
+        self.heard
+            .keys()
+            .chain(self.granted.keys())
+            .any(|tg| self.level(*tg, now) > 0.0)
+    }
+
+    pub fn prune(&mut self, now: Instant) {
+        let keep = |at: &mut Instant| now.saturating_duration_since(*at) <= HANG + RECENT;
+        self.heard.retain(|_, at| keep(at));
+        self.granted.retain(|_, at| keep(at));
+    }
+}
+
+/// Row fill for a talkgroup at `level` of recent traffic. Zero level keeps `base`.
+pub fn recent_fill(base: Color32, level: f32) -> Color32 {
+    rustcars::tint(base, RECENT_PEAK * level.clamp(0.0, 1.0))
+}
+
 fn fresh(slot: &Slot, now: Instant) -> bool {
     now.saturating_duration_since(slot.heard) <= HANG
 }
@@ -284,6 +358,41 @@ mod tests {
                 assert!(rustcars::contrast(bright, bg) >= 3.0);
             }
         }
+    }
+
+    #[test]
+    fn recent_traffic_holds_through_the_hang_and_then_decays() {
+        let mut recent = Recent::default();
+        let start = Instant::now();
+        assert_eq!(recent.level(100, start), 0.0);
+        recent.note(100, start);
+        recent.note(0, start);
+        assert_eq!(recent.level(0, start), 0.0);
+        assert_eq!(recent.level(100, start), 1.0);
+        assert_eq!(recent.level(100, start + HANG), 1.0);
+        let half = recent.level(100, start + HANG + RECENT / 2);
+        assert!((half - 0.5).abs() < 0.01);
+        assert!(recent.any(start + HANG + RECENT / 2));
+        assert_eq!(recent.level(100, start + HANG + RECENT), 0.0);
+        // A new grant refreshes the mark.
+        recent.note(100, start + HANG + RECENT / 2);
+        assert_eq!(recent.level(100, start + HANG * 2 + RECENT / 2), 1.0);
+        // A grant with no voice is the weaker mark.
+        recent.grant(200, start);
+        assert!((recent.level(200, start) - GRANT_ONLY).abs() < 0.001);
+        recent.note(200, start);
+        assert_eq!(recent.level(200, start), 1.0);
+        recent.prune(start + HANG * 2 + RECENT * 2);
+        assert!(!recent.any(start + HANG * 2 + RECENT * 2));
+    }
+
+    #[test]
+    fn the_recent_tint_keeps_text_contrast() {
+        let bg = rustcars::LcarsTheme::default().bg;
+        let filled = recent_fill(bg, 1.0);
+        let ink = rustcars::ink_on(bg);
+        assert!(rustcars::contrast(ink, filled) >= 4.5);
+        assert_eq!(recent_fill(bg, 0.0), rustcars::tint(bg, 0.0));
     }
 
     #[test]
