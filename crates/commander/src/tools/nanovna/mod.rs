@@ -1082,7 +1082,7 @@ impl NanoVna {
         } else {
             None
         };
-        let (left, right) = body_split(ui, theme, 330.0);
+        let (left, right) = body_split(ui, theme, 440.0);
         let mut caption = self.face_caption(live, trace.as_deref());
         if self.await_scan.is_some() && self.wizard.is_none() {
             caption = format!("Waiting for the NanoVNA. {caption}");
@@ -1332,17 +1332,17 @@ impl NanoVna {
 
     /// The instrument key panel down the left: FORMAT, DISPLAY, MARKER, SWEEP · CAL.
     fn softkeys(&mut self, ui: &mut Ui, theme: &LcarsTheme, live: &device::Live, samples: Option<&[Sample]>) {
-        ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
-        let width = ui.available_width().min(300.0);
-        let col2 = ((width - 6.0) / 2.0).floor();
-        let col4 = ((width - 18.0) / 4.0).floor();
+        ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
+        let width = ui.available_width().min(380.0);
+        let col2 = ((width - 8.0) / 2.0).floor();
+        let col4 = ((width - 24.0) / 4.0).floor();
 
         key_caption(ui, theme, "SWEEP · CAL", width);
         let mut scan = false;
         let mut toggle = false;
         let mut setup = false;
         ui.horizontal(|ui| {
-            scan = softkey(ui, theme, "Scan", false, col4 * 2.0 + 6.0);
+            scan = softkey(ui, theme, "Scan", false, col4 * 2.0 + 8.0);
             let run_label = if self.run { "Stop" } else { "Run" };
             toggle = softkey(ui, theme, run_label, self.run, col4);
             setup = softkey(ui, theme, "Setup", self.setup_open, col4);
@@ -3264,18 +3264,46 @@ fn softkey(ui: &mut Ui, theme: &LcarsTheme, label: &str, lit: bool, width: f32) 
 }
 
 fn softkey_enabled(ui: &mut Ui, theme: &LcarsTheme, label: &str, lit: bool, width: f32, enabled: bool) -> bool {
-    let color = if lit { palette::TAN } else { palette::SLATE };
-    rustcars::lcars_button(
-        ui,
-        theme,
-        label,
-        color,
-        vec2(width, 30.0),
-        rustcars::Cap::None,
-        enabled,
-    )
-    .clicked()
+    // A key cap: centered label with padding on every side. The label steps
+    // down in size before it is allowed to touch the edge of the cap.
+    const PAD: f32 = 8.0;
+    let base = if lit { palette::TAN } else { palette::SLATE };
+    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, KEY_H), sense);
+    let fill = if !enabled {
+        rustcars::tint(base, -0.6)
+    } else if resp.is_pointer_button_down_on() {
+        rustcars::tint(base, -0.25)
+    } else if resp.hovered() {
+        rustcars::tint(base, 0.3)
+    } else {
+        base
+    };
+    let painter = ui.painter();
+    painter.rect_filled(rect, 4.0, fill);
+    if resp.has_focus() {
+        painter.rect_stroke(
+            rect.shrink(2.0),
+            4.0,
+            Stroke::new(2.0, theme.text_hi),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let ink = rustcars::ink_on(fill);
+    let text = label.to_uppercase();
+    let mut size = (theme.header_size * 0.85).min(17.0);
+    let mut galley = painter.layout_no_wrap(text.clone(), egui::FontId::proportional(size), ink);
+    while galley.size().x > width - 2.0 * PAD && size > 9.0 {
+        size -= 1.0;
+        galley = painter.layout_no_wrap(text.clone(), egui::FontId::proportional(size), ink);
+    }
+    let at = rect.center() - galley.size() * 0.5;
+    painter.galley(at, galley, ink);
+    enabled && resp.clicked()
 }
+
+/// Height of one key cap in the left key panel.
+const KEY_H: f32 = 36.0;
 
 fn paint_chart(
     ui: &mut Ui,
