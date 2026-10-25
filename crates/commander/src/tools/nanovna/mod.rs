@@ -1332,9 +1332,10 @@ impl NanoVna {
 
     /// The instrument key panel down the left: FORMAT, DISPLAY, MARKER, SWEEP · CAL.
     fn softkeys(&mut self, ui: &mut Ui, theme: &LcarsTheme, live: &device::Live, samples: Option<&[Sample]>) {
-        ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
-        let width = ui.available_width().min(380.0);
-        let col2 = ((width - 8.0) / 2.0).floor();
+        ui.spacing_mut().item_spacing = vec2(8.0, 6.0);
+        // Leave room on the right for the scrollbar so it never covers a key.
+        let width = (ui.available_width() - 18.0).clamp(120.0, 380.0);
+        let col3 = ((width - 16.0) / 3.0).floor();
         let col4 = ((width - 24.0) / 4.0).floor();
 
         key_caption(ui, theme, "SWEEP · CAL", width);
@@ -1373,10 +1374,10 @@ impl NanoVna {
         }
 
         key_caption(ui, theme, "FORMAT", width);
-        for pair in VIEWS.chunks(2) {
+        for triple in VIEWS.chunks(3) {
             ui.horizontal(|ui| {
-                for (view, label) in pair {
-                    if softkey(ui, theme, label, self.view == *view, col2) {
+                for (view, label) in triple {
+                    if softkey(ui, theme, label, self.view == *view, col3) {
                         self.view = *view;
                     }
                 }
@@ -3303,7 +3304,7 @@ fn softkey_enabled(ui: &mut Ui, theme: &LcarsTheme, label: &str, lit: bool, widt
 }
 
 /// Height of one key cap in the left key panel.
-const KEY_H: f32 = 36.0;
+const KEY_H: f32 = 32.0;
 
 fn paint_chart(
     ui: &mut Ui,
