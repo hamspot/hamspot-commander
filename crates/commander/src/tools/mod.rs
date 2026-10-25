@@ -379,7 +379,7 @@ pub(crate) fn header_key(
         egui::Align2::RIGHT_BOTTOM,
         label.to_uppercase(),
         egui::FontId::proportional(theme.header_size),
-        theme.text_hi,
+        palette::TAN,
     );
     let enabled = ui.is_enabled();
     let l = label.to_owned();
