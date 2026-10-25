@@ -1191,7 +1191,7 @@ pub fn note_identity(id: &mut AirIdentity, raw: &str) {
     if let Some(value) = text_field(line, "SRC RID: ", &["DST RID:", "DST:", "SRC:"]) {
         id.src = value;
     } else if let Some(value) = text_field(line, "SRC: ", &["DST:", "RPT 1:", "RPT 2:"]) {
-        id.src = value;
+        id.src = id_token(value);
     }
     if let Some(n) = dec_after(line, "Src=") {
         if n != 0 {
@@ -1268,6 +1268,108 @@ pub fn note_identity(id: &mut AirIdentity, raw: &str) {
     if let Some(snr) = drm_snr(line) {
         id.code_label = "SNR".into();
         id.code = snr;
+    }
+}
+
+/// A radio id printed with trailing text, as in `9313016 REG_ACCEPT;`, is
+/// only the id. A callsign or alias (not starting with a digit) is kept.
+fn id_token(value: String) -> String {
+    if value.starts_with(|ch: char| ch.is_ascii_digit()) {
+        value
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect()
+    } else {
+        value
+    }
+}
+
+/// P25 control-channel messages that are not a call. Built from the
+/// `fprintf` text in the installed `dsd-fme` (`p25p2_vpdu.c`, `p25p1_tsbk.c`,
+/// `p25p1_pdu_trunking.c`, `p25_lcw.c`). Their `SRC:`/`TGT:`/`Target:` fields
+/// name a radio being registered, paged, or granted data, not a talkgroup.
+pub fn is_non_call(line: &str) -> bool {
+    if is_housekeeping(line) {
+        return true;
+    }
+    const MARKERS: [&str; 34] = [
+        "Deny Response",
+        "Telephone Interconnect",
+        "SNDCP",
+        "Data Channel",
+        "PD_GRANT",
+        "MAC Release",
+        "Extended Function Command",
+        "Radio Check",
+        "Radio Inhibit",
+        "Radio Uninhibit",
+        "Call Alert",
+        "Message Update",
+        "Group Regroup Add",
+        "Group Regroup Delete",
+        "Group Regroup Bitmap",
+        "Group Regroup Explicit Encryption",
+        "Talker Alias",
+        "Talker EOT",
+        "Call Termination",
+        "Adjacent Status Broadcast",
+        "Adjacent Site Status Broadcast",
+        "RFSS Status Broadcast",
+        "Network Status Broadcast",
+        "Secondary Control Channel Broadcast",
+        "System Service Broadcast",
+        "Synchronization Broadcast",
+        "Identifier Update",
+        "Channel Identifier",
+        "Group Affiliation",
+        "Location Registration",
+        "Answer Request",
+        "Emergency Alarm",
+        "Patch",
+        "Full SUID",
+    ];
+    MARKERS.iter().any(|marker| line.contains(marker))
+}
+
+/// A terminator or the decoder losing sync: the last call is over.
+pub fn is_call_end(line: &str) -> bool {
+    is_tdu(line) || line.contains("Sync: no sync") || line.contains("Call Termination")
+}
+
+/// Forget the talker, talkgroup, and encryption of the last call. The
+/// access code (NAC, color code) describes the channel and stays.
+pub fn clear_call(id: &mut AirIdentity) {
+    id.src.clear();
+    id.dst.clear();
+    id.tg = None;
+    id.rpt1.clear();
+    id.rpt2.clear();
+    id.encrypted = false;
+}
+
+/// Decides which trunking decoder lines may feed [`note_identity`], the
+/// scanner-glass source and talkgroup readout. A message header that is not
+/// a call also blocks its indented detail lines (`  CHAN: …; Target: n;`).
+#[derive(Clone, Debug, Default)]
+pub struct IdentityGate {
+    blocked: bool,
+}
+
+impl IdentityGate {
+    pub fn admit(&mut self, raw: &str) -> bool {
+        let line = strip_ansi(raw);
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        let detail = line.starts_with("  ")
+            || ["CHAN:", "CHAN-T:", "DSO:", "SVC:", "SVC ["]
+                .iter()
+                .any(|lead| trimmed.starts_with(lead));
+        if !detail {
+            self.blocked = is_non_call(trimmed);
+        }
+        !(self.blocked || is_non_call(trimmed))
     }
 }
 
@@ -2266,6 +2368,130 @@ mod tests {
             sys: None,
             reg: None,
         })
+    }
+
+    /// Non-call lines as the installed dsd-fme prints them (format strings
+    /// from p25p2_vpdu.c, p25p1_tsbk.c, p25p1_pdu_trunking.c, p25_lcw.c,
+    /// with sample numbers filled in). Detail lines keep their indentation.
+    const NON_CALL: &[&str] = &[
+        " Unit Registration Response - SITE: 025 SRC_ID: 1725 SRC: 9313016 REG_ACCEPT;",
+        " Unit Registration Response - SITE: 025 SRC_ID: 1725 SRC: 9313016 REG_FAIL;",
+        " Unit Registration Response - WACN: BEE00; SYS: 6BD; SRC: 9313016 REG_DENY; - Extended;",
+        " Unit Registration Response - WACN: BEE00; SYS: 6BD; SRC: 9313016 REG_REFUSED; - Extended;",
+        " Unit Registration - SRC: 9313016; TGT: 3013428;",
+        " Unit Deregistration Acknowlegement - WACN: BEE00; SYS: 6BD; SRC: 9313016",
+        " Authentication Demand;",
+        " Authentication FNE Response; - Extended;",
+        " Group Affiliation Query",
+        " Status Query",
+        " Status Update",
+        " Call Alert",
+        " Message Update – Source ID Extension Required",
+        " MFID 90 (Moto) Acknowledge Response: ",
+        " MFID 90 (Moto) Queued Response: ",
+        " MFID 90 (Moto) Deny Response: ",
+        " Extended Function Command: Class: 00; Operand: 7F; Arg/Src: 8E1D18; Target: 3013428; Radio Check; ",
+        " Extended Function Command: Class: 00; Operand: 7F; Arg/Src: 8E1D18; Target: 3013428; Radio Inhibit; ",
+        " Extended Function Command: Class: 00; Operand: 7E; Arg/Src: 8E1D18; Target: 3013428; Radio Uninhibit; ",
+        " Telephone Interconnect Voice Channel Grant Explicit",
+        "  CHAN: 0125; Timer: 3.000000 Seconds; Target: 3013428;",
+        " Telephone Interconnect Answer Request",
+        " SNDCP Data Channel Grant - Explicit",
+        "  DSO: 00; CHAN-T: 0125; CHAN-R: 0125; Target: 3013428;",
+        " SNDCP Data Page Request ",
+        "  DSO: 00; DAC: 00; Target: 3013428;",
+        " MAC Release:  Unforced; Call Preemption; RES1: 0; RES2: 0; TGT: 3013428; ",
+        " MFID90 (Moto) Group Regroup Add Command ",
+        " MFID90 (Moto) Group Regroup Delete",
+        " MFID A4 (Harris) Group Regroup Bitmap: ",
+        " MFID A4 (Harris) Group Regroup Explicit Encryption Command",
+        " MFID90 (Moto) Talker Alias Header",
+        " MFID90 (Moto) Talker EOT; SRC: 9313016;",
+        " MFIDA4 (Harris) Data Channel; SRC: 9313016; TGT: 3013428;",
+        " Adjacent Status Broadcast - Abbreviated",
+        "  RFSS[001] SITE[037] CHAN[0125] SSC[30]",
+        " Adjacent Status Broadcast - Extended",
+        " RFSS Status Broadcast - Explicit ",
+        " Network Status Broadcast - Abbreviated ",
+        " Secondary Control Channel Broadcast - Explicit",
+        " System Service Broadcast - Abbreviated ",
+        " Synchronization Broadcast",
+        " Identifier Update (8.3.1.23)",
+        " Identifier Update for TDMA - Abbreviated",
+        " Channel Identifier Update VU; Iden: 1; Base: 851006250;",
+        " Full SUID: 00BEE006-09313016",
+    ];
+
+    #[test]
+    fn non_call_lines_never_reach_the_readout() {
+        let mut gate = IdentityGate::default();
+        let mut ident = AirIdentity::default();
+        for line in NON_CALL {
+            if gate.admit(line) {
+                note_identity(&mut ident, line);
+            }
+            assert!(ident.src.is_empty(), "src from {line:?}: {:?}", ident.src);
+            assert_eq!(ident.tg, None, "tg from {line:?}");
+            assert!(ident.dst.is_empty(), "dst from {line:?}");
+        }
+        // No grant and no direct call either.
+        let mut feed = DsdFeed::default();
+        for line in NON_CALL {
+            for event in feed.push_line(line) {
+                assert!(
+                    !matches!(event, CcEvent::Grant { .. } | CcEvent::Direct { .. } | CcEvent::Voice),
+                    "{line:?} made {event:?}"
+                );
+            }
+        }
+        // The glass stays idle: no headline, no TGID.
+        let rows = glass_rows(None, &ident);
+        assert_eq!(rows.headline, None);
+        assert_eq!(rows.tgid, None);
+    }
+
+    #[test]
+    fn without_the_gate_a_registration_fills_the_glass() {
+        // The bug David saw: "9313016 REG_ACCEPT;" as the headline and the
+        // registration command's target as the TGID.
+        let mut ident = AirIdentity::default();
+        note_identity(&mut ident, " Unit Registration - SRC: 9313016; TGT: 3013428;");
+        assert_eq!(ident.tg, Some(3013428));
+        let mut ident = AirIdentity::default();
+        note_identity(&mut ident, " Unit Registration Response - SITE: 025 SRC_ID: 1725 SRC: 9313016 REG_ACCEPT;");
+        // The id token guard keeps only the number even without the gate.
+        assert_eq!(ident.src, "9313016");
+    }
+
+    #[test]
+    fn call_lines_still_reach_the_readout_and_a_terminator_clears_them() {
+        let mut gate = IdentityGate::default();
+        let mut ident = AirIdentity::default();
+        for line in [
+            " Network Status Broadcast - Abbreviated ",
+            " VCH 0 - TG: 10035; SRC: 610191; ",
+        ] {
+            if gate.admit(line) {
+                note_identity(&mut ident, line);
+            }
+        }
+        // The glass reads the talker; the talkgroup comes from the grant.
+        assert_eq!(ident.src, "610191");
+        // A detail line after a call header is admitted.
+        assert!(gate.admit(" Unit to Unit Channel Grant"));
+        assert!(gate.admit("  CHAN: 0125; SRC: 1; TGT: 42; "));
+        // A detail line after a non-call header is not.
+        assert!(!gate.admit(" SNDCP Data Channel Grant - Explicit"));
+        assert!(!gate.admit("  DSO: 00; CHAN-T: 0125; CHAN-R: 0125; Target: 9;"));
+        assert!(is_call_end(" TDU"));
+        assert!(is_call_end("Sync: no sync"));
+        ident.code_label = "NAC".into();
+        ident.code = "6B5".into();
+        ident.tg = Some(10035);
+        clear_call(&mut ident);
+        assert_eq!(ident.tg, None);
+        assert!(ident.src.is_empty());
+        assert_eq!(ident.code, "6B5");
     }
 
     #[test]

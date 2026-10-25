@@ -394,6 +394,8 @@ struct App {
     cc_site: HashMap<u64, follow::SiteBanner>,
     /// Callsign, talkgroup, and access code from decoder text. Not a tune.
     cc_identity: HashMap<u64, follow::AirIdentity>,
+    /// Which trunking lines may reach `cc_identity`.
+    identity_gate: HashMap<u64, follow::IdentityGate>,
     /// Last invert flag sent per radio. The channel file owns the value.
     invert_sent: HashMap<u64, bool>,
     /// Trunking-system time as a skew from this machine's clock.
@@ -1909,6 +1911,7 @@ impl App {
             voice_frames: HashMap::new(),
             cc_site: HashMap::new(),
             cc_identity: HashMap::new(),
+            identity_gate: HashMap::new(),
             invert_sent: HashMap::new(),
             system_clock: clock::SystemClock::default(),
             config_path: String::new(),
@@ -7715,7 +7718,7 @@ impl App {
             }
             self.cc_site.insert(id, banner);
         }
-        self.note_identity(id, lines);
+        self.note_trunk_identity(id, lines);
         let now = clock::unix_now_ms();
         for plain in plains {
             self.system_clock.note_line(&plain, now);
@@ -7859,6 +7862,34 @@ impl App {
             let lines = self.hub.take_identity(id);
             self.note_identity(id, &lines);
         }
+    }
+
+    /// Trunking decoder lines. Only call evidence reaches the glass; a
+    /// terminator clears the last call so an idle control channel is idle.
+    fn note_trunk_identity(&mut self, id: u64, lines: &[String]) {
+        if lines.is_empty() {
+            return;
+        }
+        let gate = self.identity_gate.entry(id).or_default();
+        let mut admitted = Vec::new();
+        let mut ended = false;
+        for line in lines {
+            let plain = follow::plain_line(line);
+            if follow::is_call_end(&plain) {
+                ended = true;
+                admitted.clear();
+                continue;
+            }
+            if gate.admit(line) {
+                admitted.push(line.clone());
+            }
+        }
+        if ended {
+            if let Some(ident) = self.cc_identity.get_mut(&id) {
+                follow::clear_call(ident);
+            }
+        }
+        self.note_identity(id, &admitted);
     }
 
     fn note_identity(&mut self, id: u64, lines: &[String]) {
