@@ -9,6 +9,7 @@ mod limits;
 mod markers;
 mod proto;
 mod rf;
+mod search;
 mod sweep;
 mod traces;
 
@@ -725,6 +726,13 @@ pub struct NanoVna {
     cur_pane: u8,
     trace_menu: Option<usize>,
     couple: bool,
+    /// TARGET value for the target search, in the trace unit. Issue 67.
+    target_text: String,
+    /// Repeat this search each sweep (TRACK): 0 max, 1 min.
+    track: Option<u8>,
+    /// Band-filter readout on S21 panes, SWR-bandwidth readout on S11 panes.
+    filter_on: bool,
+    swr_bw_on: bool,
     cal_state: cal::CalState,
     details_open: bool,
     last_sweep: Option<std::time::Instant>,
@@ -796,6 +804,10 @@ impl NanoVna {
             cur_pane: 0,
             trace_menu: None,
             couple: true,
+            target_text: "-3".into(),
+            track: None,
+            filter_on: false,
+            swr_bw_on: false,
             cal_state: cal::CalState::Uncal,
             details_open: false,
             last_sweep: None,
@@ -1307,6 +1319,9 @@ impl NanoVna {
                     self.marker_block(ui, theme, trace.as_deref());
                 });
         });
+        if let Some(code) = self.track {
+            self.marker_search(code, trace.as_deref());
+        }
         let placed = self.placed(trace.as_deref());
         let (cal, state) = match trace.as_deref() {
             Some(t) => self.cal_for(t, None),
@@ -1435,7 +1450,8 @@ impl NanoVna {
                 };
                 // Coupled markers show on every pane; uncoupled only on the active one. Issue 66.
                 let marks: Vec<(usize, usize)> = if self.couple || pane == active_pane { placed.to_vec() } else { Vec::new() };
-                let info = self.marker_info(trace, &marks);
+                let mut info = self.marker_info(trace, &marks);
+                info.extend(self.analysis_lines(trace));
                 let manual = self.face.scales.get(self.key().as_str()).copied();
                 let overlay = self.overlay(trace);
                 let (hit, _, gesture) = paint_chart(
@@ -2367,6 +2383,115 @@ impl NanoVna {
         if let Some(code) = search {
             self.marker_search(code, samples);
         }
+        // TARGET search, TRACK, peaks to markers, filter and SWR readouts. Issue 67.
+        let ok = samples.is_some();
+        let mut find: Option<i32> = None;
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("TARGET").monospace().color(palette::TEXT_MUTED))
+                .on_hover_text("Value to search for, in the active trace's unit");
+            ui.add(egui::TextEdit::singleline(&mut self.target_text).desired_width(col4).font(egui::TextStyle::Monospace));
+            if softkey_enabled(ui, theme, "◀ Tgt", false, col4, ok) {
+                find = Some(-1);
+            }
+            if softkey_enabled(ui, theme, "Tgt ▶", false, col4, ok) {
+                find = Some(1);
+            }
+        });
+        if let Some(dir) = find {
+            self.target_search(dir, samples);
+        }
+        ui.horizontal(|ui| {
+            let label = match self.track {
+                Some(0) => "Track max",
+                Some(_) => "Track min",
+                None => "Track off",
+            };
+            if softkey(ui, theme, label, self.track.is_some(), col4) {
+                self.track = match self.track {
+                    None => Some(0),
+                    Some(0) => Some(1),
+                    _ => None,
+                };
+            }
+            if softkey_enabled(ui, theme, "Peaks→M", false, col4, ok) {
+                self.peaks_to_markers(samples);
+            }
+            if softkey(ui, theme, "Filter", self.filter_on, col4) {
+                self.filter_on = !self.filter_on;
+            }
+            if softkey(ui, theme, "SWR BW", self.swr_bw_on, col4) {
+                self.swr_bw_on = !self.swr_bw_on;
+            }
+        });
+    }
+
+    /// Move the active marker to the next TARGET crossing left or right. Issue 67.
+    fn target_search(&mut self, dir: i32, samples: Option<&[Sample]>) {
+        let Some(samples) = samples else { return };
+        let Some(target) = self.target_text.trim().parse::<f64>().ok() else {
+            self.note = "TARGET is a number in the trace unit, for example -3.".into();
+            return;
+        };
+        if is_disk(self.view) || self.view == View::Tdr {
+            self.note = "Target search works on Cartesian frequency traces.".into();
+            return;
+        }
+        let (xs, ys) = series(self.view, samples, self.z0_value(), self.velocity_value());
+        let from = self.marker_index(self.marker_on, samples);
+        match search::target(&xs, &ys, target, from, dir) {
+            Some(hz) => {
+                self.markers[self.marker_on] = Some(hz);
+                self.note.clear();
+            }
+            None => self.note = format!("No crossing of {target} in that direction."),
+        }
+    }
+
+    /// Put M1..M8 on the highest peaks of the active trace. Issue 67.
+    fn peaks_to_markers(&mut self, samples: Option<&[Sample]>) {
+        let Some(samples) = samples else { return };
+        if is_disk(self.view) || self.view == View::Tdr {
+            self.note = "Peak search works on Cartesian frequency traces.".into();
+            return;
+        }
+        let (_, ys) = series(self.view, samples, self.z0_value(), self.velocity_value());
+        let finite: Vec<f64> = ys.iter().copied().filter(|v| v.is_finite()).collect();
+        let span = finite.iter().cloned().fold(f64::NEG_INFINITY, f64::max) - finite.iter().cloned().fold(f64::INFINITY, f64::min);
+        let found = search::peaks(&ys, markers::NORMAL, (span * 0.05).max(1e-12));
+        for slot in 0..markers::NORMAL {
+            self.markers[slot] = found.get(slot).and_then(|i| samples.get(*i)).map(|s| s.hz);
+        }
+        self.note = format!("{} peak(s) placed on markers.", found.len());
+    }
+
+    /// Filter / SWR-bandwidth lines painted with the marker list. Issue 67.
+    fn analysis_lines(&self, samples: Option<&[Sample]>) -> Vec<(String, Color32)> {
+        let mut out = Vec::new();
+        let Some(samples) = samples else { return out };
+        let xs: Vec<f64> = samples.iter().map(|s| s.hz).collect();
+        let s21 = uses_s21(self.view);
+        if self.filter_on && s21 {
+            let db: Vec<f64> = samples.iter().map(|s| 20.0 * s.s21.norm().max(1e-12).log10()).collect();
+            match search::bandfilter(&xs, &db) {
+                Some(f) => {
+                    out.push((format!("FLT  CF {}  IL {:.2} dB  Q {:.1}", display::fmt_hz(f.center_hz), f.loss_db, f.q()), palette::TEXT));
+                    out.push((format!("     3dB {}–{} ({})", display::fmt_hz(f.lo3), display::fmt_hz(f.hi3), display::fmt_hz(f.bw3())), palette::TEXT));
+                    out.push((format!("     6dB {}–{} ({})", display::fmt_hz(f.lo6), display::fmt_hz(f.hi6), display::fmt_hz(f.bw6())), palette::TEXT));
+                }
+                None => out.push(("FLT  edges outside the sweep".into(), palette::TEXT_MUTED)),
+            }
+        }
+        if self.swr_bw_on && !s21 {
+            let swr: Vec<f64> = samples.iter().map(|s| rf::swr(s.s11)).collect();
+            if let Some(b) = search::swr_band(&xs, &swr, 2.0) {
+                out.push((format!("SWR  min {:.2} @ {}", b.min_swr, display::fmt_hz(b.min_hz)), palette::TEXT));
+                out.push(match b.edges {
+                    Some((lo, hi)) => (format!("     2:1 {}–{} ({})", display::fmt_hz(lo), display::fmt_hz(hi), display::fmt_hz(hi - lo)), palette::TEXT),
+                    None => ("     never under 2:1".into(), palette::TEXT_MUTED),
+                });
+            }
+        }
+        out
     }
 
     /// Start continuous sweeps, or ask for a zone scan when there is no calibration.
