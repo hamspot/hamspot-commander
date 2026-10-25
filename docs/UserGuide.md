@@ -526,7 +526,9 @@ Config → Automation has an Amplifiers grid under Rotators. Add opens the Ampli
 
 Each second the row shows frequency, power state (OFF, ON, STBY, OPER), SWR and forward power when the backend reports them. The line under the keys lists every level the backend reports. Standby, Operate, Off and Reset act on the selected amplifier. Commander sends them only when you click. Opening a station file or restarting a daemon never puts an amplifier in Operate.
 
-Use the Dummy (model 1) to try the screen. Amplifier rows are saved in the station file as `amplifiers`.
+Under the keys, a live amplifier has a **Freq MHz** field with **Set** (sends `set_freq` once) and a **Follow rig frequency** checkbox. Follow is off by default and saved per amplifier (`follow_rig` in the station file). When it is on, Commander sends the active rig's frequency with `set_freq` after it has stayed put for 0.4 s; it never sends power or level commands. Levels that the backend lists as settable (`set_level ?`) get a slider and a **Set** key; an amplifier that lists none says so. The Dummy's levels are all read-only meters. A refused command shows its `RPRT` code in the row's status.
+
+Use the Dummy (model 1) to try the screen. Amplifier rows are saved in the station file as `amplifiers`. Amplifiers are not written to the Gpredict hardware files; Gpredict has no amplifier devices.
 
 ---
 
@@ -840,4 +842,8 @@ The RF patch bay at the bottom of the Config tab is a drawing of how coax runs i
 - **Flow.** Chevrons move along each cable in the direction of the signal, with a TX (amber) or RX (teal) tag. Below the panel the bay lists each path, for example `TX path: IC-9700 → KPA1500 → ATU → Yagi`, and warns about open outputs, loops, an amplifier fed from nothing, or an amplifier in line with a receive-only radio.
 - The layout is saved in the station file under `patchbay` (devices with positions, and cables from an output jack to an input jack). Older station files load with an empty bay.
 
-Later work (#96, #97) can use the same model to drive Hamlib `ampctl`, a rig's antenna port or an external switch.
+- **Configured amplifiers (#96).** The amplifier model list is the same one the Automation window uses (`ampctld -l`, with Hamlib 4.6.5's list as fallback). Click an amplifier box and pick a **Configured amplifier** from the Automation list, or leave it "unbound (visual only)". **Add to Automation list** creates a matching amplifier row (Dummy model when the box has no Hamlib model) and binds the box to it; it sends nothing to the amplifier. A bound box shows a power LED with its word (OFF, ON, STBY, OPER), the frequency, whether the daemon is up or the device is missing, SWR, forward power and any fault. Renaming the amplifier in Automation keeps the binding. A box bound to a name that no longer exists says "not configured".
+- **Power keys.** A bound, live box has Standby and Operate (amber) keys. They send only on that click, like the Automation keys. The patch bay never sends Operate on its own.
+- **Amplifier warnings (#97).** With a bound amplifier on a TX path, the bay warns when the amplifier is OFF, ON or STBY while the TX path is patched through it, and when it is in OPERATE but the path does not end in an antenna or dummy load. These are reminders only.
+
+Still to do (#97): nothing in the bay switches or keys hardware. Antenna switch control, PTT/ALC and automatic operate are not built and are not planned without a separate decision.

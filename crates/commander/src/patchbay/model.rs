@@ -4,14 +4,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-/// Hamlib amplifier models from `ampctl -l` (Hamlib 4.6.5). (model, label, beta)
-pub const HAMLIB_AMPS: &[(i32, &str, bool)] = &[
-    (1, "Hamlib Dummy", false),
-    (2, "NET ampctl", false),
-    (201, "Elecraft KPA1500", true),
-    (301, "Gemini DX1200/HF-1K", false),
-    (401, "Expert 1.3K/1.5K/2K-FA", true),
-];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -75,6 +67,10 @@ pub struct Device {
     /// Radio row name in the station this device stands for.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub radio: String,
+    /// Configured amplifier (station `amplifiers` row name) this box shows
+    /// live state for (#96). Empty means unbound, visual only.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub amp: String,
     /// The radio can transmit in this station.
     #[serde(default)]
     pub tx: bool,
@@ -109,6 +105,7 @@ impl Device {
             name: name.into(),
             model: 0,
             radio: String::new(),
+            amp: String::new(),
             tx: false,
             bands: String::new(),
             ways: default_ways(),
