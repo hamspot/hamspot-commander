@@ -821,3 +821,15 @@ The first free TCP port at or above 4532 on 127.0.0.1 is the listen port. Nothin
 ## 13.6 Further reading in the source tree
 
 `README.md` is the short project readme. `docs/AudioGraph.md` names the PipeWire nodes for a Hamlib dummy wired to a USB sound device. `docs/AGENT-HSCommander.md` tells another session how to turn a listing into a station file and, when the operator supplies key ids, the key file beside it. This user guide is the operator manual. Where the readme still speaks of an older screen layout, trust the window and this guide.
+
+## RF patch bay (Config tab)
+
+The RF patch bay at the bottom of the Config tab is a drawing of how coax runs in your station. It is **visual only**: nothing on it switches, keys or tunes hardware yet.
+
+- **Devices.** Every radio row in the station appears automatically (HackRF, GQRX and line taps are marked RX ONLY). Add amplifiers (the Hamlib `ampctl` models, or "Other amplifier"), antenna switches, tuners, SWR/power meters, dummy loads and antennas from the Add row. Click a box to rename it, note its bands, set a switch's ways and position, or remove it. Drag a box by its coloured title bar.
+- **Jacks.** Inputs are on the left of a box and outputs on the right, in the transmit sense; received signal flows the other way. Round jacks are coax, small square jacks are PTT/ALC control.
+- **Cables.** Drag from a jack to another jack. The end snaps to the nearest jack that accepts it. Output to output, input to input, coax to control, a box to itself and a jack that already has a cable are refused, and the reason shows below the panel. Drag a plugged end to move it; drop it on empty panel to unplug it. Right-click a cable, or click it and press Delete, to remove it.
+- **Flow.** Chevrons move along each cable in the direction of the signal, with a TX (amber) or RX (teal) tag. Below the panel the bay lists each path, for example `TX path: IC-9700 → KPA1500 → ATU → Yagi`, and warns about open outputs, loops, an amplifier fed from nothing, or an amplifier in line with a receive-only radio.
+- The layout is saved in the station file under `patchbay` (devices with positions, and cables from an output jack to an input jack). Older station files load with an empty bay.
+
+Later work (#96, #97) can use the same model to drive Hamlib `ampctl`, a rig's antenna port or an external switch.
