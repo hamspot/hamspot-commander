@@ -479,6 +479,12 @@ The Graph button beside each stored calibration standard opens that standard in 
 
 Keys with three small dots on the right edge have click modes. Green is click, orange is double-click, and purple is triple-click. The same actions are on the keyboard while no text box has focus. A letter alone is the click, Shift and the letter is the double-click, and Ctrl and the letter is the triple-click. The letters are R Run, L Layout, T Trace, S Store, A Auto, K Limits, M Marker, and I for the status line. The left and right arrows move the active marker one point. The tooltip on each key lists all three actions and their keys.
 
+### Conventions: keep in step with rustcars
+
+Click modes and their modifiers come from rustcars, the interface library every screen uses: click is the primary action (green), double-click or Shift is the first alternate (orange), and triple-click or Ctrl is the second alternate (purple). The NanoVNA keyboard letters follow the same rule. Before adding a new shortcut or modifier anywhere in Commander, check it against rustcars (its mode buttons and any keys it handles) so the two never give the same key two meanings.
+
+Each calibration set records when it was measured as an ISO 8601 date-time in UTC, such as `2026-10-25T22:40:17Z`. The calibration badge, the Cal list, and the Graph window show it to the minute. A set saved before this was added shows no date.
+
 ---
 
 # 9. CAT control and GQRX
