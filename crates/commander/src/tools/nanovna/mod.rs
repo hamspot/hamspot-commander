@@ -7,6 +7,7 @@ mod markers;
 mod proto;
 mod rf;
 mod sweep;
+mod traces;
 
 use std::collections::VecDeque;
 use std::fs;
@@ -665,9 +666,11 @@ pub struct NanoVna {
     marker_on: usize,
     readout_fmt: markers::Readout,
     marker_freq: String,
-    memory: Option<Vec<Sample>>,
+    /// MEM1..MEM4 frozen traces and the selected slot. Issue 70.
+    mems: [Option<Vec<Sample>>; traces::MEMS],
+    mem_sel: usize,
+    math: traces::Math,
     show_memory: bool,
-    show_diff: bool,
     admittance: bool,
     history: VecDeque<Vec<Sample>>,
     seen: u64,
@@ -734,9 +737,10 @@ impl NanoVna {
             marker_on: 0,
             readout_fmt: markers::Readout::Trace,
             marker_freq: String::new(),
-            memory: None,
+            mems: Default::default(),
+            mem_sel: 0,
+            math: traces::Math::Off,
             show_memory: false,
-            show_diff: false,
             admittance: false,
             history: VecDeque::new(),
             seen: 0,
@@ -798,7 +802,7 @@ impl NanoVna {
         self.smooth = face.smooth.to_string();
         self.face = face;
         self.history.clear();
-        self.memory = None;
+        self.mems = Default::default();
         self.dirty = false;
     }
 
@@ -1107,15 +1111,15 @@ impl NanoVna {
         ui.horizontal(|ui| {
             if action_button(ui, theme, "Memory", vec2(88.0, 32.0)).clicked() {
                 if let Some(trace) = self.display_trace(live) {
-                    self.memory = Some(trace);
+                    self.mems[self.mem_sel] = Some(trace);
                     self.show_memory = true;
                 }
             }
             if action_button(ui, theme, "Mem on", vec2(80.0, 32.0)).clicked() {
                 self.show_memory = !self.show_memory;
             }
-            if action_button(ui, theme, "Diff", vec2(70.0, 32.0)).clicked() {
-                self.show_diff = !self.show_diff;
+            if action_button(ui, theme, "Math", vec2(70.0, 32.0)).clicked() {
+                self.math = next_math(self.math);
             }
         });
         ui.horizontal(|ui| {
@@ -1219,12 +1223,24 @@ impl NanoVna {
             self.cal_graph_dialog(ui, theme);
             return;
         }
-        let trace = self.display_trace(live);
-        let memory = if self.show_memory {
-            self.memory.clone()
+        let mut trace = self.display_trace(live);
+        let mut memory = if self.show_memory {
+            self.memory().cloned()
         } else {
             None
         };
+        // With no live trace, a shown memory (for example an imported file)
+        // becomes the trace so markers and readouts work on it. Issue 53.
+        if trace.is_none() && memory.is_some() {
+            trace = memory.take();
+        }
+        let math = match (&trace, &memory) {
+            (Some(t), Some(m)) => traces::trace_math(t, m, self.math),
+            _ => None,
+        };
+        if self.math != traces::Math::Off && memory.is_some() && math.is_none() && self.wizard.is_none() {
+            self.note = "Math needs the memory on the same frequency grid as the trace.".into();
+        }
         let (left, right) = body_split(ui, theme, 440.0);
         let mut caption = self.face_caption(live, trace.as_deref());
         if self.await_scan.is_some() && self.wizard.is_none() {
@@ -1270,7 +1286,7 @@ impl NanoVna {
                     self.view,
                     trace.as_deref(),
                     memory.as_deref(),
-                    self.show_diff,
+                    math.as_deref(),
                     self.z0_value(),
                     self.velocity_value(),
                     self.admittance,
@@ -1439,8 +1455,13 @@ impl NanoVna {
             put(&mut x, &format!("REF {} {unit}", display::fmt_tick(ref_value, scale.per_div)), palette::TEXT);
         }
         put(&mut x, "CH1", palette::TEXT_MUTED);
-        if self.show_memory && self.memory.is_some() {
-            put(&mut x, "MEM", palette::TEXT_MUTED);
+        if self.show_memory && self.memory().is_some() {
+            put(&mut x, &format!("MEM{}", self.mem_sel + 1), MEM_COLOR);
+        }
+        match self.math {
+            traces::Math::Sub if self.show_memory => put(&mut x, "MATH D−M", palette::BRICK),
+            traces::Math::Div if self.show_memory => put(&mut x, "MATH D/M", palette::BRICK),
+            _ => {}
         }
         let (badge, fill) = match cal {
             Some(set) if set.thru.is_empty() => ("CAL OSL".to_string(), palette::OLIVE),
@@ -1728,20 +1749,59 @@ impl NanoVna {
             if softkey_enabled(ui, theme, "Y adm", self.admittance && smith, col4, smith) {
                 self.admittance = !self.admittance;
             }
-            if softkey(ui, theme, "Store", false, col4) {
+            // STORE: single = store, double = toggle memory display, triple = cycle math.
+            let resp = softkey_response(ui, theme, "Store", false, col4, samples.is_some());
+            if resp.triple_clicked() {
+                self.math = next_math(self.math);
+            } else if resp.double_clicked() {
+                self.show_memory = !self.show_memory;
+            } else if resp.clicked() {
                 if let Some(trace) = samples {
-                    self.memory = Some(trace.to_vec());
+                    self.mems[self.mem_sel] = Some(trace.to_vec());
                     self.show_memory = true;
                 }
             }
-            let has_mem = self.memory.is_some();
+            let has_mem = self.memory().is_some();
             if softkey_enabled(ui, theme, "Mem", self.show_memory && has_mem, col4, has_mem) {
                 self.show_memory = !self.show_memory;
             }
-            if softkey_enabled(ui, theme, "Diff", self.show_diff && has_mem, col4, has_mem) {
-                self.show_diff = !self.show_diff;
+            let math_label = match self.math {
+                traces::Math::Off => "Math off",
+                traces::Math::Sub => "D − M",
+                traces::Math::Div => "D / M",
+            };
+            if softkey_enabled(ui, theme, math_label, self.math != traces::Math::Off, col4, has_mem) {
+                self.math = next_math(self.math);
             }
         });
+        ui.horizontal(|ui| {
+            for slot in 0..traces::MEMS {
+                let label = if self.mems[slot].is_some() { format!("MEM{}", slot + 1) } else { format!("MEM{}·", slot + 1) };
+                if softkey(ui, theme, &label, self.mem_sel == slot, col4) {
+                    self.mem_sel = slot;
+                }
+            }
+        });
+        let mut import = false;
+        let mut save = false;
+        let mut clear = false;
+        ui.horizontal(|ui| {
+            import = softkey(ui, theme, "Import", false, col4);
+            save = softkey_enabled(ui, theme, "Save mem", false, col4, self.memory().is_some());
+            clear = softkey_enabled(ui, theme, "Clr mem", false, col4, self.memory().is_some());
+        });
+        if import {
+            self.import_memory();
+        }
+        if save {
+            if let Some(mem) = self.memory().cloned() {
+                let text = rf::touchstone_s2p(&mem, self.z0_value());
+                self.save_bytes("Save memory", &format!("nanovna-mem{}.s2p", self.mem_sel + 1), text.as_bytes());
+            }
+        }
+        if clear {
+            self.mems[self.mem_sel] = None;
+        }
 
         key_caption(ui, theme, "SCALE", width);
         let cart = !is_disk(self.view);
@@ -3306,6 +3366,47 @@ impl NanoVna {
         }
     }
 
+    /// The selected memory trace. Issue 70.
+    fn memory(&self) -> Option<&Vec<Sample>> {
+        self.mems[self.mem_sel].as_ref()
+    }
+
+    /// Load a Touchstone (.s1p/.s2p) or CSV sweep into the selected memory. Issues 70 and 53.
+    fn import_memory(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Import a sweep into memory")
+            .add_filter("Touchstone or CSV", &["s1p", "s2p", "csv", "S1P", "S2P", "CSV"])
+            .pick_file()
+        else {
+            return;
+        };
+        let text = match fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(err) => {
+                self.note = err.to_string();
+                return;
+            }
+        };
+        let z0 = self.z0_value();
+        let csv = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("csv"));
+        let parsed = if csv { traces::parse_csv(&text, z0) } else { traces::parse_touchstone(&text) };
+        match parsed {
+            Ok(mut imp) => {
+                traces::renormalize(&mut imp.samples, imp.z0, z0);
+                let n = imp.samples.len();
+                self.mems[self.mem_sel] = Some(imp.samples);
+                self.show_memory = true;
+                self.note = format!(
+                    "MEM{} ← {} ({n} points{}).",
+                    self.mem_sel + 1,
+                    path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default(),
+                    if imp.has_s21 { ", S11 and S21" } else { ", S11 only" }
+                );
+            }
+            Err(err) => self.note = format!("Import failed: {err}"),
+        }
+    }
+
     fn z0_value(&self) -> f64 {
         self.face.z0
     }
@@ -3693,6 +3794,8 @@ const GRID: Color32 = Color32::from_rgb(0x4A, 0x55, 0x66);
 const GRID_FAINT: Color32 = Color32::from_rgb(0x2C, 0x33, 0x3D);
 const TRACE1: Color32 = Color32::from_rgb(0xF2, 0xC2, 0x6B);
 const TRACE2: Color32 = Color32::from_rgb(0x78, 0xAA, 0xD2);
+/// Memory traces. Drawn dashed on Cartesian panes.
+const MEM_COLOR: Color32 = palette::TEAL;
 const PANE_BG: Color32 = Color32::from_rgb(12, 16, 22);
 
 /// Graticule, labelled ticks, reference line, and traces on one Cartesian pane.
@@ -3787,7 +3890,11 @@ fn paint_cartesian(
         if ys.len() != xs.len() {
             continue;
         }
-        let mut prev = None;
+        let mut prev: Option<Pos2> = None;
+        // Memory traces are drawn dashed so they read apart from live data
+        // without relying on colour. Issue 70.
+        let dashed = *color == MEM_COLOR;
+        let mut run = 0.0f32;
         for (x, y) in xs.iter().zip(ys.iter()) {
             if !y.is_finite() {
                 prev = None;
@@ -3795,7 +3902,11 @@ fn paint_cartesian(
             }
             let pos = map(*x, *y);
             if let Some(was) = prev {
-                clip.line_segment([was, pos], Stroke::new(2.0, *color));
+                let len: f32 = was.distance(pos);
+                if !dashed || (run % 12.0) < 7.0 {
+                    clip.line_segment([was, pos], Stroke::new(2.0, *color));
+                }
+                run += len.max(1.0);
             }
             prev = Some(pos);
         }
@@ -3940,7 +4051,7 @@ fn paint_chart(
     view: View,
     samples: Option<&[Sample]>,
     memory: Option<&[Sample]>,
-    diff: bool,
+    math: Option<&[Sample]>,
     z0: f64,
     velocity: f64,
     admittance: bool,
@@ -4000,19 +4111,21 @@ fn paint_chart(
             let (mx, my) = memory
                 .map(|memory| series(view, memory, z0, velocity))
                 .unwrap_or_default();
-            let delta: Vec<f64> = if diff && my.len() == ys.len() {
-                ys.iter().zip(&my).map(|(a, b)| a - b).collect()
+            let delta: Vec<f64> = math.map(|m| series(view, m, z0, velocity).1).unwrap_or_default();
+            // A memory on another grid is resampled onto the trace's frequencies.
+            let my: Vec<f64> = if !my.is_empty() && mx != xs {
+                traces::resample(&mx, &my, &xs)
             } else {
-                Vec::new()
+                my
             };
             let mut traces: Vec<(&[f64], Color32)> = vec![(&ys, TRACE1)];
             if !second.is_empty() {
                 traces.push((&second, TRACE2));
             }
-            if my.len() == ys.len() && mx.len() == xs.len() && !my.is_empty() {
-                traces.push((&my, palette::TEAL));
+            if my.len() == ys.len() && !my.is_empty() {
+                traces.push((&my, MEM_COLOR));
             }
-            if !delta.is_empty() {
+            if delta.len() == ys.len() && !delta.is_empty() {
                 traces.push((&delta, palette::BRICK));
             }
             paint_cartesian(&painter, rect, view, &xs, &traces, markers, label_px, manual);
@@ -4139,6 +4252,15 @@ fn paint_marker_info(painter: &egui::Painter, rect: Rect, info: &[(String, Color
     for (i, g) in galleys.into_iter().enumerate() {
         let color = info[i].1;
         painter.galley(Pos2::new(boxr.left() + 6.0, boxr.top() + 4.0 + line_h * i as f32), g, color);
+    }
+}
+
+/// Off → D−M → D/M → off. Issue 70.
+fn next_math(m: traces::Math) -> traces::Math {
+    match m {
+        traces::Math::Off => traces::Math::Sub,
+        traces::Math::Sub => traces::Math::Div,
+        traces::Math::Div => traces::Math::Off,
     }
 }
 
