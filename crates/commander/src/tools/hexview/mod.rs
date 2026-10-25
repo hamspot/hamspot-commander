@@ -14,8 +14,8 @@ mod hex;
 
 use hex::ROW;
 use rustcars::{
-    Cap, LcarsFrame, LcarsTheme, Mode, Side, action_button, apply_theme, install_lcars_font,
-    lcars_button, mode_list, palette, readout,
+    LcarsFrame, LcarsTheme, Mode, Side, action_button, apply_theme, install_lcars_font,
+    mode_list, palette, readout,
 };
 use std::collections::BTreeMap;
 
@@ -136,15 +136,7 @@ impl HexView {
         let t = self.theme;
         super::screen_header(ui, "hex_header", &t, |ui| {
                 ui.horizontal(|ui| {
-                    lcars_button(
-                        ui,
-                        &t,
-                        "Hex",
-                        palette::TAN,
-                        egui::vec2(110.0, t.bar_thin),
-                        Cap::Left,
-                        true,
-                    );
+                    super::title_block(ui, &t, "Hex", palette::TAN, egui::vec2(110.0, t.bar_thin));
                     ui.add_space(t.main_gap);
                     super::screen_title(ui, &t, "HEX VIEWER");
                     ui.add_space(t.main_gap);

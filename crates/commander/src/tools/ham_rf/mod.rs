@@ -322,13 +322,10 @@ impl HamRf {
         let t = self.theme;
         super::screen_header(ui, "ham_header", &t, |ui| {
                 ui.horizontal(|ui| {
-                    super::screen_title(ui, &t, "RF CALC");
+                    super::title_block(ui, &t, "RF Calc", palette::TAN, vec2(110.0, t.bar_thin));
                     ui.add_space(t.main_gap);
-                    for (i, (tool, label, _)) in TOOLS.iter().enumerate() {
-                        let cap = match i {
-                            0 => Cap::Left,
-                            _ => Cap::None,
-                        };
+                    for (tool, label, _) in TOOLS.iter() {
+                        let cap = Cap::None;
                         let base = if *tool == self.tool {
                             palette::TAN
                         } else {

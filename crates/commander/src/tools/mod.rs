@@ -319,6 +319,28 @@ fn paint_window_mark(painter: &egui::Painter, rect: egui::Rect, color: egui::Col
     painter.line_segment([to, to - dir * head - normal * (head * 0.55)], stroke);
 }
 
+/// Name block at the left of a screen's header: the same tan cap as a tab,
+/// but it is a label. It has no click sense and no hover or press color.
+pub(crate) fn title_block(
+    ui: &mut egui::Ui,
+    theme: &LcarsTheme,
+    label: &str,
+    base: egui::Color32,
+    size: egui::Vec2,
+) {
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, rustcars::cap_radius(Cap::Left, rect.height()), base);
+    let pad = (rect.height() / 2.0).min(theme.main_gap);
+    painter.text(
+        egui::pos2(rect.right() - pad, rect.bottom() - theme.frame_gap),
+        egui::Align2::RIGHT_BOTTOM,
+        label.to_uppercase(),
+        egui::FontId::proportional(theme.header_size),
+        rustcars::ink_on(base),
+    );
+}
+
 /// Title beside a screen's own tabs. The slot is one tab tall. The ink
 /// starts at the left of the slot and sits on the vertical center.
 pub(crate) fn screen_title(ui: &mut egui::Ui, theme: &LcarsTheme, text: &str) {

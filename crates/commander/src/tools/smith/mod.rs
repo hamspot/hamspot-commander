@@ -21,8 +21,8 @@ pub(crate) mod math;
 use egui::{Color32, Pos2, Stroke, Ui, vec2};
 use math::{Cx, LenUnit, Stub, cx};
 use rustcars::{
-    Cap, LcarsFrame, LcarsTheme, Mode, Side, action_button, apply_theme, handle_mode,
-    install_lcars_font, lcars_button, mode_button, paint_pips, palette, readout, tint,
+    LcarsFrame, LcarsTheme, Mode, Side, action_button, apply_theme, handle_mode,
+    install_lcars_font, mode_button, paint_pips, palette, readout, tint,
 };
 
 fn g(v: f64) -> String {
@@ -192,15 +192,7 @@ impl Smith {
         let t = self.theme;
         super::screen_header(ui, "smith_header", &t, |ui| {
                 ui.horizontal(|ui| {
-                    lcars_button(
-                        ui,
-                        &t,
-                        "Smith",
-                        palette::TAN,
-                        vec2(120.0, t.bar_thin),
-                        Cap::Left,
-                        true,
-                    );
+                    super::title_block(ui, &t, "Smith", palette::TAN, vec2(120.0, t.bar_thin));
                     ui.add_space(t.main_gap);
                     super::screen_title(ui, &t, "SMITH CHART");
                 });

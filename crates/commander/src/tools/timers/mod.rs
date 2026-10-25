@@ -16,8 +16,8 @@ mod clock;
 use chrono::{DateTime, FixedOffset, Local, Offset, Utc};
 use clock::{ClockFmt, Countdown, Stamp, Stopwatch, ZONES};
 use rustcars::{
-    Cap, LcarsFrame, LcarsTheme, Mode, Side, action_button, apply_theme, install_lcars_font,
-    lcars_button, mode_button, mode_list, palette, readout,
+    LcarsFrame, LcarsTheme, Mode, Side, action_button, apply_theme, install_lcars_font,
+    mode_button, mode_list, palette, readout,
 };
 
 pub struct Timers {
@@ -71,15 +71,7 @@ impl Timers {
         }
         super::screen_header(ui, "timers_header", &t, |ui| {
                 ui.horizontal(|ui| {
-                    lcars_button(
-                        ui,
-                        &t,
-                        "Timers",
-                        palette::TAN,
-                        egui::vec2(120.0, t.bar_thin),
-                        Cap::Left,
-                        true,
-                    );
+                    super::title_block(ui, &t, "Timers", palette::TAN, egui::vec2(120.0, t.bar_thin));
                     ui.add_space(t.main_gap);
                     super::screen_title(ui, &t, "STATION CLOCKS");
                 });
