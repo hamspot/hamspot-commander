@@ -36,6 +36,17 @@ pub const SIGNAL_MARGIN_DB: f64 = 6.0;
 /// the rig does not say when the new reading has settled.
 pub const SCAN_DWELL: std::time::Duration = std::time::Duration::from_millis(1200);
 
+/// Default voice hang. A P25 talker who unkeys and rekeys (a butt-key, a
+/// push-to-talk gap, a dead carrier between overs) is held this long on the
+/// voice channel before the radio goes back to the control channel.
+pub const VOICE_HANG_DEFAULT: std::time::Duration = std::time::Duration::from_millis(2500);
+/// Longest hang a station file may ask for.
+pub const VOICE_HANG_MAX_MS: u32 = 15_000;
+/// A voice channel that prints nothing at all (no frame, sync, or terminator)
+/// for the hang plus this long is treated as ended. Without it a channel
+/// that went silent with no terminator would hold the radio forever.
+pub const VOICE_SILENCE_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
     Watch,
@@ -139,6 +150,13 @@ pub struct Follower {
     next_scan: Option<std::time::Instant>,
     /// Strength pass in progress. The home index stays put until it finishes.
     scan: Option<StrengthScan>,
+    /// How long a voice channel is held after the talker stops.
+    hang: std::time::Duration,
+    /// Last sign of life on the voice channel: the tune or a voice frame.
+    voice_at: Option<std::time::Instant>,
+    /// When the call looked finished (terminator, sync loss, dead carrier).
+    /// The radio stays on the voice channel until the hang has run from here.
+    ending: Option<std::time::Instant>,
 }
 
 /// One pass across the control list, in list order.
@@ -173,6 +191,9 @@ impl Follower {
             held: false,
             next_scan: None,
             scan: None,
+            hang: VOICE_HANG_DEFAULT,
+            voice_at: None,
+            ending: None,
         };
         follower.set_controls(controls);
         follower
@@ -250,8 +271,30 @@ impl Follower {
         self.sent
     }
 
+    /// Set the voice hang. A station file value in milliseconds.
+    pub fn set_hang(&mut self, hang: std::time::Duration) {
+        self.hang = hang;
+    }
+
+    pub fn hang(&self) -> std::time::Duration {
+        self.hang
+    }
+
+    /// True while a finished-looking call is being held for the hang.
+    pub fn in_hang(&self) -> bool {
+        self.role == Role::Voice && self.ending.is_some()
+    }
+
     pub fn note_sent(&mut self, hz: f64) {
+        self.note_sent_at(hz, std::time::Instant::now());
+    }
+
+    pub fn note_sent_at(&mut self, hz: f64, now: std::time::Instant) {
         self.sent = Some(hz);
+        if self.pending.is_some() && self.role != Role::Voice {
+            self.voice_at = Some(now);
+            self.ending = None;
+        }
         // The next search line may already have been counted on the
         // frequency this tune is leaving. Arm on that line. Hop on the next.
         self.hunt_armed = false;
@@ -468,6 +511,53 @@ impl Follower {
     }
 
     pub fn push(&mut self, event: CcEvent) {
+        self.push_at(event, std::time::Instant::now());
+    }
+
+    /// Return to the control channel once the hang has run out. Call this
+    /// every update, even when the decoder printed nothing.
+    pub fn tick(&mut self, now: std::time::Instant) {
+        if self.role != Role::Voice {
+            return;
+        }
+        if let Some(ending) = self.ending {
+            if now.saturating_duration_since(ending) >= self.hang {
+                self.back_to_control();
+            }
+            return;
+        }
+        if let Some(at) = self.voice_at {
+            if now.saturating_duration_since(at) >= self.hang + VOICE_SILENCE_GRACE {
+                self.back_to_control();
+            }
+        }
+    }
+
+    /// The call looks finished. Hold the voice channel for the hang; a later
+    /// voice frame or sync on this channel picks the same call back up.
+    fn start_hang(&mut self, now: std::time::Instant) {
+        if self.ending.is_none() {
+            self.ending = Some(now);
+        }
+        if let Some(tg) = self.active_tg() {
+            self.status = format!("voice talkgroup {tg} hang");
+        }
+        if self.hang.is_zero() {
+            self.back_to_control();
+        }
+    }
+
+    fn voice_alive(&mut self, now: std::time::Instant) {
+        if self.role != Role::Voice {
+            return;
+        }
+        self.voice_at = Some(now);
+        if self.ending.take().is_some() {
+            self.refresh_status();
+        }
+    }
+
+    pub fn push_at(&mut self, event: CcEvent, now: std::time::Instant) {
         match event {
             CcEvent::Iden => {
                 self.iden = true;
@@ -494,11 +584,20 @@ impl Follower {
                 // A control channel sends terminators between trunking blocks.
                 // Only a terminator after the radio has been sent to the voice
                 // frequency ends the hop.
+                // Butt-keys and push-to-talk gaps send a terminator too, so
+                // the channel is held for the hang instead of dropped.
                 if self.role == Role::Voice {
-                    self.back_to_control();
+                    self.start_hang(now);
                 }
             }
+            CcEvent::Voice => self.voice_alive(now),
             CcEvent::Sync => {
+                // Sync alone on a voice channel is not voice: a dead carrier
+                // or trailing terminators sync too. Only a voice frame keeps
+                // the call or ends the hang.
+                if self.role == Role::Voice {
+                    return;
+                }
                 // Sync on a dead carrier is not a signal. Only a pass that
                 // found a stronger channel, or one already chosen, may hold.
                 if self.scan.is_none() && self.held && self.role == Role::Watch {
@@ -506,12 +605,16 @@ impl Follower {
                     self.status = "locked".into();
                 }
             }
-            CcEvent::SyncLost => self.on_sync_lost(),
-            CcEvent::Search => self.on_search(),
-            CcEvent::Adjacent { .. }
-            | CcEvent::Unit(_)
-            | CcEvent::Direct { .. }
-            | CcEvent::Voice => {}
+            CcEvent::SyncLost => self.on_sync_lost(now),
+            CcEvent::Search => {
+                // A dead carrier on the voice channel: no lock. Hold it.
+                if self.role == Role::Voice {
+                    self.start_hang(now);
+                } else {
+                    self.on_search();
+                }
+            }
+            CcEvent::Adjacent { .. } | CcEvent::Unit(_) | CcEvent::Direct { .. } => {}
         }
     }
 
@@ -549,9 +652,9 @@ impl Follower {
         self.status = format!("voice talkgroup {tg}");
     }
 
-    fn on_sync_lost(&mut self) {
+    fn on_sync_lost(&mut self, now: std::time::Instant) {
         if self.role == Role::Voice {
-            self.back_to_control();
+            self.start_hang(now);
             return;
         }
         // A grant is already chosen. Losing the control channel does not
@@ -594,6 +697,8 @@ impl Follower {
     }
 
     fn back_to_control(&mut self) {
+        self.ending = None;
+        self.voice_at = None;
         self.pending = None;
         self.role = Role::Watch;
         self.synced = false;
@@ -2102,6 +2207,120 @@ mod tests {
         assert!(hear_clear(CLEAR_ALG, false, false));
     }
 
+    fn on_voice(hang_ms: u64, now: std::time::Instant) -> Follower {
+        let mut follow = Follower::new(vec![851_012_500.0, 852_475_000.0]);
+        follow.set_hang(std::time::Duration::from_millis(hang_ms));
+        follow.push_at(CcEvent::Iden, now);
+        follow.push_at(clear(853_500_000.0, 20), now);
+        follow.note_sent_at(853_500_000.0, now);
+        assert_eq!(follow.role(), Role::Voice);
+        follow
+    }
+
+    fn ms(n: u64) -> std::time::Duration {
+        std::time::Duration::from_millis(n)
+    }
+
+    #[test]
+    fn the_default_voice_hang_suits_p25_gaps() {
+        let follow = Follower::new(vec![851_012_500.0]);
+        assert_eq!(follow.hang(), VOICE_HANG_DEFAULT);
+        assert!(VOICE_HANG_DEFAULT >= ms(2000) && VOICE_HANG_DEFAULT <= ms(3000));
+    }
+
+    #[test]
+    fn a_grant_for_another_talkgroup_does_not_preempt_live_voice() {
+        let t = std::time::Instant::now();
+        let mut follow = on_voice(2500, t);
+        follow.push_at(CcEvent::Voice, t + ms(100));
+        follow.push_at(clear(854_000_000.0, 99), t + ms(200));
+        follow.tick(t + ms(300));
+        assert_eq!(follow.target_hz(), Some(853_500_000.0));
+        assert_eq!(follow.active_tg(), Some(20));
+        assert!(follow.play_voice());
+    }
+
+    #[test]
+    fn a_terminator_is_held_for_the_hang() {
+        let t = std::time::Instant::now();
+        let mut follow = on_voice(2500, t);
+        follow.push_at(CcEvent::Voice, t);
+        follow.push_at(CcEvent::End, t + ms(500));
+        assert!(follow.in_hang());
+        follow.tick(t + ms(2900));
+        assert_eq!(follow.target_hz(), Some(853_500_000.0));
+        assert!(follow.play_voice());
+        follow.tick(t + ms(3000));
+        assert_eq!(follow.role(), Role::Watch);
+        assert_eq!(follow.target_hz(), Some(851_012_500.0));
+    }
+
+    #[test]
+    fn a_dead_carrier_is_held_and_then_released() {
+        let t = std::time::Instant::now();
+        let mut follow = on_voice(2500, t);
+        follow.push_at(CcEvent::Voice, t);
+        // Carrier stays up with sync but no voice, then the decoder loses it.
+        follow.push_at(CcEvent::Sync, t + ms(200));
+        follow.push_at(CcEvent::SyncLost, t + ms(400));
+        follow.push_at(CcEvent::Search, t + ms(600));
+        follow.tick(t + ms(2800));
+        assert_eq!(follow.target_hz(), Some(853_500_000.0));
+        follow.tick(t + ms(2900));
+        assert_eq!(follow.role(), Role::Watch);
+    }
+
+    #[test]
+    fn sync_without_voice_does_not_hold_forever() {
+        let t = std::time::Instant::now();
+        let mut follow = on_voice(2500, t);
+        for step in 1..30 {
+            follow.push_at(CcEvent::Sync, t + ms(step * 250));
+            follow.tick(t + ms(step * 250));
+        }
+        assert_eq!(follow.role(), Role::Watch);
+    }
+
+    #[test]
+    fn a_butt_key_inside_the_hang_resumes_the_same_call() {
+        let t = std::time::Instant::now();
+        let mut follow = on_voice(2500, t);
+        follow.push_at(CcEvent::Voice, t);
+        follow.push_at(CcEvent::End, t + ms(300));
+        follow.tick(t + ms(1500));
+        follow.push_at(CcEvent::Voice, t + ms(2000));
+        assert!(!follow.in_hang());
+        assert_eq!(follow.status(), "voice talkgroup 20");
+        follow.tick(t + ms(4000));
+        assert_eq!(follow.target_hz(), Some(853_500_000.0));
+        follow.push_at(CcEvent::End, t + ms(4100));
+        follow.tick(t + ms(6600));
+        assert_eq!(follow.role(), Role::Watch);
+        assert_eq!(follow.voice_hz(), None);
+    }
+
+    #[test]
+    fn the_configured_hang_is_honoured() {
+        let t = std::time::Instant::now();
+        let mut follow = on_voice(6000, t);
+        follow.push_at(CcEvent::End, t);
+        follow.tick(t + ms(5900));
+        assert_eq!(follow.role(), Role::Voice);
+        follow.tick(t + ms(6000));
+        assert_eq!(follow.role(), Role::Watch);
+        let mut zero = on_voice(0, t);
+        zero.push_at(CcEvent::End, t);
+        assert_eq!(zero.role(), Role::Watch);
+    }
+
+    #[test]
+    fn an_encrypted_voice_channel_still_leaves_at_once() {
+        let t = std::time::Instant::now();
+        let mut follow = on_voice(2500, t);
+        follow.push_at(CcEvent::Alg(0x84), t);
+        assert_eq!(follow.role(), Role::Watch);
+    }
+
     #[test]
     fn a_terminator_returns_to_the_same_control_channel() {
         let mut follow = Follower::new(vec![851_012_500.0, 852_475_000.0]);
@@ -2110,6 +2329,7 @@ mod tests {
         follow.note_sent(853_500_000.0);
         assert_eq!(follow.role(), Role::Voice);
         follow.push(CcEvent::End);
+        follow.tick(std::time::Instant::now() + std::time::Duration::from_secs(60));
         assert_eq!(follow.target_hz(), Some(851_012_500.0));
         assert_eq!(follow.role(), Role::Watch);
         assert_eq!(follow.sent(), None);
@@ -2122,6 +2342,7 @@ mod tests {
         follow.push(clear(853_500_000.0, 20));
         follow.note_sent(853_500_000.0);
         follow.push(CcEvent::SyncLost);
+        follow.tick(std::time::Instant::now() + std::time::Duration::from_secs(60));
         assert_eq!(follow.target_hz(), Some(851_012_500.0));
         assert_eq!(follow.voice_hz(), None);
     }
@@ -2836,6 +3057,7 @@ mod tests {
         follow.push(clear(853_500_000.0, 20));
         follow.note_sent(853_500_000.0);
         follow.push(CcEvent::End);
+        follow.tick(std::time::Instant::now() + std::time::Duration::from_secs(60));
         follow.note_sent(851_012_500.0);
         follow.push(CcEvent::Search);
         follow.push(CcEvent::Search);
@@ -3102,6 +3324,9 @@ mod tests {
         for event in feed.push_line("Sync: no sync") {
             follow.push(event);
         }
+        // Held for the voice hang, then back to control.
+        assert_eq!(follow.role(), Role::Voice);
+        follow.tick(std::time::Instant::now() + std::time::Duration::from_secs(60));
         assert_eq!(follow.role(), Role::Watch);
         assert_eq!(follow.target_hz(), Some(453_000_000.0));
 
