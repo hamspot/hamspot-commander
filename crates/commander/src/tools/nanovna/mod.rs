@@ -9,6 +9,7 @@ mod limits;
 mod markers;
 mod proto;
 mod rf;
+mod calstd;
 mod search;
 mod sweep;
 mod traces;
@@ -738,6 +739,10 @@ pub struct NanoVna {
     last_sweep: Option<std::time::Instant>,
     /// A stored calibration standard shown in its own window. Issue 75.
     cal_graph: Option<(CalSet, WizStep)>,
+    /// Format, compare set (index into the stored sets) and error-term view of that window.
+    cal_graph_view: View,
+    cal_compare: Option<usize>,
+    cal_terms: bool,
 }
 
 impl NanoVna {
@@ -811,6 +816,9 @@ impl NanoVna {
             cal_state: cal::CalState::Uncal,
             details_open: false,
             last_sweep: None,
+            cal_graph_view: View::Smith,
+            cal_compare: None,
+            cal_terms: false,
             cal_graph: None,
         }
     }
@@ -3439,21 +3447,41 @@ impl NanoVna {
                             let has = stored
                                 .as_ref()
                                 .is_some_and(|set| !step_samples(set, step).is_empty());
-                            if rustcars::lcars_button(
+                            let graph = rustcars::lcars_button(
                                 ui,
                                 theme,
-                                "Graph",
+                                if has { "Graph" } else { "not stored" },
                                 palette::SLATE,
                                 vec2(64.0, 26.0),
                                 rustcars::Cap::None,
                                 has,
                             )
-                            .on_hover_text("View graph of this stored standard")
-                            .clicked()
-                            {
-                                if let Some(set) = stored.clone() {
-                                    self.cal_graph = Some((set, step));
-                                }
+                            .on_hover_text(format!(
+                                "View graph of the {} standard in {name}.\nClick: Smith (polar for S21) · Double: return loss (S21 dB) · Triple: phase",
+                                step.step_name()
+                            ));
+                            // Single, double and triple click pick the first view. Issue 75.
+                            let pick = if graph.triple_clicked() {
+                                Some(2)
+                            } else if graph.double_clicked() {
+                                Some(1)
+                            } else if graph.clicked() {
+                                Some(0)
+                            } else {
+                                None
+                            };
+                            if let (Some(mode), Some(set)) = (pick, stored.clone()) {
+                                let s21 = matches!(step, WizStep::Thru | WizStep::Isol);
+                                self.cal_graph_view = match (mode, s21) {
+                                    (0, false) => View::Smith,
+                                    (0, true) => View::PolarS21,
+                                    (1, false) => View::ReturnLoss,
+                                    (1, true) => View::S21,
+                                    (_, false) => View::PhaseS11,
+                                    (_, true) => View::Phase,
+                                };
+                                self.cal_graph = Some((set, step));
+                                self.cal_compare = None;
                             }
                             if reload_button(ui, theme).clicked() {
                                 self.start_wizard(
@@ -3482,20 +3510,55 @@ impl NanoVna {
             });
     }
 
-    /// The raw curve of one stored standard: magnitude against frequency and the polar locus.
+    /// One stored standard: the chosen format with an ideal reference, the worst
+    /// point, an optional compare set, the solved error terms, PNG and CSV. Issue 75.
     fn cal_graph_dialog(&mut self, ui: &mut Ui, theme: &LcarsTheme) {
         let Some((set, step)) = self.cal_graph.clone() else {
             return;
         };
-        let rows = step_samples(&set, step);
-        let xs: Vec<f64> = (0..rows.len()).map(|i| set.start_hz + set.step_hz * i as f64).collect();
-        let mag: Vec<f64> = rows.iter().map(|r| rf::db(pair(*r))).collect();
-        let pts: Vec<Sample> = rows
+        let kind = match step {
+            WizStep::Open => calstd::Kind::Open,
+            WizStep::Short => calstd::Kind::Short,
+            WizStep::Load => calstd::Kind::Load,
+            WizStep::Thru => calstd::Kind::Thru,
+            _ => calstd::Kind::Isol,
+        };
+        let s21 = kind.is_s21();
+        let values = pairs(step_samples(&set, step));
+        let to_samples = |vals: &[Cx]| -> Vec<Sample> {
+            vals.iter()
+                .enumerate()
+                .map(|(i, v)| Sample { hz: calstd::hz(set.start_hz, set.step_hz, i), s11: *v, s21: *v })
+                .collect()
+        };
+        let pts = to_samples(&values);
+        // The ideal null is drawn at the floor, not at minus infinity.
+        let ideal = if kind.ideal().abs() == 0.0 { Cx::new(10f64.powf(calstd::NULL_DB / 20.0), 0.0) } else { kind.ideal() };
+        let ideal_pts = to_samples(&vec![ideal; values.len()]);
+        let others: Vec<(usize, String)> = self
+            .face
+            .cals
             .iter()
-            .zip(&xs)
-            .map(|(r, hz)| Sample { hz: *hz, s11: pair(*r), s21: Cx::new(0.0, 0.0) })
+            .enumerate()
+            .filter(|(_, c)| **c != set && !step_samples(c, step).is_empty())
+            .map(|(i, c)| (i, format!("{} {} {}", if c.name.is_empty() { &c.zone } else { &c.name }, c.band, c.id)))
             .collect();
+        let compare: Option<Vec<Sample>> = self
+            .cal_compare
+            .and_then(|i| self.face.cals.get(i))
+            .map(|c| to_samples(&pairs(step_samples(c, step))));
+        let worst = calstd::worst(kind, &values);
+        let views: &[View] = if s21 {
+            &[View::PolarS21, View::S21, View::Phase, View::Unwrap, View::GroupDelay]
+        } else {
+            &[View::Smith, View::ReturnLoss, View::PhaseS11, View::UnwrapS11]
+        };
+        if !views.contains(&self.cal_graph_view) {
+            self.cal_graph_view = views[0];
+        }
+        let terms = rf::solve_osl(&pairs(&set.open), &pairs(&set.short), &pairs(&set.load)).ok();
         let mut open = true;
+        let mut export: Option<bool> = None;
         let title = format!(
             "{} · {} · {}",
             if set.zone.is_empty() { "Calibration" } else { set.zone.as_str() },
@@ -3505,40 +3568,147 @@ impl NanoVna {
         egui::Window::new(title)
             .open(&mut open)
             .resizable(true)
-            .default_size(vec2(720.0, 420.0))
+            .default_size(vec2(760.0, 480.0))
             .show(ui.ctx(), |ui| {
+                let col = 96.0;
+                ui.horizontal_wrapped(|ui| {
+                    for v in views {
+                        if softkey(ui, theme, view_name(*v), !self.cal_terms && self.cal_graph_view == *v, col) {
+                            self.cal_graph_view = *v;
+                            self.cal_terms = false;
+                        }
+                    }
+                    if softkey_enabled(ui, theme, "Err terms", self.cal_terms, col, terms.is_some()) {
+                        self.cal_terms = !self.cal_terms;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    let current = self
+                        .cal_compare
+                        .and_then(|i| others.iter().find(|(j, _)| *j == i))
+                        .map(|(_, n)| n.clone())
+                        .unwrap_or_else(|| "Compare: off".into());
+                    egui::ComboBox::from_id_salt("vna-cal-compare").selected_text(current).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.cal_compare, None, "off");
+                        for (i, n) in &others {
+                            ui.selectable_value(&mut self.cal_compare, Some(*i), n);
+                        }
+                    });
+                    if softkey(ui, theme, "PNG", false, col) {
+                        export = Some(true);
+                    }
+                    if softkey(ui, theme, "CSV", false, col) {
+                        export = Some(false);
+                    }
+                });
+                let worst_text = worst
+                    .map(|w| {
+                        format!(
+                            " · worst {} at {}",
+                            if matches!(kind, calstd::Kind::Load | calstd::Kind::Isol) {
+                                format!("{:.1} dB", w.db)
+                            } else {
+                                format!("{:.2} dB off ideal", w.db)
+                            },
+                            display::fmt_hz(calstd::hz(set.start_hz, set.step_hz, w.index))
+                        )
+                    })
+                    .unwrap_or_default();
                 ui.label(
                     egui::RichText::new(format!(
-                        "{} points · {} to {} · Z0 {} Ω · uncorrected ratio as stored",
-                        rows.len(),
-                        display::fmt_hz(xs.first().copied().unwrap_or(0.0)),
-                        display::fmt_hz(xs.last().copied().unwrap_or(0.0)),
+                        "{} points · {} to {} · Z0 {} Ω · device {}{worst_text} · uncorrected ratio as stored (no date is stored in a set)",
+                        values.len(),
+                        display::fmt_hz(pts.first().map(|s| s.hz).unwrap_or(0.0)),
+                        display::fmt_hz(pts.last().map(|s| s.hz).unwrap_or(0.0)),
                         trim_num(set.z0),
+                        if set.id.is_empty() { "-" } else { set.id.as_str() },
                     ))
                     .monospace()
                     .size(theme.data_size * 0.85)
                     .color(palette::TEXT_MUTED),
                 );
-                ui.label(
-                    egui::RichText::new("Magnitude dB (gold) · Phase on the polar plot")
-                        .size(theme.data_size * 0.8)
-                        .color(palette::TEXT_MUTED),
-                );
-                let h = (ui.available_height() - 4.0).max(220.0);
-                let w = ui.available_width();
-                ui.horizontal(|ui| {
-                    let (rect, _) = ui.allocate_exact_size(vec2((w * 0.6).max(240.0), h), Sense::hover());
-                    let painter = ui.painter_at(rect);
-                    painter.rect_filled(rect, 0.0, PANE_BG);
-                    paint_cartesian(&painter, rect, View::S21, &xs, &[(&mag, TRACE1)], &[], theme.data_size, None, &Overlay::default());
-                    let (rect, _) = ui.allocate_exact_size(vec2((w * 0.38).max(160.0), h), Sense::hover());
-                    let painter = ui.painter_at(rect);
-                    painter.rect_filled(rect, 0.0, PANE_BG);
+                let legend = if self.cal_terms {
+                    "Directivity (gold) · Source match (teal) · Reflection tracking (plum), |term| dB".to_string()
+                } else {
+                    format!(
+                        "Measured (gold) · Ideal {} (grey){} · R = worst point",
+                        step.step_name().to_lowercase(),
+                        if compare.is_some() { " · Compare (teal)" } else { "" }
+                    )
+                };
+                ui.label(egui::RichText::new(legend).size(theme.data_size * 0.8).color(palette::TEXT_MUTED));
+                let h = (ui.available_height() - 4.0).max(240.0);
+                let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width().max(320.0), h), Sense::hover());
+                let painter = ui.painter_at(rect);
+                painter.rect_filled(rect, 0.0, PANE_BG);
+                let xs: Vec<f64> = pts.iter().map(|s| s.hz).collect();
+                if self.cal_terms {
+                    if let Some(t) = &terms {
+                        let d = calstd::term_db(&t.directivity);
+                        let m = calstd::term_db(&t.source_match);
+                        let r = calstd::term_db(&t.reflection_tracking);
+                        let n = d.len().min(xs.len());
+                        paint_cartesian(
+                            &painter,
+                            rect,
+                            View::S21,
+                            &xs[..n],
+                            &[(&d[..n], TRACE1), (&m[..n], MEM_COLOR), (&r[..n], palette::PLUM)],
+                            &[],
+                            theme.data_size,
+                            None,
+                            &Overlay::default(),
+                        );
+                    }
+                } else if self.cal_graph_view == View::Smith {
+                    paint_smith(&painter, rect, false, Some(&pts), compare.as_deref(), set.z0, None, theme.data_size);
+                    let disk = smith_disk(rect);
+                    let at = disk.center + vec2(kind.ideal().re as f32 * disk.rad, -(kind.ideal().im as f32) * disk.rad);
+                    painter.circle_stroke(at, 7.0, egui::Stroke::new(2.0, palette::TEXT));
+                    painter.text(at + vec2(0.0, -12.0), egui::Align2::CENTER_BOTTOM, "ideal", egui::FontId::monospace(theme.data_size * 0.8), palette::TEXT);
+                    if let Some(w) = worst.and_then(|w| pts.get(w.index)) {
+                        let p = disk.center + vec2(w.s11.re as f32 * disk.rad, -(w.s11.im as f32) * disk.rad);
+                        paint_marker(&painter, p, markers::REF, theme.data_size);
+                    }
+                } else if self.cal_graph_view == View::PolarS21 {
                     let plot = rect.shrink(16.0);
                     paint_polar(&painter, plot, theme.data_size);
+                    stroke_polar(&painter, plot, &ideal_pts, IDEAL_COLOR);
+                    if let Some(c) = &compare {
+                        stroke_polar(&painter, plot, c, MEM_COLOR);
+                    }
                     stroke_polar(&painter, plot, &pts, TRACE1);
-                });
+                } else {
+                    let view = self.cal_graph_view;
+                    let ys = series(view, &pts, set.z0, 0.66).1;
+                    let ideal_ys = series(view, &ideal_pts, set.z0, 0.66).1;
+                    let cmp_ys = compare.as_ref().map(|c| series(view, c, set.z0, 0.66).1);
+                    let mut traces: Vec<(&[f64], Color32)> = vec![(&ys, TRACE1), (&ideal_ys, IDEAL_COLOR)];
+                    if let Some(c) = &cmp_ys {
+                        let n = c.len().min(xs.len());
+                        traces.push((&c[..n], MEM_COLOR));
+                    }
+                    let marks: Vec<(usize, usize)> = worst.map(|w| vec![(markers::REF, w.index)]).unwrap_or_default();
+                    paint_cartesian(&painter, rect, view, &xs, &traces, &marks, theme.data_size, None, &Overlay::default());
+                }
             });
+        if let Some(png) = export {
+            let name = format!("cal-{}-{}", if set.zone.is_empty() { "set" } else { set.zone.as_str() }, step.step_name().to_lowercase());
+            let cmp: Option<Vec<Cx>> = self.cal_compare.and_then(|i| self.face.cals.get(i)).map(|c| pairs(step_samples(c, step)));
+            if png {
+                let xs: Vec<f64> = pts.iter().map(|s| s.hz).collect();
+                let view = if is_disk(self.cal_graph_view) { if s21 { View::S21 } else { View::ReturnLoss } } else { self.cal_graph_view };
+                let ys = series(view, &pts, set.z0, 0.66).1;
+                let iy = series(view, &ideal_pts, set.z0, 0.66).1;
+                match rf::chart_png_traces(&format!("{} {}", step.step_name(), view_name(view)), &xs, &[&ys, &iy]) {
+                    Ok(bytes) => self.save_bytes("Save chart", &format!("{name}.png"), &bytes),
+                    Err(err) => self.note = err,
+                }
+            } else {
+                let text = calstd::csv(set.start_hz, set.step_hz, &values, cmp.as_deref());
+                self.save_bytes("Save CSV", &format!("{name}.csv"), text.as_bytes());
+            }
+        }
         if !open {
             self.cal_graph = None;
         }
@@ -4598,6 +4768,8 @@ const TRACE_COLORS: [Color32; 4] = [
 const MATH_TEXT: Color32 = Color32::from_rgb(0xFF, 0x99, 0x88);
 /// Memory traces. Drawn dashed on Cartesian panes.
 const MEM_COLOR: Color32 = palette::TEAL;
+/// Ideal reference behind a calibration standard: light grey, above 3:1 on the pane. Issue 75.
+const IDEAL_COLOR: Color32 = Color32::from_rgb(0x9A, 0x9C, 0xA8);
 const PANE_BG: Color32 = Color32::from_rgb(12, 16, 22);
 
 /// Graticule, labelled ticks, reference line, and traces on one Cartesian pane.
