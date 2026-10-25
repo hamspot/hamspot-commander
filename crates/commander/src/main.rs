@@ -1957,6 +1957,7 @@ impl App {
         };
         {
             let mut tools = app.tools.lock().expect("tools");
+            tools.set_rotators(Arc::clone(&app.rotators));
             tools.detached = cc
                 .storage
                 .and_then(|storage| storage.get_string("tool_detach"))

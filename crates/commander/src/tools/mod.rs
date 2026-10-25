@@ -4,6 +4,7 @@
 mod calculator;
 mod ham_rf;
 mod hexview;
+mod rotator;
 pub mod nanovna;
 pub(crate) mod smith;
 mod station_log;
@@ -19,15 +20,17 @@ pub enum Screen {
     Smith,
     Hex,
     Log,
+    Rotator,
 }
 
-const SCREENS: [(Screen, &str); 6] = [
+const SCREENS: [(Screen, &str); 7] = [
     (Screen::NanoVna, "NanoVNA"),
     (Screen::HamRf, "RF Calc"),
     (Screen::Calculator, "Calc"),
     (Screen::Smith, "Smith"),
     (Screen::Hex, "Hex"),
     (Screen::Log, "Logbook"),
+    (Screen::Rotator, "Rotator"),
 ];
 
 pub struct Tools {
@@ -44,6 +47,7 @@ pub struct Tools {
     hex: hexview::HexView,
     smith: smith::Smith,
     nanovna: nanovna::NanoVna,
+    rotator: rotator::Rotator,
     /// True while the NanoVNA screen was showing on the previous frame.
     nano_open: bool,
     open_note: String,
@@ -73,9 +77,15 @@ impl Tools {
             ),
             smith: smith::Smith::new(ctx),
             nanovna: nanovna::NanoVna::new(ctx),
+            rotator: rotator::Rotator::new(),
             nano_open: false,
             open_note: String::new(),
         }
+    }
+
+    /// The rotators Config Automation starts. The Rotator screen drives the selected one.
+    pub fn set_rotators(&mut self, hub: std::sync::Arc<crate::rot::Hub>) {
+        self.rotator.set_hub(hub);
     }
 
     pub fn set_plan(&mut self, plan: &crate::plan::BandPlan) {
@@ -235,6 +245,7 @@ impl Tools {
             }
             Screen::Smith => self.smith.draw(ui),
             Screen::NanoVna => self.nanovna.draw(ui),
+            Screen::Rotator => self.rotator.draw(ui),
         }
     }
 }
@@ -394,7 +405,7 @@ mod tests {
         let labels: Vec<_> = SCREENS.iter().map(|(_, label)| *label).collect();
         assert_eq!(
             labels,
-            vec!["NanoVNA", "RF Calc", "Calc", "Smith", "Hex", "Logbook"]
+            vec!["NanoVNA", "RF Calc", "Calc", "Smith", "Hex", "Logbook", "Rotator"]
         );
     }
 }
