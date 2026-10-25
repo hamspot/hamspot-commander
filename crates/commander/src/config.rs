@@ -1311,4 +1311,48 @@ mod tests {
         assert!(keys.keys[0].text.is_empty());
         assert_eq!(keys.keys[0].alg, "84");
     }
+
+    #[test]
+    fn the_satellite_eme_example_station_loads() {
+        let text = include_str!("../../../examples/Example-Satellite-EME.HSCommander");
+        let file = parse(text).expect("example station");
+        assert_eq!(file.bsp_name, "satellite-eme.json");
+        assert_eq!(file.bsp.zones.len(), 7);
+        let bands: usize = file.bsp.zones.iter().map(|zone| zone.bands.len()).sum();
+        assert_eq!(bands, 14);
+        let segments: usize = file
+            .bsp
+            .zones
+            .iter()
+            .flat_map(|zone| zone.bands.iter())
+            .map(|band| band.segments.len())
+            .sum();
+        assert_eq!(segments, 33);
+        for band in file.bsp.zones.iter().flat_map(|zone| zone.bands.iter()) {
+            assert!(band.lo_hz >= 1_000_000.0 && band.hi_hz <= 6_000_000_000.0, "{}", band.name);
+        }
+        let two_m = &file.bsp.zones[1].bands[0];
+        assert_eq!(two_m.segments[0].lo_hz, 144_000_000.0);
+        assert_eq!(two_m.segments[0].use_kind, crate::plan::Use::Cw);
+        assert_eq!(file.channels.zones.len(), 3);
+        let channels: usize = file.channels.zones.iter().map(|zone| zone.channels.len()).sum();
+        assert_eq!(channels, 19);
+        assert!(file
+            .channels
+            .zones
+            .iter()
+            .flat_map(|zone| zone.channels.iter())
+            .all(|channel| !channel.control && !channel.encrypted));
+        assert_eq!(file.radios.len(), 1);
+        let radio = &file.radios[0];
+        assert_eq!(radio.driver, crate::cat::RadioDriver::Hackrf);
+        assert_eq!(radio.sample_rate, crate::hackrf::SAMPLE_RATE);
+        assert!(radio.audio.rx && !radio.audio.tx);
+        assert!(radio.tx_pipe.is_empty() && radio.rx_pipe.is_empty());
+        assert_eq!(file.rotators.len(), 1);
+        assert_eq!(file.rotators[0].name, "Dummy");
+        assert_eq!(file.rotators[0].model, 1);
+        assert_eq!(file.tune.freq_hz, 145_800_000.0);
+        assert!(parse(&to_string(&file).unwrap()).is_ok());
+    }
 }
