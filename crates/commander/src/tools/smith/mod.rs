@@ -123,6 +123,8 @@ pub struct Smith {
     pub vf: String,
     pub grid: usize,
     pub matching: usize,
+    /// L-network match readout: 0 off, 1 on. Issue 58.
+    pub lnet: usize,
     /// Markers in the Gamma plane, by mode: [primary, alt1, alt2].
     pub markers: [Option<Cx>; 3],
     pub last_click: Option<Cx>,
@@ -154,6 +156,7 @@ impl Smith {
             vf: s("0.66"),
             grid: 0,
             matching: 0,
+            lnet: 0,
             markers: [None; 3],
             last_click: None,
             hover: None,
@@ -305,7 +308,41 @@ impl Smith {
                     &mut self.matching,
                 )
             });
+            ui.vertical(|ui| pick(ui, &t, "L NETWORK", &["Off", "Show"], &mut self.lnet));
         });
+        if self.lnet == 1 {
+            // L network: up to four lossless solutions with part values at f. Issue 58.
+            let z0 = num(&self.z0).unwrap_or(50.0);
+            let f_hz = num(&self.f).unwrap_or(0.0) * 1e6;
+            let all = math::l_match(zn);
+            if all.is_empty() {
+                ui.label(egui::RichText::new("NO L NETWORK NEEDED (MATCHED) OR LOAD IS PURE REACTANCE").color(palette::TEXT_MUTED));
+            }
+            let rows: Vec<(String, String)> = all
+                .iter()
+                .enumerate()
+                .map(|(i, m)| {
+                    let order = match m.topology {
+                        math::LTopology::ShuntFirst => "SHUNT AT LOAD, SERIES TO SOURCE",
+                        math::LTopology::SeriesFirst => "SERIES AT LOAD, SHUNT AT SOURCE",
+                    };
+                    (
+                        format!("L{} {order}", i + 1),
+                        format!(
+                            "X {} ohm ({}) · B {} mS ({})",
+                            g(m.x * z0),
+                            math::reactance_part(m.x * z0, f_hz),
+                            g(m.b / z0 * 1e3),
+                            math::susceptance_part(m.b / z0, f_hz)
+                        ),
+                    )
+                })
+                .collect();
+            for (k, v) in &rows {
+                ui.label(egui::RichText::new(k).color(palette::TEXT_MUTED));
+                ui.label(egui::RichText::new(v).monospace());
+            }
+        }
         if self.matching > 0 {
             let kind = if self.matching == 1 {
                 Stub::Short
