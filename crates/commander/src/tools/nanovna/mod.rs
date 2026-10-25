@@ -4,6 +4,7 @@
 mod device;
 mod cal;
 mod display;
+mod layout;
 mod limits;
 mod markers;
 mod proto;
@@ -27,7 +28,7 @@ const START_DEFAULT: f64 = 50_000_000.0;
 const STOP_DEFAULT: f64 = 900_000_000.0;
 const POINTS_DEFAULT: u16 = 101;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum View {
     Smith,
     /// Admittance Smith chart (Y grid). Issue 64 / 58.
@@ -210,6 +211,9 @@ pub struct Face {
     /// Group-delay aperture in points. Issue 64.
     #[serde(default = "default_aperture", skip_serializing_if = "is_default_aperture")]
     pub gd_aperture: u32,
+    /// Pane grid and trace assignment. Issues 62 and 63.
+    #[serde(default, skip_serializing_if = "layout::Layout::is_default")]
+    pub layout: layout::Layout,
     /// Limit lines by trace format key. Issue 71.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub limits: std::collections::BTreeMap<String, limits::LimitSet>,
@@ -278,6 +282,7 @@ impl Default for Face {
             scales: std::collections::BTreeMap::new(),
             gd_aperture: 4,
             limits: std::collections::BTreeMap::new(),
+            layout: layout::Layout::default(),
         }
     }
 }
@@ -715,6 +720,11 @@ pub struct NanoVna {
     /// Correction off (CAL OFF) and the state of the shown trace. Issue 65.
     cal_off: bool,
     limits_edit: bool,
+    /// Active trace, the pane being drawn, the open trace menu, marker coupling. Issues 62, 63, 66.
+    active_trc: usize,
+    cur_pane: u8,
+    trace_menu: Option<usize>,
+    couple: bool,
     cal_state: cal::CalState,
     details_open: bool,
     last_sweep: Option<std::time::Instant>,
@@ -782,6 +792,10 @@ impl NanoVna {
             sweep_count: 0,
             cal_off: false,
             limits_edit: false,
+            active_trc: 0,
+            cur_pane: 0,
+            trace_menu: None,
+            couple: true,
             cal_state: cal::CalState::Uncal,
             details_open: false,
             last_sweep: None,
@@ -818,6 +832,10 @@ impl NanoVna {
         self.host_avg = face.host_average.to_string();
         self.smooth = face.smooth.to_string();
         self.face = face;
+        self.active_trc = 0;
+        if let Some(v) = self.face.layout.traces.first().and_then(|t| view_from_id(&t.view)) {
+            self.view = v;
+        }
         self.history.clear();
         self.mems = Default::default();
         self.dirty = false;
@@ -898,6 +916,8 @@ impl NanoVna {
         self.chart(ui, &theme, &live);
         self.details_dialog(ui, &theme, &live);
         self.limits_dialog(ui, &theme);
+        let shown_trace = self.display_trace(&live);
+        self.trace_menu_dialog(ui, &theme, shown_trace.as_deref());
         self.setup_dialog(ui, &theme, &live);
         self.wizard_dialog(ui, &theme, &live);
     }
@@ -1287,55 +1307,178 @@ impl NanoVna {
                     self.marker_block(ui, theme, trace.as_deref());
                 });
         });
-        let mut clicked = None;
-        let mut scale_gesture = ScaleGesture::default();
         let placed = self.placed(trace.as_deref());
-        let info = self.marker_info(trace.as_deref(), &placed);
         let (cal, state) = match trace.as_deref() {
             Some(t) => self.cal_for(t, None),
             None => (None, if self.cal_off { cal::CalState::Off } else { cal::CalState::Uncal }),
         };
         self.cal_state = state;
+        self.sync_traces();
         show_frame(ui, theme, right, Side::Right, |ui| {
-            self.trace_header(ui, theme, trace.as_deref(), cal.as_ref());
             let table_h = if placed.is_empty() { 0.0 } else { 22.0 * (placed.len() as f32 + 1.0) + 6.0 };
             let status_h = 26.0;
-            let chart_h = (ui.available_height() - table_h - status_h - 8.0).max(120.0);
-            ui.allocate_ui(vec2(ui.available_width(), chart_h), |ui| {
-                let manual = self.face.scales.get(scale_key(self.view)).copied();
-                let overlay = self.overlay(trace.as_deref());
-                let (hit, _, gesture) = paint_chart(
-                    ui,
-                    self.view,
-                    trace.as_deref(),
-                    memory.as_deref(),
-                    math.as_deref(),
-                    self.z0_value(),
-                    self.velocity_value(),
-                    false,
-                    theme.data_size,
-                    &placed,
-                    &info,
-                    manual,
-                    &overlay,
-                );
-                clicked = hit;
-                scale_gesture = gesture;
-            });
+            let grid_h = (ui.available_height() - table_h - status_h - 8.0).max(160.0);
+            let area = Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), grid_h));
+            ui.allocate_rect(area, Sense::hover());
+            self.draw_panes(ui, theme, area, trace.as_deref(), memory.as_deref(), math.as_deref(), &placed, cal.as_ref());
             if let Some(samples) = trace.as_deref() {
                 self.marker_table(ui, theme, samples, &placed);
             }
             self.status_bar(ui, theme, live, trace.as_deref(), cal.as_ref());
         });
-        if scale_gesture.ref_divs != 0.0 {
-            let by = scale_gesture.ref_divs as f64;
-            self.edit_scale(trace.as_deref(), |m| m.shifted(by, 10));
+    }
+
+    /// The trace whose settings the keys edit, kept in the layout. Issue 62.
+    fn sync_traces(&mut self) {
+        if self.face.layout.traces.is_empty() {
+            self.face.layout.traces.push(layout::TraceCfg { view: view_id(self.view), pane: 0, hidden: false });
+            self.active_trc = 0;
         }
-        if scale_gesture.wheel != 0 {
-            let up = scale_gesture.wheel > 0;
-            self.edit_scale(trace.as_deref(), |m| m.stepped(up));
+        self.active_trc = self.active_trc.min(self.face.layout.traces.len() - 1);
+        let id = view_id(self.view);
+        let t = &mut self.face.layout.traces[self.active_trc];
+        if t.view != id {
+            t.view = id;
+            self.dirty = true;
         }
-        if let (Some((index, clicks)), Some(samples)) = (clicked, trace.as_deref()) {
+        self.cur_pane = t.pane;
+    }
+
+    fn trace_view(&self, t: usize) -> View {
+        self.face.layout.traces.get(t).and_then(|c| view_from_id(&c.view)).unwrap_or(self.view)
+    }
+
+    /// Make trace `t` the active one: the keys and marker table follow it.
+    fn activate(&mut self, t: usize) {
+        if t < self.face.layout.traces.len() {
+            self.active_trc = t;
+            self.view = self.trace_view(t);
+            self.cur_pane = self.face.layout.traces[t].pane;
+        }
+    }
+
+    /// Draw every shown pane: its header lines and its chart. Issues 62 and 63.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_panes(
+        &mut self,
+        ui: &mut Ui,
+        theme: &LcarsTheme,
+        area: Rect,
+        trace: Option<&[Sample]>,
+        memory: Option<&[Sample]>,
+        math: Option<&[Sample]>,
+        placed: &[(usize, usize)],
+        cal: Option<&CalSet>,
+    ) {
+        let shown = self.face.layout.shown();
+        let (cols, rows) = layout::grid(shown.len());
+        let gap = 6.0;
+        let cw = (area.width() - gap * (cols as f32 - 1.0)) / cols as f32;
+        let ch = (area.height() - gap * (rows as f32 - 1.0)) / rows as f32;
+        let active_pane = self.cur_pane;
+        let mut new_active: Option<usize> = None;
+        let mut max_toggle: Option<u8> = None;
+        let mut clicked: Option<(usize, u8)> = None;
+        for (k, pane) in shown.iter().copied().enumerate() {
+            let (cx, cy) = (k % cols, k / cols);
+            let rect = Rect::from_min_size(
+                Pos2::new(area.left() + cx as f32 * (cw + gap), area.top() + cy as f32 * (ch + gap)),
+                vec2(cw, ch),
+            );
+            let all = self.face.layout.in_pane(pane);
+            let visible: Vec<usize> = all.iter().copied().filter(|t| !self.face.layout.traces[*t].hidden).collect();
+            let primary = visible.first().copied();
+            ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                self.cur_pane = pane;
+                if all.is_empty() {
+                    let resp = ui.allocate_exact_size(vec2(rect.width(), 26.0), Sense::click()).1;
+                    ui.painter().text(
+                        resp.rect.left_center() + vec2(8.0, 0.0),
+                        egui::Align2::LEFT_CENTER,
+                        format!("PANE {} · NO TRACE · +TRACE OR MOVE ONE HERE", pane + 1),
+                        egui::FontId::monospace(theme.data_size * 0.8),
+                        palette::TEXT_MUTED,
+                    );
+                    if resp.double_clicked() {
+                        max_toggle = Some(pane);
+                    }
+                }
+                for &t in &all {
+                    self.view = self.trace_view(t);
+                    let color = if Some(t) == primary { TRACE1 } else { TRACE_COLORS[t % TRACE_COLORS.len()] };
+                    let resp = self.trace_header(ui, theme, trace, cal, t, t == self.active_trc, color);
+                    if resp.double_clicked() {
+                        max_toggle = Some(pane);
+                    } else if resp.clicked() {
+                        new_active = Some(t);
+                        self.trace_menu = Some(t);
+                    }
+                }
+                let Some(p) = primary else {
+                    return;
+                };
+                let pv = self.trace_view(p);
+                self.view = pv;
+                let z0 = self.z0_value();
+                let vf = self.velocity_value();
+                // Other visible Cartesian traces in the pane draw over the first one.
+                let extra: Vec<(Vec<f64>, Color32)> = match trace {
+                    Some(samples) if !is_disk(pv) && pv != View::Tdr => visible[1..]
+                        .iter()
+                        .filter_map(|t| {
+                            let v = self.trace_view(*t);
+                            (!is_disk(v) && v != View::Tdr).then(|| (series(v, samples, z0, vf).1, TRACE_COLORS[*t % TRACE_COLORS.len()]))
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                // Coupled markers show on every pane; uncoupled only on the active one. Issue 66.
+                let marks: Vec<(usize, usize)> = if self.couple || pane == active_pane { placed.to_vec() } else { Vec::new() };
+                let info = self.marker_info(trace, &marks);
+                let manual = self.face.scales.get(self.key().as_str()).copied();
+                let overlay = self.overlay(trace);
+                let (hit, _, gesture) = paint_chart(
+                    ui,
+                    pv,
+                    trace,
+                    memory,
+                    math,
+                    z0,
+                    vf,
+                    false,
+                    theme.data_size,
+                    &marks,
+                    &info,
+                    manual,
+                    &overlay,
+                    &extra,
+                );
+                if gesture.ref_divs != 0.0 {
+                    let by = gesture.ref_divs as f64;
+                    self.edit_scale(trace, |m| m.shifted(by, 10));
+                    new_active = Some(p);
+                }
+                if gesture.wheel != 0 {
+                    let up = gesture.wheel > 0;
+                    self.edit_scale(trace, |m| m.stepped(up));
+                    new_active = Some(p);
+                }
+                if hit.is_some() {
+                    clicked = hit;
+                    if new_active.is_none() {
+                        new_active = Some(p);
+                    }
+                }
+            });
+        }
+        if let Some(pane) = max_toggle {
+            self.face.layout.toggle_max(pane);
+            self.dirty = true;
+        }
+        let active = new_active.unwrap_or(self.active_trc);
+        self.activate(active);
+        if let (Some((index, clicks)), Some(samples)) = (clicked, trace) {
             let slot = markers::click_slot(self.marker_on, clicks);
             if let Some(sample) = samples.get(index) {
                 self.markers[slot] = Some(sample.hz);
@@ -1346,12 +1489,98 @@ impl NanoVna {
         }
     }
 
+    /// Scale and limit key for the shown format in the pane being drawn.
+    /// Pane 1 keeps the plain format name so older files keep their scales.
+    fn key(&self) -> String {
+        let base = scale_key(self.view);
+        if self.cur_pane == 0 { base.to_string() } else { format!("P{} {base}", self.cur_pane + 1) }
+    }
+
+    /// Per-trace menu opened from its header line. Issue 63.
+    fn trace_menu_dialog(&mut self, ui: &mut Ui, theme: &LcarsTheme, samples: Option<&[Sample]>) {
+        let Some(t) = self.trace_menu else {
+            return;
+        };
+        if t >= self.face.layout.traces.len() {
+            self.trace_menu = None;
+            return;
+        }
+        let mut open = true;
+        let mut pick: Option<View> = None;
+        let mut hide = false;
+        let mut auto = false;
+        let mut store = false;
+        let mut move_next = false;
+        let mut remove = false;
+        let cur = self.trace_view(t);
+        let hidden = self.face.layout.traces[t].hidden;
+        egui::Window::new(format!("TRC{} settings", t + 1))
+            .open(&mut open)
+            .resizable(false)
+            .show(ui.ctx(), |ui| {
+                for s21 in [false, true] {
+                    ui.label(egui::RichText::new(if s21 { "S21 FORMAT" } else { "S11 FORMAT" }).color(palette::TEXT_MUTED));
+                    ui.horizontal_wrapped(|ui| {
+                        for (v, label) in VIEWS.iter().filter(|(v, _)| uses_s21(*v) == s21) {
+                            if ui.selectable_label(*v == cur, *label).clicked() {
+                                pick = Some(*v);
+                            }
+                        }
+                    });
+                }
+                ui.horizontal(|ui| {
+                    hide = action_button(ui, theme, if hidden { "Show" } else { "Hide" }, vec2(80.0, 30.0)).clicked();
+                    auto = action_button(ui, theme, "Auto scale", vec2(110.0, 30.0)).clicked();
+                    store = action_button(ui, theme, "Store mem", vec2(110.0, 30.0)).clicked();
+                });
+                ui.horizontal(|ui| {
+                    move_next = action_button(ui, theme, "Next pane", vec2(110.0, 30.0)).clicked();
+                    remove = self.face.layout.traces.len() > 1
+                        && action_button(ui, theme, "Remove", vec2(90.0, 30.0)).clicked();
+                });
+            });
+        self.activate(t);
+        if let Some(v) = pick {
+            self.view = v;
+        }
+        if hide {
+            let h = &mut self.face.layout.traces[t].hidden;
+            *h = !*h;
+            self.dirty = true;
+        }
+        if auto {
+            if self.face.scales.remove(self.key().as_str()).is_some() {
+                self.dirty = true;
+            }
+        }
+        if store {
+            if let Some(trace) = samples {
+                self.mems[self.mem_sel] = Some(trace.to_vec());
+                self.show_memory = true;
+            }
+        }
+        if move_next {
+            self.face.layout.move_next(t);
+            self.dirty = true;
+        }
+        if remove {
+            self.face.layout.traces.remove(t);
+            self.activate(0);
+            self.dirty = true;
+            open = false;
+        }
+        self.sync_traces();
+        if !open {
+            self.trace_menu = None;
+        }
+    }
+
     /// The scale the Cartesian pane uses: (scale, reference value, manual). Issue 69.
     fn shown_scale(&self, samples: Option<&[Sample]>) -> Option<(display::Scale, f64, bool)> {
         if is_disk(self.view) {
             return None;
         }
-        if let Some(m) = self.face.scales.get(scale_key(self.view)) {
+        if let Some(m) = self.face.scales.get(self.key().as_str()) {
             return Some((m.to_scale(10), m.ref_value, true));
         }
         let samples = samples?;
@@ -1366,7 +1595,7 @@ impl NanoVna {
         let Some((scale, ref_value, _)) = self.shown_scale(samples) else {
             return;
         };
-        let key = scale_key(self.view).to_string();
+        let key = self.key();
         let base = self
             .face
             .scales
@@ -1443,50 +1672,29 @@ impl NanoVna {
         }
     }
 
-    /// The R&S trace-list line over the pane: name, parameter chip, format, scale, channel, cal.
-    fn trace_header(&mut self, ui: &mut Ui, theme: &LcarsTheme, samples: Option<&[Sample]>, cal: Option<&CalSet>) {
+    /// One trace line over a pane: name, parameter chip, format, scale, REF,
+    /// flags and the CAL badge. Sections drop from the right when narrow. Issue 63.
+    #[allow(clippy::too_many_arguments)]
+    fn trace_header(
+        &mut self,
+        ui: &mut Ui,
+        theme: &LcarsTheme,
+        samples: Option<&[Sample]>,
+        cal: Option<&CalSet>,
+        trc: usize,
+        active: bool,
+        color: Color32,
+    ) -> egui::Response {
         let (param, format, unit) = view_meta(self.view);
         let shown = self.shown_scale(samples);
-        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::hover());
+        let hidden = self.face.layout.traces.get(trc).is_some_and(|t| t.hidden);
+        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::click());
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 0.0, palette::STRIP);
-        let font = egui::FontId::monospace(theme.data_size * 0.9);
-        let mut x = rect.left() + 8.0;
-        let put = |x: &mut f32, text: &str, color: Color32| {
-            let g = painter.layout_no_wrap(text.to_string(), font.clone(), color);
-            let w = g.size().x;
-            painter.galley(Pos2::new(*x, rect.center().y - g.size().y / 2.0), g, color);
-            *x += w + 14.0;
-        };
-        put(&mut x, "TRC1", palette::TEXT);
-        // Parameter chip in the trace colour with dark ink.
-        let g = painter.layout_no_wrap(param.to_string(), font.clone(), rustcars::ink_on(TRACE1));
-        let chip = Rect::from_min_size(
-            Pos2::new(x, rect.top() + 3.0),
-            vec2(g.size().x + 12.0, rect.height() - 6.0),
-        );
-        painter.rect_filled(chip, 4.0, TRACE1);
-        painter.galley(
-            Pos2::new(chip.left() + 6.0, chip.center().y - g.size().y / 2.0),
-            g,
-            rustcars::ink_on(TRACE1),
-        );
-        x = chip.right() + 14.0;
-        put(&mut x, format, palette::TEXT);
-        if let Some((scale, ref_value, manual)) = shown {
-            put(&mut x, if manual { "MAN" } else { "AUTO" }, palette::TEXT_MUTED);
-            put(&mut x, &format!("{} {unit}/", display::fmt_tick(scale.per_div, scale.per_div / 10.0)), palette::TEXT);
-            put(&mut x, &format!("REF {} {unit}", display::fmt_tick(ref_value, scale.per_div)), palette::TEXT);
+        painter.rect_filled(rect, 0.0, if active { palette::STRIP } else { rustcars::tint(palette::STRIP, -0.4) });
+        if active {
+            painter.rect_filled(Rect::from_min_size(rect.min, vec2(4.0, rect.height())), 0.0, palette::TAN);
         }
-        put(&mut x, "CH1", palette::TEXT_MUTED);
-        if self.show_memory && self.memory().is_some() {
-            put(&mut x, &format!("MEM{}", self.mem_sel + 1), MEM_COLOR);
-        }
-        match self.math {
-            traces::Math::Sub if self.show_memory => put(&mut x, "MATH D−M", palette::BRICK),
-            traces::Math::Div if self.show_memory => put(&mut x, "MATH D/M", palette::BRICK),
-            _ => {}
-        }
+        let font = egui::FontId::monospace(theme.data_size * 0.85);
         // CAL, CAL INT, CAL OFF or UNCAL, with the kind and range of the set. Issue 65.
         let state = self.cal_state;
         let kind = match cal {
@@ -1500,20 +1708,68 @@ impl NanoVna {
                 format!(" · {}-{}", display::fmt_hz(set.start_hz), display::fmt_hz(hi))
             })
             .unwrap_or_default();
-        let badge = format!("{}{kind}{range}", if samples.is_none() && state != cal::CalState::Off { "UNCAL" } else { state.label() });
+        let label = if samples.is_none() && state != cal::CalState::Off { "UNCAL" } else { state.label() };
         let fill = match state {
             cal::CalState::Exact if samples.is_some() => palette::OLIVE,
             cal::CalState::Interp => palette::TAN,
             cal::CalState::Off => palette::SLATE,
             _ => palette::BRICK,
         };
-        let g = painter.layout_no_wrap(badge, font.clone(), rustcars::ink_on(fill));
+        // The long badge first; the short label when the pane is narrow.
+        let long = format!("{label}{kind}{range}");
+        let mut g = painter.layout_no_wrap(long, font.clone(), rustcars::ink_on(fill));
+        if g.size().x > rect.width() * 0.45 {
+            g = painter.layout_no_wrap(label.to_string(), font.clone(), rustcars::ink_on(fill));
+        }
         let chip = Rect::from_min_size(
             Pos2::new(rect.right() - g.size().x - 20.0, rect.top() + 3.0),
             vec2(g.size().x + 12.0, rect.height() - 6.0),
         );
+        let limit = chip.left() - 8.0;
+        let mut x = rect.left() + 10.0;
+        let mut cut = false;
+        let mut put = |x: &mut f32, text: &str, color: Color32| {
+            if cut {
+                return;
+            }
+            let g = painter.layout_no_wrap(text.to_string(), font.clone(), color);
+            let w = g.size().x;
+            if *x + w > limit {
+                cut = true;
+                return;
+            }
+            painter.galley(Pos2::new(*x, rect.center().y - g.size().y / 2.0), g, color);
+            *x += w + 12.0;
+        };
+        put(&mut x, &format!("TRC{}", trc + 1), palette::TEXT);
+        // Parameter chip in the trace colour with dark ink.
+        let pg = painter.layout_no_wrap(param.to_string(), font.clone(), rustcars::ink_on(color));
+        if x + pg.size().x + 12.0 < limit {
+            let pchip = Rect::from_min_size(Pos2::new(x, rect.top() + 3.0), vec2(pg.size().x + 12.0, rect.height() - 6.0));
+            painter.rect_filled(pchip, 4.0, color);
+            painter.galley(Pos2::new(pchip.left() + 6.0, pchip.center().y - pg.size().y / 2.0), pg, rustcars::ink_on(color));
+            x = pchip.right() + 12.0;
+        }
+        put(&mut x, format, palette::TEXT);
+        if hidden {
+            put(&mut x, "HIDDEN", palette::TEXT_MUTED);
+        }
+        if let Some((scale, ref_value, manual)) = shown {
+            put(&mut x, &format!("{} {unit}/", display::fmt_tick(scale.per_div, scale.per_div / 10.0)), palette::TEXT);
+            put(&mut x, &format!("REF {} {unit}", display::fmt_tick(ref_value, scale.per_div)), palette::TEXT);
+            put(&mut x, if manual { "MAN" } else { "AUTO" }, palette::TEXT_MUTED);
+        }
+        if self.show_memory && self.memory().is_some() {
+            put(&mut x, &format!("MEM{}", self.mem_sel + 1), MEM_COLOR);
+        }
+        match self.math {
+            traces::Math::Sub if self.show_memory => put(&mut x, "MATH D−M", MATH_TEXT),
+            traces::Math::Div if self.show_memory => put(&mut x, "MATH D/M", MATH_TEXT),
+            _ => {}
+        }
+        put(&mut x, "CH1", palette::TEXT_MUTED);
         // Badge: single = Cal tab (wizard), double = restore a saved set, triple = correction on/off.
-        let badge_resp = ui.interact(chip, egui::Id::unique("vna-cal-badge"), Sense::click());
+        let badge_resp = ui.interact(chip, egui::Id::unique(("vna-cal-badge", trc)), Sense::click());
         if badge_resp.triple_clicked() {
             self.cal_off = !self.cal_off;
             self.note = if self.cal_off { "Correction is off (CAL OFF).".into() } else { "Correction is on.".into() };
@@ -1522,14 +1778,13 @@ impl NanoVna {
         } else if badge_resp.clicked() {
             self.cal_page = true;
         }
-        if chip.left() > x {
-            painter.rect_filled(chip, 4.0, fill);
-            painter.galley(
-                Pos2::new(chip.left() + 6.0, chip.center().y - g.size().y / 2.0),
-                g,
-                rustcars::ink_on(fill),
-            );
-        }
+        painter.rect_filled(chip, 4.0, fill);
+        painter.galley(
+            Pos2::new(chip.left() + 6.0, chip.center().y - g.size().y / 2.0),
+            g,
+            rustcars::ink_on(fill),
+        );
+        resp.on_hover_text("Click: trace menu (format, scale, memory, hide, pane) · double: maximize or restore pane")
     }
 
     /// One row per placed marker under the chart, with delta to R. Issue 66.
@@ -1747,6 +2002,103 @@ impl NanoVna {
             self.setup_open = true;
         }
 
+        key_caption(ui, theme, "LAYOUT · TRACE", width);
+        let mut lay: Option<(u8, u8)> = None;
+        ui.horizontal(|ui| {
+            // LAYOUT: single = choose, double = swap pane order, triple = default four-pane set.
+            for n in [1u8, 2, 4] {
+                let resp = softkey_response(ui, theme, &format!("Layout·{n}"), self.face.layout.panes == n, col3, true);
+                if resp.triple_clicked() {
+                    lay = Some((n, 3));
+                } else if resp.double_clicked() {
+                    lay = Some((n, 2));
+                } else if resp.clicked() {
+                    lay = Some((n, 1));
+                }
+            }
+        });
+        match lay {
+            Some((n, 1)) => {
+                if n == 4 && self.face.layout.traces.len() <= 1 {
+                    self.face.layout = layout::Layout::default_four();
+                    self.activate(0);
+                } else {
+                    self.face.layout.set_panes(n);
+                }
+                self.dirty = true;
+            }
+            Some((_, 2)) => {
+                self.face.layout.swap_order();
+                self.dirty = true;
+            }
+            Some((_, 3)) => {
+                self.face.layout = layout::Layout::default_four();
+                self.activate(0);
+                self.dirty = true;
+            }
+            _ => {}
+        }
+        let n_tr = self.face.layout.traces.len().max(1);
+        let mut tr_op: Option<(usize, u8)> = None;
+        ui.horizontal(|ui| {
+            // TRC keys: single = select (again: show/hide), double = trace menu, triple = store memory.
+            for t in 0..n_tr {
+                let hidden = self.face.layout.traces.get(t).is_some_and(|c| c.hidden);
+                let label = if hidden { format!("TRC{} off", t + 1) } else { format!("TRC{}", t + 1) };
+                let resp = softkey_response(ui, theme, &label, t == self.active_trc, col4, true);
+                if resp.triple_clicked() {
+                    tr_op = Some((t, 3));
+                } else if resp.double_clicked() {
+                    tr_op = Some((t, 2));
+                } else if resp.clicked() {
+                    tr_op = Some((t, 1));
+                }
+            }
+            if n_tr < layout::MAX_TRACES && softkey(ui, theme, "+Trace", false, col4) {
+                tr_op = Some((usize::MAX, 0));
+            }
+        });
+        match tr_op {
+            Some((usize::MAX, _)) => {
+                let pane = (self.face.layout.traces.len() as u8) % self.face.layout.panes.max(1);
+                self.face.layout.traces.push(layout::TraceCfg { view: view_id(View::S21), pane, hidden: false });
+                let t = self.face.layout.traces.len() - 1;
+                self.activate(t);
+                self.dirty = true;
+            }
+            Some((t, 1)) => {
+                if t == self.active_trc {
+                    if let Some(c) = self.face.layout.traces.get_mut(t) {
+                        c.hidden = !c.hidden;
+                        self.dirty = true;
+                    }
+                } else {
+                    self.activate(t);
+                }
+            }
+            Some((t, 2)) => {
+                self.activate(t);
+                self.trace_menu = Some(t);
+            }
+            Some((t, 3)) => {
+                self.activate(t);
+                if let Some(trace) = samples {
+                    self.mems[self.mem_sel] = Some(trace.to_vec());
+                    self.show_memory = true;
+                }
+            }
+            _ => {}
+        }
+        ui.horizontal(|ui| {
+            if softkey_enabled(ui, theme, "Pane →", false, col4, self.face.layout.panes > 1) {
+                self.face.layout.move_next(self.active_trc);
+                self.dirty = true;
+            }
+            if softkey(ui, theme, if self.couple { "Couple on" } else { "Couple off" }, self.couple, col4) {
+                self.couple = !self.couple;
+            }
+        });
+
         key_caption(ui, theme, "FORMAT", width);
         // Parameter first; only the formats valid for it are offered. Issue 64.
         let s21 = uses_s21(self.view);
@@ -1878,7 +2230,7 @@ impl NanoVna {
         if let Some((scale, ref_value, _)) = shown.filter(|_| cart) {
             let (_, _, unit) = view_meta(self.view);
             let mut r = ref_value;
-            let mut pos = self.face.scales.get(scale_key(self.view)).map(|m| m.ref_pos).unwrap_or_else(|| display::ManualScale::from_scale(&scale, ref_value).ref_pos);
+            let mut pos = self.face.scales.get(self.key().as_str()).map(|m| m.ref_pos).unwrap_or_else(|| display::ManualScale::from_scale(&scale, ref_value).ref_pos);
             let mut per = scale.per_div;
             let (mut cr, mut cp, mut cd) = (false, false, false);
             ui.horizontal(|ui| {
@@ -1899,7 +2251,7 @@ impl NanoVna {
         }
         match scale_op {
             Some(1) | Some(2) => {
-                if self.face.scales.remove(scale_key(self.view)).is_some() {
+                if self.face.scales.remove(self.key().as_str()).is_some() {
                     self.dirty = true;
                 }
             }
@@ -1918,7 +2270,7 @@ impl NanoVna {
 
         key_caption(ui, theme, "LIMITS", width);
         let cart_lim = !is_disk(self.view) && self.view != View::Tdr;
-        let key = scale_key(self.view).to_string();
+        let key = self.key();
         let lim_on = self.face.limits.get(&key).is_some_and(|s| s.on);
         let mut lim_op = None;
         ui.horizontal(|ui| {
@@ -3564,7 +3916,7 @@ impl NanoVna {
         if is_disk(self.view) || self.view == View::Tdr {
             return o;
         }
-        if let Some(set) = self.face.limits.get(scale_key(self.view)).filter(|s| s.on && !s.segs.is_empty()) {
+        if let Some(set) = self.face.limits.get(self.key().as_str()).filter(|s| s.on && !s.segs.is_empty()) {
             o.limits = set.segs.clone();
             if let Some(samples) = samples {
                 let (xs, ys) = series(self.view, samples, self.z0_value(), self.velocity_value());
@@ -3586,7 +3938,8 @@ impl NanoVna {
             return;
         };
         self.view = View::Swr;
-        let set = self.face.limits.entry(scale_key(View::Swr).to_string()).or_default();
+        let k = self.key();
+        let set = self.face.limits.entry(k).or_default();
         set.segs = vec![limits::swr_preset(band.lo_mhz * 1e6, band.hi_mhz * 1e6, swr)];
         set.on = true;
         self.dirty = true;
@@ -3598,7 +3951,7 @@ impl NanoVna {
         if !self.limits_edit {
             return;
         }
-        let key = scale_key(self.view).to_string();
+        let key = self.key();
         let (_, _, unit) = view_meta(self.view);
         let mut open = true;
         let mut set = self.face.limits.get(&key).cloned().unwrap_or_default();
@@ -4109,6 +4462,15 @@ const GRID: Color32 = Color32::from_rgb(0x4A, 0x55, 0x66);
 const GRID_FAINT: Color32 = Color32::from_rgb(0x2C, 0x33, 0x3D);
 const TRACE1: Color32 = Color32::from_rgb(0xF2, 0xC2, 0x6B);
 const TRACE2: Color32 = Color32::from_rgb(0x78, 0xAA, 0xD2);
+/// TRC1..TRC4 colours for extra traces sharing a pane and their header chips.
+const TRACE_COLORS: [Color32; 4] = [
+    TRACE1,
+    Color32::from_rgb(0x8C, 0xC8, 0xFF),
+    Color32::from_rgb(0xE0, 0xA0, 0xE0),
+    Color32::from_rgb(0xA0, 0xE0, 0x90),
+];
+/// MATH label text: brick is too dark for text on the strip.
+const MATH_TEXT: Color32 = Color32::from_rgb(0xFF, 0x99, 0x88);
 /// Memory traces. Drawn dashed on Cartesian panes.
 const MEM_COLOR: Color32 = palette::TEAL;
 const PANE_BG: Color32 = Color32::from_rgb(12, 16, 22);
@@ -4427,6 +4789,7 @@ fn paint_chart(
     info: &[(String, Color32)],
     manual: Option<display::ManualScale>,
     overlay: &Overlay,
+    extra: &[(Vec<f64>, Color32)],
 ) -> (Option<(usize, u8)>, Option<String>, ScaleGesture) {
     // S21 polar draws the S21 points through the S11 polar painter.
     let as_s11 = |s: &[Sample]| -> Vec<Sample> { s.iter().map(|x| Sample { s11: x.s21, ..*x }).collect() };
@@ -4512,6 +4875,11 @@ fn paint_chart(
             }
             if delta.len() == ys.len() && !delta.is_empty() {
                 traces.push((&delta, palette::BRICK));
+            }
+            for (e, c) in extra {
+                if e.len() == ys.len() {
+                    traces.push((e, *c));
+                }
             }
             paint_cartesian(&painter, rect, view, &xs, &traces, markers, label_px, manual, overlay);
             None
@@ -4636,6 +5004,16 @@ struct ScaleGesture {
     ref_divs: f32,
     /// +1 coarser, -1 finer per division, from the wheel over the value axis.
     wheel: i32,
+}
+
+/// Stable id of a format for the layout: "S11 SMITH", "S21 DB MAG". Issue 62.
+fn view_id(view: View) -> String {
+    let (param, format, _) = view_meta(view);
+    format!("{param} {format}")
+}
+
+fn view_from_id(id: &str) -> Option<View> {
+    VIEWS.iter().map(|(v, _)| *v).find(|v| view_id(*v) == id)
 }
 
 /// Key under which a trace format's manual scale is saved.
@@ -5329,6 +5707,22 @@ mod tests {
         assert!(!device::unplugged("/dev/null"));
         assert!(!device::unplugged(""));
         assert!(!device::unplugged("COM3"));
+    }
+
+    #[test]
+    fn every_format_has_a_unique_layout_id_and_the_default_panes_resolve() {
+        let ids: Vec<String> = VIEWS.iter().map(|(v, _)| view_id(*v)).collect();
+        for (i, id) in ids.iter().enumerate() {
+            assert!(!ids[..i].contains(id), "duplicate {id}");
+            assert!(view_from_id(id) == Some(VIEWS[i].0));
+        }
+        let four = layout::Layout::default_four();
+        let views: Vec<View> = four.traces.iter().map(|t| view_from_id(&t.view).expect(&t.view)).collect();
+        assert_eq!(views, vec![View::ReturnLoss, View::S21, View::Smith, View::GroupDelay]);
+        let mut face = Face::default();
+        face.layout = four;
+        let back: Face = serde_json::from_str(&serde_json::to_string(&face).unwrap()).unwrap();
+        assert_eq!(back.layout, face.layout);
     }
 
     #[test]
