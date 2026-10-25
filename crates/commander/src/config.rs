@@ -794,6 +794,23 @@ mod tests {
         assert_eq!(gqrx.radios[0].driver, crate::cat::RadioDriver::Gqrx);
     }
 
+    /// Every station file in David's config folders still loads with this
+    /// build (skipped where the folders are absent).
+    #[test]
+    fn existing_station_files_still_load() {
+        for dir in ["/home/user/Documents/hscommand-config", "/home/user/.config/hamspot-commander"] {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|e| e == "HSCommander") {
+                    load_file(&path).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+                }
+            }
+        }
+    }
+
     #[test]
     fn safet_station_file_loads_when_it_is_present() {
         let path = Path::new("/home/user/.config/hamspot-commander/SAFE-T.HSCommander");

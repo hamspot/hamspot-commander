@@ -30,6 +30,8 @@ const POINTS_DEFAULT: u16 = 101;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum View {
     Smith,
+    /// Admittance Smith chart (Y grid). Issue 64 / 58.
+    SmithY,
     Polar,
     Swr,
     ReturnLoss,
@@ -52,8 +54,9 @@ enum View {
 
 /// Every format with its key label. FORMAT shows the ones valid for the
 /// selected parameter (S11 or S21). Issue 64.
-const VIEWS: [(View, &str); 18] = [
+const VIEWS: [(View, &str); 19] = [
     (View::Smith, "Smith"),
+    (View::SmithY, "Smith Y"),
     (View::Polar, "Polar"),
     (View::Swr, "SWR"),
     (View::ReturnLoss, "Return loss"),
@@ -83,7 +86,7 @@ fn uses_s21(view: View) -> bool {
 
 /// Polar and Smith draw on a disk, not a Cartesian grid.
 fn is_disk(view: View) -> bool {
-    matches!(view, View::Smith | View::Polar | View::PolarS21)
+    matches!(view, View::Smith | View::SmithY | View::Polar | View::PolarS21)
 }
 
 /// The parameter a format reads from one sample.
@@ -680,7 +683,6 @@ pub struct NanoVna {
     mem_sel: usize,
     math: traces::Math,
     show_memory: bool,
-    admittance: bool,
     history: VecDeque<Vec<Sample>>,
     seen: u64,
     pending: Option<Standard>,
@@ -754,7 +756,6 @@ impl NanoVna {
             mem_sel: 0,
             math: traces::Math::Off,
             show_memory: false,
-            admittance: false,
             history: VecDeque::new(),
             seen: 0,
             pending: None,
@@ -1311,7 +1312,7 @@ impl NanoVna {
                     math.as_deref(),
                     self.z0_value(),
                     self.velocity_value(),
-                    self.admittance,
+                    false,
                     theme.data_size,
                     &placed,
                     &info,
@@ -1794,10 +1795,6 @@ impl NanoVna {
 
         key_caption(ui, theme, "DISPLAY", width);
         ui.horizontal(|ui| {
-            let smith = self.view == View::Smith;
-            if softkey_enabled(ui, theme, "Y adm", self.admittance && smith, col4, smith) {
-                self.admittance = !self.admittance;
-            }
             // STORE: single = store, double = toggle memory display, triple = cycle math.
             let resp = softkey_response(ui, theme, "Store", false, col4, samples.is_some());
             if resp.triple_clicked() {
@@ -3247,6 +3244,22 @@ impl NanoVna {
                 true
             }
             Err(err) => {
+                // Numbers that are only out of range are clamped with a note,
+                // like the SWEEP panel. Text that is not a number still errors. Issue 68.
+                if let (Ok(a), Ok(b), Ok(n)) = (parse_hz(&self.start), parse_hz(&self.stop), self.points.trim().parse::<i64>()) {
+                    let max = self.session.snapshot().identity.map(|id| id.max_hz()).unwrap_or(3.0e9);
+                    let c = sweep::clamp(a as f64, b as f64, n, proto::FREQ_FLOOR_HZ as f64, max, proto::POINTS_MAX as u16);
+                    if !c.notes.is_empty() {
+                        self.start = hz_field(c.start);
+                        self.stop = hz_field(c.stop);
+                        self.points = c.points.to_string();
+                        if self.parse_setup().is_ok() {
+                            let ok = self.send_sweep();
+                            self.note = format!("Clamped: {}.", c.notes.join("; "));
+                            return ok;
+                        }
+                    }
+                }
                 self.note = err;
                 false
             }
@@ -4004,7 +4017,7 @@ fn series(view: View, samples: &[Sample], z0: f64, velocity: f64) -> (Vec<f64>, 
             samples.iter().map(|s| s.hz).collect(),
             samples.iter().map(|s| param_of(view, s).re).collect(),
         ),
-        View::Smith | View::Polar | View::PolarS21 => (
+        View::Smith | View::SmithY | View::Polar | View::PolarS21 => (
             samples.iter().map(|s| s.hz).collect(),
             samples.iter().map(|s| param_of(view, s).abs()).collect(),
         ),
@@ -4024,6 +4037,7 @@ fn second_series(view: View, samples: &[Sample], z0: f64) -> Vec<f64> {
 fn view_meta(view: View) -> (&'static str, &'static str, &'static str) {
     match view {
         View::Smith => ("S11", "SMITH", "U"),
+        View::SmithY => ("S11", "SMITH Y", "U"),
         View::Polar => ("S11", "POLAR", "U"),
         View::Swr => ("S11", "SWR", "U"),
         View::ReturnLoss => ("S11", "RETURN LOSS", "dB"),
@@ -4048,7 +4062,7 @@ fn view_meta(view: View) -> (&'static str, &'static str, &'static str) {
 fn marker_value(view: View, sample: &Sample, z0: f64) -> String {
     let (_, _, unit) = view_meta(view);
     match view {
-        View::Smith | View::Impedance => {
+        View::Smith | View::SmithY | View::Impedance => {
             let d = rf::derive(sample, z0);
             format!("{} {:+}j Ω", num(d.r), num(d.x))
         }
@@ -4417,6 +4431,8 @@ fn paint_chart(
     // S21 polar draws the S21 points through the S11 polar painter.
     let as_s11 = |s: &[Sample]| -> Vec<Sample> { s.iter().map(|x| Sample { s11: x.s21, ..*x }).collect() };
     let (mapped, mapped_mem);
+    // The admittance Smith format is the Smith painter with its Y grid.
+    let (view, admittance) = if view == View::SmithY { (View::Smith, true) } else { (view, admittance) };
     let (view, samples, memory) = if view == View::PolarS21 {
         mapped = samples.map(as_s11);
         mapped_mem = memory.map(as_s11);
@@ -5313,6 +5329,22 @@ mod tests {
         assert!(!device::unplugged("/dev/null"));
         assert!(!device::unplugged(""));
         assert!(!device::unplugged("COM3"));
+    }
+
+    #[test]
+    fn an_older_nanovna_section_loads_with_every_new_field_defaulted() {
+        let old = r#"{"port":"/dev/ttyACM0","start_hz":1000000.0,"stop_hz":30000000.0,"points":201}"#;
+        let face: Face = serde_json::from_str(old).unwrap();
+        assert!(face.scales.is_empty() && face.limits.is_empty());
+        assert_eq!(face.gd_aperture, 4);
+        assert!(validate(&face).is_ok());
+        // A default face writes nothing new, so files without VNA settings stay unchanged.
+        assert_eq!(serde_json::to_string(&Face::default().for_station()).unwrap(), "{}");
+        let set: CalSet = serde_json::from_str(
+            r#"{"id":"a","start_hz":1.0,"step_hz":1.0,"z0":50.0,"open":[],"short":[],"load":[]}"#,
+        )
+        .unwrap();
+        assert!(set.name.is_empty());
     }
 
     #[test]
