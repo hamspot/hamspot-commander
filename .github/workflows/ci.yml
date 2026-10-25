@@ -15,6 +15,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            libxkbcommon-dev libgtk-3-dev
+            libxkbcommon-dev libgtk-3-dev libudev-dev pkg-config
       - name: Test
         run: cargo test --workspace
