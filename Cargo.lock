@@ -694,7 +694,7 @@ dependencies = [
 
 [[package]]
 name = "commander"
-version = "0.8.0"
+version = "0.8.5"
 dependencies = [
  "chrono",
  "eframe",
@@ -2987,7 +2987,7 @@ dependencies = [
 
 [[package]]
 name = "rigctl"
-version = "0.8.0"
+version = "0.8.5"
 
 [[package]]
 name = "ron"

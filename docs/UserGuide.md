@@ -2,13 +2,13 @@
 
 **User Guide**
 
-Version 0.8.0
+Version 0.8.5
 
 24 October 2026
 
 Hamspot
 
-This guide tells you how to run Hamspot Commander, tune a radio from the window, save a station file, and keep a portable copy on an Ubuntu live USB. It describes the program that ships in release 0.8.0. It does not describe a later build.
+This guide tells you how to run Hamspot Commander, tune a radio from the window, save a station file, and keep a portable copy on an Ubuntu live USB. It describes the program that ships in release 0.8.5. It does not describe a later build.
 
 Ham Radio Deluxe is a trademark of its owner. This project does not copy that program's icons, pictures, or manual text. The chapter order of this guide follows the same kind of operator manual: what the program is, how to start it, how the face works, then how to configure it.
 
@@ -64,7 +64,7 @@ Button names are printed as they appear on the window, for example `Add hamlib` 
 
 ## 1.4 Computer
 
-Release 0.8.0 of the portable build is a 64-bit Linux program. The install script in the source tree accepts only Ubuntu 26.04. The portable folder can be copied onto another Ubuntu machine of the same kind. It still needs the packages in the next section. Those packages are not inside the zip.
+Release 0.8.5 of the portable build is a 64-bit Linux program. The install script in the source tree accepts only Ubuntu 26.04. The portable folder can be copied onto another Ubuntu machine of the same kind. It still needs the packages in the next section. Those packages are not inside the zip.
 
 You need a graphical session. The window uses the desktop's display. Audio uses the session's PipeWire socket. Do not point the launcher at a different runtime directory. The start script leaves that socket alone on purpose.
 
@@ -99,9 +99,9 @@ GQRX is a receiver on this face. Its caps are one VFO, no transmit, no RIT, and 
 
 The portable zip for this guide is attached to the GitHub release:
 
-https://github.com/hamspot/hamspot-commander/releases/tag/v0.8.0
+https://github.com/hamspot/hamspot-commander/releases/tag/v0.8.5
 
-The file name is `hamspot-commander-0.8.0-portable-linux-x86_64.zip`. Unzipping it produces one folder, `HamSpotCommander`. Chapter 11 is the procedure for a USB stick.
+The file name is `hamspot-commander-0.8.5-portable-linux-x86_64.zip`. Unzipping it produces one folder, `HamSpotCommander`. Chapter 11 is the procedure for a USB stick.
 
 ---
 
@@ -609,7 +609,7 @@ The live user is the one the Ubuntu image logs in as. Commands below use that us
 
 ## 11.4 Copy the zip onto the stick
 
-From any computer, copy `hamspot-commander-0.8.0-portable-linux-x86_64.zip` onto the `usbdata` partition, or download the release onto the live session after you have confirmed persistence.
+From any computer, copy `hamspot-commander-0.8.5-portable-linux-x86_64.zip` onto the `usbdata` partition, or download the release onto the live session after you have confirmed persistence.
 
 The release page is chapter 1.7.
 
@@ -618,7 +618,7 @@ The release page is chapter 1.7.
 On the persistent live session:
 
 ```bash
-ZIP=/media/$USER/usbdata/hamspot-commander-0.8.0-portable-linux-x86_64.zip
+ZIP=/media/$USER/usbdata/hamspot-commander-0.8.5-portable-linux-x86_64.zip
 mkdir -p "$HOME/Applications"
 unzip "$ZIP" -d "$HOME/Applications"
 ```

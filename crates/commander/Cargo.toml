@@ -1,6 +1,6 @@
 [package]
 name = "commander"
-version = "0.8.0"
+version = "0.8.5"
 description = "Hamspot Commander rig-control face"
 edition.workspace = true
 license.workspace = true
