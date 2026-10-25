@@ -2,24 +2,27 @@
 //! aircraft attitude indicator. Geometry is pure and tested; the painter uses
 //! muted tones so the amber azimuth scale stays readable on top.
 
-/// Degrees of elevation from the window center to its edge.
-pub const VIEW_DEG: f64 = 45.0;
+/// Degrees of elevation from the window center to its edge: the full range
+/// plus a margin, so 0 and the top of the range are always in view.
+pub fn view_deg(max_el: f64) -> f64 {
+    max_el.max(10.0) + 5.0
+}
 
 /// Pixels per degree for a window of radius `r`.
-pub fn px_per_deg(r: f64) -> f64 {
-    r / VIEW_DEG
+pub fn px_per_deg(r: f64, max_el: f64) -> f64 {
+    r / view_deg(max_el)
 }
 
 /// Screen y offset from the window center (down positive) of the line for
 /// elevation `pitch` while the antenna is at `el`. Raising the antenna moves
 /// the horizon (pitch 0) down, like a climbing aircraft.
-pub fn pitch_dy(pitch: f64, el: f64, r: f64) -> f64 {
-    (el - pitch) * px_per_deg(r)
+pub fn pitch_dy(pitch: f64, el: f64, r: f64, max_el: f64) -> f64 {
+    (el - pitch) * px_per_deg(r, max_el)
 }
 
 /// Horizon offset, clamped just outside the window so the fill stays sane.
-pub fn horizon_dy(el: f64, r: f64) -> f64 {
-    pitch_dy(0.0, el, r).clamp(-r * 1.01, r * 1.01)
+pub fn horizon_dy(el: f64, r: f64, max_el: f64) -> f64 {
+    pitch_dy(0.0, el, r, max_el).clamp(-r * 1.01, r * 1.01)
 }
 
 /// Half width of the window at offset `dy`. None outside the circle.
@@ -27,13 +30,15 @@ pub fn half_chord(dy: f64, r: f64) -> Option<f64> {
     (dy.abs() < r).then(|| (r * r - dy * dy).sqrt())
 }
 
-/// Ladder rungs: every 5 from -10 to `max_el`. A labelled rung every 15.
+/// Ladder rungs from -5 to `max_el`: every 5 labelled every 15 for a 0..90
+/// range, every 10 labelled every 30 beyond that so rungs stay apart.
 pub fn ladder(max_el: f64) -> Vec<(f64, bool)> {
-    let top = (max_el / 5.0).floor() as i32;
-    (-2..=top)
+    let (step, label) = if max_el > 90.0 { (10.0, 30.0) } else { (5.0, 15.0) };
+    let top = (max_el / step).floor() as i32;
+    (-1..=top)
         .map(|i| {
-            let p = i as f64 * 5.0;
-            (p, i % 3 == 0 && i != 0)
+            let p = i as f64 * step;
+            (p, i > 0 && (p % label).abs() < 1e-9)
         })
         .collect()
 }
@@ -79,7 +84,7 @@ pub fn paint(
     let e = el.unwrap_or(0.0);
     let at = |x: f64, y: f64| c + egui::vec2(x as f32, y as f32);
     painter.circle_filled(c, r, GROUND);
-    let hy = horizon_dy(e, rr);
+    let hy = horizon_dy(e, rr, max_el);
     let sky: Vec<egui::Pos2> = sky_polygon(hy, rr, 64).into_iter().map(|(x, y)| at(x, y)).collect();
     if sky.len() > 2 {
         painter.add(egui::Shape::convex_polygon(sky, SKY, egui::Stroke::NONE));
@@ -96,7 +101,7 @@ pub fn paint(
     }
     // Ladder.
     for (pitch, labelled) in ladder(max_el) {
-        let dy = pitch_dy(pitch, e, rr);
+        let dy = pitch_dy(pitch, e, rr, max_el);
         let Some(half) = half_chord(dy, rr) else { continue };
         let (len, stroke) = if pitch == 0.0 {
             (half, egui::Stroke::new(2.0, HORIZON))
@@ -127,7 +132,7 @@ pub fn paint(
     }
     // EL preset marker on the right edge.
     if let Some(p) = preset_el {
-        let dy = pitch_dy(p, e, rr);
+        let dy = pitch_dy(p, e, rr, max_el);
         if let Some(half) = half_chord(dy, rr) {
             let tip = at(half - 2.0, dy);
             let m = r * 0.07;
@@ -166,13 +171,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn horizon_moves_down_as_elevation_rises() {
-        assert_eq!(pitch_dy(0.0, 0.0, 90.0), 0.0);
-        assert_eq!(pitch_dy(0.0, 45.0, 90.0), 90.0);
-        assert_eq!(pitch_dy(30.0, 30.0, 90.0), 0.0);
-        assert_eq!(pitch_dy(90.0, 45.0, 90.0), -90.0);
-        assert!((horizon_dy(90.0, 90.0) - 90.9).abs() < 1e-9);
-        assert!((horizon_dy(-90.0, 90.0) + 90.9).abs() < 1e-9);
+    fn full_range_stays_in_view() {
+        // 0..90: the window spans 95 degrees from center to edge.
+        assert_eq!(view_deg(90.0), 95.0);
+        assert_eq!(pitch_dy(0.0, 0.0, 95.0, 90.0), 0.0);
+        assert_eq!(pitch_dy(90.0, 0.0, 95.0, 90.0), -90.0);
+        assert_eq!(pitch_dy(0.0, 90.0, 95.0, 90.0), 90.0);
+        // 0..180 compresses the scale.
+        assert_eq!(pitch_dy(180.0, 0.0, 185.0, 180.0), -180.0);
+        assert!((horizon_dy(500.0, 10.0, 90.0) - 10.1).abs() < 1e-9);
     }
 
     #[test]
@@ -183,15 +190,19 @@ mod tests {
     }
 
     #[test]
-    fn ladder_every_five_labelled_every_fifteen_to_zenith() {
+    fn ladder_spacing_follows_the_range() {
         let l = ladder(90.0);
-        assert_eq!(l.first(), Some(&(-10.0, false)));
+        assert_eq!(l.first(), Some(&(-5.0, false)));
         assert_eq!(l.last(), Some(&(90.0, true)));
-        assert_eq!(l.len(), 21);
+        assert_eq!(l.len(), 20);
         assert!(l.contains(&(15.0, true)));
         assert!(l.contains(&(0.0, false)));
         assert!(l.contains(&(10.0, false)));
-        assert_eq!(ladder(180.0).last(), Some(&(180.0, true)));
+        let f = ladder(180.0);
+        assert_eq!(f.last(), Some(&(180.0, true)));
+        assert!(f.contains(&(30.0, true)));
+        assert!(f.contains(&(20.0, false)));
+        assert_eq!(f.len(), 20);
     }
 
     #[test]

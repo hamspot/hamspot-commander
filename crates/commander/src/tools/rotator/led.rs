@@ -1,19 +1,6 @@
 //! Red seven-segment AZ/EL readouts (issue #85). Formatting is pure and tested.
 //! The painter draws lit segments in red and unlit ones as dim ghosts.
 
-use super::geom::{self, StopAt};
-
-/// Azimuth shown on the AZ readout. With a north stop the G-1000 travel is
-/// 0..450, so the overlap reads 360.0..450.0. With the factory south stop the
-/// rotctld value is -180..270. The readout shows the compass bearing and the
-/// OVL annunciator says which pass it is.
-pub fn display_az(az: f64, stop: StopAt) -> f64 {
-    match stop {
-        StopAt::North => az,
-        StopAt::South => geom::bearing(az),
-    }
-}
-
 fn round1(v: f64) -> f64 {
     (v * 10.0).round() / 10.0
 }
@@ -159,6 +146,7 @@ mod tests {
         assert_eq!(format_az(Some(359.96), true), "  0.0");
         assert_eq!(format_az(Some(359.96), false), "360.0");
         assert_eq!(format_az(Some(400.0), false), "400.0");
+        assert_eq!(format_az(Some(630.0), false), "630.0");
         assert_eq!(format_az(Some(450.0), false), "450.0");
         assert_eq!(format_az(Some(-12.34), false), "-12.3");
         assert_eq!(format_az(Some(-0.04), false), "  0.0");
@@ -177,14 +165,6 @@ mod tests {
         assert_eq!(format_el(Some(200.0)), " OVr");
         assert!(el_flipped(90.2));
         assert!(!el_flipped(90.04));
-    }
-
-    #[test]
-    fn overlap_shows_past_360_with_a_north_stop() {
-        assert_eq!(display_az(400.0, StopAt::North), 400.0);
-        assert_eq!(display_az(200.0, StopAt::South), 200.0);
-        assert_eq!(display_az(-90.0, StopAt::South), 270.0);
-        assert!(geom::in_overlap(400.0, StopAt::North));
     }
 
     #[test]
