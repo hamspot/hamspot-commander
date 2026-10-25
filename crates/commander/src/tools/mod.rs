@@ -88,6 +88,15 @@ impl Tools {
         self.rotator.set_hub(hub);
     }
 
+    /// Rotator tab settings as JSON, for eframe storage.
+    pub fn rotator_settings(&self) -> String {
+        self.rotator.settings_json()
+    }
+
+    pub fn load_rotator_settings(&mut self, text: &str) {
+        self.rotator.load_settings_json(text);
+    }
+
     pub fn set_plan(&mut self, plan: &crate::plan::BandPlan) {
         self.nanovna.set_plan(plan);
     }

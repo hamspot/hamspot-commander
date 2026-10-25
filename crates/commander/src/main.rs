@@ -1987,6 +1987,9 @@ impl App {
         {
             let mut tools = app.tools.lock().expect("tools");
             tools.set_rotators(Arc::clone(&app.rotators));
+            if let Some(text) = cc.storage.and_then(|storage| storage.get_string("rotator_settings")) {
+                tools.load_rotator_settings(&text);
+            }
             tools.detached = cc
                 .storage
                 .and_then(|storage| storage.get_string("tool_detach"))
@@ -2405,6 +2408,7 @@ impl eframe::App for App {
         if let Some(size) = tools.saved_size {
             storage.set_string("tool_win_size", format!("{},{}", size.x, size.y));
         }
+        storage.set_string("rotator_settings", tools.rotator_settings());
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
