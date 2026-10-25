@@ -2,6 +2,7 @@
 //! The device is optional. Nothing is polled until Connect.
 
 mod device;
+mod display;
 mod proto;
 mod rf;
 
@@ -33,13 +34,17 @@ enum View {
     Unwrap,
     GroupDelay,
     Tdr,
+    LinMag,
+    ReIm,
 }
 
-const VIEWS: [(View, &str); 10] = [
+const VIEWS: [(View, &str); 12] = [
     (View::Smith, "Smith"),
     (View::Polar, "Polar"),
     (View::Swr, "SWR"),
     (View::ReturnLoss, "Return loss"),
+    (View::LinMag, "Lin mag"),
+    (View::ReIm, "Real + imag"),
     (View::Impedance, "R + X"),
     (View::S21, "S21 dB"),
     (View::Phase, "Phase"),
@@ -629,6 +634,11 @@ pub struct NanoVna {
     /// Ignore the device's previous sweep until the measurement just started arrives.
     blank_until_sweep: bool,
     archive_dirty: bool,
+    /// Time between the last two sweeps that arrived while running.
+    sweep_ms: Option<f64>,
+    last_sweep: Option<std::time::Instant>,
+    /// A stored calibration standard shown in its own window. Issue 75.
+    cal_graph: Option<(CalSet, WizStep)>,
 }
 
 impl NanoVna {
@@ -684,6 +694,9 @@ impl NanoVna {
             sweep_zone: None,
             blank_until_sweep: false,
             archive_dirty: false,
+            sweep_ms: None,
+            last_sweep: None,
+            cal_graph: None,
         }
     }
 
@@ -764,6 +777,11 @@ impl NanoVna {
         if live.generation != self.seen && !live.sweep.is_empty() {
             self.ingest(&live.sweep);
             self.seen = live.generation;
+            let now = std::time::Instant::now();
+            if let (true, Some(was)) = (self.run, self.last_sweep) {
+                self.sweep_ms = Some(now.duration_since(was).as_secs_f64() * 1000.0);
+            }
+            self.last_sweep = Some(now);
         }
         self.pump(&live);
         if self.arm_connect
@@ -1040,51 +1058,6 @@ impl NanoVna {
 
     /// Smith, Polar, SWR, and the other chart views. They sit at the top of
     /// the right frame. The zone tabs stay above both frames.
-    fn view_row(&mut self, ui: &mut Ui, theme: &LcarsTheme) {
-        ui.horizontal_wrapped(|ui| {
-            for (view, label) in VIEWS {
-                let color = if view == self.view {
-                    palette::TAN
-                } else {
-                    palette::SLATE
-                };
-                if rustcars::lcars_button(
-                    ui,
-                    theme,
-                    label,
-                    color,
-                    vec2(label.len() as f32 * 10.0 + 28.0, 32.0),
-                    rustcars::Cap::None,
-                    true,
-                )
-                .clicked()
-                {
-                    self.view = view;
-                }
-            }
-            if self.view == View::Smith {
-                let y_color = if self.admittance {
-                    palette::TAN
-                } else {
-                    palette::SLATE
-                };
-                if rustcars::lcars_button(
-                    ui,
-                    theme,
-                    "Y",
-                    y_color,
-                    vec2(48.0, 32.0),
-                    rustcars::Cap::None,
-                    true,
-                )
-                .clicked()
-                {
-                    self.admittance = !self.admittance;
-                }
-            }
-        });
-    }
-
     fn chart(&mut self, ui: &mut Ui, theme: &LcarsTheme, live: &device::Live) {
         self.band_strip(ui, theme, live);
         if self.cal_page {
@@ -1100,6 +1073,7 @@ impl NanoVna {
             show_frame(ui, theme, right, Side::Right, |ui| {
                 self.cal_body(ui, theme, live);
             });
+            self.cal_graph_dialog(ui, theme);
             return;
         }
         let trace = self.display_trace(live);
@@ -1108,7 +1082,7 @@ impl NanoVna {
         } else {
             None
         };
-        let (left, right) = body_split(ui, theme, 420.0);
+        let (left, right) = body_split(ui, theme, 440.0);
         let mut caption = self.face_caption(live, trace.as_deref());
         if self.await_scan.is_some() && self.wizard.is_none() {
             caption = format!("Waiting for the NanoVNA. {caption}");
@@ -1116,27 +1090,39 @@ impl NanoVna {
             caption = format!("{}  {caption}", self.note);
         }
         show_frame(ui, theme, left, Side::Left, |ui| {
-            ui.label(
-                egui::RichText::new(&caption)
-                    .monospace()
-                    .size(theme.data_size)
-                    .color(palette::TEXT_MUTED),
-            );
             egui::ScrollArea::vertical()
-                .id_salt("nanovna-marker")
+                .id_salt("nanovna-keys")
                 .auto_shrink([false, false])
                 .max_height(ui.available_height())
                 .show(ui, |ui| {
-                    self.chart_edge(ui, theme, live);
+                    self.softkeys(ui, theme, live, trace.as_deref());
                     ui.add_space(8.0);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&caption)
+                                .monospace()
+                                .size(theme.data_size * 0.85)
+                                .color(palette::TEXT_MUTED),
+                        )
+                        .wrap(),
+                    );
+                    ui.add_space(6.0);
                     self.marker_block(ui, theme, trace.as_deref());
                 });
         });
         let mut clicked = None;
+        let placed: Vec<(usize, usize)> = self
+            .markers
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, at)| at.map(|at| (slot, at)))
+            .collect();
+        let cal = trace.as_deref().and_then(|t| self.matched_cal(t)).cloned();
         show_frame(ui, theme, right, Side::Right, |ui| {
-            self.view_row(ui, theme);
-            ui.add_space(theme.frame_gap);
-            let chart_h = ui.available_height().max(120.0);
+            self.trace_header(ui, theme, trace.as_deref(), cal.as_ref());
+            let table_h = if placed.is_empty() { 0.0 } else { 22.0 * (placed.len() as f32 + 1.0) + 6.0 };
+            let status_h = 26.0;
+            let chart_h = (ui.available_height() - table_h - status_h - 8.0).max(120.0);
             ui.allocate_ui(vec2(ui.available_width(), chart_h), |ui| {
                 let (hit, _) = paint_chart(
                     ui,
@@ -1148,12 +1134,324 @@ impl NanoVna {
                     self.velocity_value(),
                     self.admittance,
                     theme.data_size,
+                    &placed,
                 );
                 clicked = hit;
             });
+            if let Some(samples) = trace.as_deref() {
+                self.marker_table(ui, theme, samples, &placed);
+            }
+            self.status_bar(ui, theme, live, trace.as_deref(), cal.as_ref());
         });
         if let Some(index) = clicked {
             self.markers[self.marker_on] = Some(index);
+        }
+    }
+
+    /// The R&S trace-list line over the pane: name, parameter chip, format, scale, channel, cal.
+    fn trace_header(&self, ui: &mut Ui, theme: &LcarsTheme, samples: Option<&[Sample]>, cal: Option<&CalSet>) {
+        let (param, format, unit) = view_meta(self.view);
+        let scale = match (self.view, samples) {
+            (View::Smith | View::Polar, _) | (_, None) => None,
+            (view, Some(samples)) => {
+                let (_, mut ys) = series(view, samples, self.z0_value(), self.velocity_value());
+                ys.extend(second_series(view, samples, self.z0_value()));
+                Some(display::auto_scale(&ys, 10))
+            }
+        };
+        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::hover());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 0.0, palette::STRIP);
+        let font = egui::FontId::monospace(theme.data_size * 0.9);
+        let mut x = rect.left() + 8.0;
+        let put = |x: &mut f32, text: &str, color: Color32| {
+            let g = painter.layout_no_wrap(text.to_string(), font.clone(), color);
+            let w = g.size().x;
+            painter.galley(Pos2::new(*x, rect.center().y - g.size().y / 2.0), g, color);
+            *x += w + 14.0;
+        };
+        put(&mut x, "TRC1", palette::TEXT);
+        // Parameter chip in the trace colour with dark ink.
+        let g = painter.layout_no_wrap(param.to_string(), font.clone(), rustcars::ink_on(TRACE1));
+        let chip = Rect::from_min_size(
+            Pos2::new(x, rect.top() + 3.0),
+            vec2(g.size().x + 12.0, rect.height() - 6.0),
+        );
+        painter.rect_filled(chip, 4.0, TRACE1);
+        painter.galley(
+            Pos2::new(chip.left() + 6.0, chip.center().y - g.size().y / 2.0),
+            g,
+            rustcars::ink_on(TRACE1),
+        );
+        x = chip.right() + 14.0;
+        put(&mut x, format, palette::TEXT);
+        if let Some(scale) = scale {
+            let ref_value = if scale.top >= 0.0 && scale.bottom() <= 0.0 { 0.0 } else { scale.top };
+            put(&mut x, &format!("{} {unit}/", display::fmt_tick(scale.per_div, scale.per_div / 10.0)), palette::TEXT);
+            put(&mut x, &format!("REF {} {unit}", display::fmt_tick(ref_value, scale.per_div)), palette::TEXT);
+        }
+        put(&mut x, "CH1", palette::TEXT_MUTED);
+        if self.show_memory && self.memory.is_some() {
+            put(&mut x, "MEM", palette::TEXT_MUTED);
+        }
+        let (badge, fill) = match cal {
+            Some(set) if set.thru.is_empty() => ("CAL OSL".to_string(), palette::OLIVE),
+            Some(_) => ("CAL OSL+THRU".to_string(), palette::OLIVE),
+            None if samples.is_some() => ("CAL ON".to_string(), palette::OLIVE),
+            None => ("UNCAL".to_string(), palette::BRICK),
+        };
+        let g = painter.layout_no_wrap(badge, font.clone(), rustcars::ink_on(fill));
+        let chip = Rect::from_min_size(
+            Pos2::new(rect.right() - g.size().x - 20.0, rect.top() + 3.0),
+            vec2(g.size().x + 12.0, rect.height() - 6.0),
+        );
+        if chip.left() > x {
+            painter.rect_filled(chip, 4.0, fill);
+            painter.galley(
+                Pos2::new(chip.left() + 6.0, chip.center().y - g.size().y / 2.0),
+                g,
+                rustcars::ink_on(fill),
+            );
+        }
+    }
+
+    /// One row per placed marker under the chart. Issue 68.
+    fn marker_table(&self, ui: &mut Ui, theme: &LcarsTheme, samples: &[Sample], placed: &[(usize, usize)]) {
+        if placed.is_empty() {
+            return;
+        }
+        let z0 = self.z0_value();
+        let (_, ys) = series(self.view, samples, z0, self.velocity_value());
+        let (_, _, unit) = view_meta(self.view);
+        let font = egui::FontId::monospace(theme.data_size * 0.85);
+        let row = |ui: &mut Ui, cells: [String; 5], color: Color32, lit: bool| {
+            let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::hover());
+            let painter = ui.painter_at(rect);
+            if lit {
+                painter.rect_filled(rect, 0.0, palette::STRIP);
+            }
+            let widths = [0.07, 0.2, 0.25, 0.28, 0.2];
+            let mut x = rect.left() + 6.0;
+            for (cell, w) in cells.iter().zip(widths) {
+                painter.text(
+                    Pos2::new(x, rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    cell,
+                    font.clone(),
+                    color,
+                );
+                x += rect.width() * w;
+            }
+        };
+        row(
+            ui,
+            ["MKR".into(), "STIMULUS".into(), "VALUE".into(), "Z = R + jX".into(), "SWR".into()],
+            palette::TEXT_MUTED,
+            false,
+        );
+        for (slot, index) in placed {
+            let Some(sample) = samples.get(*index) else {
+                continue;
+            };
+            let value = match self.view {
+                View::GroupDelay | View::Unwrap => ys
+                    .get(*index)
+                    .map(|v| format!("{} {unit}", num(*v)))
+                    .unwrap_or_default(),
+                View::Tdr => "-".into(),
+                view => marker_value(view, sample, z0),
+            };
+            let d = rf::derive(sample, z0);
+            row(
+                ui,
+                [
+                    format!("M{}", slot + 1),
+                    display::fmt_hz(sample.hz),
+                    value,
+                    format!("{} {:+}j Ω", num(d.r), num(d.x)),
+                    format!("{} : 1", num(rf::swr(sample.s11))),
+                ],
+                MARKER_COLORS[*slot % MARKER_COLORS.len()],
+                *slot == self.marker_on,
+            );
+        }
+    }
+
+    /// The channel and instrument line along the bottom. Issues 65 and 71.
+    fn status_bar(&self, ui: &mut Ui, theme: &LcarsTheme, live: &device::Live, samples: Option<&[Sample]>, cal: Option<&CalSet>) {
+        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::hover());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 0.0, palette::STRIP);
+        let (start, stop, points) = match samples {
+            Some(s) if !s.is_empty() => (s[0].hz, s[s.len() - 1].hz, s.len()),
+            _ => (self.face.start_hz, self.face.stop_hz, self.face.points as usize),
+        };
+        let avg = self.host_average_value().max(1);
+        let mut left = format!(
+            "CH1  START {}  STOP {}  {} PTS  AVG {}",
+            display::fmt_hz(start),
+            display::fmt_hz(stop),
+            points,
+            avg,
+        );
+        if let Some(set) = cal {
+            if !set.zone.is_empty() {
+                left.push_str(&format!("  CAL {}", set.zone));
+            }
+        }
+        let device = if live.connected {
+            let fw = live
+                .identity
+                .as_ref()
+                .map(|id| format!("  FW {}.{}", id.fw_major, id.fw_minor))
+                .unwrap_or_default();
+            format!("NANOVNA V2 · {}{fw}", self.face.port)
+        } else {
+            "NOT CONNECTED".to_string()
+        };
+        let time = self
+            .sweep_ms
+            .map(|ms| format!(" · {} ms/SWEEP", ms.round()))
+            .unwrap_or_default();
+        let font = egui::FontId::monospace(theme.data_size * 0.8);
+        painter.text(
+            Pos2::new(rect.left() + 8.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            left,
+            font.clone(),
+            palette::TEXT,
+        );
+        painter.text(
+            Pos2::new(rect.right() - 8.0, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            format!("{device}{time}"),
+            font,
+            if live.connected { palette::TEXT } else { palette::TEXT_MUTED },
+        );
+    }
+
+    /// The instrument key panel down the left: FORMAT, DISPLAY, MARKER, SWEEP · CAL.
+    fn softkeys(&mut self, ui: &mut Ui, theme: &LcarsTheme, live: &device::Live, samples: Option<&[Sample]>) {
+        ui.spacing_mut().item_spacing = vec2(8.0, 6.0);
+        // Leave room on the right for the scrollbar so it never covers a key.
+        let width = (ui.available_width() - 18.0).clamp(120.0, 380.0);
+        let col3 = ((width - 16.0) / 3.0).floor();
+        let col4 = ((width - 24.0) / 4.0).floor();
+
+        key_caption(ui, theme, "SWEEP · CAL", width);
+        let mut scan = false;
+        let mut toggle = false;
+        let mut setup = false;
+        ui.horizontal(|ui| {
+            scan = softkey(ui, theme, "Scan", false, col4 * 2.0 + 8.0);
+            let run_label = if self.run { "Stop" } else { "Run" };
+            toggle = softkey(ui, theme, run_label, self.run, col4);
+            setup = softkey(ui, theme, "Setup", self.setup_open, col4);
+        });
+        if scan {
+            self.begin_scan(live);
+        }
+        if toggle {
+            if self.run {
+                self.run = false;
+                self.run_state = Run::Idle;
+            } else if self.wizard.is_some() {
+                self.note = "Finish the calibration before Run.".into();
+            } else if self.setup_has_cal(live) {
+                self.sweep_zone = self.zone_name();
+                self.shown_scan = None;
+                self.shown_id.clear();
+                self.history.clear();
+                self.blank_until_sweep = true;
+                self.run = true;
+            } else {
+                self.begin_scan(live);
+            }
+        }
+        if setup {
+            self.ports = device::list_ports();
+            self.setup_open = true;
+        }
+
+        key_caption(ui, theme, "FORMAT", width);
+        for triple in VIEWS.chunks(3) {
+            ui.horizontal(|ui| {
+                for (view, label) in triple {
+                    if softkey(ui, theme, label, self.view == *view, col3) {
+                        self.view = *view;
+                    }
+                }
+            });
+        }
+
+        key_caption(ui, theme, "DISPLAY", width);
+        ui.horizontal(|ui| {
+            let smith = self.view == View::Smith;
+            if softkey_enabled(ui, theme, "Y adm", self.admittance && smith, col4, smith) {
+                self.admittance = !self.admittance;
+            }
+            if softkey(ui, theme, "Store", false, col4) {
+                if let Some(trace) = samples {
+                    self.memory = Some(trace.to_vec());
+                    self.show_memory = true;
+                }
+            }
+            let has_mem = self.memory.is_some();
+            if softkey_enabled(ui, theme, "Mem", self.show_memory && has_mem, col4, has_mem) {
+                self.show_memory = !self.show_memory;
+            }
+            if softkey_enabled(ui, theme, "Diff", self.show_diff && has_mem, col4, has_mem) {
+                self.show_diff = !self.show_diff;
+            }
+        });
+
+        key_caption(ui, theme, "MARKER", width);
+        ui.horizontal(|ui| {
+            for slot in 0..4 {
+                let title = format!("M{}", slot + 1);
+                if softkey(ui, theme, &title, self.marker_on == slot, col4) {
+                    self.marker_on = slot;
+                }
+            }
+        });
+        let mut search: Option<u8> = None;
+        ui.horizontal(|ui| {
+            let ok = samples.is_some();
+            for (code, label) in [(0u8, "Max"), (1, "Min"), (2, "Next pk"), (3, "Clear")] {
+                let enabled = ok || code == 3;
+                if softkey_enabled(ui, theme, label, false, col4, enabled) {
+                    search = Some(code);
+                }
+            }
+        });
+        if let Some(code) = search {
+            self.marker_search(code, samples);
+        }
+    }
+
+    /// Move the active marker: 0 max, 1 min, 2 next peak, 3 clear. Issue 67.
+    fn marker_search(&mut self, code: u8, samples: Option<&[Sample]>) {
+        if code == 3 {
+            self.markers[self.marker_on] = None;
+            return;
+        }
+        let Some(samples) = samples else {
+            return;
+        };
+        if self.view == View::Tdr {
+            self.note = "Marker search works on frequency traces.".into();
+            return;
+        }
+        let (_, ys) = series(self.view, samples, self.z0_value(), self.velocity_value());
+        let at = self.markers[self.marker_on];
+        let found = match code {
+            0 => display::search_max(&ys),
+            1 => display::search_min(&ys),
+            _ => display::next_peak(&ys, at),
+        };
+        match found {
+            Some(index) => self.markers[self.marker_on] = Some(index),
+            None => self.note = "No further peak on this trace.".into(),
         }
     }
 
@@ -1230,47 +1528,6 @@ impl NanoVna {
                 readout(ui, theme, &value, false);
             });
         }
-    }
-
-    /// Scan, Run, Setup, and the markers, down the left edge of the chart.
-    fn chart_edge(&mut self, ui: &mut Ui, theme: &LcarsTheme, live: &device::Live) {
-        ui.vertical(|ui| {
-            ui.spacing_mut().item_spacing.y = 4.0;
-            let scan = edge_button(ui, theme, "Scan", true);
-            let run_label = if self.run { "Stop" } else { "Run" };
-            let toggle = edge_button(ui, theme, run_label, true);
-            let setup = edge_button(ui, theme, "Setup", self.setup_open);
-            if scan {
-                self.begin_scan(live);
-            }
-            if toggle {
-                if self.run {
-                    self.run = false;
-                    self.run_state = Run::Idle;
-                } else if self.wizard.is_some() {
-                    self.note = "Finish the calibration before Run.".into();
-                } else if self.setup_has_cal(live) {
-                    self.sweep_zone = self.zone_name();
-                    self.shown_scan = None;
-                    self.shown_id.clear();
-                    self.history.clear();
-                    self.blank_until_sweep = true;
-                    self.run = true;
-                } else {
-                    self.begin_scan(live);
-                }
-            }
-            if setup {
-                self.ports = device::list_ports();
-                self.setup_open = true;
-            }
-            for slot in 0..4 {
-                let title = format!("M{}", slot + 1);
-                if edge_button(ui, theme, &title, self.marker_on == slot) {
-                    self.marker_on = slot;
-                }
-            }
-        });
     }
 
     fn finder_readout(&self, ui: &mut Ui, theme: &LcarsTheme, samples: &[Sample]) {
@@ -1911,6 +2168,25 @@ impl NanoVna {
                         let summary = step_summary(stored.as_ref(), step);
                         ui.horizontal(|ui| {
                             ui.set_min_height(super::LIST_ROW);
+                            let has = stored
+                                .as_ref()
+                                .is_some_and(|set| !step_samples(set, step).is_empty());
+                            if rustcars::lcars_button(
+                                ui,
+                                theme,
+                                "Graph",
+                                palette::SLATE,
+                                vec2(64.0, 26.0),
+                                rustcars::Cap::None,
+                                has,
+                            )
+                            .on_hover_text("View graph of this stored standard")
+                            .clicked()
+                            {
+                                if let Some(set) = stored.clone() {
+                                    self.cal_graph = Some((set, step));
+                                }
+                            }
                             if reload_button(ui, theme).clicked() {
                                 self.start_wizard(
                                     live,
@@ -1936,6 +2212,68 @@ impl NanoVna {
                     }
                 }
             });
+    }
+
+    /// The raw curve of one stored standard: magnitude against frequency and the polar locus.
+    fn cal_graph_dialog(&mut self, ui: &mut Ui, theme: &LcarsTheme) {
+        let Some((set, step)) = self.cal_graph.clone() else {
+            return;
+        };
+        let rows = step_samples(&set, step);
+        let xs: Vec<f64> = (0..rows.len()).map(|i| set.start_hz + set.step_hz * i as f64).collect();
+        let mag: Vec<f64> = rows.iter().map(|r| rf::db(pair(*r))).collect();
+        let pts: Vec<Sample> = rows
+            .iter()
+            .zip(&xs)
+            .map(|(r, hz)| Sample { hz: *hz, s11: pair(*r), s21: Cx::new(0.0, 0.0) })
+            .collect();
+        let mut open = true;
+        let title = format!(
+            "{} · {} · {}",
+            if set.zone.is_empty() { "Calibration" } else { set.zone.as_str() },
+            step.step_name(),
+            "raw standard",
+        );
+        egui::Window::new(title)
+            .open(&mut open)
+            .resizable(true)
+            .default_size(vec2(720.0, 420.0))
+            .show(ui.ctx(), |ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} points · {} to {} · Z0 {} Ω · uncorrected ratio as stored",
+                        rows.len(),
+                        display::fmt_hz(xs.first().copied().unwrap_or(0.0)),
+                        display::fmt_hz(xs.last().copied().unwrap_or(0.0)),
+                        trim_num(set.z0),
+                    ))
+                    .monospace()
+                    .size(theme.data_size * 0.85)
+                    .color(palette::TEXT_MUTED),
+                );
+                ui.label(
+                    egui::RichText::new("Magnitude dB (gold) · Phase on the polar plot")
+                        .size(theme.data_size * 0.8)
+                        .color(palette::TEXT_MUTED),
+                );
+                let h = (ui.available_height() - 4.0).max(220.0);
+                let w = ui.available_width();
+                ui.horizontal(|ui| {
+                    let (rect, _) = ui.allocate_exact_size(vec2((w * 0.6).max(240.0), h), Sense::hover());
+                    let painter = ui.painter_at(rect);
+                    painter.rect_filled(rect, 0.0, PANE_BG);
+                    paint_cartesian(&painter, rect, View::S21, &xs, &[(&mag, TRACE1)], &[], theme.data_size);
+                    let (rect, _) = ui.allocate_exact_size(vec2((w * 0.38).max(160.0), h), Sense::hover());
+                    let painter = ui.painter_at(rect);
+                    painter.rect_filled(rect, 0.0, PANE_BG);
+                    let plot = rect.shrink(16.0);
+                    paint_polar(&painter, plot);
+                    stroke_polar(&painter, plot, &pts, TRACE1);
+                });
+            });
+        if !open {
+            self.cal_graph = None;
+        }
     }
 
     fn zone_cal(&self, id: Option<&str>, zone: &str) -> Option<&CalSet> {
@@ -2650,12 +2988,227 @@ fn series(view: View, samples: &[Sample], z0: f64, velocity: f64) -> (Vec<f64>, 
                 (Vec::new(), Vec::new())
             }
         }
+        View::LinMag => (
+            samples.iter().map(|s| s.hz).collect(),
+            samples.iter().map(|s| s.s11.abs()).collect(),
+        ),
+        View::ReIm => (
+            samples.iter().map(|s| s.hz).collect(),
+            samples.iter().map(|s| s.s11.re).collect(),
+        ),
         View::Smith | View::Polar => (
             samples.iter().map(|s| s.hz).collect(),
             samples.iter().map(|s| s.s11.abs()).collect(),
         ),
     }
 }
+
+/// The second line some formats draw: X beside R, imaginary beside real.
+fn second_series(view: View, samples: &[Sample], z0: f64) -> Vec<f64> {
+    match view {
+        View::Impedance => samples.iter().map(|s| rf::derive(s, z0).x).collect(),
+        View::ReIm => samples.iter().map(|s| s.s11.im).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Measured parameter, format name, and unit for the trace header. Issue 63.
+fn view_meta(view: View) -> (&'static str, &'static str, &'static str) {
+    match view {
+        View::Smith => ("S11", "SMITH", "U"),
+        View::Polar => ("S11", "POLAR", "U"),
+        View::Swr => ("S11", "SWR", "U"),
+        View::ReturnLoss => ("S11", "RETURN LOSS", "dB"),
+        View::LinMag => ("S11", "LIN MAG", "U"),
+        View::ReIm => ("S11", "REAL + IMAG", "U"),
+        View::Impedance => ("S11", "R + jX", "Ω"),
+        View::S21 => ("S21", "DB MAG", "dB"),
+        View::Phase => ("S21", "PHASE", "°"),
+        View::Unwrap => ("S21", "UNWR PHASE", "°"),
+        View::GroupDelay => ("S21", "DELAY", "ns"),
+        View::Tdr => ("S11", "TDR", "U"),
+    }
+}
+
+/// Primary marker value in the trace's own format.
+fn marker_value(view: View, sample: &Sample, z0: f64) -> String {
+    let (_, _, unit) = view_meta(view);
+    match view {
+        View::Smith | View::Impedance => {
+            let d = rf::derive(sample, z0);
+            format!("{} {:+}j Ω", num(d.r), num(d.x))
+        }
+        View::Polar => format!(
+            "{} ∠ {}°",
+            fmt_g(sample.s11.abs()),
+            fmt_g(sample.s11.arg().to_degrees())
+        ),
+        View::Swr => format!("{} : 1", num(rf::swr(sample.s11))),
+        View::ReturnLoss => format!("{} dB", num(rf::return_loss_db(sample.s11))),
+        View::LinMag => fmt_g(sample.s11.abs()),
+        View::ReIm => format!("{} {:+}j", fmt_g(sample.s11.re), fmt_g(sample.s11.im)),
+        View::S21 => format!("{} dB", num(rf::db(sample.s21))),
+        View::Phase => format!("{} °", num(sample.s21.arg().to_degrees())),
+        _ => format!("{unit}"),
+    }
+}
+
+/// Where Cartesian panes draw: room on the left for tick labels and below for frequencies.
+fn cart_plot(rect: Rect) -> Rect {
+    Rect::from_min_max(
+        Pos2::new(rect.left() + 58.0, rect.top() + 10.0),
+        Pos2::new(rect.right() - 16.0, rect.bottom() - 22.0),
+    )
+}
+
+const MARKER_COLORS: [Color32; 4] = [
+    Color32::from_rgb(0xFF, 0x99, 0x00),
+    Color32::from_rgb(0x99, 0xCC, 0xFF),
+    Color32::from_rgb(0xCC, 0x99, 0xCC),
+    Color32::from_rgb(0x99, 0xDD, 0x88),
+];
+const GRID: Color32 = Color32::from_rgb(0x4A, 0x55, 0x66);
+const GRID_FAINT: Color32 = Color32::from_rgb(0x2C, 0x33, 0x3D);
+const TRACE1: Color32 = Color32::from_rgb(0xF2, 0xC2, 0x6B);
+const TRACE2: Color32 = Color32::from_rgb(0x78, 0xAA, 0xD2);
+const PANE_BG: Color32 = Color32::from_rgb(12, 16, 22);
+
+/// Graticule, labelled ticks, reference line, and traces on one Cartesian pane.
+fn paint_cartesian(
+    painter: &egui::Painter,
+    rect: Rect,
+    view: View,
+    xs: &[f64],
+    traces: &[(&[f64], Color32)],
+    markers: &[(usize, usize)],
+    label_px: f32,
+) {
+    let plot = cart_plot(rect);
+    let font = egui::FontId::monospace((label_px * 0.8).max(10.0));
+    let mut all = Vec::new();
+    for (ys, _) in traces {
+        all.extend_from_slice(ys);
+    }
+    let scale = display::auto_scale(&all, 10);
+    for (i, value) in scale.lines().into_iter().enumerate() {
+        let y = plot.top() + plot.height() * i as f32 / scale.divs as f32;
+        painter.line_segment(
+            [Pos2::new(plot.left(), y), Pos2::new(plot.right(), y)],
+            Stroke::new(1.0, if i % 5 == 0 { GRID } else { GRID_FAINT }),
+        );
+        if i % 2 == 0 {
+            painter.text(
+                Pos2::new(plot.left() - 6.0, y),
+                egui::Align2::RIGHT_CENTER,
+                display::fmt_tick(value, scale.per_div),
+                font.clone(),
+                palette::TEXT_MUTED,
+            );
+        }
+    }
+    let xmin = xs.iter().copied().fold(f64::INFINITY, f64::min);
+    let xmax = xs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    if xmax > xmin {
+        let tdr = view == View::Tdr;
+        for tick in display::ticks(xmin, xmax, 6) {
+            let x = plot.left() + ((tick - xmin) / (xmax - xmin)) as f32 * plot.width();
+            painter.line_segment(
+                [Pos2::new(x, plot.top()), Pos2::new(x, plot.bottom())],
+                Stroke::new(1.0, GRID_FAINT),
+            );
+            let text = if tdr {
+                format!("{} m", trim_num(tick))
+            } else {
+                display::fmt_hz(tick)
+            };
+            painter.text(
+                Pos2::new(x, plot.bottom() + 3.0),
+                egui::Align2::CENTER_TOP,
+                text,
+                font.clone(),
+                palette::TEXT_MUTED,
+            );
+        }
+    }
+    painter.rect_stroke(plot, 0.0, Stroke::new(1.0, GRID), egui::StrokeKind::Inside);
+    // Reference line and its triangle on the right edge, like the R&S ref marker.
+    let ref_value = if scale.top >= 0.0 && scale.bottom() <= 0.0 { 0.0 } else { scale.top };
+    let ry = plot.top() + scale.fraction(ref_value) as f32 * plot.height();
+    let ref_stroke = Stroke::new(1.0, TRACE1);
+    let mut x = plot.left();
+    while x < plot.right() {
+        let end = (x + 6.0).min(plot.right());
+        painter.line_segment([Pos2::new(x, ry), Pos2::new(end, ry)], ref_stroke);
+        x += 10.0;
+    }
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            Pos2::new(plot.right(), ry),
+            Pos2::new(plot.right() + 9.0, ry - 6.0),
+            Pos2::new(plot.right() + 9.0, ry + 6.0),
+        ],
+        TRACE1,
+        Stroke::NONE,
+    ));
+    if !(xmax > xmin) {
+        return;
+    }
+    let map = |x: f64, y: f64| {
+        Pos2::new(
+            plot.left() + ((x - xmin) / (xmax - xmin)) as f32 * plot.width(),
+            plot.top() + (scale.fraction(y) as f32).clamp(-0.02, 1.02) * plot.height(),
+        )
+    };
+    let clip = painter.with_clip_rect(plot.expand(2.0));
+    for (ys, color) in traces {
+        if ys.len() != xs.len() {
+            continue;
+        }
+        let mut prev = None;
+        for (x, y) in xs.iter().zip(ys.iter()) {
+            if !y.is_finite() {
+                prev = None;
+                continue;
+            }
+            let pos = map(*x, *y);
+            if let Some(was) = prev {
+                clip.line_segment([was, pos], Stroke::new(2.0, *color));
+            }
+            prev = Some(pos);
+        }
+    }
+    if let Some((ys, _)) = traces.first() {
+        for (slot, index) in markers {
+            if let (Some(x), Some(y)) = (xs.get(*index), ys.get(*index)) {
+                if y.is_finite() {
+                    paint_marker(painter, map(*x, *y), *slot, label_px);
+                }
+            }
+        }
+    }
+}
+
+/// A numbered marker: a downward triangle on the trace with its number above.
+fn paint_marker(painter: &egui::Painter, at: Pos2, slot: usize, label_px: f32) {
+    let color = MARKER_COLORS[slot % MARKER_COLORS.len()];
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            at,
+            Pos2::new(at.x - 6.0, at.y - 10.0),
+            Pos2::new(at.x + 6.0, at.y - 10.0),
+        ],
+        color,
+        Stroke::new(1.0, Color32::BLACK),
+    ));
+    painter.text(
+        Pos2::new(at.x, at.y - 12.0),
+        egui::Align2::CENTER_BOTTOM,
+        format!("{}", slot + 1),
+        egui::FontId::monospace((label_px * 0.8).max(10.0)),
+        color,
+    );
+}
+
 
 /// Left and right rects for the elbow frames. The left side stays at `left_w`
 /// until the window is too narrow to keep a chart beside it.
@@ -2685,19 +3238,73 @@ fn show_frame(ui: &mut Ui, theme: &LcarsTheme, rect: Rect, side: Side, add: impl
     });
 }
 
-fn edge_button(ui: &mut Ui, theme: &LcarsTheme, label: &str, on: bool) -> bool {
-    let color = if on { palette::TAN } else { palette::SLATE };
-    rustcars::lcars_button(
-        ui,
-        theme,
-        label,
-        color,
-        vec2(88.0, 32.0),
-        rustcars::Cap::None,
-        true,
-    )
-    .clicked()
+/// A small group caption over a block of keys, with a rule like a front-panel silkscreen.
+fn key_caption(ui: &mut Ui, theme: &LcarsTheme, text: &str, width: f32) {
+    ui.add_space(4.0);
+    let (rect, _) = ui.allocate_exact_size(vec2(width, 16.0), Sense::hover());
+    let painter = ui.painter_at(rect);
+    let g = painter.layout_no_wrap(
+        text.to_string(),
+        egui::FontId::proportional(theme.data_size * 0.8),
+        palette::TEXT_MUTED,
+    );
+    let tw = g.size().x;
+    painter.galley(Pos2::new(rect.left(), rect.center().y - g.size().y / 2.0), g, palette::TEXT_MUTED);
+    painter.line_segment(
+        [
+            Pos2::new(rect.left() + tw + 8.0, rect.center().y),
+            Pos2::new(rect.right(), rect.center().y),
+        ],
+        Stroke::new(1.0, palette::TAN),
+    );
 }
+
+/// A uniform key cap. Lit keys are tan, idle keys slate.
+fn softkey(ui: &mut Ui, theme: &LcarsTheme, label: &str, lit: bool, width: f32) -> bool {
+    softkey_enabled(ui, theme, label, lit, width, true)
+}
+
+fn softkey_enabled(ui: &mut Ui, theme: &LcarsTheme, label: &str, lit: bool, width: f32, enabled: bool) -> bool {
+    // A key cap: centered label with padding on every side. The label steps
+    // down in size before it is allowed to touch the edge of the cap.
+    const PAD: f32 = 8.0;
+    let base = if lit { palette::TAN } else { palette::SLATE };
+    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, KEY_H), sense);
+    let fill = if !enabled {
+        rustcars::tint(base, -0.6)
+    } else if resp.is_pointer_button_down_on() {
+        rustcars::tint(base, -0.25)
+    } else if resp.hovered() {
+        rustcars::tint(base, 0.3)
+    } else {
+        base
+    };
+    let painter = ui.painter();
+    painter.rect_filled(rect, 4.0, fill);
+    if resp.has_focus() {
+        painter.rect_stroke(
+            rect.shrink(2.0),
+            4.0,
+            Stroke::new(2.0, theme.text_hi),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let ink = rustcars::ink_on(fill);
+    let text = label.to_uppercase();
+    let mut size = (theme.header_size * 0.85).min(17.0);
+    let mut galley = painter.layout_no_wrap(text.clone(), egui::FontId::proportional(size), ink);
+    while galley.size().x > width - 2.0 * PAD && size > 9.0 {
+        size -= 1.0;
+        galley = painter.layout_no_wrap(text.clone(), egui::FontId::proportional(size), ink);
+    }
+    let at = rect.center() - galley.size() * 0.5;
+    painter.galley(at, galley, ink);
+    enabled && resp.clicked()
+}
+
+/// Height of one key cap in the left key panel.
+const KEY_H: f32 = 32.0;
 
 fn paint_chart(
     ui: &mut Ui,
@@ -2709,6 +3316,7 @@ fn paint_chart(
     velocity: f64,
     admittance: bool,
     label_px: f32,
+    markers: &[(usize, usize)],
 ) -> (Option<usize>, Option<String>) {
     let size = vec2(
         ui.available_width().max(240.0),
@@ -2717,7 +3325,7 @@ fn paint_chart(
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     let painter = ui.painter_at(rect);
     if view != View::Smith {
-        painter.rect_filled(rect, 0.0, Color32::from_rgb(12, 16, 22));
+        painter.rect_filled(rect, 0.0, PANE_BG);
     }
     let plot = rect.shrink(16.0);
     let hover = match view {
@@ -2745,45 +3353,57 @@ fn paint_chart(
             let (xs, ys) = samples
                 .map(|samples| series(view, samples, z0, velocity))
                 .unwrap_or_default();
-            if view == View::Impedance {
-                let react: Vec<f64> = samples
-                    .unwrap_or(&[])
-                    .iter()
-                    .map(|sample| rf::derive(sample, z0).x)
-                    .collect();
-                if let Some((ymin, ymax)) = shared_range(&[&ys, &react]) {
-                    stroke_scaled(&painter, plot, &xs, &ys, palette::TAN, ymin, ymax);
-                    stroke_scaled(
-                        &painter,
-                        plot,
-                        &xs,
-                        &react,
-                        Color32::from_rgb(120, 170, 210),
-                        ymin,
-                        ymax,
-                    );
-                    painter.text(
-                        plot.left_top(),
-                        egui::Align2::LEFT_TOP,
-                        "R tan   X blue",
-                        egui::FontId::monospace(label_px),
-                        palette::TEXT_MUTED,
-                    );
-                }
+            let second = samples
+                .map(|samples| second_series(view, samples, z0))
+                .unwrap_or_default();
+            let (mx, my) = memory
+                .map(|memory| series(view, memory, z0, velocity))
+                .unwrap_or_default();
+            let delta: Vec<f64> = if diff && my.len() == ys.len() {
+                ys.iter().zip(&my).map(|(a, b)| a - b).collect()
             } else {
-                stroke_xy(&painter, plot, &xs, &ys, palette::TAN);
+                Vec::new()
+            };
+            let mut traces: Vec<(&[f64], Color32)> = vec![(&ys, TRACE1)];
+            if !second.is_empty() {
+                traces.push((&second, TRACE2));
             }
-            if let Some(memory) = memory {
-                let (mx, my) = series(view, memory, z0, velocity);
-                stroke_xy(&painter, plot, &mx, &my, palette::TEAL);
-                if diff && my.len() == ys.len() && !ys.is_empty() {
-                    let delta: Vec<f64> = ys.iter().zip(&my).map(|(a, b)| a - b).collect();
-                    stroke_xy(&painter, plot, &xs, &delta, palette::BRICK);
-                }
+            if my.len() == ys.len() && mx.len() == xs.len() && !my.is_empty() {
+                traces.push((&my, palette::TEAL));
             }
+            if !delta.is_empty() {
+                traces.push((&delta, palette::BRICK));
+            }
+            paint_cartesian(&painter, rect, view, &xs, &traces, markers, label_px);
             None
         }
     };
+    if matches!(view, View::Smith | View::Polar) {
+        if let Some(samples) = samples {
+            let (center, radius) = if view == View::Smith {
+                let disk = smith_disk(rect);
+                (disk.center, disk.rad)
+            } else {
+                let plot = rect.shrink(16.0);
+                (plot.center(), plot.width().min(plot.height()) * 0.45)
+            };
+            for (slot, index) in markers {
+                if let Some(sample) = samples.get(*index) {
+                    let (mut re, mut im) = (sample.s11.re, sample.s11.im);
+                    if !(re.is_finite() && im.is_finite()) {
+                        continue;
+                    }
+                    let mag = re.hypot(im);
+                    if mag > 1.0 {
+                        re /= mag;
+                        im /= mag;
+                    }
+                    let at = Pos2::new(center.x + re as f32 * radius, center.y - im as f32 * radius);
+                    paint_marker(&painter, at, *slot, label_px);
+                }
+            }
+        }
+    }
     let clicked = if resp.clicked() {
         samples.and_then(|samples| hit(view, rect, samples, resp.interact_pointer_pos()?))
     } else {
@@ -3309,99 +3929,6 @@ fn stroke_polar(painter: &egui::Painter, plot: Rect, samples: &[Sample], color: 
     }
 }
 
-fn shared_range(rows: &[&[f64]]) -> Option<(f64, f64)> {
-    let mut ymin = f64::INFINITY;
-    let mut ymax = f64::NEG_INFINITY;
-    for row in rows {
-        for value in *row {
-            if value.is_finite() {
-                ymin = ymin.min(*value);
-                ymax = ymax.max(*value);
-            }
-        }
-    }
-    if ymax > ymin { Some((ymin, ymax)) } else { None }
-}
-
-fn stroke_scaled(
-    painter: &egui::Painter,
-    plot: Rect,
-    xs: &[f64],
-    ys: &[f64],
-    color: Color32,
-    ymin: f64,
-    ymax: f64,
-) {
-    if xs.len() < 2 || xs.len() != ys.len() || !(ymax > ymin) {
-        return;
-    }
-    let xmin = xs.iter().copied().fold(f64::INFINITY, f64::min);
-    let xmax = xs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    if !(xmax > xmin) {
-        return;
-    }
-    painter.rect_stroke(
-        plot,
-        0.0,
-        Stroke::new(1.0, Color32::from_rgb(70, 84, 102)),
-        egui::StrokeKind::Inside,
-    );
-    let mut prev = None;
-    for (x, y) in xs.iter().zip(ys) {
-        if !y.is_finite() {
-            prev = None;
-            continue;
-        }
-        let px = plot.left() + ((*x - xmin) / (xmax - xmin)) as f32 * plot.width();
-        let py = plot.bottom() - ((*y - ymin) / (ymax - ymin)) as f32 * plot.height();
-        let pos = Pos2::new(px, py);
-        if let Some(was) = prev {
-            painter.line_segment([was, pos], Stroke::new(2.0, color));
-        }
-        prev = Some(pos);
-    }
-}
-
-fn stroke_xy(painter: &egui::Painter, plot: Rect, xs: &[f64], ys: &[f64], color: Color32) {
-    if xs.len() < 2 || xs.len() != ys.len() {
-        return;
-    }
-    let xmin = xs.iter().copied().fold(f64::INFINITY, f64::min);
-    let xmax = xs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let finite: Vec<f64> = ys.iter().copied().filter(|y| y.is_finite()).collect();
-    if finite.is_empty() || !(xmax > xmin) {
-        return;
-    }
-    let ymin = finite.iter().copied().fold(f64::INFINITY, f64::min);
-    let ymax = finite.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    if !(ymax > ymin) {
-        return;
-    }
-    let map = |x: f64, y: f64| {
-        let px = plot.left() + ((x - xmin) / (xmax - xmin)) as f32 * plot.width();
-        let py = plot.bottom() - ((y - ymin) / (ymax - ymin)) as f32 * plot.height();
-        Pos2::new(px, py)
-    };
-    painter.rect_stroke(
-        plot,
-        0.0,
-        Stroke::new(1.0, Color32::from_rgb(70, 84, 102)),
-        egui::StrokeKind::Inside,
-    );
-    let mut prev = None;
-    for (x, y) in xs.iter().zip(ys) {
-        if !y.is_finite() {
-            prev = None;
-            continue;
-        }
-        let pos = map(*x, *y);
-        if let Some(was) = prev {
-            painter.line_segment([was, pos], Stroke::new(2.0, color));
-        }
-        prev = Some(pos);
-    }
-}
-
 fn hit(view: View, rect: Rect, samples: &[Sample], pos: Pos2) -> Option<usize> {
     match view {
         View::Smith => {
@@ -3414,7 +3941,7 @@ fn hit(view: View, rect: Rect, samples: &[Sample], pos: Pos2) -> Option<usize> {
             nearest_gamma(samples, pos, plot.center(), radius)
         }
         _ => {
-            let plot = rect.shrink(16.0);
+            let plot = cart_plot(rect);
             if !plot.contains(pos) || samples.len() < 2 {
                 return None;
             }

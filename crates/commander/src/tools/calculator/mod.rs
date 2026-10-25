@@ -312,15 +312,7 @@ impl Calc {
         self.keyboard(ui);
         super::screen_header(ui, "calc_header", &t, |ui| {
                 ui.horizontal(|ui| {
-                    lcars_button(
-                        ui,
-                        &t,
-                        "Calc",
-                        palette::TAN,
-                        egui::vec2(110.0, t.bar_thin),
-                        Cap::Left,
-                        true,
-                    );
+                    super::title_block(ui, &t, "Calc", palette::TAN, egui::vec2(110.0, t.bar_thin));
                     let label = if self.env.angle == Angle::Deg {
                         "Deg"
                     } else {
@@ -344,8 +336,6 @@ impl Calc {
                             Angle::Deg
                         };
                     }
-                    ui.add_space(t.main_gap);
-                    super::screen_title(ui, &t, "SCIENTIFIC CALCULATOR");
                 });
         });
         egui::CentralPanel::default()

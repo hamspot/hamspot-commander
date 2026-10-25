@@ -322,15 +322,13 @@ impl HamRf {
         let t = self.theme;
         super::screen_header(ui, "ham_header", &t, |ui| {
                 ui.horizontal(|ui| {
-                    super::screen_title(ui, &t, "RF CALC");
-                    ui.add_space(t.main_gap);
-                    for (i, (tool, label, _)) in TOOLS.iter().enumerate() {
-                        let cap = match i {
-                            0 => Cap::Left,
-                            _ => Cap::None,
-                        };
+                    super::title_block(ui, &t, "RF Calc", palette::TAN, vec2(110.0, t.bar_thin));
+                    for (tool, label, _) in TOOLS.iter() {
+                        let cap = Cap::None;
+                        // One color for every tab. The open tab is a slightly
+                        // lighter shade of the same slate.
                         let base = if *tool == self.tool {
-                            palette::TAN
+                            tint(palette::SLATE, -0.2)
                         } else {
                             tint(palette::SLATE, -0.45)
                         };

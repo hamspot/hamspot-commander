@@ -319,42 +319,72 @@ fn paint_window_mark(painter: &egui::Painter, rect: egui::Rect, color: egui::Col
     painter.line_segment([to, to - dir * head - normal * (head * 0.55)], stroke);
 }
 
-/// Title beside a screen's own tabs. The slot is one tab tall. The ink
-/// starts at the left of the slot and sits on the vertical center.
-pub(crate) fn screen_title(ui: &mut egui::Ui, theme: &LcarsTheme, text: &str) {
-    let height = theme.bar_thin;
-    let color = theme.text;
-    let mut size = theme.header_size.min(height);
-    let mut galley = ui.painter().layout_no_wrap(
-        text.to_string(),
-        egui::FontId::proportional(size),
-        color,
+/// Name block at the left of a screen's header: the same tan cap as a tab,
+/// but it is a label. It has no click sense and no hover or press color.
+pub(crate) fn title_block(
+    ui: &mut egui::Ui,
+    theme: &LcarsTheme,
+    label: &str,
+    base: egui::Color32,
+    size: egui::Vec2,
+) {
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, rustcars::cap_radius(Cap::Left, rect.height()), base);
+    let pad = (rect.height() / 2.0).min(theme.main_gap);
+    painter.text(
+        egui::pos2(rect.right() - pad, rect.bottom() - theme.frame_gap),
+        egui::Align2::RIGHT_BOTTOM,
+        label.to_uppercase(),
+        egui::FontId::proportional(theme.header_size),
+        rustcars::ink_on(base),
     );
-    // A font whose line box is taller than the tab would clip, the same way
-    // title_size did. Step down until the line fits the tab.
-    while galley.rect.height() > height && size > 10.0 {
-        size -= 1.0;
-        galley = ui.painter().layout_no_wrap(
-            text.to_string(),
-            egui::FontId::proportional(size),
-            color,
+}
+
+/// A header key beside the tabs: tab size and tab label placement, a dark
+/// fill, and a thin amber border. It is for an action, not a tab choice.
+pub(crate) fn header_key(
+    ui: &mut egui::Ui,
+    theme: &LcarsTheme,
+    label: &str,
+    size: egui::Vec2,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    let colors = rustcars::Mode::Inactive.colors();
+    let mut fill = colors.fill;
+    if resp.is_pointer_button_down_on() {
+        fill = rustcars::tint(fill, -0.25);
+    } else if resp.hovered() {
+        fill = rustcars::tint(fill, 0.12);
+    }
+    let painter = ui.painter();
+    painter.rect_filled(rect, 0.0, fill);
+    painter.rect_stroke(
+        rect,
+        0.0,
+        egui::Stroke::new(1.0, palette::TAN),
+        egui::StrokeKind::Inside,
+    );
+    if resp.has_focus() {
+        painter.rect_stroke(
+            rect.shrink(3.0),
+            0.0,
+            egui::Stroke::new(1.0, theme.text_hi),
+            egui::StrokeKind::Inside,
         );
     }
-    let ink = galley.mesh_bounds;
-    let width = if ink.width().is_finite() {
-        ink.width().max(1.0)
-    } else {
-        1.0
-    };
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
-    let ink_x = if ink.left().is_finite() { ink.left() } else { 0.0 };
-    let ink_y = if ink.center().y.is_finite() {
-        ink.center().y
-    } else {
-        galley.rect.height() * 0.5
-    };
-    let pos = egui::pos2(rect.left() - ink_x, rect.center().y - ink_y);
-    ui.painter().with_clip_rect(rect).galley(pos, galley, color);
+    let pad = (rect.height() / 2.0).min(theme.main_gap);
+    painter.text(
+        egui::pos2(rect.right() - pad, rect.bottom() - theme.frame_gap),
+        egui::Align2::RIGHT_BOTTOM,
+        label.to_uppercase(),
+        egui::FontId::proportional(theme.header_size),
+        palette::TAN,
+    );
+    let enabled = ui.is_enabled();
+    let l = label.to_owned();
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, &l));
+    resp
 }
 
 /// One list row, on every tool screen. Monospace at `data_size`.

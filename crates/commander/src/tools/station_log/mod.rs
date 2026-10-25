@@ -111,15 +111,7 @@ impl Diary {
         let t = self.theme;
         super::screen_header(ui, "diary_header", &t, |ui| {
                 ui.horizontal(|ui| {
-                    lcars_button(
-                        ui,
-                        &t,
-                        "Logbook",
-                        palette::TAN,
-                        egui::vec2(110.0, t.bar_thin),
-                        Cap::Left,
-                        true,
-                    );
+                    super::title_block(ui, &t, "Logbook", palette::TAN, egui::vec2(110.0, t.bar_thin));
                     let seg = egui::vec2(90.0, t.bar_thin);
                     if lcars_button(ui, &t, "Today", palette::TEAL, seg, Cap::None, true).clicked()
                     {
@@ -129,8 +121,6 @@ impl Diary {
                         self.date.clear();
                         self.search.clear();
                     }
-                    ui.add_space(t.main_gap);
-                    super::screen_title(ui, &t, "LOGBOOK");
                 });
         });
         egui::CentralPanel::default()
