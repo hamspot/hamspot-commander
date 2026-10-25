@@ -98,7 +98,42 @@ enum RotCmd {
     Remove(u64),
     Select(u64),
     Replace(Vec<RotatorSpec>),
+    SetPos(u64, f64, f64),
+    Move(u64, Spin, i32),
+    Stop(u64),
     Shutdown,
+}
+
+/// Direction for a hamlib `move`. Hamlib codes: 8 = LEFT (CCW), 16 = RIGHT (CW).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Spin {
+    Ccw,
+    Cw,
+}
+
+impl Spin {
+    pub fn hamlib_code(self) -> i32 {
+        match self {
+            Spin::Ccw => 8,
+            Spin::Cw => 16,
+        }
+    }
+}
+
+/// The `rotctld` command line for a one-shot control request.
+pub fn control_line(cmd: &Control) -> String {
+    match *cmd {
+        Control::SetPos(az, el) => format!("set_pos {az:.1} {el:.1}"),
+        Control::Move(spin, speed) => format!("move {} {}", spin.hamlib_code(), speed.clamp(1, 100)),
+        Control::Stop => "stop".into(),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Control {
+    SetPos(f64, f64),
+    Move(Spin, i32),
+    Stop,
 }
 
 struct Slot {
@@ -294,6 +329,16 @@ impl PosClient {
         Ok(Self { stream })
     }
 
+    /// One control request. A non-zero RPRT (a limit, for example) is an error.
+    fn control(&mut self, cmd: &Control) -> Result<(), String> {
+        let line = control_line(cmd);
+        let reply = transact(&mut self.stream, &line)?;
+        if reply.0 != 0 {
+            return Err(format!("{line}: RPRT {}", reply.0));
+        }
+        Ok(())
+    }
+
     fn position(&mut self) -> Result<(f64, f64), String> {
         let reply = transact(&mut self.stream, "get_pos")?;
         if reply.0 != 0 {
@@ -392,6 +437,20 @@ impl Hub {
         self.send(RotCmd::Replace(specs));
     }
 
+    /// Point rotator `id` at `az`/`el` (`set_pos`). The rotator turns on its own.
+    pub fn set_pos(&self, id: u64, az: f64, el: f64) {
+        self.send(RotCmd::SetPos(id, az, el));
+    }
+
+    /// Turn rotator `id` until `stop` (`move`). `speed` is hamlib's 1..100.
+    pub fn turn(&self, id: u64, spin: Spin, speed: i32) {
+        self.send(RotCmd::Move(id, spin, speed));
+    }
+
+    pub fn stop(&self, id: u64) {
+        self.send(RotCmd::Stop(id));
+    }
+
     /// Stop every `rotctld` this program started. The supervisor's stop is
     /// the completion signal. The wait is bounded because a dead supervisor
     /// cannot set `done`, and closing the window must not hang.
@@ -488,6 +547,11 @@ fn supervise(hub: Arc<Hub>, ctx: egui::Context) {
                         }
                     }
                 }
+                RotCmd::SetPos(id, az, el) => control_slot(&mut slots, id, Control::SetPos(az, el)),
+                RotCmd::Move(id, spin, speed) => {
+                    control_slot(&mut slots, id, Control::Move(spin, speed))
+                }
+                RotCmd::Stop(id) => control_slot(&mut slots, id, Control::Stop),
                 RotCmd::Select(id) => {
                     if slots.iter().any(|slot| slot.id == id) {
                         selected = id;
@@ -540,6 +604,22 @@ fn supervise(hub: Arc<Hub>, ctx: egui::Context) {
     }
     *hub.done.lock().expect("rot done") = true;
     hub.done_wake.notify_all();
+}
+
+/// Send one control request to a running `rotctld`. A refusal shows in the
+/// status line. The next position read happens right away.
+fn control_slot(slots: &mut [Slot], id: u64, cmd: Control) {
+    let Some(slot) = slots.iter_mut().find(|slot| slot.id == id) else {
+        return;
+    };
+    let Some(port) = slot.port else {
+        return;
+    };
+    if let Err(err) = PosClient::open(port).and_then(|mut client| client.control(&cmd)) {
+        slot.status = err;
+        slot.status_dirty = true;
+    }
+    slot.next_pos = Some(Instant::now());
 }
 
 fn new_slot(id: u64, spec: RotatorSpec, models: &[RotModel]) -> Slot {
@@ -856,6 +936,48 @@ mod tests {
         let other = format_model_row(&rows[1]);
         assert_eq!(shown.find("Yaesu"), other.find("Yaesu"));
         assert_eq!(shown.find("GS-232A"), other.find("GS-232B"));
+    }
+
+    #[test]
+    fn control_lines_use_hamlib_long_names_and_codes() {
+        assert_eq!(control_line(&Control::SetPos(-90.0, 0.0)), "set_pos -90.0 0.0");
+        assert_eq!(control_line(&Control::Move(Spin::Ccw, 50)), "move 8 50");
+        assert_eq!(control_line(&Control::Move(Spin::Cw, 500)), "move 16 100");
+        assert_eq!(control_line(&Control::Stop), "stop");
+    }
+
+    /// The Dummy limited to a south-stop G-1000: -180..270 is 450 degrees.
+    #[test]
+    fn dummy_with_g1000_limits_refuses_a_heading_past_the_stop() {
+        let spec = RotatorSpec {
+            conf: "min_az=-180,max_az=270".into(),
+            ..RotatorSpec::dummy()
+        };
+        let port = match claim_port(PORT_START) {
+            Ok(port) => port,
+            Err(_) => return,
+        };
+        let mut child = match spawn_rotctld(&spec, port) {
+            Ok(child) => child,
+            Err(_) => {
+                release_port(port);
+                return;
+            }
+        };
+        if wait_ready(port, &mut child).is_err() {
+            stop_child(&mut child);
+            release_port(port);
+            return;
+        }
+        let mut client = PosClient::open(port).expect("client");
+        assert!(client.control(&Control::SetPos(300.0, 0.0)).is_err());
+        assert!(client.control(&Control::SetPos(250.0, 0.0)).is_ok());
+        assert!(client.control(&Control::Move(Spin::Ccw, 50)).is_ok());
+        assert!(client.control(&Control::Stop).is_ok());
+        assert!(client.position().is_ok());
+        drop(client);
+        stop_child(&mut child);
+        release_port(port);
     }
 
     #[test]
