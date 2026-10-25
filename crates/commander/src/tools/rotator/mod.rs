@@ -224,7 +224,7 @@ impl Rotator {
         heading(ui, "LEFT (CCW) / (CW) RIGHT");
         ui.horizontal(|ui| {
             for (spin, label, cap) in [(Spin::Ccw, "LEFT", Cap::Left), (Spin::Cw, "RIGHT", Cap::Right)] {
-                let resp = lcars_button(ui, &t, label, palette::SLATE, key * egui::vec2(0.7, 1.0), cap, live);
+                let resp = key_button(ui, &t, label, palette::SLATE, key * egui::vec2(0.7, 1.0), cap, live);
                 let held = live && resp.is_pointer_button_down_on();
                 if let (Some(id), Some(hub)) = (id, hub.as_ref()) {
                     if held && self.jog != Some(spin) {
@@ -249,7 +249,7 @@ impl Rotator {
                     .speed(1.0)
                     .suffix("°"),
             );
-            if lcars_button(ui, &t, "START", palette::TAN, key * egui::vec2(0.7, 1.0), Cap::None, live)
+            if key_button(ui, &t, "START", palette::TAN, key * egui::vec2(0.7, 1.0), Cap::None, live)
                 .clicked()
             {
                 if let (Some(id), Some(hub), Some(az)) = (id, hub.as_ref(), az) {
@@ -292,7 +292,7 @@ impl Rotator {
         let running = self.track.is_some();
         let label = if running { "STOP" } else { "START" };
         let color = if running { palette::BRICK } else { palette::OLIVE };
-        if lcars_button(ui, &t, label, color, key, Cap::Both, live).clicked() {
+        if key_button(ui, &t, label, color, key, Cap::Both, live).clicked() {
             if running {
                 self.track = None;
                 if let (Some(id), Some(hub)) = (id, hub.as_ref()) {
@@ -313,7 +313,7 @@ impl Rotator {
             }
         }
         ui.add_space(t.main_gap);
-        if lcars_button(ui, &t, "STOP ALL", palette::BRICK, key, Cap::Both, live).clicked() {
+        if key_button(ui, &t, "STOP ALL", palette::BRICK, key, Cap::Both, live).clicked() {
             self.track = None;
             self.jog = None;
             if let (Some(id), Some(hub)) = (id, hub.as_ref()) {
@@ -324,6 +324,70 @@ impl Rotator {
             ui.label(egui::RichText::new(&self.note).color(t.text));
         }
     }
+}
+
+/// Space left for a label: the rect minus the round ends of its caps.
+fn label_area(rect: egui::Rect, cap: Cap) -> egui::Rect {
+    let r = rect.height() * 0.5;
+    let (left, right) = match cap {
+        Cap::Left => (r, 0.0),
+        Cap::Right => (0.0, r),
+        Cap::Both => (r, r),
+        Cap::None => (0.0, 0.0),
+    };
+    egui::Rect::from_min_max(rect.min + egui::vec2(left, 0.0), rect.max - egui::vec2(right, 0.0))
+}
+
+/// Top-left of a galley of `size` centered in `area`.
+fn label_pos(area: egui::Rect, size: egui::Vec2) -> egui::Pos2 {
+    area.center() - size * 0.5
+}
+
+/// A rotator key: the lcars_button shape, but the label is centered both ways
+/// with padding and shrinks to fit (lcars_button puts it bottom right).
+fn key_button(
+    ui: &mut egui::Ui,
+    t: &LcarsTheme,
+    label: &str,
+    base: egui::Color32,
+    size: egui::Vec2,
+    cap: Cap,
+    enabled: bool,
+) -> egui::Response {
+    const PAD: f32 = 8.0;
+    let sense = if enabled { egui::Sense::click() } else { egui::Sense::hover() };
+    let (rect, resp) = ui.allocate_exact_size(size, sense);
+    let fill = if !enabled {
+        rustcars::tint(base, -0.6)
+    } else if resp.is_pointer_button_down_on() {
+        rustcars::tint(base, -0.25)
+    } else if resp.hovered() {
+        rustcars::tint(base, 0.3)
+    } else {
+        base
+    };
+    let radius = rustcars::cap_radius(cap, rect.height());
+    let painter = ui.painter();
+    painter.rect_filled(rect, radius, fill);
+    if resp.has_focus() {
+        painter.rect_stroke(
+            rect.shrink(2.0),
+            radius,
+            egui::Stroke::new(2.0, t.text_hi),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let ink = rustcars::ink_on(fill);
+    let area = label_area(rect, cap).shrink(PAD.min(rect.height() * 0.2));
+    let text = label.to_uppercase();
+    let mut font = t.header_size.min(rect.height() - 2.0 * PAD).max(9.0);
+    let mut galley = painter.layout_no_wrap(text.clone(), egui::FontId::proportional(font), ink);
+    while (galley.size().x > area.width() || galley.size().y > rect.height()) && font > 9.0 {
+        font -= 1.0;
+        galley = painter.layout_no_wrap(text.clone(), egui::FontId::proportional(font), ink);
+    }
+    painter.galley(label_pos(area, galley.size()), galley, ink);
+    resp
 }
 
 fn at(center: egui::Pos2, bearing: f64, r: f32) -> egui::Pos2 {
@@ -438,5 +502,21 @@ fn paint_dial(
     );
     if az.is_none() {
         painter.text(center, egui::Align2::CENTER_CENTER, "NO POSITION", font(r * 0.08), AMBER_DIM);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn labels_center_in_the_flat_part_of_the_key() {
+        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(100.0, 40.0));
+        let size = egui::vec2(30.0, 10.0);
+        assert_eq!(label_pos(rect, size), egui::pos2(45.0, 35.0));
+        assert_eq!(label_area(rect, Cap::None), rect);
+        assert_eq!(label_area(rect, Cap::Both).center(), rect.center());
+        assert_eq!(label_area(rect, Cap::Left).left(), 30.0);
+        assert_eq!(label_area(rect, Cap::Right).right(), 90.0);
     }
 }
