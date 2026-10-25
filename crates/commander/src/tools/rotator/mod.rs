@@ -5,6 +5,8 @@
 //! It drives the rotator selected in Config Automation through `rot::Hub`
 //! (`rotctld`). Test it with the hamlib Dummy (model 1). Issues #77-#83.
 pub mod geom;
+mod horizon;
+mod led;
 
 use std::sync::Arc;
 
@@ -42,6 +44,9 @@ pub struct Rotator {
     /// SPEED, seconds per 360.
     speed_s: f64,
     preset: f64,
+    preset_el: f64,
+    /// Elevation range 0..180 (a flip-capable rotator) instead of 0..90.
+    el_flip: bool,
     rate: f64,
     per_minute: bool,
     dir: TrackDir,
@@ -58,6 +63,8 @@ impl Rotator {
             stop_at: StopAt::South,
             speed_s: 70.0,
             preset: 0.0,
+            preset_el: 0.0,
+            el_flip: false,
             rate: 15.0,
             per_minute: true,
             dir: TrackDir::Cw,
@@ -69,6 +76,10 @@ impl Rotator {
 
     pub fn set_hub(&mut self, hub: Arc<rot::Hub>) {
         self.hub = Some(hub);
+    }
+
+    fn max_el(&self) -> f64 {
+        if self.el_flip { 180.0 } else { 90.0 }
     }
 
     fn rate_dps(&self) -> f64 {
@@ -103,7 +114,8 @@ impl Rotator {
             });
         });
         let az = row.as_ref().and_then(|row| row.azimuth);
-        let el = row.as_ref().and_then(|row| row.elevation).unwrap_or(0.0);
+        let el_now = row.as_ref().and_then(|row| row.elevation);
+        let el = el_now.unwrap_or(0.0);
         let id = row.as_ref().filter(|row| row.port.is_some()).map(|row| row.id);
         self.step_track(ui, id, el);
         egui::CentralPanel::default()
@@ -121,9 +133,18 @@ impl Rotator {
                 );
                 let preset_az = az.map(|az| geom::az_for_bearing(self.preset, az, self.stop_at));
                 paint_dial(ui.painter(), dial_rect, az, Some(self.preset), self.stop_at, preset_az);
+                paint_globe(
+                    ui.painter(),
+                    dial_rect,
+                    el_now,
+                    Some(self.preset_el),
+                    self.max_el(),
+                );
+                // The azimuth scale, needle and lamp go back on top of the globe.
+                paint_dial_top(ui.painter(), dial_rect, az, Some(self.preset), self.stop_at, preset_az);
                 ui.scope_builder(egui::UiBuilder::new().max_rect(panel), |ui| {
                     egui::ScrollArea::vertical().id_salt("rotator-panel").show(ui, |ui| {
-                        self.controls(ui, id, az, el);
+                        self.controls(ui, id, az, el_now);
                     });
                 });
             });
@@ -166,7 +187,13 @@ impl Rotator {
         }
     }
 
-    fn controls(&mut self, ui: &mut egui::Ui, id: Option<u64>, az: Option<f64>, el: f64) {
+    fn controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        id: Option<u64>,
+        az: Option<f64>,
+        el_now: Option<f64>,
+    ) {
         let t = self.theme;
         let key = egui::vec2(132.0, t.bar_thin);
         let live = id.is_some();
@@ -175,16 +202,7 @@ impl Rotator {
             ui.label(egui::RichText::new(text).color(AMBER).size(t.header_size * 0.6));
         };
 
-        heading(ui, "AZIMUTH");
-        let text = match az {
-            Some(az) => format!(
-                "{:05.1}°  (travel {:.0}° of 450)",
-                geom::bearing(az),
-                geom::travel(az, self.stop_at)
-            ),
-            None => "---".into(),
-        };
-        ui.label(egui::RichText::new(text).color(t.text).size(t.data_size));
+        self.readouts(ui, az, el_now);
         if let Some(az) = az {
             if geom::out_of_range(az, self.stop_at) {
                 ui.label(
@@ -241,12 +259,44 @@ impl Rotator {
         });
         ui.add_space(t.main_gap);
 
-        heading(ui, "PRESET");
+        heading(ui, "UP / DOWN");
+        ui.horizontal(|ui| {
+            for (spin, label, cap) in [(Spin::Up, "UP", Cap::Left), (Spin::Down, "DOWN", Cap::Right)] {
+                let resp = key_button(ui, &t, label, palette::TEAL, key * egui::vec2(0.7, 1.0), cap, live);
+                let held = live && resp.is_pointer_button_down_on();
+                if let (Some(id), Some(hub)) = (id, hub.as_ref()) {
+                    if held && self.jog != Some(spin) {
+                        self.track = None;
+                        hub.turn(id, spin, geom::hamlib_speed(self.speed_s));
+                        self.jog = Some(spin);
+                    } else if !held && self.jog == Some(spin) {
+                        hub.stop(id);
+                        self.jog = None;
+                    }
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("EL range:");
+            ui.selectable_value(&mut self.el_flip, false, "0–90");
+            ui.selectable_value(&mut self.el_flip, true, "0–180 (flip)");
+        });
+        self.preset_el = self.preset_el.clamp(0.0, self.max_el());
+        ui.add_space(t.main_gap);
+
+        let max_el = self.max_el();
+        heading(ui, "PRESET  AZ / EL");
         ui.horizontal(|ui| {
             ui.add(
                 egui::DragValue::new(&mut self.preset)
                     .range(0.0..=359.9)
                     .speed(1.0)
+                    .suffix("°"),
+            );
+            ui.add(
+                egui::DragValue::new(&mut self.preset_el)
+                    .range(0.0..=max_el)
+                    .speed(0.5)
                     .suffix("°"),
             );
             if key_button(ui, &t, "START", palette::TAN, key * egui::vec2(0.7, 1.0), Cap::None, live)
@@ -255,11 +305,11 @@ impl Rotator {
                 if let (Some(id), Some(hub), Some(az)) = (id, hub.as_ref(), az) {
                     self.track = None;
                     let target = geom::az_for_bearing(self.preset, az, self.stop_at);
-                    hub.set_pos(id, target, el);
+                    hub.set_pos(id, target, self.preset_el);
                     self.note = if geom::path_enters_overlap(az, target, self.stop_at) {
-                        format!("Preset {:.0}° -> az {target:.1}: path enters OVERLAP.", self.preset)
+                        format!("Preset {:.0}° -> az {target:.1} el {:.1}: path enters OVERLAP.", self.preset, self.preset_el)
                     } else {
-                        format!("Preset {:.0}° -> az {target:.1}.", self.preset)
+                        format!("Preset {:.0}° -> az {target:.1} el {:.1}.", self.preset, self.preset_el)
                     };
                 }
             }
@@ -390,6 +440,86 @@ fn key_button(
     resp
 }
 
+impl Rotator {
+    /// Red LED readouts. AZ shows travel past 360 with a north stop, and OVL
+    /// lights in the overlap. EL shows up to 180.0 and FLIP past 90.
+    fn readouts(&self, ui: &mut egui::Ui, az: Option<f64>, el: Option<f64>) {
+        let t = self.theme;
+        let overlap = az.is_some_and(|az| geom::in_overlap(az, self.stop_at));
+        let wrap = self.stop_at == StopAt::South;
+        let az_text = led::format_az(az.map(|az| led::display_az(az, self.stop_at)), wrap);
+        let el_text = led::format_el(el);
+        let digit_h = 34.0;
+        let small = egui::FontId::proportional(11.0);
+        for (name, text, cells, flag_on, flag) in [
+            ("AZ", az_text, 4.0, overlap, "OVL"),
+            ("EL", el_text, 4.0, el.is_some_and(led::el_flipped), "FLIP"),
+        ] {
+            let width = 230.0_f32.min(ui.available_width());
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(width, digit_h + 6.0), egui::Sense::hover());
+            let painter = ui.painter();
+            painter.text(
+                rect.left_center(),
+                egui::Align2::LEFT_CENTER,
+                name,
+                egui::FontId::proportional(14.0),
+                AMBER,
+            );
+            let n = led::cells(&text).len().max(cells as usize) as f32;
+            let led_w = digit_h * 0.62 * n + 10.0;
+            let led_rect = egui::Rect::from_min_size(
+                rect.left_top() + egui::vec2(28.0, 3.0),
+                egui::vec2(led_w, digit_h),
+            );
+            led::paint(painter, led_rect, &text, led::LIT);
+            painter.text(
+                egui::pos2(led_rect.right() + 6.0, led_rect.top() + 2.0),
+                egui::Align2::LEFT_TOP,
+                flag,
+                small.clone(),
+                if flag_on { led::LIT } else { led::GHOST },
+            );
+            if name == "AZ" && overlap && !wrap {
+                if let Some(az) = az {
+                    painter.text(
+                        egui::pos2(led_rect.right() + 6.0, led_rect.bottom() - 2.0),
+                        egui::Align2::LEFT_BOTTOM,
+                        format!("BRG {}", led::format_az(Some(geom::bearing(az)), true).trim()),
+                        small.clone(),
+                        egui::Color32::from_rgb(0x90, 0x30, 0x28),
+                    );
+                }
+            }
+        }
+        if let Some(az) = az {
+            ui.label(
+                egui::RichText::new(format!("travel {:.0}° of 450", geom::travel(az, self.stop_at)))
+                    .color(t.text)
+                    .size(12.0),
+            );
+        }
+    }
+}
+
+fn paint_globe(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    el: Option<f64>,
+    preset_el: Option<f64>,
+    max_el: f64,
+) {
+    let r = dial_radius(rect);
+    horizon::paint(painter, rect.center(), r * GLOBE, el, preset_el, max_el);
+}
+
+/// Globe radius as a share of the dial radius. The 30-degree labels sit at
+/// 0.63 with their inner edge near 0.58, so 0.52 leaves a dark gap.
+const GLOBE: f32 = 0.52;
+
+fn dial_radius(rect: egui::Rect) -> f32 {
+    (rect.width().min(rect.height()) * 0.5 - 8.0).max(40.0)
+}
+
 fn at(center: egui::Pos2, bearing: f64, r: f32) -> egui::Pos2 {
     let (x, y) = geom::dial_xy(bearing, r as f64);
     center + egui::vec2(x as f32, y as f32)
@@ -406,11 +536,26 @@ fn paint_dial(
     preset_az: Option<f64>,
 ) {
     let center = rect.center();
-    let r = (rect.width().min(rect.height()) * 0.5 - 8.0).max(40.0);
-    let overlap = az.is_some_and(|az| geom::in_overlap(az, stop));
+    let _ = (az, preset, stop, preset_az);
+    let r = dial_radius(rect);
     painter.circle_filled(center, r, BEZEL);
     painter.circle_filled(center, r * 0.93, FACE);
     painter.circle_stroke(center, r * 0.93, egui::Stroke::new(1.5, AMBER_DIM));
+}
+
+/// Everything that draws over the elevation globe: the overlap arc, the
+/// amber scale, crosshair, text, preset marker, needle and OVERLAP lamp.
+fn paint_dial_top(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    az: Option<f64>,
+    preset: Option<f64>,
+    stop: StopAt,
+    preset_az: Option<f64>,
+) {
+    let center = rect.center();
+    let r = dial_radius(rect);
+    let overlap = az.is_some_and(|az| geom::in_overlap(az, stop));
 
     // Overlap sector: the bearings the rotator can reach twice.
     let (a, b) = stop.overlap_bearings();
@@ -501,7 +646,8 @@ fn paint_dial(
         egui::Color32::from_gray(0xC8),
     );
     if az.is_none() {
-        painter.text(center, egui::Align2::CENTER_CENTER, "NO POSITION", font(r * 0.08), AMBER_DIM);
+        // Below the globe's OFF flag, clear of the wings.
+        painter.text(center + egui::vec2(0.0, r * 0.18), egui::Align2::CENTER_CENTER, "NO POSITION", font(r * 0.06), AMBER_DIM);
     }
 }
 
