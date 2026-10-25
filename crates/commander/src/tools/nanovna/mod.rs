@@ -3061,7 +3061,7 @@ impl NanoVna {
                     let painter = ui.painter_at(rect);
                     painter.rect_filled(rect, 0.0, PANE_BG);
                     let plot = rect.shrink(16.0);
-                    paint_polar(&painter, plot);
+                    paint_polar(&painter, plot, theme.data_size);
                     stroke_polar(&painter, plot, &pts, TRACE1);
                 });
             });
@@ -4446,14 +4446,29 @@ fn paint_chart(
             label_px,
         ),
         View::Polar => {
-            paint_polar(&painter, plot);
+            paint_polar(&painter, plot, label_px);
             if let Some(samples) = samples {
                 stroke_polar(&painter, plot, samples, palette::TAN);
             }
             if let Some(memory) = memory {
                 stroke_polar(&painter, plot, memory, palette::TEAL);
             }
-            None
+            // Constant-|Γ| circle through the pointer and its readout. Issue 52.
+            let center = plot.center();
+            let radius = plot.width().min(plot.height()) * 0.45;
+            resp.hover_pos().and_then(|p| {
+                let re = ((p.x - center.x) / radius) as f64;
+                let im = (-(p.y - center.y) / radius) as f64;
+                let r = polar_readout(re, im)?;
+                painter.circle_stroke(center, radius * r.mag as f32, Stroke::new(1.0, palette::TAN));
+                Some(format!(
+                    "|Γ| {:.3}  ∠ {:.1}°  SWR {}  RL {} dB",
+                    r.mag,
+                    r.angle_deg,
+                    if r.swr.is_finite() { format!("{:.2}", r.swr) } else { "INF".into() },
+                    if r.rl_db.is_finite() { format!("{:.2}", r.rl_db) } else { "INF".into() },
+                ))
+            })
         }
         _ => {
             let (xs, ys) = samples
@@ -5122,7 +5137,31 @@ fn stroke_run(painter: &egui::Painter, run: &mut Vec<Pos2>, color: Color32) {
     }
 }
 
-fn paint_polar(painter: &egui::Painter, plot: Rect) {
+/// Magnitude, angle, SWR and return loss of a point on the polar plot. Issue 52.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PolarReading {
+    mag: f64,
+    angle_deg: f64,
+    swr: f64,
+    rl_db: f64,
+}
+
+/// None outside the unit circle, where a passive load cannot be.
+fn polar_readout(re: f64, im: f64) -> Option<PolarReading> {
+    let mag = re.hypot(im);
+    if !(mag <= 1.0) {
+        return None;
+    }
+    let g = Cx::new(re, im);
+    Some(PolarReading { mag, angle_deg: im.atan2(re).to_degrees(), swr: rf::swr(g), rl_db: rf::return_loss_db(g) })
+}
+
+/// |Γ| for an SWR ring.
+fn gamma_for_swr(swr: f64) -> f64 {
+    (swr - 1.0) / (swr + 1.0)
+}
+
+fn paint_polar(painter: &egui::Painter, plot: Rect, label_px: f32) {
     let center = plot.center();
     let radius = plot.width().min(plot.height()) * 0.45;
     let ring = Stroke::new(1.0, Color32::from_rgb(70, 84, 102));
@@ -5131,9 +5170,30 @@ fn paint_polar(painter: &egui::Painter, plot: Rect) {
         [Pos2::new(center.x - radius, center.y), Pos2::new(center.x + radius, center.y)],
         ring,
     );
-    for swr in [1.5_f32, 2.0, 3.0] {
-        let gamma = (swr - 1.0) / (swr + 1.0);
+    painter.line_segment(
+        [Pos2::new(center.x, center.y - radius), Pos2::new(center.x, center.y + radius)],
+        ring,
+    );
+    let font = egui::FontId::monospace((label_px * 0.7).max(9.0));
+    for swr in [1.5_f64, 2.0, 3.0] {
+        let gamma = gamma_for_swr(swr) as f32;
         painter.circle_stroke(center, radius * gamma, ring);
+        painter.text(
+            Pos2::new(center.x + radius * gamma * 0.707 + 2.0, center.y - radius * gamma * 0.707),
+            egui::Align2::LEFT_BOTTOM,
+            format!("SWR {swr}"),
+            font.clone(),
+            palette::TEXT_MUTED,
+        );
+    }
+    for (text, at, align) in [
+        ("0°", Pos2::new(center.x + radius + 4.0, center.y), egui::Align2::LEFT_CENTER),
+        ("180°", Pos2::new(center.x - radius - 4.0, center.y), egui::Align2::RIGHT_CENTER),
+        ("+90°", Pos2::new(center.x, center.y - radius - 2.0), egui::Align2::CENTER_BOTTOM),
+        ("−90°", Pos2::new(center.x, center.y + radius + 2.0), egui::Align2::CENTER_TOP),
+        ("|Γ| = 1", Pos2::new(center.x - radius * 0.707 - 2.0, center.y - radius * 0.707), egui::Align2::RIGHT_BOTTOM),
+    ] {
+        painter.text(at, align, text, font.clone(), palette::TEXT_MUTED);
     }
 }
 
@@ -5205,6 +5265,17 @@ fn nearest_gamma(samples: &[Sample], pos: Pos2, center: Pos2, radius: f32) -> Op
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn the_polar_readout_gives_magnitude_angle_swr_and_return_loss() {
+        let r = polar_readout(0.0, 0.5).unwrap();
+        assert!((r.mag - 0.5).abs() < 1e-12 && (r.angle_deg - 90.0).abs() < 1e-9);
+        assert!((r.swr - 3.0).abs() < 1e-9);
+        assert!((r.rl_db - 6.0206).abs() < 1e-3);
+        assert!(polar_readout(0.9, 0.9).is_none());
+        assert!((gamma_for_swr(2.0) - 1.0 / 3.0).abs() < 1e-12);
+        assert!((gamma_for_swr(1.5) - 0.2).abs() < 1e-12);
+    }
 
     #[test]
     fn formats_are_offered_only_for_their_parameter_with_units() {
