@@ -22,6 +22,7 @@ mod patchbay;
 mod pulse;
 mod talkgroups;
 mod units;
+mod amp;
 mod rot;
 mod rx_pipe;
 mod scan;
@@ -168,6 +169,18 @@ struct CatDraft {
 }
 
 #[derive(Clone)]
+struct AmpDraft {
+    id: Option<u64>,
+    name: String,
+    model: i32,
+    device: String,
+    serial_speed: String,
+    conf: String,
+    port_label: String,
+    error: String,
+}
+
+#[derive(Clone)]
 struct RotDraft {
     id: Option<u64>,
     name: String,
@@ -207,6 +220,9 @@ struct App {
     rotators: Arc<rot::Hub>,
     rot_models: Vec<rot::RotModel>,
     rot_edit: Option<RotDraft>,
+    amplifiers: Arc<amp::Hub>,
+    amp_models: Vec<amp::AmpModel>,
+    amp_edit: Option<AmpDraft>,
     /// Apply was sent. The station file is written once the hub has that command.
     rx_pipe_pending: Option<(u64, String)>,
     tx_pipe_pending: Option<(u64, String)>,
@@ -1766,6 +1782,7 @@ impl App {
         });
         let hub = cat::Hub::spawn(Arc::clone(&face), kick, ctx.clone());
         let rotators = rot::Hub::spawn(ctx.clone());
+        let amplifiers = amp::Hub::spawn(ctx.clone());
         let shared_thread = Arc::clone(&shared);
         let wake_thread = Arc::clone(&wake);
         let face_thread = Arc::clone(&face);
@@ -1812,6 +1829,9 @@ impl App {
             rotators,
             rot_models: Vec::new(),
             rot_edit: None,
+            amplifiers,
+            amp_models: Vec::new(),
+            amp_edit: None,
             rx_pipe_pending: None,
             tx_pipe_pending: None,
             favorite: None,
@@ -2373,6 +2393,7 @@ impl eframe::App for App {
         // are still written when they happen.
         self.hub.shutdown();
         self.rotators.shutdown();
+        self.amplifiers.shutdown();
         // A crash never reaches here. The cleanup child covers that, and this
         // call is only for a window close where that child failed to start.
         if !exit_watch::child_is_watching() {
@@ -2774,6 +2795,9 @@ impl eframe::App for App {
         }
         if self.rot_edit.is_some() {
             self.rotator_window(&ctx);
+        }
+        if self.amp_edit.is_some() {
+            self.amplifier_window(&ctx);
         }
         self.show_meter_window(&ctx, &snap);
         self.show_tools_window(&ctx);
@@ -4391,6 +4415,8 @@ impl App {
                 }
             });
             ui.label("A Yaesu G-5500 uses GS-232A (601) or GS-232B (603).");
+            ui.add_space(8.0);
+            self.amplifier_rows(ui);
         });
         if let Some(id) = select {
             self.rotators.select(id);
@@ -5549,6 +5575,267 @@ impl App {
         self.rot_edit = None;
     }
 
+    /// Amplifiers grid and the selected amplifier's keys, under Rotators.
+    /// Power keys send only on a click. A load or a restart sends none.
+    fn amplifier_rows(&mut self, ui: &mut egui::Ui) {
+        let amps = self.amplifiers.view();
+        let mut select = None;
+        ui.label("Amplifiers");
+        ui.add_space(4.0);
+        egui::Grid::new("amplifiers")
+            .striped(true)
+            .min_col_width(64.0)
+            .show(ui, |ui| {
+                for head in ["Name", "Model", "Device", "Listen", "Freq", "Power", "SWR", "Fwd", "Status"] {
+                    ui.label(head);
+                }
+                ui.end_row();
+                for row in &amps.rows {
+                    let model = if row.make.is_empty() && row.model_label.is_empty() {
+                        row.spec.model.to_string()
+                    } else {
+                        format!("{}  {} {}", row.spec.model, row.make, row.model_label)
+                    };
+                    let device = if row.spec.device.trim().is_empty() {
+                        "—".to_string()
+                    } else {
+                        row.spec.device.clone()
+                    };
+                    let listen = match row.port {
+                        Some(port) => format!("127.0.0.1:{port}"),
+                        None => "127.0.0.1".to_string(),
+                    };
+                    let freq = row
+                        .state
+                        .freq_hz
+                        .map(|hz| format!("{:.3} MHz", hz / 1e6))
+                        .unwrap_or_else(|| "—".into());
+                    let power = row
+                        .state
+                        .power
+                        .map(|p| p.label().to_string())
+                        .unwrap_or_else(|| "—".into());
+                    let level = |name: &str| {
+                        row.state
+                            .level(name)
+                            .map(amp::format_level)
+                            .unwrap_or_else(|| "—".into())
+                    };
+                    let cells = [
+                        row.spec.name.clone(),
+                        model,
+                        device,
+                        listen,
+                        freq,
+                        power,
+                        level("SWR"),
+                        level("PWRFORWARD"),
+                        row.status.clone(),
+                    ];
+                    for cell in &cells {
+                        if cat_cell(ui, cell, row.selected) {
+                            select = Some(row.id);
+                        }
+                    }
+                    ui.end_row();
+                }
+            });
+        ui.add_space(6.0);
+        let selected = amps.rows.iter().find(|row| row.selected);
+        ui.horizontal(|ui| {
+            if ui.button("Add").clicked() {
+                self.open_amplifier(None);
+            }
+            if ui.add_enabled(selected.is_some(), egui::Button::new("Edit")).clicked() {
+                if let Some(row) = selected {
+                    self.open_amplifier(Some(row));
+                }
+            }
+            if ui.add_enabled(selected.is_some(), egui::Button::new("Remove")).clicked() {
+                if let Some(row) = selected {
+                    self.amplifiers.remove(row.id);
+                }
+            }
+        });
+        let live = selected.filter(|row| row.port.is_some());
+        ui.horizontal(|ui| {
+            let keys = [
+                ("Standby", amp::Control::SetPower(amp::Power::Standby)),
+                ("Operate", amp::Control::SetPower(amp::Power::Operate)),
+                ("Off", amp::Control::SetPower(amp::Power::Off)),
+                ("Reset", amp::Control::Reset),
+            ];
+            for (label, cmd) in keys {
+                let text = if label == "Operate" {
+                    egui::RichText::new(label).color(caution())
+                } else {
+                    egui::RichText::new(label)
+                };
+                if ui.add_enabled(live.is_some(), egui::Button::new(text)).clicked() {
+                    if let Some(row) = live {
+                        self.amplifiers.control(row.id, cmd);
+                    }
+                }
+            }
+        });
+        if let Some(row) = selected {
+            if !row.state.levels.is_empty() {
+                let text = row
+                    .state
+                    .levels
+                    .iter()
+                    .map(|(name, value)| format!("{name} {}", amp::format_level(value)))
+                    .collect::<Vec<_>>()
+                    .join("  ·  ");
+                ui.label(egui::RichText::new(text).monospace());
+            }
+        }
+        ui.label("Commander never sends Operate on its own. Test with the Dummy (model 1).");
+        if let Some(id) = select {
+            self.amplifiers.select(id);
+        }
+    }
+
+    fn open_amplifier(&mut self, row: Option<&amp::AmplifierRow>) {
+        self.amp_models = amp::model_list();
+        self.amp_edit = Some(match row {
+            Some(row) => AmpDraft {
+                id: Some(row.id),
+                name: row.spec.name.clone(),
+                model: row.spec.model,
+                device: row.spec.device.clone(),
+                serial_speed: row.spec.serial_speed.clone(),
+                conf: row.spec.conf.clone(),
+                port_label: row
+                    .port
+                    .map(|port| port.to_string())
+                    .unwrap_or_else(|| "assigning".into()),
+                error: String::new(),
+            },
+            None => AmpDraft {
+                id: None,
+                name: "Amplifier".into(),
+                model: 1,
+                device: String::new(),
+                serial_speed: String::new(),
+                conf: String::new(),
+                port_label: "assigning".into(),
+                error: String::new(),
+            },
+        });
+    }
+
+    fn amplifier_window(&mut self, ctx: &egui::Context) {
+        let mut open = true;
+        let mut commit = false;
+        let serial = self.hub.view().serial;
+        egui::Window::new("Amplifier").open(&mut open).show(ctx, |ui| {
+            let models = self.amp_models.clone();
+            let Some(edit) = &mut self.amp_edit else {
+                return;
+            };
+            ui.horizontal(|ui| {
+                ui.label("Name");
+                ui.text_edit_singleline(&mut edit.name);
+            });
+            let current = models
+                .iter()
+                .find(|row| row.id == edit.model)
+                .map(amp::model_button_label)
+                .unwrap_or_else(|| edit.model.to_string());
+            egui::ComboBox::from_id_salt("amplifier-model")
+                .selected_text(current)
+                .show_ui(ui, |ui| {
+                    let _ = ui.selectable_label(
+                        false,
+                        egui::RichText::new(amp::model_menu_header()).monospace().strong(),
+                    );
+                    for row in &models {
+                        let text = egui::RichText::new(amp::format_model_row(row)).monospace();
+                        if ui.selectable_label(edit.model == row.id, text).clicked() {
+                            edit.model = row.id;
+                        }
+                    }
+                });
+            ui.horizontal(|ui| {
+                ui.label("Model");
+                let mut text = edit.model.to_string();
+                if ui.text_edit_singleline(&mut text).changed() {
+                    if let Ok(model) = text.trim().parse::<i32>() {
+                        edit.model = model;
+                    }
+                }
+            });
+            let device_label = if edit.device.trim().is_empty() {
+                "none".to_string()
+            } else {
+                edit.device.clone()
+            };
+            egui::ComboBox::from_id_salt("amplifier-device")
+                .selected_text(device_label)
+                .show_ui(ui, |ui| {
+                    if ui.selectable_label(edit.device.trim().is_empty(), "none").clicked() {
+                        edit.device.clear();
+                    }
+                    for path in &serial {
+                        if ui.selectable_label(edit.device == *path, path).clicked() {
+                            edit.device.clone_from(path);
+                        }
+                    }
+                });
+            ui.horizontal(|ui| {
+                ui.label("Device");
+                ui.text_edit_singleline(&mut edit.device);
+            });
+            ui.horizontal(|ui| {
+                ui.label("Serial speed");
+                ui.text_edit_singleline(&mut edit.serial_speed);
+            });
+            ui.horizontal(|ui| {
+                ui.label("Extra -C");
+                ui.text_edit_singleline(&mut edit.conf);
+            });
+            ui.label(format!("Listen  127.0.0.1:{}", edit.port_label));
+            if !edit.error.is_empty() {
+                ui.label(egui::RichText::new(&edit.error).color(caution()));
+            }
+            if ui.button("Save").clicked() {
+                commit = true;
+            }
+        });
+        if !open {
+            self.amp_edit = None;
+            return;
+        }
+        if commit {
+            self.commit_amplifier();
+        }
+    }
+
+    fn commit_amplifier(&mut self) {
+        let Some(edit) = self.amp_edit.clone() else {
+            return;
+        };
+        let spec = amp::AmplifierSpec {
+            name: edit.name.trim().to_string(),
+            model: edit.model,
+            device: edit.device.trim().to_string(),
+            serial_speed: edit.serial_speed.trim().to_string(),
+            conf: edit.conf.trim().to_string(),
+        };
+        if let Err(err) = amp::validate_spec(&spec) {
+            if let Some(edit) = &mut self.amp_edit {
+                edit.error = err;
+            }
+            return;
+        }
+        match edit.id {
+            Some(id) => self.amplifiers.update(id, spec),
+            None => self.amplifiers.add(spec),
+        }
+        self.amp_edit = None;
+    }
+
     fn commit_hamlib(&mut self) {
         let Some(edit) = self.cat_edit.clone() else {
             return;
@@ -6123,6 +6410,13 @@ impl App {
                 .into_iter()
                 .map(|row| row.spec)
                 .collect(),
+            amplifiers: self
+                .amplifiers
+                .view()
+                .rows
+                .into_iter()
+                .map(|row| row.spec)
+                .collect(),
             selected: self
                 .hub
                 .view()
@@ -6211,6 +6505,7 @@ impl App {
             radios,
             audio,
             rotators,
+            amplifiers,
             selected,
             page,
             tabs,
@@ -6274,6 +6569,8 @@ impl App {
         self.cc_on.clear();
         self.hub.apply_audio(audio);
         self.rotators.replace(rotators);
+        // The daemons start and are polled. No power command is sent.
+        self.amplifiers.replace(amplifiers);
         self.page = page_from_name(&page);
         if self.page != Page::Tools {
             self.page_return = self.page;
