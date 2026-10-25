@@ -72,8 +72,6 @@ impl Timers {
         super::screen_header(ui, "timers_header", &t, |ui| {
                 ui.horizontal(|ui| {
                     super::title_block(ui, &t, "Timers", palette::TAN, egui::vec2(120.0, t.bar_thin));
-                    ui.add_space(t.main_gap);
-                    super::screen_title(ui, &t, "STATION CLOCKS");
                 });
         });
         egui::CentralPanel::default()

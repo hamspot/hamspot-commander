@@ -121,8 +121,6 @@ impl Diary {
                         self.date.clear();
                         self.search.clear();
                     }
-                    ui.add_space(t.main_gap);
-                    super::screen_title(ui, &t, "LOGBOOK");
                 });
         });
         egui::CentralPanel::default()

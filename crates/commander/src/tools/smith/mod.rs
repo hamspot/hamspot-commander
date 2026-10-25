@@ -193,8 +193,6 @@ impl Smith {
         super::screen_header(ui, "smith_header", &t, |ui| {
                 ui.horizontal(|ui| {
                     super::title_block(ui, &t, "Smith", palette::TAN, vec2(120.0, t.bar_thin));
-                    ui.add_space(t.main_gap);
-                    super::screen_title(ui, &t, "SMITH CHART");
                 });
         });
         egui::CentralPanel::default()

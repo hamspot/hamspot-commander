@@ -138,8 +138,6 @@ impl HexView {
                 ui.horizontal(|ui| {
                     super::title_block(ui, &t, "Hex", palette::TAN, egui::vec2(110.0, t.bar_thin));
                     ui.add_space(t.main_gap);
-                    super::screen_title(ui, &t, "HEX VIEWER");
-                    ui.add_space(t.main_gap);
                     if action_button(ui, &t, "Open", egui::vec2(96.0, t.bar_thin)).clicked() {
                         self.open_request = true;
                     }

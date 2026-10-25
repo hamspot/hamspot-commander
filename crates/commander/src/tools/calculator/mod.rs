@@ -336,8 +336,6 @@ impl Calc {
                             Angle::Deg
                         };
                     }
-                    ui.add_space(t.main_gap);
-                    super::screen_title(ui, &t, "SCIENTIFIC CALCULATOR");
                 });
         });
         egui::CentralPanel::default()

@@ -341,44 +341,6 @@ pub(crate) fn title_block(
     );
 }
 
-/// Title beside a screen's own tabs. The slot is one tab tall. The ink
-/// starts at the left of the slot and sits on the vertical center.
-pub(crate) fn screen_title(ui: &mut egui::Ui, theme: &LcarsTheme, text: &str) {
-    let height = theme.bar_thin;
-    let color = theme.text;
-    let mut size = theme.header_size.min(height);
-    let mut galley = ui.painter().layout_no_wrap(
-        text.to_string(),
-        egui::FontId::proportional(size),
-        color,
-    );
-    // A font whose line box is taller than the tab would clip, the same way
-    // title_size did. Step down until the line fits the tab.
-    while galley.rect.height() > height && size > 10.0 {
-        size -= 1.0;
-        galley = ui.painter().layout_no_wrap(
-            text.to_string(),
-            egui::FontId::proportional(size),
-            color,
-        );
-    }
-    let ink = galley.mesh_bounds;
-    let width = if ink.width().is_finite() {
-        ink.width().max(1.0)
-    } else {
-        1.0
-    };
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
-    let ink_x = if ink.left().is_finite() { ink.left() } else { 0.0 };
-    let ink_y = if ink.center().y.is_finite() {
-        ink.center().y
-    } else {
-        galley.rect.height() * 0.5
-    };
-    let pos = egui::pos2(rect.left() - ink_x, rect.center().y - ink_y);
-    ui.painter().with_clip_rect(rect).galley(pos, galley, color);
-}
-
 /// One list row, on every tool screen. Monospace at `data_size`.
 pub(crate) const LIST_ROW: f32 = 28.0;
 
