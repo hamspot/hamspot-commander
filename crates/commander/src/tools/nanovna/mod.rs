@@ -185,6 +185,26 @@ pub struct CalSet {
     pub thru: Vec<[f64; 2]>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub isolation: Vec<[f64; 2]>,
+    /// When the set was last measured: ISO 8601 UTC, e.g. `2026-10-25T22:40:00Z`.
+    /// Sets saved before this field load as None and show "no date".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_at: Option<String>,
+}
+
+/// ISO 8601 UTC stamp for a calibration set, to the second.
+pub fn cal_stamp_now() -> String {
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+/// Short form for badges and lists, in UTC to the minute: `2026-10-25T22:40Z`.
+/// Accepts any RFC 3339 / ISO 8601 date-time with Z or an offset.
+pub fn cal_date_text(saved_at: Option<&str>) -> String {
+    match saved_at {
+        None => "no date".into(),
+        Some(s) => chrono::DateTime::parse_from_rfc3339(s)
+            .map(|d| d.with_timezone(&chrono::Utc).format("%Y-%m-%dT%H:%MZ").to_string())
+            .unwrap_or_else(|_| s.to_string()),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1804,7 +1824,8 @@ impl NanoVna {
             _ => palette::BRICK,
         };
         // The long badge first; the short label when the pane is narrow.
-        let long = format!("{label}{kind}{range}");
+        let date = cal.map(|set| format!(" · {}", cal_date_text(set.saved_at.as_deref()))).unwrap_or_default();
+        let long = format!("{label}{kind}{range}{date}");
         let mut g = painter.layout_no_wrap(long, font.clone(), rustcars::ink_on(fill));
         if g.size().x > rect.width() * 0.45 {
             g = painter.layout_no_wrap(label.to_string(), font.clone(), rustcars::ink_on(fill));
@@ -3080,6 +3101,7 @@ impl NanoVna {
                 set.band = name.clone();
             }
             fill_standard(set, standard, raw);
+            set.saved_at = Some(cal_stamp_now());
         } else {
             let (zone, name) = band.clone().unwrap_or_default();
             let mut set = CalSet {
@@ -3095,6 +3117,7 @@ impl NanoVna {
                 load: Vec::new(),
                 thru: Vec::new(),
                 isolation: Vec::new(),
+                saved_at: Some(cal_stamp_now()),
             };
             fill_standard(&mut set, standard, raw);
             self.face.cals.push(set);
@@ -3519,6 +3542,11 @@ impl NanoVna {
                                     self.archive_dirty = true;
                                 }
                             }
+                            ui.label(
+                                egui::RichText::new(format!("SAVED {}", cal_date_text(set.saved_at.as_deref())))
+                                    .monospace()
+                                    .color(palette::TEXT_MUTED),
+                            );
                             let del = action_button(ui, theme, "Delete", vec2(90.0, 26.0))
                                 .on_hover_text("Double-click to delete this calibration set");
                             if del.double_clicked() {
@@ -3707,12 +3735,13 @@ impl NanoVna {
                     .unwrap_or_default();
                 ui.label(
                     egui::RichText::new(format!(
-                        "{} points · {} to {} · Z0 {} Ω · device {}{worst_text} · uncorrected ratio as stored (no date is stored in a set)",
+                        "{} points · {} to {} · Z0 {} Ω · device {} · saved {}{worst_text} · uncorrected ratio as stored",
                         values.len(),
                         display::fmt_hz(pts.first().map(|s| s.hz).unwrap_or(0.0)),
                         display::fmt_hz(pts.last().map(|s| s.hz).unwrap_or(0.0)),
                         trim_num(set.z0),
                         if set.id.is_empty() { "-" } else { set.id.as_str() },
+                        cal_date_text(set.saved_at.as_deref()),
                     ))
                     .monospace()
                     .size(theme.data_size * 0.85)
@@ -3722,7 +3751,8 @@ impl NanoVna {
                     "Directivity (gold) · Source match (teal) · Reflection tracking (plum), |term| dB".to_string()
                 } else {
                     format!(
-                        "Measured (gold) · Ideal {} (grey){} · R = worst point",
+                        "Measured (gold, saved {}) · Ideal {} (grey){} · R = worst point",
+                        cal_date_text(set.saved_at.as_deref()),
                         step.step_name().to_lowercase(),
                         if compare.is_some() { " · Compare (teal)" } else { "" }
                     )
@@ -6135,6 +6165,24 @@ mod tests {
     }
 
     #[test]
+    fn calibration_dates_round_trip_old_sets_load_and_format() {
+        let mut set = one_standard();
+        assert!(set.saved_at.is_none());
+        let old = serde_json::to_string(&set).unwrap();
+        assert!(!old.contains("saved_at"), "no field written when there is no date");
+        let back: CalSet = serde_json::from_str(&old).unwrap();
+        assert_eq!(back.saved_at, None);
+        assert_eq!(cal_date_text(None), "no date");
+        set.saved_at = Some("2026-10-25T22:40:17Z".into());
+        let back: CalSet = serde_json::from_str(&serde_json::to_string(&set).unwrap()).unwrap();
+        assert_eq!(back, set);
+        assert_eq!(cal_date_text(back.saved_at.as_deref()), "2026-10-25T22:40Z");
+        assert_eq!(cal_date_text(Some("2026-10-25T18:40:00-04:00")), "2026-10-25T22:40Z");
+        let now = cal_stamp_now();
+        assert!(chrono::DateTime::parse_from_rfc3339(&now).is_ok() && now.ends_with('Z'), "{now}");
+    }
+
+    #[test]
     fn every_format_has_a_unique_layout_id_and_the_default_panes_resolve() {
         let ids: Vec<String> = VIEWS.iter().map(|(v, _)| view_id(*v)).collect();
         for (i, id) in ids.iter().enumerate() {
@@ -6203,6 +6251,7 @@ mod tests {
             load: vec![[0.0, 0.0], [0.0, 0.0]],
             thru: Vec::new(),
             isolation: Vec::new(),
+            saved_at: None,
         });
         assert!(validate(&face).is_err());
     }
@@ -6221,6 +6270,7 @@ mod tests {
             load: Vec::new(),
             thru: Vec::new(),
             isolation: Vec::new(),
+            saved_at: None,
         }
     }
 

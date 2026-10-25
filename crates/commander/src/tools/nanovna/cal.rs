@@ -107,6 +107,7 @@ mod tests {
             load: rows(Cx::ZERO),
             thru: Vec::new(),
             isolation: Vec::new(),
+            saved_at: None,
         }
     }
 

@@ -758,6 +758,7 @@ mod tests {
             load: Vec::new(),
             thru: Vec::new(),
             isolation: Vec::new(),
+            saved_at: None,
         });
         let text = to_string(&file).unwrap();
         assert!(text.contains("\"cals\""));
