@@ -52,6 +52,10 @@ pub struct Live {
     pub generation: u64,
     pub busy: bool,
     pub capture_png: Option<Vec<u8>>,
+    /// Sweeps that failed since connect. Issue 72.
+    pub sweep_errors: u64,
+    /// Set when the port vanished while connected, so the UI can warn.
+    pub lost: bool,
 }
 
 impl Default for Live {
@@ -65,6 +69,8 @@ impl Default for Live {
             generation: 0,
             busy: false,
             capture_png: None,
+            sweep_errors: 0,
+            lost: false,
         }
     }
 }
@@ -150,10 +156,29 @@ impl Drop for Session {
 fn worker(rx: Receiver<Cmd>, live: Arc<Mutex<Live>>, ctx: egui::Context) {
     let mut port: Option<Box<dyn serialport::SerialPort>> = None;
     let mut identity: Option<Identity> = None;
+    let mut path_open = String::new();
     loop {
-        let cmd = match rx.recv() {
+        // Wake a few times a second so an unplugged board shows as
+        // disconnected within a second even when no sweep is running. Issue 72.
+        let cmd = match rx.recv_timeout(Duration::from_millis(300)) {
             Ok(cmd) => cmd,
-            Err(_) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if port.is_some() && unplugged(&path_open) {
+                    port = None;
+                    identity = None;
+                    let mut guard = live.lock().expect("nanovna");
+                    guard.connected = false;
+                    guard.identity = None;
+                    guard.device_id = None;
+                    guard.lost = true;
+                    guard.status = format!("Disconnected. {path_open} went away.");
+                    drop(guard);
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                    ctx.request_repaint_of(super::super::viewport_id());
+                }
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
         if matches!(cmd, Cmd::Stop) {
             break;
@@ -163,6 +188,12 @@ fn worker(rx: Receiver<Cmd>, live: Arc<Mutex<Live>>, ctx: egui::Context) {
             Cmd::Connect(path) => {
                 port = None;
                 identity = None;
+                path_open = path.clone();
+                {
+                    let mut guard = live.lock().expect("nanovna");
+                    guard.lost = false;
+                    guard.sweep_errors = 0;
+                }
                 match open_port(&path).and_then(|mut opened| {
                     let id = identify(&mut *opened)?;
                     Ok((opened, id.0, id.1))
@@ -228,7 +259,10 @@ fn worker(rx: Receiver<Cmd>, live: Arc<Mutex<Live>>, ctx: egui::Context) {
                             }
                             Ok(())
                         }
-                        Err(err) => Err(err),
+                        Err(err) => {
+                            live.lock().expect("nanovna").sweep_errors += 1;
+                            Err(err)
+                        }
                     }
                 } else {
                     Err("Not connected.".into())
@@ -275,6 +309,20 @@ fn worker(rx: Receiver<Cmd>, live: Arc<Mutex<Live>>, ctx: egui::Context) {
         set_busy(&live, false);
         ctx.request_repaint_of(egui::ViewportId::ROOT);
         ctx.request_repaint_of(super::super::viewport_id());
+    }
+}
+
+/// True when a Unix device node for an open port no longer exists. Other
+/// systems name ports without a path, so they rely on I/O errors instead.
+pub fn unplugged(path: &str) -> bool {
+    #[cfg(unix)]
+    {
+        !path.is_empty() && path.starts_with('/') && !std::path::Path::new(path).exists()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
     }
 }
 

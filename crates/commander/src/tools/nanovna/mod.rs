@@ -647,6 +647,9 @@ pub struct NanoVna {
     archive_dirty: bool,
     /// Time between the last two sweeps that arrived while running.
     sweep_ms: Option<f64>,
+    /// Sweeps received since connect, and the device details popover. Issue 72.
+    sweep_count: u64,
+    details_open: bool,
     last_sweep: Option<std::time::Instant>,
     /// A stored calibration standard shown in its own window. Issue 75.
     cal_graph: Option<(CalSet, WizStep)>,
@@ -709,6 +712,8 @@ impl NanoVna {
             blank_until_sweep: false,
             archive_dirty: false,
             sweep_ms: None,
+            sweep_count: 0,
+            details_open: false,
             last_sweep: None,
             cal_graph: None,
         }
@@ -791,6 +796,7 @@ impl NanoVna {
         if live.generation != self.seen && !live.sweep.is_empty() {
             self.ingest(&live.sweep);
             self.seen = live.generation;
+            self.sweep_count += 1;
             let now = std::time::Instant::now();
             if let (true, Some(was)) = (self.run, self.last_sweep) {
                 self.sweep_ms = Some(now.duration_since(was).as_secs_f64() * 1000.0);
@@ -814,7 +820,12 @@ impl NanoVna {
         if let Some(png) = self.session.take_capture() {
             self.save_bytes("Save screenshot", "nanovna-screen.png", &png);
         }
+        if live.connected {
+            // Keeps the status bar honest about a lost board within a second.
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+        }
         self.chart(ui, &theme, &live);
+        self.details_dialog(ui, &theme, &live);
         self.setup_dialog(ui, &theme, &live);
         self.wizard_dialog(ui, &theme, &live);
     }
@@ -839,6 +850,70 @@ impl NanoVna {
                     });
             });
         self.setup_open = open;
+    }
+
+    /// Device details read from the identity and device-id registers. Issue 72.
+    fn details_dialog(&mut self, ui: &mut Ui, theme: &LcarsTheme, live: &device::Live) {
+        if !self.details_open {
+            return;
+        }
+        let mut open = true;
+        let text = self.device_details(live);
+        egui::Window::new("NanoVNA device")
+            .open(&mut open)
+            .resizable(false)
+            .show(ui.ctx(), |ui| {
+                ui.label(egui::RichText::new(&text).monospace().size(theme.data_size * 0.85));
+                ui.horizontal(|ui| {
+                    if action_button(ui, theme, "Copy", vec2(80.0, 32.0)).clicked() {
+                        ui.ctx().copy_text(text.clone());
+                    }
+                    if action_button(ui, theme, "Reconnect", vec2(120.0, 32.0)).clicked() {
+                        self.reconnect();
+                    }
+                });
+            });
+        self.details_open = open;
+    }
+
+    fn device_details(&self, live: &device::Live) -> String {
+        let mut out = String::new();
+        let line = |out: &mut String, k: &str, v: String| out.push_str(&format!("{k:<14}{v}\n"));
+        line(&mut out, "STATE", if live.connected { "CONNECTED".into() } else if live.lost { "DISCONNECTED (LOST)".into() } else { "NOT CONNECTED".into() });
+        line(&mut out, "PORT", if self.face.port.is_empty() { "-".into() } else { self.face.port.clone() });
+        if let Some(id) = live.identity {
+            line(&mut out, "FIRMWARE", id.version_label());
+            line(&mut out, "BOARD", id.board.to_string());
+            line(&mut out, "VARIANT", id.variant.to_string());
+            line(&mut out, "PROTOCOL", id.protocol.to_string());
+            line(&mut out, "MAX FREQ", display::fmt_hz(id.max_hz()));
+            line(&mut out, "DEV AVG/POWER", if id.power_and_average() { "yes".into() } else { "needs FW 1.0.2".into() });
+        }
+        if let Some(dev) = live.device_id {
+            line(&mut out, "DEVICE ID", proto::device_id_hex(&dev));
+        }
+        line(&mut out, "MAX POINTS", proto::POINTS_MAX.to_string());
+        line(&mut out, "SWEEPS", self.sweep_count.to_string());
+        line(&mut out, "SWEEP ERRORS", live.sweep_errors.to_string());
+        if let Some(ms) = self.sweep_ms {
+            line(&mut out, "SWEEP TIME", format!("{} ms", ms.round()));
+        }
+        line(&mut out, "STATUS", live.status.clone());
+        out.trim_end().to_string()
+    }
+
+    fn reconnect(&mut self) {
+        if self.face.port.is_empty() {
+            self.note = "Choose a USB port in Setup first.".into();
+            return;
+        }
+        self.user_closed = false;
+        self.run = false;
+        self.run_state = Run::Idle;
+        self.sweep_count = 0;
+        self.session.disconnect();
+        self.session.connect(self.face.port.clone());
+        self.note = format!("Reconnecting to {}.", self.face.port);
     }
 
     fn pump(&mut self, live: &device::Live) {
@@ -1404,8 +1479,8 @@ impl NanoVna {
     }
 
     /// The channel and instrument line along the bottom. Issues 65 and 71.
-    fn status_bar(&self, ui: &mut Ui, theme: &LcarsTheme, live: &device::Live, samples: Option<&[Sample]>, cal: Option<&CalSet>) {
-        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::hover());
+    fn status_bar(&mut self, ui: &mut Ui, theme: &LcarsTheme, live: &device::Live, samples: Option<&[Sample]>, cal: Option<&CalSet>) {
+        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::click());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, palette::STRIP);
         // The summary follows the SWEEP fields as they are edited; the
@@ -1436,13 +1511,48 @@ impl NanoVna {
                 .map(|id| format!("  FW {}.{}", id.fw_major, id.fw_minor))
                 .unwrap_or_default();
             format!("NANOVNA V2 · {}{fw}", self.face.port)
+        } else if live.lost {
+            "DISCONNECTED".to_string()
         } else {
             "NOT CONNECTED".to_string()
         };
-        let time = self
+        let mut time = self
             .sweep_ms
             .map(|ms| format!(" · {} ms/SWEEP", ms.round()))
             .unwrap_or_default();
+        if live.connected {
+            time.push_str(&format!(" · #{}", self.sweep_count));
+        }
+        // Warnings carry text, never colour alone.
+        let mut warn = Vec::new();
+        if live.identity.is_some_and(|id| !id.power_and_average()) {
+            warn.push("FW < 1.0.2: NO DEV AVG/POWER");
+        }
+        if live.sweep_errors > 0 && live.connected {
+            warn.push("SWEEP ERRORS");
+        }
+        if live.lost {
+            warn.push("CHECK USB");
+        }
+        if !warn.is_empty() {
+            left.push_str(&format!("  ⚠ {}", warn.join(" · ")));
+        }
+        let status_line = format!("{left}  {device}{time}");
+        if resp.hovered() {
+            painter.rect_stroke(rect, 0.0, Stroke::new(1.0, palette::TAN), egui::StrokeKind::Inside);
+        }
+        // single = details, double = reconnect, triple = copy the status line.
+        if resp.triple_clicked() {
+            ui.ctx().copy_text(status_line.clone());
+            self.note = "Status line copied.".into();
+        } else if resp.double_clicked() {
+            self.details_open = false;
+            self.reconnect();
+        } else if resp.clicked() {
+            self.details_open = !self.details_open;
+        }
+        let resp = resp.on_hover_text("Click: device details · double: reconnect · triple: copy status line");
+        let _ = resp;
         let font = egui::FontId::monospace(theme.data_size * 0.8);
         painter.text(
             Pos2::new(rect.left() + 8.0, rect.center().y),
@@ -1456,7 +1566,7 @@ impl NanoVna {
             egui::Align2::RIGHT_CENTER,
             format!("{device}{time}"),
             font,
-            if live.connected { palette::TEXT } else { palette::TEXT_MUTED },
+            if live.connected { palette::TEXT } else if live.lost { palette::BRICK } else { palette::TEXT_MUTED },
         );
     }
 
@@ -4485,6 +4595,15 @@ fn nearest_gamma(samples: &[Sample], pos: Pos2, center: Pos2, radius: f32) -> Op
 mod tests {
     use super::*;
     use std::fs;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_vanished_device_node_reads_as_unplugged() {
+        assert!(device::unplugged("/dev/hamspot-no-such-nanovna"));
+        assert!(!device::unplugged("/dev/null"));
+        assert!(!device::unplugged(""));
+        assert!(!device::unplugged("COM3"));
+    }
 
     #[test]
     fn a_manual_scale_is_saved_per_trace_format() {
