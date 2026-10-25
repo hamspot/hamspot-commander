@@ -467,6 +467,18 @@ CSV, s1p, and s2p write the trace you see, including calibration and port extens
 
 TX power and on-device averaging appear only when the firmware is 1.0.2 or newer and the sweep starts at or above 140 MHz. Below that, the screen says so. Commander does not flash the unit. A white screen after you hold the left button while switching on is the bootloader. Use `bootload_firmware.py` or NanoVNA-QT. Do not use a standard USB DFU tool. If ModemManager takes the port, install `docs/nanovna-v2.rules` by hand and add your user to the `dialout` group. Commander does not install that rule.
 
+### NanoVNA page layout and keys
+
+Layout·1, Layout·2, and Layout·4 split the chart into one, two, or four panes. Up to four traces can be shown. Each trace has its own format, such as S11 return loss, S21 dB, Smith, or S21 group delay, and its own pane. +Trace adds a trace. Pane → moves the active trace to the next pane. Several traces in one Cartesian pane are drawn over each other in the trace colors. Double-click a pane to fill the chart with it, and double-click again to restore the grid. Each pane keeps its own scale. The layout is saved in the station file.
+
+A header line sits above each pane: the trace number, the parameter, the format, the scale per division, the reference, AUTO or MAN, memory and math flags, and the calibration badge. Clicking the header opens that trace's menu. When a pane is narrow, the header drops sections from the right instead of overlapping them. Couple on shows the markers on every pane at the same frequency. Couple off shows them only on the active pane.
+
+Marker search: Max, Min, and Next pk move the active marker. TARGET takes a value in the trace unit, and ◀ Tgt or Tgt ▶ move the marker to the next point where the trace crosses it. Track follows the maximum or the minimum on every sweep. Peaks→M puts M1 to M8 on the highest peaks. Filter, on an S21 pane, shows the center frequency, the insertion loss, the 3 dB and 6 dB edges and widths, and Q. SWR BW, on an S11 pane, shows the lowest SWR and the band where SWR stays under 2:1.
+
+The Graph button beside each stored calibration standard opens that standard in its own window. Click opens the Smith chart (polar for the cable and loads-on-both-jacks steps). Double-click opens return loss (S21 dB). Triple-click opens phase. A light grey ideal trace is drawn behind the measured one, and R marks the point furthest from ideal, with the value in the summary line. Compare draws another stored set over it. Err terms plots directivity, source match, and reflection tracking. A wild source match or tracking curve usually means a standard was fitted wrongly. PNG and CSV save what is shown.
+
+Keys with three small dots on the right edge have click modes. Green is click, orange is double-click, and purple is triple-click. The same actions are on the keyboard while no text box has focus. A letter alone is the click, Shift and the letter is the double-click, and Ctrl and the letter is the triple-click. The letters are R Run, L Layout, T Trace, S Store, A Auto, K Limits, M Marker, and I for the status line. The left and right arrows move the active marker one point. The tooltip on each key lists all three actions and their keys.
+
 ---
 
 # 9. CAT control and GQRX
