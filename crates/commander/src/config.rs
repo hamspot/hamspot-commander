@@ -47,6 +47,10 @@ pub struct ConfigFile {
     /// that frame existed, which still loads and starts no rotator.
     #[serde(default)]
     pub rotators: Vec<crate::rot::RotatorSpec>,
+    /// Amplifiers the Automation frame starts through `ampctld`. Absent in a
+    /// file written before amplifier support, which still loads.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub amplifiers: Vec<crate::amp::AmplifierSpec>,
     /// Index into `radios` of the row the Tune page drives. Absent means the first row.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub selected: usize,
@@ -431,6 +435,9 @@ pub fn validate(file: &ConfigFile) -> Result<(), String> {
     for rotator in &file.rotators {
         crate::rot::validate_spec(rotator)?;
     }
+    for amplifier in &file.amplifiers {
+        crate::amp::validate_spec(amplifier)?;
+    }
     let mut seen_follow = Vec::new();
     for index in &file.control_follow {
         if *index >= file.radios.len() || seen_follow.contains(index) {
@@ -612,6 +619,7 @@ mod tests {
             radios: Vec::new(),
             audio: AudioGraph::default(),
             rotators: Vec::new(),
+            amplifiers: Vec::new(),
             selected: 0,
             page: String::new(),
             tabs: Vec::new(),
@@ -1128,6 +1136,28 @@ mod tests {
         assert_eq!(back.rotators[0].model, 601);
         assert_eq!(back.rotators[0].device, "/dev/ttyUSB0");
         file.rotators[0].name.clear();
+        assert!(to_string(&file).is_err());
+    }
+
+    #[test]
+    fn a_file_without_amplifiers_loads_and_one_amplifier_round_trips() {
+        let text = to_string(&sample()).unwrap();
+        assert!(!text.contains("\"amplifiers\""));
+        let loaded = parse(&text).unwrap();
+        assert!(loaded.amplifiers.is_empty());
+        let mut file = sample();
+        file.amplifiers.push(crate::amp::AmplifierSpec::dummy());
+        let text = to_string(&file).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["amplifiers"][0]["model"], 1);
+        let back = parse(&text).unwrap();
+        assert_eq!(back.amplifiers, file.amplifiers);
+        let short = text.replace(
+            &serde_json::to_string(&value["amplifiers"]).unwrap(),
+            r#"[{"name":"Dummy","model":1}]"#,
+        );
+        assert_eq!(parse(&short).unwrap().amplifiers[0].name, "Dummy");
+        file.amplifiers[0].name.clear();
         assert!(to_string(&file).is_err());
     }
 
