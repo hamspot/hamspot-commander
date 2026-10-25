@@ -762,6 +762,7 @@ mod tests {
             id: "device".into(),
             zone: String::new(),
             band: String::new(),
+            name: String::new(),
             start_hz: 50_000_000.0,
             step_hz: 1_000_000.0,
             z0: 50.0,
@@ -770,6 +771,7 @@ mod tests {
             load: Vec::new(),
             thru: Vec::new(),
             isolation: Vec::new(),
+            saved_at: None,
         });
         let text = to_string(&file).unwrap();
         assert!(text.contains("\"cals\""));
@@ -804,6 +806,23 @@ mod tests {
         value["radios"][0]["driver"] = serde_json::json!("gqrx");
         let gqrx = parse(&value.to_string()).unwrap();
         assert_eq!(gqrx.radios[0].driver, crate::cat::RadioDriver::Gqrx);
+    }
+
+    /// Every station file in David's config folders still loads with this
+    /// build (skipped where the folders are absent).
+    #[test]
+    fn existing_station_files_still_load() {
+        for dir in ["/home/user/Documents/hscommand-config", "/home/user/.config/hamspot-commander"] {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|e| e == "HSCommander") {
+                    load_file(&path).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+                }
+            }
+        }
     }
 
     #[test]

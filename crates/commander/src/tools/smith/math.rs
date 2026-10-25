@@ -203,6 +203,89 @@ fn finish(g0: Cx, d: f64, kind: Stub) -> Option<StubMatch> {
     })
 }
 
+/// Where the shunt element of an L network sits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LTopology {
+    /// Shunt B across the load, then series X toward the source.
+    ShuntFirst,
+    /// Series X with the load, then shunt B across the source side.
+    SeriesFirst,
+}
+
+/// One lossless L-network match to Z0 (normalized reactance x and susceptance b).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LMatch {
+    pub topology: LTopology,
+    pub x: f64,
+    pub b: f64,
+}
+
+/// Input impedance (normalized) the network presents with load `zl`.
+pub fn l_input(zl: Cx, m: LMatch) -> Cx {
+    match m.topology {
+        LTopology::ShuntFirst => zl.inv().add(cx(0.0, m.b)).inv().add(cx(0.0, m.x)),
+        LTopology::SeriesFirst => zl.add(cx(0.0, m.x)).inv().add(cx(0.0, m.b)).inv(),
+    }
+}
+
+/// Every L-network match of a normalized load to 1 (Pozar 5.1), checked by
+/// computing the input impedance. Empty for a matched or reactive load.
+pub fn l_match(zl: Cx) -> Vec<LMatch> {
+    let (r, x) = (zl.re, zl.im);
+    let mut out = Vec::new();
+    if !(r > 1e-9) || !r.is_finite() || !x.is_finite() || gamma(zl).abs() < 1e-9 {
+        return out;
+    }
+    let mag2 = r * r + x * x;
+    // Shunt first: needs r^2 + x^2 >= r (the load lies outside the g = 1 circle's mirror).
+    let disc = r * (mag2 - r);
+    if disc >= 0.0 {
+        for sign in [1.0, -1.0] {
+            let b = (x + sign * disc.sqrt()) / mag2;
+            if b.abs() < 1e-15 {
+                continue;
+            }
+            let xs = 1.0 / b + x / r - 1.0 / (b * r);
+            out.push(LMatch { topology: LTopology::ShuntFirst, x: xs, b });
+        }
+    }
+    // Series first: needs r <= 1.
+    if r <= 1.0 {
+        let d = (r * (1.0 - r)).sqrt();
+        let bb = ((1.0 - r) / r).sqrt();
+        for sign in [1.0, -1.0] {
+            out.push(LMatch { topology: LTopology::SeriesFirst, x: sign * d - x, b: sign * bb });
+        }
+    }
+    out.retain(|m| l_input(zl, *m).sub(ONE).abs() < 1e-6);
+    out.dedup_by(|a, b| a.topology == b.topology && (a.x - b.x).abs() < 1e-9 && (a.b - b.b).abs() < 1e-9);
+    out
+}
+
+/// A reactance in ohms as the part that makes it at `f_hz`: "1.234 µH" or "56.0 pF".
+pub fn reactance_part(x_ohm: f64, f_hz: f64) -> String {
+    let w = TAU * f_hz;
+    if x_ohm.abs() < 1e-12 || w <= 0.0 {
+        return "none".into();
+    }
+    if x_ohm > 0.0 { si(x_ohm / w, "H") } else { si(-1.0 / (w * x_ohm), "F") }
+}
+
+/// A susceptance in siemens as the part that makes it at `f_hz`.
+pub fn susceptance_part(b_s: f64, f_hz: f64) -> String {
+    let w = TAU * f_hz;
+    if b_s.abs() < 1e-15 || w <= 0.0 {
+        return "none".into();
+    }
+    if b_s > 0.0 { si(b_s / w, "F") } else { si(-1.0 / (w * b_s), "H") }
+}
+
+fn si(v: f64, unit: &str) -> String {
+    let a = v.abs();
+    let (k, p) = if a >= 1.0 { (1.0, "") } else if a >= 1e-3 { (1e3, "m") } else if a >= 1e-6 { (1e6, "µ") } else if a >= 1e-9 { (1e9, "n") } else { (1e12, "p") };
+    format!("{:.3} {p}{unit}", v * k)
+}
+
 /// Input admittance of a stub of `len` wavelengths (normalized).
 #[cfg(test)]
 pub fn stub_admittance(len: f64, kind: Stub) -> Cx {
@@ -222,6 +305,26 @@ mod tests {
     }
     fn close_c(a: Cx, b: Cx, tol: f64) {
         assert!(a.sub(b).abs() <= tol, "{a:?} vs {b:?}");
+    }
+
+    #[test]
+    fn l_networks_match_loads_inside_and_outside_the_unit_circle() {
+        // 100 + j50 on 50 ohm (z = 2 + j1) and 10 - j20 (z = 0.2 - j0.4).
+        for zl in [cx(2.0, 1.0), cx(0.2, -0.4), cx(0.5, 0.0), cx(4.0, -3.0)] {
+            let all = l_match(zl);
+            assert!(!all.is_empty(), "{zl:?}");
+            for m in all {
+                close_c(l_input(zl, m), cx(1.0, 0.0), 1e-6);
+            }
+        }
+        // r > 1 needs the shunt element at the load.
+        assert!(l_match(cx(2.0, 1.0)).iter().all(|m| m.topology == LTopology::ShuntFirst));
+        assert!(l_match(cx(1.0, 0.0)).is_empty());
+        assert!(l_match(cx(0.0, 1.0)).is_empty());
+        // 50 ohm of reactance at 10 MHz: 795.8 nH; -50 ohm: 318.3 pF.
+        assert_eq!(reactance_part(50.0, 10e6), "795.775 nH");
+        assert_eq!(reactance_part(-50.0, 10e6), "318.310 pF");
+        assert_eq!(susceptance_part(0.02, 10e6), "318.310 pF");
     }
 
     #[test]

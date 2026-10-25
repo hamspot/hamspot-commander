@@ -315,11 +315,18 @@ pub fn unwrap_phase(values: &[Cx]) -> Vec<f64> {
 /// Group delay from the slope of unwrapped phase, averaged over up to two
 /// points on each side. τ = −Δφ / (2π Δf), with φ in radians.
 pub fn group_delay(hz: &[f64], unwrapped: &[f64]) -> Vec<f64> {
+    group_delay_aperture(hz, unwrapped, 4)
+}
+
+/// Group delay over an aperture of `aperture` points (split evenly either
+/// side, at least 2). A wider aperture is smoother but blurs fast changes. Issue 64.
+pub fn group_delay_aperture(hz: &[f64], unwrapped: &[f64], aperture: usize) -> Vec<f64> {
+    let half = (aperture.max(2) / 2).max(1);
     let n = hz.len().min(unwrapped.len());
     let mut out = vec![f64::NAN; n];
     for index in 0..n {
-        let lo = index.saturating_sub(2);
-        let hi = (index + 2).min(n - 1);
+        let lo = index.saturating_sub(half);
+        let hi = (index + half).min(n - 1);
         if hi <= lo || !(hz[hi] > hz[lo]) {
             continue;
         }
@@ -797,6 +804,32 @@ mod tests {
         let back = apply_osl(measured, &terms, 0).unwrap();
         assert!((back.re - actual.re).abs() < 1e-9);
         assert!((back.im - actual.im).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_hundred_plus_j50_load_on_fifty_ohm_is_swr_2_62() {
+        let z = Cx::new(100.0, 50.0);
+        let g = z.sub(Cx::new(50.0, 0.0)).div(z.add(Cx::new(50.0, 0.0))).unwrap();
+        assert!((swr(g) - 2.618).abs() < 1e-3, "{}", swr(g));
+        let back = impedance(g, 50.0).unwrap();
+        assert!((back.re - 100.0).abs() < 1e-9 && (back.im - 50.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn group_delay_of_an_ideal_line_is_constant_for_every_aperture() {
+        let tau = 7.5e-9;
+        let hz: Vec<f64> = (0..201).map(|i| 1e6 + i as f64 * 2e6).collect();
+        let s21: Vec<Cx> = hz
+            .iter()
+            .map(|f| { let ph = -2.0 * PI * f * tau; Cx::new(ph.cos(), ph.sin()) })
+            .collect();
+        let un = unwrap_phase(&s21);
+        for ap in [2, 4, 10, 30] {
+            let d = group_delay_aperture(&hz, &un, ap);
+            for v in d.iter().filter(|v| v.is_finite()) {
+                assert!((v - tau).abs() < 1e-12, "aperture {ap}: {v}");
+            }
+        }
     }
 
     #[test]

@@ -13,7 +13,7 @@
 //! The maths is in `calc.rs` and the band table in `bands.rs`, both unit tested.
 //! Everything here is approximate bench math: trim real antennas with an analyzer, and
 //! check the current FCC rules before you transmit.
-mod bands;
+pub(crate) mod bands;
 mod calc;
 
 use calc::{CABLES, DistUnit, FreqUnit, LNetwork, LcSolve, LenUnit, PowerUnit, Q, Reflection};

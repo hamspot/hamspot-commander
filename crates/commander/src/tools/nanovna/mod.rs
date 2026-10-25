@@ -2,9 +2,20 @@
 //! The device is optional. Nothing is polled until Connect.
 
 mod device;
+mod cal;
 mod display;
+mod layout;
+mod limits;
+mod markers;
 mod proto;
 mod rf;
+mod keys;
+#[cfg(test)]
+mod a11y;
+mod calstd;
+mod search;
+mod sweep;
+mod traces;
 
 use std::collections::VecDeque;
 use std::fs;
@@ -22,9 +33,11 @@ const START_DEFAULT: f64 = 50_000_000.0;
 const STOP_DEFAULT: f64 = 900_000_000.0;
 const POINTS_DEFAULT: u16 = 101;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum View {
     Smith,
+    /// Admittance Smith chart (Y grid). Issue 64 / 58.
+    SmithY,
     Polar,
     Swr,
     ReturnLoss,
@@ -36,22 +49,61 @@ enum View {
     Tdr,
     LinMag,
     ReIm,
+    /// |Z| from S11. Issue 64.
+    Zabs,
+    PhaseS11,
+    UnwrapS11,
+    PolarS21,
+    ReImS21,
+    LinMagS21,
 }
 
-const VIEWS: [(View, &str); 12] = [
+/// Every format with its key label. FORMAT shows the ones valid for the
+/// selected parameter (S11 or S21). Issue 64.
+const VIEWS: [(View, &str); 19] = [
     (View::Smith, "Smith"),
+    (View::SmithY, "Smith Y"),
     (View::Polar, "Polar"),
     (View::Swr, "SWR"),
     (View::ReturnLoss, "Return loss"),
     (View::LinMag, "Lin mag"),
     (View::ReIm, "Real + imag"),
     (View::Impedance, "R + X"),
-    (View::S21, "S21 dB"),
+    (View::Zabs, "|Z|"),
+    (View::PhaseS11, "Phase"),
+    (View::UnwrapS11, "Unwrap"),
+    (View::Tdr, "TDR"),
+    (View::S21, "dB mag"),
     (View::Phase, "Phase"),
     (View::Unwrap, "Unwrap"),
     (View::GroupDelay, "Group delay"),
-    (View::Tdr, "TDR"),
+    (View::PolarS21, "Polar"),
+    (View::ReImS21, "Real + imag"),
+    (View::LinMagS21, "Lin mag"),
 ];
+
+/// True when the format reads S21; the rest read S11.
+fn uses_s21(view: View) -> bool {
+    matches!(
+        view,
+        View::S21 | View::Phase | View::Unwrap | View::GroupDelay | View::PolarS21 | View::ReImS21 | View::LinMagS21
+    )
+}
+
+/// Polar and Smith draw on a disk, not a Cartesian grid.
+fn is_disk(view: View) -> bool {
+    matches!(view, View::Smith | View::SmithY | View::Polar | View::PolarS21)
+}
+
+/// The parameter a format reads from one sample.
+fn param_of(view: View, sample: &Sample) -> Cx {
+    if uses_s21(view) { sample.s21 } else { sample.s11 }
+}
+
+thread_local! {
+    /// Group-delay aperture in points, set from the face each frame. Issue 64.
+    static GD_APERTURE: std::cell::Cell<usize> = const { std::cell::Cell::new(4) };
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Standard {
@@ -120,6 +172,9 @@ pub struct CalSet {
     /// Band or subband name. A subband is `band / segment`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub band: String,
+    /// Operator's name for the set. Empty shows the zone. Issue 65.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
     pub start_hz: f64,
     pub step_hz: f64,
     pub z0: f64,
@@ -130,6 +185,26 @@ pub struct CalSet {
     pub thru: Vec<[f64; 2]>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub isolation: Vec<[f64; 2]>,
+    /// When the set was last measured: ISO 8601 UTC, e.g. `2026-10-25T22:40:00Z`.
+    /// Sets saved before this field load as None and show "no date".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_at: Option<String>,
+}
+
+/// ISO 8601 UTC stamp for a calibration set, to the second.
+pub fn cal_stamp_now() -> String {
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+/// Short form for badges and lists, in UTC to the minute: `2026-10-25T22:40Z`.
+/// Accepts any RFC 3339 / ISO 8601 date-time with Z or an offset.
+pub fn cal_date_text(saved_at: Option<&str>) -> String {
+    match saved_at {
+        None => "no date".into(),
+        Some(s) => chrono::DateTime::parse_from_rfc3339(s)
+            .map(|d| d.with_timezone(&chrono::Utc).format("%Y-%m-%dT%H:%MZ").to_string())
+            .unwrap_or_else(|_| s.to_string()),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -155,6 +230,25 @@ pub struct Face {
     pub smooth: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cals: Vec<CalSet>,
+    /// Manual scales by trace format key. A format with no entry auto-scales. Issue 69.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub scales: std::collections::BTreeMap<String, display::ManualScale>,
+    /// Group-delay aperture in points. Issue 64.
+    #[serde(default = "default_aperture", skip_serializing_if = "is_default_aperture")]
+    pub gd_aperture: u32,
+    /// Pane grid and trace assignment. Issues 62 and 63.
+    #[serde(default, skip_serializing_if = "layout::Layout::is_default")]
+    pub layout: layout::Layout,
+    /// Limit lines by trace format key. Issue 71.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub limits: std::collections::BTreeMap<String, limits::LimitSet>,
+}
+
+fn default_aperture() -> u32 {
+    4
+}
+fn is_default_aperture(v: &u32) -> bool {
+    *v == 4
 }
 
 fn default_start() -> f64 {
@@ -210,6 +304,10 @@ impl Default for Face {
             host_average: 1,
             smooth: 1,
             cals: Vec::new(),
+            scales: std::collections::BTreeMap::new(),
+            gd_aperture: 4,
+            limits: std::collections::BTreeMap::new(),
+            layout: layout::Layout::default(),
         }
     }
 }
@@ -602,13 +700,19 @@ pub struct NanoVna {
     dev_avg: String,
     view: View,
     run: bool,
+    /// Stop after the next sweep (SINGLE). Issue 68.
+    single: bool,
     run_state: Run,
-    markers: [Option<usize>; 4],
+    /// Marker frequencies in Hz: M1..M8 then R. Issue 66.
+    markers: [Option<f64>; markers::SLOTS],
     marker_on: usize,
-    memory: Option<Vec<Sample>>,
+    readout_fmt: markers::Readout,
+    marker_freq: String,
+    /// MEM1..MEM4 frozen traces and the selected slot. Issue 70.
+    mems: [Option<Vec<Sample>>; traces::MEMS],
+    mem_sel: usize,
+    math: traces::Math,
     show_memory: bool,
-    show_diff: bool,
-    admittance: bool,
     history: VecDeque<Vec<Sample>>,
     seen: u64,
     pending: Option<Standard>,
@@ -636,9 +740,36 @@ pub struct NanoVna {
     archive_dirty: bool,
     /// Time between the last two sweeps that arrived while running.
     sweep_ms: Option<f64>,
+    /// Sweeps received since connect, and the device details popover. Issue 72.
+    sweep_count: u64,
+    /// Correction off (CAL OFF) and the state of the shown trace. Issue 65.
+    cal_off: bool,
+    limits_edit: bool,
+    /// Active trace, the pane being drawn, the open trace menu, marker coupling. Issues 62, 63, 66.
+    active_trc: usize,
+    cur_pane: u8,
+    trace_menu: Option<usize>,
+    couple: bool,
+    /// TARGET value for the target search, in the trace unit. Issue 67.
+    target_text: String,
+    /// Repeat this search each sweep (TRACK): 0 max, 1 min.
+    track: Option<u8>,
+    /// Band-filter readout on S21 panes, SWR-bandwidth readout on S11 panes.
+    filter_on: bool,
+    swr_bw_on: bool,
+    cal_state: cal::CalState,
+    details_open: bool,
     last_sweep: Option<std::time::Instant>,
     /// A stored calibration standard shown in its own window. Issue 75.
     cal_graph: Option<(CalSet, WizStep)>,
+    /// Format, compare set (index into the stored sets) and error-term view of that window.
+    cal_graph_view: View,
+    /// Keyboard click-mode presses waiting for their key group this frame. Issue 73.
+    kbd: Vec<(keys::Group, u8)>,
+    /// Arrow-key marker step waiting for the chart: -1 / +1.
+    kbd_step: i32,
+    cal_compare: Option<usize>,
+    cal_terms: bool,
 }
 
 impl NanoVna {
@@ -665,13 +796,16 @@ impl NanoVna {
             ports: Vec::new(),
             view: View::Smith,
             run: false,
+            single: false,
             run_state: Run::Idle,
-            markers: [None; 4],
+            markers: [None; markers::SLOTS],
             marker_on: 0,
-            memory: None,
+            readout_fmt: markers::Readout::Trace,
+            marker_freq: String::new(),
+            mems: Default::default(),
+            mem_sel: 0,
+            math: traces::Math::Off,
             show_memory: false,
-            show_diff: false,
-            admittance: false,
             history: VecDeque::new(),
             seen: 0,
             pending: None,
@@ -695,7 +829,25 @@ impl NanoVna {
             blank_until_sweep: false,
             archive_dirty: false,
             sweep_ms: None,
+            sweep_count: 0,
+            cal_off: false,
+            limits_edit: false,
+            active_trc: 0,
+            cur_pane: 0,
+            trace_menu: None,
+            couple: true,
+            target_text: "-3".into(),
+            track: None,
+            filter_on: false,
+            swr_bw_on: false,
+            cal_state: cal::CalState::Uncal,
+            details_open: false,
             last_sweep: None,
+            cal_graph_view: View::Smith,
+            kbd: Vec::new(),
+            kbd_step: 0,
+            cal_compare: None,
+            cal_terms: false,
             cal_graph: None,
         }
     }
@@ -729,8 +881,12 @@ impl NanoVna {
         self.host_avg = face.host_average.to_string();
         self.smooth = face.smooth.to_string();
         self.face = face;
+        self.active_trc = 0;
+        if let Some(v) = self.face.layout.traces.first().and_then(|t| view_from_id(&t.view)) {
+            self.view = v;
+        }
         self.history.clear();
-        self.memory = None;
+        self.mems = Default::default();
         self.dirty = false;
     }
 
@@ -774,9 +930,12 @@ impl NanoVna {
     pub fn draw(&mut self, ui: &mut Ui) {
         let theme = LcarsTheme::default();
         let live = self.session.snapshot();
+        GD_APERTURE.with(|a| a.set(self.face.gd_aperture.clamp(2, 200) as usize));
+        self.read_keys(ui);
         if live.generation != self.seen && !live.sweep.is_empty() {
             self.ingest(&live.sweep);
             self.seen = live.generation;
+            self.sweep_count += 1;
             let now = std::time::Instant::now();
             if let (true, Some(was)) = (self.run, self.last_sweep) {
                 self.sweep_ms = Some(now.duration_since(was).as_secs_f64() * 1000.0);
@@ -800,7 +959,15 @@ impl NanoVna {
         if let Some(png) = self.session.take_capture() {
             self.save_bytes("Save screenshot", "nanovna-screen.png", &png);
         }
+        if live.connected {
+            // Keeps the status bar honest about a lost board within a second.
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+        }
         self.chart(ui, &theme, &live);
+        self.details_dialog(ui, &theme, &live);
+        self.limits_dialog(ui, &theme);
+        let shown_trace = self.display_trace(&live);
+        self.trace_menu_dialog(ui, &theme, shown_trace.as_deref());
         self.setup_dialog(ui, &theme, &live);
         self.wizard_dialog(ui, &theme, &live);
     }
@@ -827,6 +994,70 @@ impl NanoVna {
         self.setup_open = open;
     }
 
+    /// Device details read from the identity and device-id registers. Issue 72.
+    fn details_dialog(&mut self, ui: &mut Ui, theme: &LcarsTheme, live: &device::Live) {
+        if !self.details_open {
+            return;
+        }
+        let mut open = true;
+        let text = self.device_details(live);
+        egui::Window::new("NanoVNA device")
+            .open(&mut open)
+            .resizable(false)
+            .show(ui.ctx(), |ui| {
+                ui.label(egui::RichText::new(&text).monospace().size(theme.data_size * 0.85));
+                ui.horizontal(|ui| {
+                    if action_button(ui, theme, "Copy", vec2(80.0, 32.0)).clicked() {
+                        ui.ctx().copy_text(text.clone());
+                    }
+                    if action_button(ui, theme, "Reconnect", vec2(120.0, 32.0)).clicked() {
+                        self.reconnect();
+                    }
+                });
+            });
+        self.details_open = open;
+    }
+
+    fn device_details(&self, live: &device::Live) -> String {
+        let mut out = String::new();
+        let line = |out: &mut String, k: &str, v: String| out.push_str(&format!("{k:<14}{v}\n"));
+        line(&mut out, "STATE", if live.connected { "CONNECTED".into() } else if live.lost { "DISCONNECTED (LOST)".into() } else { "NOT CONNECTED".into() });
+        line(&mut out, "PORT", if self.face.port.is_empty() { "-".into() } else { self.face.port.clone() });
+        if let Some(id) = live.identity {
+            line(&mut out, "FIRMWARE", id.version_label());
+            line(&mut out, "BOARD", id.board.to_string());
+            line(&mut out, "VARIANT", id.variant.to_string());
+            line(&mut out, "PROTOCOL", id.protocol.to_string());
+            line(&mut out, "MAX FREQ", display::fmt_hz(id.max_hz()));
+            line(&mut out, "DEV AVG/POWER", if id.power_and_average() { "yes".into() } else { "needs FW 1.0.2".into() });
+        }
+        if let Some(dev) = live.device_id {
+            line(&mut out, "DEVICE ID", proto::device_id_hex(&dev));
+        }
+        line(&mut out, "MAX POINTS", proto::POINTS_MAX.to_string());
+        line(&mut out, "SWEEPS", self.sweep_count.to_string());
+        line(&mut out, "SWEEP ERRORS", live.sweep_errors.to_string());
+        if let Some(ms) = self.sweep_ms {
+            line(&mut out, "SWEEP TIME", format!("{} ms", ms.round()));
+        }
+        line(&mut out, "STATUS", live.status.clone());
+        out.trim_end().to_string()
+    }
+
+    fn reconnect(&mut self) {
+        if self.face.port.is_empty() {
+            self.note = "Choose a USB port in Setup first.".into();
+            return;
+        }
+        self.user_closed = false;
+        self.run = false;
+        self.run_state = Run::Idle;
+        self.sweep_count = 0;
+        self.session.disconnect();
+        self.session.connect(self.face.port.clone());
+        self.note = format!("Reconnecting to {}.", self.face.port);
+    }
+
     fn pump(&mut self, live: &device::Live) {
         match self.run_state {
             Run::Queued if live.busy => self.run_state = Run::Running,
@@ -843,6 +1074,10 @@ impl NanoVna {
             if self.setup_has_cal(live) {
                 if self.send_sweep() {
                     self.run_state = Run::Queued;
+                    if self.single {
+                        self.single = false;
+                        self.run = false;
+                    }
                 }
             } else {
                 self.run = false;
@@ -964,15 +1199,15 @@ impl NanoVna {
         ui.horizontal(|ui| {
             if action_button(ui, theme, "Memory", vec2(88.0, 32.0)).clicked() {
                 if let Some(trace) = self.display_trace(live) {
-                    self.memory = Some(trace);
+                    self.mems[self.mem_sel] = Some(trace);
                     self.show_memory = true;
                 }
             }
             if action_button(ui, theme, "Mem on", vec2(80.0, 32.0)).clicked() {
                 self.show_memory = !self.show_memory;
             }
-            if action_button(ui, theme, "Diff", vec2(70.0, 32.0)).clicked() {
-                self.show_diff = !self.show_diff;
+            if action_button(ui, theme, "Math", vec2(70.0, 32.0)).clicked() {
+                self.math = next_math(self.math);
             }
         });
         ui.horizontal(|ui| {
@@ -1014,7 +1249,7 @@ impl NanoVna {
                 format!("Not connected to {}.", self.face.port)
             };
         };
-        let Some(index) = self.markers[self.marker_on] else {
+        let Some(index) = self.marker_index(self.marker_on, samples) else {
             return self.cal_label(live);
         };
         let Some(sample) = samples.get(index) else {
@@ -1022,8 +1257,8 @@ impl NanoVna {
         };
         let d = rf::derive(sample, self.z0_value());
         format!(
-            "M{}  {} Hz  SWR {}  RL {} dB  |Z| {} Ω  {} {:+}j Ω  Q {}  S21 {} dB  series {}  parallel {}",
-            self.marker_on + 1,
+            "{}  {} Hz  SWR {}  RL {} dB  |Z| {} Ω  {} {:+}j Ω  Q {}  S21 {} dB  series {}  parallel {}",
+            markers::slot_name(self.marker_on),
             sample.hz.round(),
             num(rf::swr(sample.s11)),
             num(rf::return_loss_db(sample.s11)),
@@ -1076,12 +1311,24 @@ impl NanoVna {
             self.cal_graph_dialog(ui, theme);
             return;
         }
-        let trace = self.display_trace(live);
-        let memory = if self.show_memory {
-            self.memory.clone()
+        let mut trace = self.display_trace(live);
+        let mut memory = if self.show_memory {
+            self.memory().cloned()
         } else {
             None
         };
+        // With no live trace, a shown memory (for example an imported file)
+        // becomes the trace so markers and readouts work on it. Issue 53.
+        if trace.is_none() && memory.is_some() {
+            trace = memory.take();
+        }
+        let math = match (&trace, &memory) {
+            (Some(t), Some(m)) => traces::trace_math(t, m, self.math),
+            _ => None,
+        };
+        if self.math != traces::Math::Off && memory.is_some() && math.is_none() && self.wizard.is_none() {
+            self.note = "Math needs the memory on the same frequency grid as the trace.".into();
+        }
         let (left, right) = body_split(ui, theme, 440.0);
         let mut caption = self.face_caption(live, trace.as_deref());
         if self.await_scan.is_some() && self.wizard.is_none() {
@@ -1110,127 +1357,562 @@ impl NanoVna {
                     self.marker_block(ui, theme, trace.as_deref());
                 });
         });
-        let mut clicked = None;
-        let placed: Vec<(usize, usize)> = self
-            .markers
-            .iter()
-            .enumerate()
-            .filter_map(|(slot, at)| at.map(|at| (slot, at)))
-            .collect();
-        let cal = trace.as_deref().and_then(|t| self.matched_cal(t)).cloned();
+        if let Some(code) = self.track {
+            self.marker_search(code, trace.as_deref());
+        }
+        if let Some(samples) = trace.as_deref().filter(|s| !s.is_empty()) {
+            // M / Shift+M / Ctrl+M: active marker, next marker, reference marker; ← → step it. Issue 73.
+            if let Some(op) = self.key_op(keys::Group::Marker) {
+                self.marker_on = match op {
+                    1 => self.marker_on,
+                    2 => (self.marker_on + 1) % markers::NORMAL,
+                    _ => markers::REF,
+                };
+                if self.markers[self.marker_on].is_none() {
+                    self.markers[self.marker_on] = Some(samples[samples.len() / 2].hz);
+                }
+            }
+            if self.kbd_step != 0 {
+                let at = self.marker_index(self.marker_on, samples).unwrap_or(samples.len() / 2) as i64;
+                let to = (at + self.kbd_step as i64).clamp(0, samples.len() as i64 - 1) as usize;
+                self.markers[self.marker_on] = Some(samples[to].hz);
+            }
+        }
+        let placed = self.placed(trace.as_deref());
+        let (cal, state) = match trace.as_deref() {
+            Some(t) => self.cal_for(t, None),
+            None => (None, if self.cal_off { cal::CalState::Off } else { cal::CalState::Uncal }),
+        };
+        self.cal_state = state;
+        self.sync_traces();
         show_frame(ui, theme, right, Side::Right, |ui| {
-            self.trace_header(ui, theme, trace.as_deref(), cal.as_ref());
             let table_h = if placed.is_empty() { 0.0 } else { 22.0 * (placed.len() as f32 + 1.0) + 6.0 };
             let status_h = 26.0;
-            let chart_h = (ui.available_height() - table_h - status_h - 8.0).max(120.0);
-            ui.allocate_ui(vec2(ui.available_width(), chart_h), |ui| {
-                let (hit, _) = paint_chart(
-                    ui,
-                    self.view,
-                    trace.as_deref(),
-                    memory.as_deref(),
-                    self.show_diff,
-                    self.z0_value(),
-                    self.velocity_value(),
-                    self.admittance,
-                    theme.data_size,
-                    &placed,
-                );
-                clicked = hit;
-            });
+            let grid_h = (ui.available_height() - table_h - status_h - 8.0).max(160.0);
+            let area = Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), grid_h));
+            ui.allocate_rect(area, Sense::hover());
+            self.draw_panes(ui, theme, area, trace.as_deref(), memory.as_deref(), math.as_deref(), &placed, cal.as_ref());
             if let Some(samples) = trace.as_deref() {
                 self.marker_table(ui, theme, samples, &placed);
             }
             self.status_bar(ui, theme, live, trace.as_deref(), cal.as_ref());
         });
-        if let Some(index) = clicked {
-            self.markers[self.marker_on] = Some(index);
+    }
+
+    /// The trace whose settings the keys edit, kept in the layout. Issue 62.
+    fn sync_traces(&mut self) {
+        if self.face.layout.traces.is_empty() {
+            self.face.layout.traces.push(layout::TraceCfg { view: view_id(self.view), pane: 0, hidden: false });
+            self.active_trc = 0;
+        }
+        self.active_trc = self.active_trc.min(self.face.layout.traces.len() - 1);
+        let id = view_id(self.view);
+        let t = &mut self.face.layout.traces[self.active_trc];
+        if t.view != id {
+            t.view = id;
+            self.dirty = true;
+        }
+        self.cur_pane = t.pane;
+    }
+
+    fn trace_view(&self, t: usize) -> View {
+        self.face.layout.traces.get(t).and_then(|c| view_from_id(&c.view)).unwrap_or(self.view)
+    }
+
+    /// Make trace `t` the active one: the keys and marker table follow it.
+    fn activate(&mut self, t: usize) {
+        if t < self.face.layout.traces.len() {
+            self.active_trc = t;
+            self.view = self.trace_view(t);
+            self.cur_pane = self.face.layout.traces[t].pane;
         }
     }
 
-    /// The R&S trace-list line over the pane: name, parameter chip, format, scale, channel, cal.
-    fn trace_header(&self, ui: &mut Ui, theme: &LcarsTheme, samples: Option<&[Sample]>, cal: Option<&CalSet>) {
-        let (param, format, unit) = view_meta(self.view);
-        let scale = match (self.view, samples) {
-            (View::Smith | View::Polar, _) | (_, None) => None,
-            (view, Some(samples)) => {
-                let (_, mut ys) = series(view, samples, self.z0_value(), self.velocity_value());
-                ys.extend(second_series(view, samples, self.z0_value()));
-                Some(display::auto_scale(&ys, 10))
+    /// Draw every shown pane: its header lines and its chart. Issues 62 and 63.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_panes(
+        &mut self,
+        ui: &mut Ui,
+        theme: &LcarsTheme,
+        area: Rect,
+        trace: Option<&[Sample]>,
+        memory: Option<&[Sample]>,
+        math: Option<&[Sample]>,
+        placed: &[(usize, usize)],
+        cal: Option<&CalSet>,
+    ) {
+        let shown = self.face.layout.shown();
+        let (cols, rows) = layout::grid(shown.len());
+        let gap = 6.0;
+        let cw = (area.width() - gap * (cols as f32 - 1.0)) / cols as f32;
+        let ch = (area.height() - gap * (rows as f32 - 1.0)) / rows as f32;
+        let active_pane = self.cur_pane;
+        let mut new_active: Option<usize> = None;
+        let mut max_toggle: Option<u8> = None;
+        let mut clicked: Option<(usize, u8)> = None;
+        for (k, pane) in shown.iter().copied().enumerate() {
+            let (cx, cy) = (k % cols, k / cols);
+            let rect = Rect::from_min_size(
+                Pos2::new(area.left() + cx as f32 * (cw + gap), area.top() + cy as f32 * (ch + gap)),
+                vec2(cw, ch),
+            );
+            let all = self.face.layout.in_pane(pane);
+            let visible: Vec<usize> = all.iter().copied().filter(|t| !self.face.layout.traces[*t].hidden).collect();
+            let primary = visible.first().copied();
+            ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                self.cur_pane = pane;
+                if all.is_empty() {
+                    let resp = ui.allocate_exact_size(vec2(rect.width(), 26.0), Sense::click()).1;
+                    ui.painter().text(
+                        resp.rect.left_center() + vec2(8.0, 0.0),
+                        egui::Align2::LEFT_CENTER,
+                        format!("PANE {} · NO TRACE · +TRACE OR MOVE ONE HERE", pane + 1),
+                        egui::FontId::monospace(theme.data_size * 0.8),
+                        palette::TEXT_MUTED,
+                    );
+                    if resp.double_clicked() {
+                        max_toggle = Some(pane);
+                    }
+                }
+                for &t in &all {
+                    self.view = self.trace_view(t);
+                    let color = if Some(t) == primary { TRACE1 } else { TRACE_COLORS[t % TRACE_COLORS.len()] };
+                    let resp = self.trace_header(ui, theme, trace, cal, t, t == self.active_trc, color);
+                    if resp.double_clicked() {
+                        max_toggle = Some(pane);
+                    } else if resp.clicked() {
+                        new_active = Some(t);
+                        self.trace_menu = Some(t);
+                    }
+                }
+                let Some(p) = primary else {
+                    return;
+                };
+                let pv = self.trace_view(p);
+                self.view = pv;
+                let z0 = self.z0_value();
+                let vf = self.velocity_value();
+                // Other visible Cartesian traces in the pane draw over the first one.
+                let extra: Vec<(Vec<f64>, Color32)> = match trace {
+                    Some(samples) if !is_disk(pv) && pv != View::Tdr => visible[1..]
+                        .iter()
+                        .filter_map(|t| {
+                            let v = self.trace_view(*t);
+                            (!is_disk(v) && v != View::Tdr).then(|| (series(v, samples, z0, vf).1, TRACE_COLORS[*t % TRACE_COLORS.len()]))
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                // Coupled markers show on every pane; uncoupled only on the active one. Issue 66.
+                let marks: Vec<(usize, usize)> = if self.couple || pane == active_pane { placed.to_vec() } else { Vec::new() };
+                let mut info = self.marker_info(trace, &marks);
+                info.extend(self.analysis_lines(trace));
+                let manual = self.face.scales.get(self.key().as_str()).copied();
+                let overlay = self.overlay(trace);
+                let (hit, _, gesture) = paint_chart(
+                    ui,
+                    pv,
+                    trace,
+                    memory,
+                    math,
+                    z0,
+                    vf,
+                    false,
+                    theme.data_size,
+                    &marks,
+                    &info,
+                    manual,
+                    &overlay,
+                    &extra,
+                );
+                if gesture.ref_divs != 0.0 {
+                    let by = gesture.ref_divs as f64;
+                    self.edit_scale(trace, |m| m.shifted(by, 10));
+                    new_active = Some(p);
+                }
+                if gesture.wheel != 0 {
+                    let up = gesture.wheel > 0;
+                    self.edit_scale(trace, |m| m.stepped(up));
+                    new_active = Some(p);
+                }
+                if hit.is_some() {
+                    clicked = hit;
+                    if new_active.is_none() {
+                        new_active = Some(p);
+                    }
+                }
+            });
+        }
+        if let Some(pane) = max_toggle {
+            self.face.layout.toggle_max(pane);
+            self.dirty = true;
+        }
+        let active = new_active.unwrap_or(self.active_trc);
+        self.activate(active);
+        if let (Some((index, clicks)), Some(samples)) = (clicked, trace) {
+            let slot = markers::click_slot(self.marker_on, clicks);
+            if let Some(sample) = samples.get(index) {
+                self.markers[slot] = Some(sample.hz);
+                if clicks == 2 {
+                    self.marker_on = slot;
+                }
             }
+        }
+    }
+
+    /// Scale and limit key for the shown format in the pane being drawn.
+    /// Pane 1 keeps the plain format name so older files keep their scales.
+    fn key(&self) -> String {
+        let base = scale_key(self.view);
+        if self.cur_pane == 0 { base.to_string() } else { format!("P{} {base}", self.cur_pane + 1) }
+    }
+
+    /// Per-trace menu opened from its header line. Issue 63.
+    /// Plain / Shift / Ctrl + letter = single / double / triple click on that key
+    /// group; ← → move the active marker. Ignored while a text field has focus. Issue 73.
+    fn read_keys(&mut self, ui: &Ui) {
+        self.kbd.clear();
+        self.kbd_step = 0;
+        if ui.ctx().egui_wants_keyboard_input() {
+            return;
+        }
+        let events = ui.input(|i| i.events.clone());
+        for e in events {
+            if let egui::Event::Key { key, pressed: true, modifiers, .. } = e {
+                if modifiers.alt {
+                    continue;
+                }
+                match key {
+                    egui::Key::ArrowLeft => self.kbd_step = -1,
+                    egui::Key::ArrowRight => self.kbd_step = 1,
+                    _ => {
+                        let name = key.name();
+                        if let (1, Some(c)) = (name.len(), name.chars().next()) {
+                            if let Some(g) = keys::group_of(c) {
+                                self.kbd.push((g, keys::mode(modifiers.shift, modifiers.ctrl || modifiers.command)));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Take a pending keyboard press for this key group.
+    fn key_op(&mut self, group: keys::Group) -> Option<u8> {
+        let at = self.kbd.iter().position(|(g, _)| *g == group)?;
+        Some(self.kbd.remove(at).1)
+    }
+
+    fn trace_menu_dialog(&mut self, ui: &mut Ui, theme: &LcarsTheme, samples: Option<&[Sample]>) {
+        let Some(t) = self.trace_menu else {
+            return;
         };
-        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::hover());
+        if t >= self.face.layout.traces.len() {
+            self.trace_menu = None;
+            return;
+        }
+        let mut open = true;
+        let mut pick: Option<View> = None;
+        let mut hide = false;
+        let mut auto = false;
+        let mut store = false;
+        let mut move_next = false;
+        let mut remove = false;
+        let cur = self.trace_view(t);
+        let hidden = self.face.layout.traces[t].hidden;
+        egui::Window::new(format!("TRC{} settings", t + 1))
+            .open(&mut open)
+            .resizable(false)
+            .show(ui.ctx(), |ui| {
+                for s21 in [false, true] {
+                    ui.label(egui::RichText::new(if s21 { "S21 FORMAT" } else { "S11 FORMAT" }).color(palette::TEXT_MUTED));
+                    ui.horizontal_wrapped(|ui| {
+                        for (v, label) in VIEWS.iter().filter(|(v, _)| uses_s21(*v) == s21) {
+                            if ui.selectable_label(*v == cur, *label).clicked() {
+                                pick = Some(*v);
+                            }
+                        }
+                    });
+                }
+                ui.horizontal(|ui| {
+                    hide = action_button(ui, theme, if hidden { "Show" } else { "Hide" }, vec2(80.0, 30.0)).clicked();
+                    auto = action_button(ui, theme, "Auto scale", vec2(110.0, 30.0)).clicked();
+                    store = action_button(ui, theme, "Store mem", vec2(110.0, 30.0)).clicked();
+                });
+                ui.horizontal(|ui| {
+                    move_next = action_button(ui, theme, "Next pane", vec2(110.0, 30.0)).clicked();
+                    remove = self.face.layout.traces.len() > 1
+                        && action_button(ui, theme, "Remove", vec2(90.0, 30.0)).clicked();
+                });
+            });
+        self.activate(t);
+        if let Some(v) = pick {
+            self.view = v;
+        }
+        if hide {
+            let h = &mut self.face.layout.traces[t].hidden;
+            *h = !*h;
+            self.dirty = true;
+        }
+        if auto {
+            if self.face.scales.remove(self.key().as_str()).is_some() {
+                self.dirty = true;
+            }
+        }
+        if store {
+            if let Some(trace) = samples {
+                self.mems[self.mem_sel] = Some(trace.to_vec());
+                self.show_memory = true;
+            }
+        }
+        if move_next {
+            self.face.layout.move_next(t);
+            self.dirty = true;
+        }
+        if remove {
+            self.face.layout.traces.remove(t);
+            self.activate(0);
+            self.dirty = true;
+            open = false;
+        }
+        self.sync_traces();
+        if !open {
+            self.trace_menu = None;
+        }
+    }
+
+    /// The scale the Cartesian pane uses: (scale, reference value, manual). Issue 69.
+    fn shown_scale(&self, samples: Option<&[Sample]>) -> Option<(display::Scale, f64, bool)> {
+        if is_disk(self.view) {
+            return None;
+        }
+        if let Some(m) = self.face.scales.get(self.key().as_str()) {
+            return Some((m.to_scale(10), m.ref_value, true));
+        }
+        let samples = samples?;
+        let (_, mut ys) = series(self.view, samples, self.z0_value(), self.velocity_value());
+        ys.extend(second_series(self.view, samples, self.z0_value()));
+        let scale = display::auto_scale(&ys, 10);
+        Some((scale, display::auto_ref(&scale), false))
+    }
+
+    /// Change the manual scale of the shown format, starting from what is on screen.
+    fn edit_scale(&mut self, samples: Option<&[Sample]>, f: impl FnOnce(display::ManualScale) -> display::ManualScale) {
+        let Some((scale, ref_value, _)) = self.shown_scale(samples) else {
+            return;
+        };
+        let key = self.key();
+        let base = self
+            .face
+            .scales
+            .get(&key)
+            .copied()
+            .unwrap_or_else(|| display::ManualScale::from_scale(&scale, ref_value));
+        let next = f(base);
+        if next.ref_value.is_finite() && next.per_div.is_finite() && next.per_div > 0.0 {
+            self.face.scales.insert(key, next);
+            self.dirty = true;
+        }
+    }
+
+    /// Sweep index of a marker slot on this trace. Issue 66.
+    fn marker_index(&self, slot: usize, samples: &[Sample]) -> Option<usize> {
+        markers::nearest_index(samples, self.markers.get(slot).copied().flatten()?)
+    }
+
+    /// (slot, index) for every placed marker, R last.
+    fn placed(&self, samples: Option<&[Sample]>) -> Vec<(usize, usize)> {
+        let Some(samples) = samples else {
+            return Vec::new();
+        };
+        (0..markers::SLOTS)
+            .filter_map(|slot| self.marker_index(slot, samples).map(|i| (slot, i)))
+            .collect()
+    }
+
+    /// The small marker list painted in the top right of the pane.
+    fn marker_info(&self, samples: Option<&[Sample]>, placed: &[(usize, usize)]) -> Vec<(String, Color32)> {
+        let Some(samples) = samples else {
+            return Vec::new();
+        };
+        let z0 = self.z0_value();
+        placed
+            .iter()
+            .filter_map(|(slot, i)| {
+                let sample = samples.get(*i)?;
+                Some((
+                    format!(
+                        "{:<3}{:>14}  {}",
+                        markers::slot_name(*slot),
+                        display::fmt_hz(sample.hz),
+                        self.value_text(self.view, sample, *i, z0, None)
+                    ),
+                    MARKER_COLORS[*slot % MARKER_COLORS.len()],
+                ))
+            })
+            .collect()
+    }
+
+    /// VALUE column text: the chosen readout, or the trace format.
+    fn value_text(&self, view: View, sample: &Sample, index: usize, z0: f64, ys: Option<&[f64]>) -> String {
+        if self.readout_fmt != markers::Readout::Trace {
+            let (param, _, _) = view_meta(view);
+            return markers::readout_text(self.readout_fmt, sample, z0, index, param == "S21");
+        }
+        let (_, _, unit) = view_meta(view);
+        match view {
+            View::GroupDelay | View::Unwrap | View::UnwrapS11 => {
+                let owned;
+                let ys = match ys {
+                    Some(ys) => ys,
+                    None => {
+                        owned = series(view, std::slice::from_ref(sample), z0, 0.66).1;
+                        &owned
+                    }
+                };
+                let v = if ys.len() == 1 { ys.first() } else { ys.get(index) };
+                v.map(|v| format!("{} {unit}", num(*v))).unwrap_or_default()
+            }
+            View::Tdr => "-".into(),
+            view => marker_value(view, sample, z0),
+        }
+    }
+
+    /// One trace line over a pane: name, parameter chip, format, scale, REF,
+    /// flags and the CAL badge. Sections drop from the right when narrow. Issue 63.
+    #[allow(clippy::too_many_arguments)]
+    fn trace_header(
+        &mut self,
+        ui: &mut Ui,
+        theme: &LcarsTheme,
+        samples: Option<&[Sample]>,
+        cal: Option<&CalSet>,
+        trc: usize,
+        active: bool,
+        color: Color32,
+    ) -> egui::Response {
+        let (param, format, unit) = view_meta(self.view);
+        let shown = self.shown_scale(samples);
+        let hidden = self.face.layout.traces.get(trc).is_some_and(|t| t.hidden);
+        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::click());
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 0.0, palette::STRIP);
-        let font = egui::FontId::monospace(theme.data_size * 0.9);
-        let mut x = rect.left() + 8.0;
-        let put = |x: &mut f32, text: &str, color: Color32| {
-            let g = painter.layout_no_wrap(text.to_string(), font.clone(), color);
-            let w = g.size().x;
-            painter.galley(Pos2::new(*x, rect.center().y - g.size().y / 2.0), g, color);
-            *x += w + 14.0;
-        };
-        put(&mut x, "TRC1", palette::TEXT);
-        // Parameter chip in the trace colour with dark ink.
-        let g = painter.layout_no_wrap(param.to_string(), font.clone(), rustcars::ink_on(TRACE1));
-        let chip = Rect::from_min_size(
-            Pos2::new(x, rect.top() + 3.0),
-            vec2(g.size().x + 12.0, rect.height() - 6.0),
-        );
-        painter.rect_filled(chip, 4.0, TRACE1);
-        painter.galley(
-            Pos2::new(chip.left() + 6.0, chip.center().y - g.size().y / 2.0),
-            g,
-            rustcars::ink_on(TRACE1),
-        );
-        x = chip.right() + 14.0;
-        put(&mut x, format, palette::TEXT);
-        if let Some(scale) = scale {
-            let ref_value = if scale.top >= 0.0 && scale.bottom() <= 0.0 { 0.0 } else { scale.top };
-            put(&mut x, &format!("{} {unit}/", display::fmt_tick(scale.per_div, scale.per_div / 10.0)), palette::TEXT);
-            put(&mut x, &format!("REF {} {unit}", display::fmt_tick(ref_value, scale.per_div)), palette::TEXT);
+        painter.rect_filled(rect, 0.0, if active { palette::STRIP } else { rustcars::tint(palette::STRIP, -0.4) });
+        if active {
+            painter.rect_filled(Rect::from_min_size(rect.min, vec2(4.0, rect.height())), 0.0, palette::TAN);
         }
-        put(&mut x, "CH1", palette::TEXT_MUTED);
-        if self.show_memory && self.memory.is_some() {
-            put(&mut x, "MEM", palette::TEXT_MUTED);
-        }
-        let (badge, fill) = match cal {
-            Some(set) if set.thru.is_empty() => ("CAL OSL".to_string(), palette::OLIVE),
-            Some(_) => ("CAL OSL+THRU".to_string(), palette::OLIVE),
-            None if samples.is_some() => ("CAL ON".to_string(), palette::OLIVE),
-            None => ("UNCAL".to_string(), palette::BRICK),
+        let font = egui::FontId::monospace(theme.data_size * 0.85);
+        // CAL, CAL INT, CAL OFF or UNCAL, with the kind and range of the set. Issue 65.
+        let state = self.cal_state;
+        let kind = match cal {
+            Some(set) if set.thru.is_empty() => " OSL",
+            Some(_) => " OSL+THRU",
+            None => "",
         };
-        let g = painter.layout_no_wrap(badge, font.clone(), rustcars::ink_on(fill));
+        let range = cal
+            .map(|set| {
+                let hi = set.start_hz + set.step_hz * (set.open.len().saturating_sub(1)) as f64;
+                format!(" · {}-{}", display::fmt_hz(set.start_hz), display::fmt_hz(hi))
+            })
+            .unwrap_or_default();
+        let label = if samples.is_none() && state != cal::CalState::Off { "UNCAL" } else { state.label() };
+        let fill = match state {
+            cal::CalState::Exact if samples.is_some() => palette::OLIVE,
+            cal::CalState::Interp => palette::TAN,
+            cal::CalState::Off => palette::SLATE,
+            _ => palette::BRICK,
+        };
+        // The long badge first; the short label when the pane is narrow.
+        let date = cal.map(|set| format!(" · {}", cal_date_text(set.saved_at.as_deref()))).unwrap_or_default();
+        let long = format!("{label}{kind}{range}{date}");
+        let mut g = painter.layout_no_wrap(long, font.clone(), rustcars::ink_on(fill));
+        if g.size().x > rect.width() * 0.45 {
+            g = painter.layout_no_wrap(label.to_string(), font.clone(), rustcars::ink_on(fill));
+        }
         let chip = Rect::from_min_size(
             Pos2::new(rect.right() - g.size().x - 20.0, rect.top() + 3.0),
             vec2(g.size().x + 12.0, rect.height() - 6.0),
         );
-        if chip.left() > x {
-            painter.rect_filled(chip, 4.0, fill);
-            painter.galley(
-                Pos2::new(chip.left() + 6.0, chip.center().y - g.size().y / 2.0),
-                g,
-                rustcars::ink_on(fill),
-            );
+        let limit = chip.left() - 8.0;
+        let mut x = rect.left() + 10.0;
+        let mut cut = false;
+        let mut put = |x: &mut f32, text: &str, color: Color32| {
+            if cut {
+                return;
+            }
+            let g = painter.layout_no_wrap(text.to_string(), font.clone(), color);
+            let w = g.size().x;
+            if *x + w > limit {
+                cut = true;
+                return;
+            }
+            painter.galley(Pos2::new(*x, rect.center().y - g.size().y / 2.0), g, color);
+            *x += w + 12.0;
+        };
+        put(&mut x, &format!("TRC{}", trc + 1), palette::TEXT);
+        // Parameter chip in the trace colour with dark ink.
+        let pg = painter.layout_no_wrap(param.to_string(), font.clone(), rustcars::ink_on(color));
+        if x + pg.size().x + 12.0 < limit {
+            let pchip = Rect::from_min_size(Pos2::new(x, rect.top() + 3.0), vec2(pg.size().x + 12.0, rect.height() - 6.0));
+            painter.rect_filled(pchip, 4.0, color);
+            painter.galley(Pos2::new(pchip.left() + 6.0, pchip.center().y - pg.size().y / 2.0), pg, rustcars::ink_on(color));
+            x = pchip.right() + 12.0;
         }
+        put(&mut x, format, palette::TEXT);
+        if hidden {
+            put(&mut x, "HIDDEN", palette::TEXT_MUTED);
+        }
+        if let Some((scale, ref_value, manual)) = shown {
+            put(&mut x, &format!("{} {unit}/", display::fmt_tick(scale.per_div, scale.per_div / 10.0)), palette::TEXT);
+            put(&mut x, &format!("REF {} {unit}", display::fmt_tick(ref_value, scale.per_div)), palette::TEXT);
+            put(&mut x, if manual { "MAN" } else { "AUTO" }, palette::TEXT_MUTED);
+        }
+        if self.show_memory && self.memory().is_some() {
+            put(&mut x, &format!("MEM{}", self.mem_sel + 1), MEM_COLOR);
+        }
+        match self.math {
+            traces::Math::Sub if self.show_memory => put(&mut x, "MATH D−M", MATH_TEXT),
+            traces::Math::Div if self.show_memory => put(&mut x, "MATH D/M", MATH_TEXT),
+            _ => {}
+        }
+        put(&mut x, "CH1", palette::TEXT_MUTED);
+        // Badge: single = Cal tab (wizard), double = restore a saved set, triple = correction on/off.
+        let badge_resp = ui.interact(chip, egui::Id::unique(("vna-cal-badge", trc)), Sense::click());
+        if badge_resp.triple_clicked() {
+            self.cal_off = !self.cal_off;
+            self.note = if self.cal_off { "Correction is off (CAL OFF).".into() } else { "Correction is on.".into() };
+        } else if badge_resp.double_clicked() {
+            self.restore_cal();
+        } else if badge_resp.clicked() {
+            self.cal_page = true;
+        }
+        painter.rect_filled(chip, 4.0, fill);
+        painter.galley(
+            Pos2::new(chip.left() + 6.0, chip.center().y - g.size().y / 2.0),
+            g,
+            rustcars::ink_on(fill),
+        );
+        resp.on_hover_text("Click: trace menu (format, scale, memory, hide, pane) · double: maximize or restore pane")
     }
 
-    /// One row per placed marker under the chart. Issue 68.
+    /// One row per placed marker under the chart, with delta to R. Issue 66.
     fn marker_table(&self, ui: &mut Ui, theme: &LcarsTheme, samples: &[Sample], placed: &[(usize, usize)]) {
         if placed.is_empty() {
             return;
         }
         let z0 = self.z0_value();
-        let (_, ys) = series(self.view, samples, z0, self.velocity_value());
+        let (hz, ys) = series(self.view, samples, z0, self.velocity_value());
         let (_, _, unit) = view_meta(self.view);
+        let reference = placed.iter().find(|(slot, _)| *slot == markers::REF).map(|(_, i)| *i);
         let font = egui::FontId::monospace(theme.data_size * 0.85);
-        let row = |ui: &mut Ui, cells: [String; 5], color: Color32, lit: bool| {
+        let row = |ui: &mut Ui, cells: [String; 7], color: Color32, lit: bool| {
             let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::hover());
             let painter = ui.painter_at(rect);
             if lit {
                 painter.rect_filled(rect, 0.0, palette::STRIP);
             }
-            let widths = [0.07, 0.2, 0.25, 0.28, 0.2];
+            let widths = [0.05, 0.04, 0.15, 0.2, 0.2, 0.1, 0.26];
             let mut x = rect.left() + 6.0;
             for (cell, w) in cells.iter().zip(widths) {
                 painter.text(
@@ -1245,31 +1927,33 @@ impl NanoVna {
         };
         row(
             ui,
-            ["MKR".into(), "STIMULUS".into(), "VALUE".into(), "Z = R + jX".into(), "SWR".into()],
+            ["MKR".into(), "TRC".into(), "FREQ".into(), "VALUE".into(), "Z = R + jX".into(), "SWR".into(), "DELTA TO R".into()],
             palette::TEXT_MUTED,
             false,
         );
+        let tdr = self.view == View::Tdr;
         for (slot, index) in placed {
             let Some(sample) = samples.get(*index) else {
                 continue;
             };
-            let value = match self.view {
-                View::GroupDelay | View::Unwrap => ys
-                    .get(*index)
-                    .map(|v| format!("{} {unit}", num(*v)))
-                    .unwrap_or_default(),
-                View::Tdr => "-".into(),
-                view => marker_value(view, sample, z0),
-            };
             let d = rf::derive(sample, z0);
+            let delta = match reference {
+                _ if *slot == markers::REF || tdr => "-".to_string(),
+                Some(r) => markers::delta(&ys, &hz, *index, r)
+                    .map(|(df, dv)| markers::delta_text(df, dv, unit))
+                    .unwrap_or_else(|| "-".into()),
+                None => "no R".into(),
+            };
             row(
                 ui,
                 [
-                    format!("M{}", slot + 1),
+                    markers::slot_name(*slot),
+                    "1".into(),
                     display::fmt_hz(sample.hz),
-                    value,
+                    self.value_text(self.view, sample, *index, z0, Some(&ys)),
                     format!("{} {:+}j Ω", num(d.r), num(d.x)),
                     format!("{} : 1", num(rf::swr(sample.s11))),
+                    delta,
                 ],
                 MARKER_COLORS[*slot % MARKER_COLORS.len()],
                 *slot == self.marker_on,
@@ -1278,25 +1962,31 @@ impl NanoVna {
     }
 
     /// The channel and instrument line along the bottom. Issues 65 and 71.
-    fn status_bar(&self, ui: &mut Ui, theme: &LcarsTheme, live: &device::Live, samples: Option<&[Sample]>, cal: Option<&CalSet>) {
-        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::hover());
+    fn status_bar(&mut self, ui: &mut Ui, theme: &LcarsTheme, live: &device::Live, samples: Option<&[Sample]>, cal: Option<&CalSet>) {
+        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::click());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, palette::STRIP);
-        let (start, stop, points) = match samples {
-            Some(s) if !s.is_empty() => (s[0].hz, s[s.len() - 1].hz, s.len()),
+        // The summary follows the SWEEP fields as they are edited; the
+        // shown sweep is used only when the fields do not parse. Issue 68.
+        let (start, stop, points) = match (self.parse_setup(), samples) {
+            (Ok((a, b, n)), _) => (a as f64, b as f64, n as usize),
+            (Err(_), Some(s)) if !s.is_empty() => (s[0].hz, s[s.len() - 1].hz, s.len()),
             _ => (self.face.start_hz, self.face.stop_hz, self.face.points as usize),
         };
         let avg = self.host_average_value().max(1);
+        let mode = if !self.run { "HOLD" } else if self.single { "SINGLE" } else { "CONT" };
         let mut left = format!(
-            "CH1  START {}  STOP {}  {} PTS  AVG {}",
+            "CH1  START {} · STOP {} · {} PTS · AVG {} · {mode}",
             display::fmt_hz(start),
             display::fmt_hz(stop),
             points,
             avg,
         );
+        left.push_str(&format!("  {}", self.cal_state.label()));
         if let Some(set) = cal {
-            if !set.zone.is_empty() {
-                left.push_str(&format!("  CAL {}", set.zone));
+            let name = if set.name.is_empty() { &set.zone } else { &set.name };
+            if !name.is_empty() {
+                left.push_str(&format!(" {name}"));
             }
         }
         let device = if live.connected {
@@ -1306,13 +1996,49 @@ impl NanoVna {
                 .map(|id| format!("  FW {}.{}", id.fw_major, id.fw_minor))
                 .unwrap_or_default();
             format!("NANOVNA V2 · {}{fw}", self.face.port)
+        } else if live.lost {
+            "DISCONNECTED".to_string()
         } else {
             "NOT CONNECTED".to_string()
         };
-        let time = self
+        let mut time = self
             .sweep_ms
             .map(|ms| format!(" · {} ms/SWEEP", ms.round()))
             .unwrap_or_default();
+        if live.connected {
+            time.push_str(&format!(" · #{}", self.sweep_count));
+        }
+        // Warnings carry text, never colour alone.
+        let mut warn = Vec::new();
+        if live.identity.is_some_and(|id| !id.power_and_average()) {
+            warn.push("FW < 1.0.2: NO DEV AVG/POWER");
+        }
+        if live.sweep_errors > 0 && live.connected {
+            warn.push("SWEEP ERRORS");
+        }
+        if live.lost {
+            warn.push("CHECK USB");
+        }
+        if !warn.is_empty() {
+            left.push_str(&format!("  ⚠ {}", warn.join(" · ")));
+        }
+        let status_line = format!("{left}  {device}{time}");
+        if resp.hovered() {
+            painter.rect_stroke(rect, 0.0, Stroke::new(1.0, palette::TAN), egui::StrokeKind::Inside);
+        }
+        // single = details, double = reconnect, triple = copy the status line.
+        let key = self.key_op(keys::Group::Status);
+        if resp.triple_clicked() || key == Some(3) {
+            ui.ctx().copy_text(status_line.clone());
+            self.note = "Status line copied.".into();
+        } else if resp.double_clicked() || key == Some(2) {
+            self.details_open = false;
+            self.reconnect();
+        } else if resp.clicked() || key == Some(1) {
+            self.details_open = !self.details_open;
+        }
+        let resp = resp.on_hover_text(keys::hint(keys::Group::Status));
+        let _ = resp;
         let font = egui::FontId::monospace(theme.data_size * 0.8);
         painter.text(
             Pos2::new(rect.left() + 8.0, rect.center().y),
@@ -1326,7 +2052,7 @@ impl NanoVna {
             egui::Align2::RIGHT_CENTER,
             format!("{device}{time}"),
             font,
-            if live.connected { palette::TEXT } else { palette::TEXT_MUTED },
+            if live.connected { palette::TEXT } else if live.lost { LOST_TEXT } else { palette::TEXT_MUTED },
         );
     }
 
@@ -1340,41 +2066,186 @@ impl NanoVna {
 
         key_caption(ui, theme, "SWEEP · CAL", width);
         let mut scan = false;
-        let mut toggle = false;
+        let mut mode: Option<u8> = None;
         let mut setup = false;
         ui.horizontal(|ui| {
-            scan = softkey(ui, theme, "Scan", false, col4 * 2.0 + 8.0);
-            let run_label = if self.run { "Stop" } else { "Run" };
-            toggle = softkey(ui, theme, run_label, self.run, col4);
-            setup = softkey(ui, theme, "Setup", self.setup_open, col4);
+            scan = softkey(ui, theme, "Scan", false, col4);
+            // RUN: single = continuous, double = single sweep, triple = hold.
+            let resp = softkey_response(ui, theme, "Run", self.run && !self.single, col4, true)
+                .on_hover_text(keys::hint(keys::Group::Run));
+            if resp.triple_clicked() {
+                mode = Some(2);
+            } else if resp.double_clicked() {
+                mode = Some(1);
+            } else if resp.clicked() {
+                mode = Some(0);
+            } else if let Some(m) = self.key_op(keys::Group::Run) {
+                mode = Some(m - 1);
+            }
+            if softkey(ui, theme, "Hold", !self.run, col4) {
+                mode = Some(2);
+            }
+            if softkey(ui, theme, "Single", self.run && self.single, col4) {
+                mode = Some(1);
+            }
         });
         if scan {
             self.begin_scan(live);
         }
-        if toggle {
-            if self.run {
+        match mode {
+            Some(2) => {
                 self.run = false;
+                self.single = false;
                 self.run_state = Run::Idle;
-            } else if self.wizard.is_some() {
-                self.note = "Finish the calibration before Run.".into();
-            } else if self.setup_has_cal(live) {
-                self.sweep_zone = self.zone_name();
-                self.shown_scan = None;
-                self.shown_id.clear();
-                self.history.clear();
-                self.blank_until_sweep = true;
-                self.run = true;
-            } else {
-                self.begin_scan(live);
             }
+            Some(m) => {
+                if !self.run {
+                    self.start_run(live);
+                }
+                self.single = m == 1 && self.run;
+            }
+            None => {}
         }
+        self.sweep_panel(ui, theme, live, width, col4);
+        ui.horizontal(|ui| {
+            setup = softkey(ui, theme, "Setup", self.setup_open, col4);
+        });
         if setup {
             self.ports = device::list_ports();
             self.setup_open = true;
         }
 
+        key_caption(ui, theme, "LAYOUT · TRACE", width);
+        let mut lay: Option<(u8, u8)> = None;
+        ui.horizontal(|ui| {
+            // LAYOUT: single = choose, double = swap pane order, triple = default four-pane set.
+            for n in [1u8, 2, 4] {
+                let resp = softkey_response(ui, theme, &format!("Layout·{n}"), self.face.layout.panes == n, col3, true)
+                    .on_hover_text(keys::hint(keys::Group::Layout));
+                if resp.triple_clicked() {
+                    lay = Some((n, 3));
+                } else if resp.double_clicked() {
+                    lay = Some((n, 2));
+                } else if resp.clicked() {
+                    lay = Some((n, 1));
+                }
+            }
+        });
+        if lay.is_none() {
+            if let Some(op) = self.key_op(keys::Group::Layout) {
+                let next = match self.face.layout.panes { 1 => 2, 2 => 4, _ => 1 };
+                lay = Some((next, op));
+            }
+        }
+        match lay {
+            Some((n, 1)) => {
+                if n == 4 && self.face.layout.traces.len() <= 1 {
+                    self.face.layout = layout::Layout::default_four();
+                    self.activate(0);
+                } else {
+                    self.face.layout.set_panes(n);
+                }
+                self.dirty = true;
+            }
+            Some((_, 2)) => {
+                self.face.layout.swap_order();
+                self.dirty = true;
+            }
+            Some((_, 3)) => {
+                self.face.layout = layout::Layout::default_four();
+                self.activate(0);
+                self.dirty = true;
+            }
+            _ => {}
+        }
+        let n_tr = self.face.layout.traces.len().max(1);
+        let mut tr_op: Option<(usize, u8)> = None;
+        ui.horizontal(|ui| {
+            // TRC keys: single = select (again: show/hide), double = trace menu, triple = store memory.
+            for t in 0..n_tr {
+                let hidden = self.face.layout.traces.get(t).is_some_and(|c| c.hidden);
+                let label = if hidden { format!("TRC{} off", t + 1) } else { format!("TRC{}", t + 1) };
+                let resp = softkey_response(ui, theme, &label, t == self.active_trc, col4, true)
+                    .on_hover_text(keys::hint(keys::Group::Trace));
+                if resp.triple_clicked() {
+                    tr_op = Some((t, 3));
+                } else if resp.double_clicked() {
+                    tr_op = Some((t, 2));
+                } else if resp.clicked() {
+                    tr_op = Some((t, 1));
+                }
+            }
+            if n_tr < layout::MAX_TRACES && softkey(ui, theme, "+Trace", false, col4) {
+                tr_op = Some((usize::MAX, 0));
+            }
+        });
+        if tr_op.is_none() {
+            if let Some(op) = self.key_op(keys::Group::Trace) {
+                let n = self.face.layout.traces.len().max(1);
+                let t = if op == 1 { (self.active_trc + 1) % n } else { self.active_trc };
+                tr_op = Some((t, op));
+            }
+        }
+        match tr_op {
+            Some((usize::MAX, _)) => {
+                let pane = (self.face.layout.traces.len() as u8) % self.face.layout.panes.max(1);
+                self.face.layout.traces.push(layout::TraceCfg { view: view_id(View::S21), pane, hidden: false });
+                let t = self.face.layout.traces.len() - 1;
+                self.activate(t);
+                self.dirty = true;
+            }
+            Some((t, 1)) => {
+                if t == self.active_trc {
+                    if let Some(c) = self.face.layout.traces.get_mut(t) {
+                        c.hidden = !c.hidden;
+                        self.dirty = true;
+                    }
+                } else {
+                    self.activate(t);
+                }
+            }
+            Some((t, 2)) => {
+                self.activate(t);
+                self.trace_menu = Some(t);
+            }
+            Some((t, 3)) => {
+                self.activate(t);
+                if let Some(trace) = samples {
+                    self.mems[self.mem_sel] = Some(trace.to_vec());
+                    self.show_memory = true;
+                }
+            }
+            _ => {}
+        }
+        ui.horizontal(|ui| {
+            if softkey_enabled(ui, theme, "Pane →", false, col4, self.face.layout.panes > 1) {
+                self.face.layout.move_next(self.active_trc);
+                self.dirty = true;
+            }
+            if softkey(ui, theme, if self.couple { "Couple on" } else { "Couple off" }, self.couple, col4) {
+                self.couple = !self.couple;
+            }
+        });
+
         key_caption(ui, theme, "FORMAT", width);
-        for triple in VIEWS.chunks(3) {
+        // Parameter first; only the formats valid for it are offered. Issue 64.
+        let s21 = uses_s21(self.view);
+        let mut pick_param = None;
+        ui.horizontal(|ui| {
+            if softkey(ui, theme, "S11", !s21, col4) {
+                pick_param = Some(false);
+            }
+            if softkey(ui, theme, "S21", s21, col4) {
+                pick_param = Some(true);
+            }
+        });
+        if let Some(want) = pick_param {
+            if want != s21 {
+                self.view = if want { View::S21 } else { View::Smith };
+            }
+        }
+        let valid: Vec<(View, &str)> = VIEWS.iter().copied().filter(|(v, _)| uses_s21(*v) == uses_s21(self.view)).collect();
+        for triple in valid.chunks(3) {
             ui.horizontal(|ui| {
                 for (view, label) in triple {
                     if softkey(ui, theme, label, self.view == *view, col3) {
@@ -1383,37 +2254,242 @@ impl NanoVna {
                 }
             });
         }
+        if self.view == View::GroupDelay {
+            ui.horizontal(|ui| {
+                let ap = self.face.gd_aperture;
+                if softkey_enabled(ui, theme, "Apert ▼", false, col4, ap > 2) {
+                    self.face.gd_aperture = ap.saturating_sub(2).max(2);
+                    self.dirty = true;
+                }
+                if softkey_enabled(ui, theme, "Apert ▲", false, col4, ap < 200) {
+                    self.face.gd_aperture = (ap + 2).min(200);
+                    self.dirty = true;
+                }
+                ui.label(
+                    egui::RichText::new(format!("APERTURE {} PTS", self.face.gd_aperture))
+                        .size(theme.data_size * 0.8)
+                        .color(palette::TEXT_MUTED),
+                );
+            });
+        }
 
         key_caption(ui, theme, "DISPLAY", width);
         ui.horizontal(|ui| {
-            let smith = self.view == View::Smith;
-            if softkey_enabled(ui, theme, "Y adm", self.admittance && smith, col4, smith) {
-                self.admittance = !self.admittance;
-            }
-            if softkey(ui, theme, "Store", false, col4) {
+            // STORE: single = store, double = toggle memory display, triple = cycle math.
+            let resp = softkey_response(ui, theme, "Store", false, col4, samples.is_some())
+                .on_hover_text(keys::hint(keys::Group::Store));
+            let key = if samples.is_some() { self.key_op(keys::Group::Store) } else { None };
+            if resp.triple_clicked() || key == Some(3) {
+                self.math = next_math(self.math);
+            } else if resp.double_clicked() || key == Some(2) {
+                self.show_memory = !self.show_memory;
+            } else if resp.clicked() || key == Some(1) {
                 if let Some(trace) = samples {
-                    self.memory = Some(trace.to_vec());
+                    self.mems[self.mem_sel] = Some(trace.to_vec());
                     self.show_memory = true;
                 }
             }
-            let has_mem = self.memory.is_some();
+            let has_mem = self.memory().is_some();
             if softkey_enabled(ui, theme, "Mem", self.show_memory && has_mem, col4, has_mem) {
                 self.show_memory = !self.show_memory;
             }
-            if softkey_enabled(ui, theme, "Diff", self.show_diff && has_mem, col4, has_mem) {
-                self.show_diff = !self.show_diff;
+            let math_label = match self.math {
+                traces::Math::Off => "Math off",
+                traces::Math::Sub => "D − M",
+                traces::Math::Div => "D / M",
+            };
+            if softkey_enabled(ui, theme, math_label, self.math != traces::Math::Off, col4, has_mem) {
+                self.math = next_math(self.math);
             }
         });
-
-        key_caption(ui, theme, "MARKER", width);
         ui.horizontal(|ui| {
-            for slot in 0..4 {
-                let title = format!("M{}", slot + 1);
-                if softkey(ui, theme, &title, self.marker_on == slot, col4) {
-                    self.marker_on = slot;
+            for slot in 0..traces::MEMS {
+                let label = if self.mems[slot].is_some() { format!("MEM{}", slot + 1) } else { format!("MEM{}·", slot + 1) };
+                if softkey(ui, theme, &label, self.mem_sel == slot, col4) {
+                    self.mem_sel = slot;
                 }
             }
         });
+        let mut import = false;
+        let mut save = false;
+        let mut clear = false;
+        ui.horizontal(|ui| {
+            import = softkey(ui, theme, "Import", false, col4);
+            save = softkey_enabled(ui, theme, "Save mem", false, col4, self.memory().is_some());
+            clear = softkey_enabled(ui, theme, "Clr mem", false, col4, self.memory().is_some());
+        });
+        if import {
+            self.import_memory();
+        }
+        if save {
+            if let Some(mem) = self.memory().cloned() {
+                let text = rf::touchstone_s2p(&mem, self.z0_value());
+                self.save_bytes("Save memory", &format!("nanovna-mem{}.s2p", self.mem_sel + 1), text.as_bytes());
+            }
+        }
+        if clear {
+            self.mems[self.mem_sel] = None;
+        }
+
+        key_caption(ui, theme, "SCALE", width);
+        let cart = !is_disk(self.view);
+        let shown = self.shown_scale(samples);
+        let manual = shown.is_some_and(|s| s.2);
+        let mut scale_op: Option<u8> = None;
+        ui.horizontal(|ui| {
+            // AUTO: single = auto-scale this trace, double = all traces in the
+            // pane (one trace today), triple = reset every saved scale.
+            let resp = softkey_response(ui, theme, "Auto", cart && !manual, col4, cart)
+                .on_hover_text(keys::hint(keys::Group::Auto));
+            if resp.triple_clicked() {
+                scale_op = Some(3);
+            } else if resp.double_clicked() {
+                scale_op = Some(2);
+            } else if resp.clicked() {
+                scale_op = Some(1);
+            } else if cart {
+                scale_op = self.key_op(keys::Group::Auto);
+            }
+            if softkey_enabled(ui, theme, "/div ▲", false, col4, cart && shown.is_some()) {
+                scale_op = Some(10);
+            }
+            if softkey_enabled(ui, theme, "/div ▼", false, col4, cart && shown.is_some()) {
+                scale_op = Some(11);
+            }
+            if softkey_enabled(ui, theme, "Hold", manual, col4, cart && shown.is_some()) {
+                scale_op = Some(12);
+            }
+        });
+        if let Some((scale, ref_value, _)) = shown.filter(|_| cart) {
+            let (_, _, unit) = view_meta(self.view);
+            let mut r = ref_value;
+            let mut pos = self.face.scales.get(self.key().as_str()).map(|m| m.ref_pos).unwrap_or_else(|| display::ManualScale::from_scale(&scale, ref_value).ref_pos);
+            let mut per = scale.per_div;
+            let (mut cr, mut cp, mut cd) = (false, false, false);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("REF").color(palette::TEXT_MUTED));
+                cr = ui.add(egui::DragValue::new(&mut r).speed(scale.per_div / 10.0).suffix(format!(" {unit}"))).changed();
+                ui.label(egui::RichText::new("POS").color(palette::TEXT_MUTED));
+                cp = ui.add(egui::DragValue::new(&mut pos).range(0.0..=10.0).speed(0.1).suffix(" div")).changed();
+                ui.label(egui::RichText::new("/DIV").color(palette::TEXT_MUTED));
+                cd = ui.add(egui::DragValue::new(&mut per).range(1e-12..=1e12).speed(scale.per_div / 20.0)).changed();
+            });
+            if cr || cp || cd {
+                self.edit_scale(samples, |m| display::ManualScale {
+                    ref_value: if cr { r } else { m.ref_value },
+                    ref_pos: if cp { pos } else { m.ref_pos },
+                    per_div: if cd { per } else { m.per_div },
+                });
+            }
+        }
+        match scale_op {
+            Some(1) | Some(2) => {
+                if self.face.scales.remove(self.key().as_str()).is_some() {
+                    self.dirty = true;
+                }
+            }
+            Some(3) => {
+                if !self.face.scales.is_empty() {
+                    self.face.scales.clear();
+                    self.dirty = true;
+                }
+                self.note = "Every trace format is back on auto-scale.".into();
+            }
+            Some(10) => self.edit_scale(samples, |m| m.stepped(true)),
+            Some(11) => self.edit_scale(samples, |m| m.stepped(false)),
+            Some(12) => self.edit_scale(samples, |m| m),
+            _ => {}
+        }
+
+        key_caption(ui, theme, "LIMITS", width);
+        let cart_lim = !is_disk(self.view) && self.view != View::Tdr;
+        let key = self.key();
+        let lim_on = self.face.limits.get(&key).is_some_and(|s| s.on);
+        let mut lim_op = None;
+        ui.horizontal(|ui| {
+            // LIMITS: single = on/off, double = edit, triple = SWR 1.5 preset on this band.
+            let resp = softkey_response(ui, theme, if lim_on { "Limits on" } else { "Limits off" }, lim_on, col4, cart_lim)
+                .on_hover_text(keys::hint(keys::Group::Limits));
+            if resp.triple_clicked() {
+                lim_op = Some(3);
+            } else if resp.double_clicked() {
+                lim_op = Some(2);
+            } else if resp.clicked() {
+                lim_op = Some(1);
+            } else if cart_lim {
+                lim_op = self.key_op(keys::Group::Limits);
+            }
+            if softkey_enabled(ui, theme, "Edit", self.limits_edit, col4, cart_lim) {
+                lim_op = Some(2);
+            }
+            if softkey(ui, theme, "SWR 1.5", false, col4) {
+                lim_op = Some(3);
+            }
+            if softkey(ui, theme, "SWR 2", false, col4) {
+                lim_op = Some(4);
+            }
+        });
+        match lim_op {
+            Some(1) => {
+                let set = self.face.limits.entry(key).or_default();
+                set.on = !set.on;
+                if set.segs.is_empty() {
+                    self.limits_edit = true;
+                }
+                self.dirty = true;
+            }
+            Some(2) => self.limits_edit = true,
+            Some(3) => self.limit_preset(1.5),
+            Some(4) => self.limit_preset(2.0),
+            _ => {}
+        }
+
+        key_caption(ui, theme, "MARKER", width);
+        for row in [[0usize, 1, 2, 3], [4, 5, 6, 7]] {
+            ui.horizontal(|ui| {
+                for slot in row {
+                    let placed = self.markers[slot].is_some();
+                    let title = if placed { markers::slot_name(slot) } else { format!("{}·", markers::slot_name(slot)) };
+                    if softkey(ui, theme, &title, self.marker_on == slot, col4) {
+                        self.marker_on = slot;
+                    }
+                }
+            });
+        }
+        ui.horizontal(|ui| {
+            if softkey(ui, theme, "Ref R", self.marker_on == markers::REF, col4) {
+                self.marker_on = markers::REF;
+            }
+            if softkey(ui, theme, "Clr all", false, col4) {
+                self.markers = [None; markers::SLOTS];
+            }
+            // Typed exact frequency for the active marker. Enter applies it.
+            let resp = ui.add_sized(
+                vec2(col4 * 2.0 + 8.0, KEY_H),
+                egui::TextEdit::singleline(&mut self.marker_freq)
+                    .hint_text("FREQ MHz")
+                    .font(egui::TextStyle::Monospace),
+            );
+            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                match parse_marker_mhz(&self.marker_freq) {
+                    Some(hz) => {
+                        self.markers[self.marker_on] = Some(hz);
+                        self.note.clear();
+                    }
+                    None => self.note = "Marker frequency is a number in MHz, for example 14.2.".into(),
+                }
+            }
+        });
+        key_caption(ui, theme, "MKR READOUT", width);
+        for row in markers::READOUTS.chunks(4) {
+            ui.horizontal(|ui| {
+                for (fmt, label) in row {
+                    if softkey(ui, theme, label, self.readout_fmt == *fmt, col4) {
+                        self.readout_fmt = *fmt;
+                    }
+                }
+            });
+        }
         let mut search: Option<u8> = None;
         ui.horizontal(|ui| {
             let ok = samples.is_some();
@@ -1426,6 +2502,275 @@ impl NanoVna {
         });
         if let Some(code) = search {
             self.marker_search(code, samples);
+        }
+        // TARGET search, TRACK, peaks to markers, filter and SWR readouts. Issue 67.
+        let ok = samples.is_some();
+        let mut find: Option<i32> = None;
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("TARGET").monospace().color(palette::TEXT_MUTED))
+                .on_hover_text("Value to search for, in the active trace's unit");
+            ui.add(egui::TextEdit::singleline(&mut self.target_text).desired_width(col4).font(egui::TextStyle::Monospace));
+            if softkey_enabled(ui, theme, "◀ Tgt", false, col4, ok) {
+                find = Some(-1);
+            }
+            if softkey_enabled(ui, theme, "Tgt ▶", false, col4, ok) {
+                find = Some(1);
+            }
+        });
+        if let Some(dir) = find {
+            self.target_search(dir, samples);
+        }
+        ui.horizontal(|ui| {
+            let label = match self.track {
+                Some(0) => "Track max",
+                Some(_) => "Track min",
+                None => "Track off",
+            };
+            if softkey(ui, theme, label, self.track.is_some(), col4) {
+                self.track = match self.track {
+                    None => Some(0),
+                    Some(0) => Some(1),
+                    _ => None,
+                };
+            }
+            if softkey_enabled(ui, theme, "Peaks→M", false, col4, ok) {
+                self.peaks_to_markers(samples);
+            }
+            if softkey(ui, theme, "Filter", self.filter_on, col4) {
+                self.filter_on = !self.filter_on;
+            }
+            if softkey(ui, theme, "SWR BW", self.swr_bw_on, col4) {
+                self.swr_bw_on = !self.swr_bw_on;
+            }
+        });
+    }
+
+    /// Move the active marker to the next TARGET crossing left or right. Issue 67.
+    fn target_search(&mut self, dir: i32, samples: Option<&[Sample]>) {
+        let Some(samples) = samples else { return };
+        let Some(target) = self.target_text.trim().parse::<f64>().ok() else {
+            self.note = "TARGET is a number in the trace unit, for example -3.".into();
+            return;
+        };
+        if is_disk(self.view) || self.view == View::Tdr {
+            self.note = "Target search works on Cartesian frequency traces.".into();
+            return;
+        }
+        let (xs, ys) = series(self.view, samples, self.z0_value(), self.velocity_value());
+        let from = self.marker_index(self.marker_on, samples);
+        match search::target(&xs, &ys, target, from, dir) {
+            Some(hz) => {
+                self.markers[self.marker_on] = Some(hz);
+                self.note.clear();
+            }
+            None => self.note = format!("No crossing of {target} in that direction."),
+        }
+    }
+
+    /// Put M1..M8 on the highest peaks of the active trace. Issue 67.
+    fn peaks_to_markers(&mut self, samples: Option<&[Sample]>) {
+        let Some(samples) = samples else { return };
+        if is_disk(self.view) || self.view == View::Tdr {
+            self.note = "Peak search works on Cartesian frequency traces.".into();
+            return;
+        }
+        let (_, ys) = series(self.view, samples, self.z0_value(), self.velocity_value());
+        let finite: Vec<f64> = ys.iter().copied().filter(|v| v.is_finite()).collect();
+        let span = finite.iter().cloned().fold(f64::NEG_INFINITY, f64::max) - finite.iter().cloned().fold(f64::INFINITY, f64::min);
+        let found = search::peaks(&ys, markers::NORMAL, (span * 0.05).max(1e-12));
+        for slot in 0..markers::NORMAL {
+            self.markers[slot] = found.get(slot).and_then(|i| samples.get(*i)).map(|s| s.hz);
+        }
+        self.note = format!("{} peak(s) placed on markers.", found.len());
+    }
+
+    /// Filter / SWR-bandwidth lines painted with the marker list. Issue 67.
+    fn analysis_lines(&self, samples: Option<&[Sample]>) -> Vec<(String, Color32)> {
+        let mut out = Vec::new();
+        let Some(samples) = samples else { return out };
+        let xs: Vec<f64> = samples.iter().map(|s| s.hz).collect();
+        let s21 = uses_s21(self.view);
+        if self.filter_on && s21 {
+            let db: Vec<f64> = samples.iter().map(|s| 20.0 * s.s21.norm().max(1e-12).log10()).collect();
+            match search::bandfilter(&xs, &db) {
+                Some(f) => {
+                    out.push((format!("FLT  CF {}  IL {:.2} dB  Q {:.1}", display::fmt_hz(f.center_hz), f.loss_db, f.q()), palette::TEXT));
+                    out.push((format!("     3dB {}–{} ({})", display::fmt_hz(f.lo3), display::fmt_hz(f.hi3), display::fmt_hz(f.bw3())), palette::TEXT));
+                    out.push((format!("     6dB {}–{} ({})", display::fmt_hz(f.lo6), display::fmt_hz(f.hi6), display::fmt_hz(f.bw6())), palette::TEXT));
+                }
+                None => out.push(("FLT  edges outside the sweep".into(), palette::TEXT_MUTED)),
+            }
+        }
+        if self.swr_bw_on && !s21 {
+            let swr: Vec<f64> = samples.iter().map(|s| rf::swr(s.s11)).collect();
+            if let Some(b) = search::swr_band(&xs, &swr, 2.0) {
+                out.push((format!("SWR  min {:.2} @ {}", b.min_swr, display::fmt_hz(b.min_hz)), palette::TEXT));
+                out.push(match b.edges {
+                    Some((lo, hi)) => (format!("     2:1 {}–{} ({})", display::fmt_hz(lo), display::fmt_hz(hi), display::fmt_hz(hi - lo)), palette::TEXT),
+                    None => ("     never under 2:1".into(), palette::TEXT_MUTED),
+                });
+            }
+        }
+        out
+    }
+
+    /// Start continuous sweeps, or ask for a zone scan when there is no calibration.
+    fn start_run(&mut self, live: &device::Live) {
+        if self.wizard.is_some() {
+            self.note = "Finish the calibration before Run.".into();
+        } else if self.setup_has_cal(live) {
+            self.sweep_zone = self.zone_name();
+            self.shown_scan = None;
+            self.shown_id.clear();
+            self.history.clear();
+            self.blank_until_sweep = true;
+            self.run = true;
+        } else {
+            self.begin_scan(live);
+        }
+    }
+
+    /// START, STOP, CENTER, SPAN, POINTS, AVG and band presets beside the
+    /// chart, so the Setup dialog is not needed for a sweep change. Issue 68.
+    fn sweep_panel(&mut self, ui: &mut Ui, theme: &LcarsTheme, live: &device::Live, width: f32, col4: f32) {
+        let max_hz = live.identity.map(|id| id.max_hz()).unwrap_or(3.0e9);
+        let floor = proto::FREQ_FLOOR_HZ as f64;
+        let start = parse_hz(&self.start).map(|v| v as f64).unwrap_or(self.face.start_hz);
+        let stop = parse_hz(&self.stop).map(|v| v as f64).unwrap_or(self.face.stop_hz);
+        let points: i64 = self.points.trim().parse().unwrap_or(self.face.points as i64);
+        let (center, span) = sweep::center_span(start, stop);
+        let field_w = col4 * 2.0 + 8.0;
+        let mut apply: Option<(f64, f64, i64)> = None;
+        let field = |ui: &mut Ui, label: &str, value: String| -> Option<String> {
+            let mut out = None;
+            ui.vertical(|ui| {
+                ui.label(egui::RichText::new(label).size(theme.data_size * 0.75).color(palette::TEXT_MUTED));
+                let id = egui::Id::unique(("vna-sweep", label));
+                let mut text = ui.data(|d| d.get_temp::<String>(id)).unwrap_or(value.clone());
+                let resp = ui.add_sized(
+                    vec2(field_w, KEY_H - 6.0),
+                    egui::TextEdit::singleline(&mut text).font(egui::TextStyle::Monospace).id(id.with("edit")),
+                );
+                if resp.has_focus() {
+                    ui.data_mut(|d| d.insert_temp(id, text.clone()));
+                } else {
+                    ui.data_mut(|d| d.remove::<String>(id));
+                }
+                if resp.lost_focus() && text.trim() != value.trim() {
+                    out = Some(text);
+                }
+            });
+            out
+        };
+        let mut bad = false;
+        ui.horizontal(|ui| {
+            if let Some(t) = field(ui, "START", display::fmt_hz(start)) {
+                match sweep::parse_freq(&t) {
+                    Some(v) => apply = Some((v, stop, points)),
+                    None => bad = true,
+                }
+            }
+            if let Some(t) = field(ui, "STOP", display::fmt_hz(stop)) {
+                match sweep::parse_freq(&t) {
+                    Some(v) => apply = Some((start, v, points)),
+                    None => bad = true,
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            if let Some(t) = field(ui, "CENTER", display::fmt_hz(center)) {
+                match sweep::parse_freq(&t) {
+                    Some(v) => {
+                        let (a, b) = sweep::start_stop(v, span);
+                        apply = Some((a, b, points));
+                    }
+                    None => bad = true,
+                }
+            }
+            if let Some(t) = field(ui, "SPAN", display::fmt_hz(span)) {
+                match sweep::parse_freq(&t) {
+                    Some(v) => {
+                        let (a, b) = sweep::start_stop(center, v);
+                        apply = Some((a, b, points));
+                    }
+                    None => bad = true,
+                }
+            }
+        });
+        let mut avg_text: Option<String> = None;
+        ui.horizontal(|ui| {
+            if let Some(t) = field(ui, "POINTS", points.to_string()) {
+                match t.trim().parse::<i64>() {
+                    Ok(n) => apply = Some((start, stop, n)),
+                    Err(_) => bad = true,
+                }
+            }
+            avg_text = field(ui, "AVG (HOST)", self.host_avg.clone());
+        });
+        if bad {
+            self.note = "Frequencies take k, M or G (a bare number is MHz). Points is a whole number.".into();
+        }
+        if let Some(t) = avg_text {
+            match t.trim().parse::<u32>() {
+                Ok(n) if n >= 1 => {
+                    self.host_avg = n.to_string();
+                    self.commit_fields();
+                }
+                _ => self.note = "AVG is a whole number of sweeps, 1 or more.".into(),
+            }
+        }
+        if let Some((a, b, n)) = apply {
+            let c = sweep::clamp(a, b, n, floor, max_hz, proto::POINTS_MAX as u16);
+            self.start = hz_field(c.start);
+            self.stop = hz_field(c.stop);
+            self.points = c.points.to_string();
+            self.note = if c.notes.is_empty() { String::new() } else { format!("Clamped: {}.", c.notes.join("; ")) };
+        }
+        // Device averaging needs firmware 1.0.2 and a start at or above 140 MHz.
+        let fw_ok = live.identity.is_some_and(|id| id.power_and_average());
+        ui.horizontal(|ui| {
+            let ok = fw_ok && start >= 140e6;
+            if softkey_enabled(ui, theme, "Dev avg", false, col4, ok) {
+                if let Ok(count) = self.dev_avg.trim().parse::<u8>() {
+                    if count >= 1 {
+                        self.session.average(count);
+                    }
+                }
+            }
+            ui.add_enabled(
+                ok,
+                egui::TextEdit::singleline(&mut self.dev_avg).desired_width(40.0).font(egui::TextStyle::Monospace),
+            );
+            let why = if !live.connected {
+                "connect first"
+            } else if !fw_ok {
+                "needs FW 1.0.2"
+            } else if start < 140e6 {
+                "start ≥ 140 MHz"
+            } else {
+                "on device"
+            };
+            ui.label(egui::RichText::new(why).size(theme.data_size * 0.75).color(palette::TEXT_MUTED));
+        });
+        let presets = sweep::band_presets(floor, max_hz);
+        let mut pick: Option<(f64, f64)> = None;
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("BAND").size(theme.data_size * 0.75).color(palette::TEXT_MUTED));
+            egui::ComboBox::from_id_salt("vna-band-preset")
+                .width((width - 60.0).max(80.0))
+                .selected_text("Ham band preset")
+                .show_ui(ui, |ui| {
+                    for (name, lo, hi) in &presets {
+                        let text = format!("{name}  {} – {}", display::fmt_hz(*lo), display::fmt_hz(*hi));
+                        if ui.selectable_label(false, text).clicked() {
+                            pick = Some((*lo, *hi));
+                        }
+                    }
+                });
+        });
+        if let Some((lo, hi)) = pick {
+            self.apply_edges(lo, hi);
+            self.note.clear();
         }
     }
 
@@ -1443,14 +2788,14 @@ impl NanoVna {
             return;
         }
         let (_, ys) = series(self.view, samples, self.z0_value(), self.velocity_value());
-        let at = self.markers[self.marker_on];
+        let at = self.marker_index(self.marker_on, samples);
         let found = match code {
             0 => display::search_max(&ys),
             1 => display::search_min(&ys),
             _ => display::next_peak(&ys, at),
         };
         match found {
-            Some(index) => self.markers[self.marker_on] = Some(index),
+            Some(index) => self.markers[self.marker_on] = samples.get(index).map(|s| s.hz),
             None => self.note = "No further peak on this trace.".into(),
         }
     }
@@ -1461,7 +2806,7 @@ impl NanoVna {
             readout(ui, theme, "No calibrated sweep yet.", false);
             return;
         };
-        let Some(index) = self.markers[self.marker_on] else {
+        let Some(index) = self.marker_index(self.marker_on, samples) else {
             readout(ui, theme, "Click the chart to place the selected marker.", false);
             return;
         };
@@ -1504,7 +2849,7 @@ impl NanoVna {
         readout(
             ui,
             theme,
-            &format!("M{}  {} MHz", self.marker_on + 1, fmt_g(sample.hz / 1.0e6)),
+            &format!("{}  {} MHz", markers::slot_name(self.marker_on), fmt_g(sample.hz / 1.0e6)),
             true,
         );
         for (name, value) in [
@@ -1531,7 +2876,7 @@ impl NanoVna {
     }
 
     fn finder_readout(&self, ui: &mut Ui, theme: &LcarsTheme, samples: &[Sample]) {
-        if let (Some(a), Some(b)) = (self.markers[0], self.markers[1]) {
+        if let (Some(a), Some(b)) = (self.marker_index(0, samples), self.marker_index(1, samples)) {
             if let (Some(left), Some(right)) = (samples.get(a), samples.get(b)) {
                 readout(
                     ui,
@@ -1547,6 +2892,10 @@ impl NanoVna {
             }
         }
         let z0 = self.z0_value();
+        if let Some(i) = display::search_min(&samples.iter().map(|s| rf::swr(s.s11)).collect::<Vec<_>>()) {
+            let s = &samples[i];
+            readout(ui, theme, &format!("Lowest SWR {} : 1 at {}", num(rf::swr(s.s11)), display::fmt_hz(s.hz)), false);
+        }
         for item in rf::x_resonances(samples, z0).into_iter().take(4) {
             readout(
                 ui,
@@ -1752,12 +3101,14 @@ impl NanoVna {
                 set.band = name.clone();
             }
             fill_standard(set, standard, raw);
+            set.saved_at = Some(cal_stamp_now());
         } else {
             let (zone, name) = band.clone().unwrap_or_default();
             let mut set = CalSet {
                 id,
                 zone,
                 band: name,
+                name: String::new(),
                 start_hz: start,
                 step_hz: step,
                 z0,
@@ -1766,6 +3117,7 @@ impl NanoVna {
                 load: Vec::new(),
                 thru: Vec::new(),
                 isolation: Vec::new(),
+                saved_at: Some(cal_stamp_now()),
             };
             fill_standard(&mut set, standard, raw);
             self.face.cals.push(set);
@@ -1826,11 +3178,14 @@ impl NanoVna {
         let step = ((stop - start) as f64 / f64::from(points - 1))
             .round()
             .max(1.0);
+        if self.cal_off {
+            return true;
+        }
         self.face.cals.iter().any(|set| {
             set.id == id
                 && cal_complete(set)
-                && set.open.len() == points as usize
-                && same_grid(set, start as f64, step, points as usize)
+                && ((set.open.len() == points as usize && same_grid(set, start as f64, step, points as usize))
+                    || cal::covers(set, start as f64, stop as f64))
         })
     }
 
@@ -2136,10 +3491,16 @@ impl NanoVna {
                     .color(palette::TEXT_MUTED),
             );
         }
-        if action_button(ui, theme, "Rescan all", vec2(140.0, 32.0)).clicked() {
-            let spans = self.all_zone_spans();
-            self.start_wizard(live, spans, WizStep::Open, false);
-        }
+        ui.horizontal(|ui| {
+            if action_button(ui, theme, "Rescan all", vec2(140.0, 32.0)).clicked() {
+                let spans = self.all_zone_spans();
+                self.start_wizard(live, spans, WizStep::Open, false);
+            }
+            let label = if self.cal_off { "Correction: OFF" } else { "Correction: ON" };
+            if action_button(ui, theme, label, vec2(170.0, 32.0)).clicked() {
+                self.cal_off = !self.cal_off;
+            }
+        });
         let rows: Vec<(String, f64, f64)> = self
             .plan
             .zones
@@ -2163,6 +3524,40 @@ impl NanoVna {
                             .color(theme.text_hi),
                     );
                     let stored = self.zone_cal(id.as_deref(), name).cloned();
+                    if let Some(set) = &stored {
+                        // Rename and delete the stored set. Delete needs a double click. Issue 65.
+                        let at = self.face.cals.iter().rposition(|c| c == set);
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("NAME").color(palette::TEXT_MUTED));
+                            let mut text = set.name.clone();
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(&mut text)
+                                    .hint_text(name.as_str())
+                                    .desired_width(180.0)
+                                    .font(egui::TextStyle::Monospace),
+                            );
+                            if resp.changed() {
+                                if let Some(i) = at {
+                                    self.face.cals[i].name = text.trim().to_string();
+                                    self.archive_dirty = true;
+                                }
+                            }
+                            ui.label(
+                                egui::RichText::new(format!("SAVED {}", cal_date_text(set.saved_at.as_deref())))
+                                    .monospace()
+                                    .color(palette::TEXT_MUTED),
+                            );
+                            let del = action_button(ui, theme, "Delete", vec2(90.0, 26.0))
+                                .on_hover_text("Double-click to delete this calibration set");
+                            if del.double_clicked() {
+                                if let Some(i) = at {
+                                    self.face.cals.remove(i);
+                                    self.archive_dirty = true;
+                                    self.note = format!("Deleted the {name} calibration.");
+                                }
+                            }
+                        });
+                    }
                     for step in [WizStep::Open, WizStep::Short, WizStep::Load, WizStep::Thru, WizStep::Isol]
                     {
                         let summary = step_summary(stored.as_ref(), step);
@@ -2171,21 +3566,41 @@ impl NanoVna {
                             let has = stored
                                 .as_ref()
                                 .is_some_and(|set| !step_samples(set, step).is_empty());
-                            if rustcars::lcars_button(
+                            let graph = rustcars::lcars_button(
                                 ui,
                                 theme,
-                                "Graph",
+                                if has { "Graph" } else { "not stored" },
                                 palette::SLATE,
                                 vec2(64.0, 26.0),
                                 rustcars::Cap::None,
                                 has,
                             )
-                            .on_hover_text("View graph of this stored standard")
-                            .clicked()
-                            {
-                                if let Some(set) = stored.clone() {
-                                    self.cal_graph = Some((set, step));
-                                }
+                            .on_hover_text(format!(
+                                "View graph of the {} standard in {name}.\nClick: Smith (polar for S21) · Double: return loss (S21 dB) · Triple: phase",
+                                step.step_name()
+                            ));
+                            // Single, double and triple click pick the first view. Issue 75.
+                            let pick = if graph.triple_clicked() {
+                                Some(2)
+                            } else if graph.double_clicked() {
+                                Some(1)
+                            } else if graph.clicked() {
+                                Some(0)
+                            } else {
+                                None
+                            };
+                            if let (Some(mode), Some(set)) = (pick, stored.clone()) {
+                                let s21 = matches!(step, WizStep::Thru | WizStep::Isol);
+                                self.cal_graph_view = match (mode, s21) {
+                                    (0, false) => View::Smith,
+                                    (0, true) => View::PolarS21,
+                                    (1, false) => View::ReturnLoss,
+                                    (1, true) => View::S21,
+                                    (_, false) => View::PhaseS11,
+                                    (_, true) => View::Phase,
+                                };
+                                self.cal_graph = Some((set, step));
+                                self.cal_compare = None;
                             }
                             if reload_button(ui, theme).clicked() {
                                 self.start_wizard(
@@ -2214,20 +3629,55 @@ impl NanoVna {
             });
     }
 
-    /// The raw curve of one stored standard: magnitude against frequency and the polar locus.
+    /// One stored standard: the chosen format with an ideal reference, the worst
+    /// point, an optional compare set, the solved error terms, PNG and CSV. Issue 75.
     fn cal_graph_dialog(&mut self, ui: &mut Ui, theme: &LcarsTheme) {
         let Some((set, step)) = self.cal_graph.clone() else {
             return;
         };
-        let rows = step_samples(&set, step);
-        let xs: Vec<f64> = (0..rows.len()).map(|i| set.start_hz + set.step_hz * i as f64).collect();
-        let mag: Vec<f64> = rows.iter().map(|r| rf::db(pair(*r))).collect();
-        let pts: Vec<Sample> = rows
+        let kind = match step {
+            WizStep::Open => calstd::Kind::Open,
+            WizStep::Short => calstd::Kind::Short,
+            WizStep::Load => calstd::Kind::Load,
+            WizStep::Thru => calstd::Kind::Thru,
+            _ => calstd::Kind::Isol,
+        };
+        let s21 = kind.is_s21();
+        let values = pairs(step_samples(&set, step));
+        let to_samples = |vals: &[Cx]| -> Vec<Sample> {
+            vals.iter()
+                .enumerate()
+                .map(|(i, v)| Sample { hz: calstd::hz(set.start_hz, set.step_hz, i), s11: *v, s21: *v })
+                .collect()
+        };
+        let pts = to_samples(&values);
+        // The ideal null is drawn at the floor, not at minus infinity.
+        let ideal = if kind.ideal().abs() == 0.0 { Cx::new(10f64.powf(calstd::NULL_DB / 20.0), 0.0) } else { kind.ideal() };
+        let ideal_pts = to_samples(&vec![ideal; values.len()]);
+        let others: Vec<(usize, String)> = self
+            .face
+            .cals
             .iter()
-            .zip(&xs)
-            .map(|(r, hz)| Sample { hz: *hz, s11: pair(*r), s21: Cx::new(0.0, 0.0) })
+            .enumerate()
+            .filter(|(_, c)| **c != set && !step_samples(c, step).is_empty())
+            .map(|(i, c)| (i, format!("{} {} {}", if c.name.is_empty() { &c.zone } else { &c.name }, c.band, c.id)))
             .collect();
+        let compare: Option<Vec<Sample>> = self
+            .cal_compare
+            .and_then(|i| self.face.cals.get(i))
+            .map(|c| to_samples(&pairs(step_samples(c, step))));
+        let worst = calstd::worst(kind, &values);
+        let views: &[View] = if s21 {
+            &[View::PolarS21, View::S21, View::Phase, View::Unwrap, View::GroupDelay]
+        } else {
+            &[View::Smith, View::ReturnLoss, View::PhaseS11, View::UnwrapS11]
+        };
+        if !views.contains(&self.cal_graph_view) {
+            self.cal_graph_view = views[0];
+        }
+        let terms = rf::solve_osl(&pairs(&set.open), &pairs(&set.short), &pairs(&set.load)).ok();
         let mut open = true;
+        let mut export: Option<bool> = None;
         let title = format!(
             "{} · {} · {}",
             if set.zone.is_empty() { "Calibration" } else { set.zone.as_str() },
@@ -2237,40 +3687,149 @@ impl NanoVna {
         egui::Window::new(title)
             .open(&mut open)
             .resizable(true)
-            .default_size(vec2(720.0, 420.0))
+            .default_size(vec2(760.0, 480.0))
             .show(ui.ctx(), |ui| {
+                let col = 96.0;
+                ui.horizontal_wrapped(|ui| {
+                    for v in views {
+                        if softkey(ui, theme, view_name(*v), !self.cal_terms && self.cal_graph_view == *v, col) {
+                            self.cal_graph_view = *v;
+                            self.cal_terms = false;
+                        }
+                    }
+                    if softkey_enabled(ui, theme, "Err terms", self.cal_terms, col, terms.is_some()) {
+                        self.cal_terms = !self.cal_terms;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    let current = self
+                        .cal_compare
+                        .and_then(|i| others.iter().find(|(j, _)| *j == i))
+                        .map(|(_, n)| n.clone())
+                        .unwrap_or_else(|| "Compare: off".into());
+                    egui::ComboBox::from_id_salt("vna-cal-compare").selected_text(current).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.cal_compare, None, "off");
+                        for (i, n) in &others {
+                            ui.selectable_value(&mut self.cal_compare, Some(*i), n);
+                        }
+                    });
+                    if softkey(ui, theme, "PNG", false, col) {
+                        export = Some(true);
+                    }
+                    if softkey(ui, theme, "CSV", false, col) {
+                        export = Some(false);
+                    }
+                });
+                let worst_text = worst
+                    .map(|w| {
+                        format!(
+                            " · worst {} at {}",
+                            if matches!(kind, calstd::Kind::Load | calstd::Kind::Isol) {
+                                format!("{:.1} dB", w.db)
+                            } else {
+                                format!("{:.2} dB off ideal", w.db)
+                            },
+                            display::fmt_hz(calstd::hz(set.start_hz, set.step_hz, w.index))
+                        )
+                    })
+                    .unwrap_or_default();
                 ui.label(
                     egui::RichText::new(format!(
-                        "{} points · {} to {} · Z0 {} Ω · uncorrected ratio as stored",
-                        rows.len(),
-                        display::fmt_hz(xs.first().copied().unwrap_or(0.0)),
-                        display::fmt_hz(xs.last().copied().unwrap_or(0.0)),
+                        "{} points · {} to {} · Z0 {} Ω · device {} · saved {}{worst_text} · uncorrected ratio as stored",
+                        values.len(),
+                        display::fmt_hz(pts.first().map(|s| s.hz).unwrap_or(0.0)),
+                        display::fmt_hz(pts.last().map(|s| s.hz).unwrap_or(0.0)),
                         trim_num(set.z0),
+                        if set.id.is_empty() { "-" } else { set.id.as_str() },
+                        cal_date_text(set.saved_at.as_deref()),
                     ))
                     .monospace()
                     .size(theme.data_size * 0.85)
                     .color(palette::TEXT_MUTED),
                 );
-                ui.label(
-                    egui::RichText::new("Magnitude dB (gold) · Phase on the polar plot")
-                        .size(theme.data_size * 0.8)
-                        .color(palette::TEXT_MUTED),
-                );
-                let h = (ui.available_height() - 4.0).max(220.0);
-                let w = ui.available_width();
-                ui.horizontal(|ui| {
-                    let (rect, _) = ui.allocate_exact_size(vec2((w * 0.6).max(240.0), h), Sense::hover());
-                    let painter = ui.painter_at(rect);
-                    painter.rect_filled(rect, 0.0, PANE_BG);
-                    paint_cartesian(&painter, rect, View::S21, &xs, &[(&mag, TRACE1)], &[], theme.data_size);
-                    let (rect, _) = ui.allocate_exact_size(vec2((w * 0.38).max(160.0), h), Sense::hover());
-                    let painter = ui.painter_at(rect);
-                    painter.rect_filled(rect, 0.0, PANE_BG);
+                let legend = if self.cal_terms {
+                    "Directivity (gold) · Source match (teal) · Reflection tracking (plum), |term| dB".to_string()
+                } else {
+                    format!(
+                        "Measured (gold, saved {}) · Ideal {} (grey){} · R = worst point",
+                        cal_date_text(set.saved_at.as_deref()),
+                        step.step_name().to_lowercase(),
+                        if compare.is_some() { " · Compare (teal)" } else { "" }
+                    )
+                };
+                ui.label(egui::RichText::new(legend).size(theme.data_size * 0.8).color(palette::TEXT_MUTED));
+                let h = (ui.available_height() - 4.0).max(240.0);
+                let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width().max(320.0), h), Sense::hover());
+                let painter = ui.painter_at(rect);
+                painter.rect_filled(rect, 0.0, PANE_BG);
+                let xs: Vec<f64> = pts.iter().map(|s| s.hz).collect();
+                if self.cal_terms {
+                    if let Some(t) = &terms {
+                        let d = calstd::term_db(&t.directivity);
+                        let m = calstd::term_db(&t.source_match);
+                        let r = calstd::term_db(&t.reflection_tracking);
+                        let n = d.len().min(xs.len());
+                        paint_cartesian(
+                            &painter,
+                            rect,
+                            View::S21,
+                            &xs[..n],
+                            &[(&d[..n], TRACE1), (&m[..n], MEM_COLOR), (&r[..n], palette::PLUM)],
+                            &[],
+                            theme.data_size,
+                            None,
+                            &Overlay::default(),
+                        );
+                    }
+                } else if self.cal_graph_view == View::Smith {
+                    paint_smith(&painter, rect, false, Some(&pts), compare.as_deref(), set.z0, None, theme.data_size);
+                    let disk = smith_disk(rect);
+                    let at = disk.center + vec2(kind.ideal().re as f32 * disk.rad, -(kind.ideal().im as f32) * disk.rad);
+                    painter.circle_stroke(at, 7.0, egui::Stroke::new(2.0, palette::TEXT));
+                    painter.text(at + vec2(0.0, -12.0), egui::Align2::CENTER_BOTTOM, "ideal", egui::FontId::monospace(theme.data_size * 0.8), palette::TEXT);
+                    if let Some(w) = worst.and_then(|w| pts.get(w.index)) {
+                        let p = disk.center + vec2(w.s11.re as f32 * disk.rad, -(w.s11.im as f32) * disk.rad);
+                        paint_marker(&painter, p, markers::REF, theme.data_size);
+                    }
+                } else if self.cal_graph_view == View::PolarS21 {
                     let plot = rect.shrink(16.0);
-                    paint_polar(&painter, plot);
+                    paint_polar(&painter, plot, theme.data_size);
+                    stroke_polar(&painter, plot, &ideal_pts, IDEAL_COLOR);
+                    if let Some(c) = &compare {
+                        stroke_polar(&painter, plot, c, MEM_COLOR);
+                    }
                     stroke_polar(&painter, plot, &pts, TRACE1);
-                });
+                } else {
+                    let view = self.cal_graph_view;
+                    let ys = series(view, &pts, set.z0, 0.66).1;
+                    let ideal_ys = series(view, &ideal_pts, set.z0, 0.66).1;
+                    let cmp_ys = compare.as_ref().map(|c| series(view, c, set.z0, 0.66).1);
+                    let mut traces: Vec<(&[f64], Color32)> = vec![(&ys, TRACE1), (&ideal_ys, IDEAL_COLOR)];
+                    if let Some(c) = &cmp_ys {
+                        let n = c.len().min(xs.len());
+                        traces.push((&c[..n], MEM_COLOR));
+                    }
+                    let marks: Vec<(usize, usize)> = worst.map(|w| vec![(markers::REF, w.index)]).unwrap_or_default();
+                    paint_cartesian(&painter, rect, view, &xs, &traces, &marks, theme.data_size, None, &Overlay::default());
+                }
             });
+        if let Some(png) = export {
+            let name = format!("cal-{}-{}", if set.zone.is_empty() { "set" } else { set.zone.as_str() }, step.step_name().to_lowercase());
+            let cmp: Option<Vec<Cx>> = self.cal_compare.and_then(|i| self.face.cals.get(i)).map(|c| pairs(step_samples(c, step)));
+            if png {
+                let xs: Vec<f64> = pts.iter().map(|s| s.hz).collect();
+                let view = if is_disk(self.cal_graph_view) { if s21 { View::S21 } else { View::ReturnLoss } } else { self.cal_graph_view };
+                let ys = series(view, &pts, set.z0, 0.66).1;
+                let iy = series(view, &ideal_pts, set.z0, 0.66).1;
+                match rf::chart_png_traces(&format!("{} {}", step.step_name(), view_name(view)), &xs, &[&ys, &iy]) {
+                    Ok(bytes) => self.save_bytes("Save chart", &format!("{name}.png"), &bytes),
+                    Err(err) => self.note = err,
+                }
+            } else {
+                let text = calstd::csv(set.start_hz, set.step_hz, &values, cmp.as_deref());
+                self.save_bytes("Save CSV", &format!("{name}.csv"), text.as_bytes());
+            }
+        }
         if !open {
             self.cal_graph = None;
         }
@@ -2453,6 +4012,22 @@ impl NanoVna {
                 true
             }
             Err(err) => {
+                // Numbers that are only out of range are clamped with a note,
+                // like the SWEEP panel. Text that is not a number still errors. Issue 68.
+                if let (Ok(a), Ok(b), Ok(n)) = (parse_hz(&self.start), parse_hz(&self.stop), self.points.trim().parse::<i64>()) {
+                    let max = self.session.snapshot().identity.map(|id| id.max_hz()).unwrap_or(3.0e9);
+                    let c = sweep::clamp(a as f64, b as f64, n, proto::FREQ_FLOOR_HZ as f64, max, proto::POINTS_MAX as u16);
+                    if !c.notes.is_empty() {
+                        self.start = hz_field(c.start);
+                        self.stop = hz_field(c.stop);
+                        self.points = c.points.to_string();
+                        if self.parse_setup().is_ok() {
+                            let ok = self.send_sweep();
+                            self.note = format!("Clamped: {}.", c.notes.join("; "));
+                            return ok;
+                        }
+                    }
+                }
                 self.note = err;
                 false
             }
@@ -2544,10 +4119,11 @@ impl NanoVna {
                 s21: s21[index],
             });
         }
-        if self.matched_cal_for(&samples, stored_id.as_deref()).is_none() && self.wizard.is_none() {
+        let (found, state) = self.cal_for(&samples, stored_id.as_deref());
+        if found.is_none() && state != cal::CalState::Off && self.wizard.is_none() {
             return None;
         }
-        if let Some(set) = self.matched_cal_for(&samples, stored_id.as_deref()) {
+        if let Some(set) = found.as_ref() {
             if let Ok(terms) = rf::solve_osl(&pairs(&set.open), &pairs(&set.short), &pairs(&set.load))
             {
                 let n = samples.len();
@@ -2597,6 +4173,48 @@ impl NanoVna {
         Some((vec![live.sweep.clone()], None))
     }
 
+    /// The calibration for a sweep: exact grid, else interpolated from a
+    /// covering set, else none. CAL OFF wins over both. Issue 65.
+    fn cal_for(&self, samples: &[Sample], stored_id: Option<&str>) -> (Option<CalSet>, cal::CalState) {
+        if self.cal_off {
+            return (None, cal::CalState::Off);
+        }
+        if let Some(set) = self.matched_cal_for(samples, stored_id) {
+            return (Some(set.clone()), cal::CalState::Exact);
+        }
+        if samples.len() >= 2 {
+            if let Some(id) = self.cal_device_id(stored_id) {
+                let hz: Vec<f64> = samples.iter().map(|s| s.hz).collect();
+                // Narrowest covering set first: it has the finest grid.
+                let mut sets: Vec<&CalSet> = self
+                    .face
+                    .cals
+                    .iter()
+                    .filter(|set| set.id == id && cal::covers(set, hz[0], hz[hz.len() - 1]))
+                    .collect();
+                sets.sort_by(|a, b| a.step_hz.partial_cmp(&b.step_hz).unwrap_or(std::cmp::Ordering::Equal));
+                if let Some(set) = sets.first().and_then(|set| cal::interpolate(set, &hz)) {
+                    return (Some(set), cal::CalState::Interp);
+                }
+            }
+        }
+        (None, cal::CalState::Uncal)
+    }
+
+    fn cal_device_id(&self, stored_id: Option<&str>) -> Option<String> {
+        let live_id = self
+            .session
+            .snapshot()
+            .device_id
+            .map(|raw| proto::device_id_hex(&raw));
+        let prefer_stored = self.shown_scan.is_some() && self.history.is_empty();
+        if prefer_stored {
+            stored_id.map(str::to_string).or(live_id)
+        } else {
+            live_id.or_else(|| stored_id.map(str::to_string))
+        }
+    }
+
     fn matched_cal(&self, samples: &[Sample]) -> Option<&CalSet> {
         self.matched_cal_for(samples, None)
     }
@@ -2638,8 +4256,12 @@ impl NanoVna {
         };
         let id = proto::device_id_hex(&id);
         let any = self.face.cals.iter().any(|set| set.id == id);
-        if self.matched_cal(samples).is_some() {
+        if self.cal_off {
+            "Correction is off (CAL OFF). The trace is raw.".into()
+        } else if self.matched_cal(samples).is_some() {
             "Calibrated for this device and this sweep.".into()
+        } else if self.cal_for(samples, None).1 == cal::CalState::Interp {
+            "CAL INT: the sweep grid differs, so a covering calibration is interpolated.".into()
         } else if any {
             "Outside the calibrated range. The trace is uncalibrated.".into()
         } else {
@@ -2701,6 +4323,170 @@ impl NanoVna {
                 Ok(()) => format!("Wrote {}", path.display()),
                 Err(err) => err.to_string(),
             };
+        }
+    }
+
+    /// Band edges plus this format's limit lines and verdict. Issue 71.
+    fn overlay(&self, samples: Option<&[Sample]>) -> Overlay {
+        let mut o = Overlay { edges: self.band_edges(), ..Default::default() };
+        if is_disk(self.view) || self.view == View::Tdr {
+            return o;
+        }
+        if let Some(set) = self.face.limits.get(self.key().as_str()).filter(|s| s.on && !s.segs.is_empty()) {
+            o.limits = set.segs.clone();
+            if let Some(samples) = samples {
+                let (xs, ys) = series(self.view, samples, self.z0_value(), self.velocity_value());
+                o.verdict = Some(limits::check(&xs, &ys, &set.segs));
+            }
+        }
+        o
+    }
+
+    /// A ham band preset limit for the shown format: the band holding the
+    /// sweep centre, SWR `swr`:1 on the SWR format. Issue 71.
+    fn limit_preset(&mut self, swr: f64) {
+        let center = (self.face.start_hz + self.face.stop_hz) / 2.0;
+        let start = parse_hz(&self.start).map(|v| v as f64).unwrap_or(self.face.start_hz);
+        let stop = parse_hz(&self.stop).map(|v| v as f64).unwrap_or(self.face.stop_hz);
+        let mid = if stop > start { (start + stop) / 2.0 } else { center };
+        let Some(band) = crate::tools::ham_rf::bands::find_band(mid / 1e6) else {
+            self.note = "The sweep centre is not in a ham band, so there is no band preset.".into();
+            return;
+        };
+        self.view = View::Swr;
+        let k = self.key();
+        let set = self.face.limits.entry(k).or_default();
+        set.segs = vec![limits::swr_preset(band.lo_mhz * 1e6, band.hi_mhz * 1e6, swr)];
+        set.on = true;
+        self.dirty = true;
+        self.note = format!("Limit: SWR {swr}:1 across {}.", band.name);
+    }
+
+    /// The limit line editor for the shown format. Issue 71.
+    fn limits_dialog(&mut self, ui: &mut Ui, theme: &LcarsTheme) {
+        if !self.limits_edit {
+            return;
+        }
+        let key = self.key();
+        let (_, _, unit) = view_meta(self.view);
+        let mut open = true;
+        let mut set = self.face.limits.get(&key).cloned().unwrap_or_default();
+        let before = set.clone();
+        egui::Window::new(format!("Limit lines · {key}"))
+            .open(&mut open)
+            .resizable(false)
+            .show(ui.ctx(), |ui| {
+                ui.checkbox(&mut set.on, "Limit test on");
+                let mut remove = None;
+                egui::Grid::new("vna-limits").striped(true).show(ui, |ui| {
+                    for h in ["START MHz", "STOP MHz", &format!("START {unit}"), &format!("STOP {unit}"), "TYPE", ""] {
+                        ui.label(egui::RichText::new(h).color(palette::TEXT_MUTED));
+                    }
+                    ui.end_row();
+                    for (i, seg) in set.segs.iter_mut().enumerate() {
+                        let mut a = seg.start_hz / 1e6;
+                        let mut b = seg.stop_hz / 1e6;
+                        if ui.add(egui::DragValue::new(&mut a).speed(0.01).max_decimals(6)).changed() {
+                            seg.start_hz = a * 1e6;
+                        }
+                        if ui.add(egui::DragValue::new(&mut b).speed(0.01).max_decimals(6)).changed() {
+                            seg.stop_hz = b * 1e6;
+                        }
+                        ui.add(egui::DragValue::new(&mut seg.start_v).speed(0.05));
+                        ui.add(egui::DragValue::new(&mut seg.stop_v).speed(0.05));
+                        let label = if seg.upper { "UPPER" } else { "LOWER" };
+                        if ui.button(label).clicked() {
+                            seg.upper = !seg.upper;
+                        }
+                        if ui.button("Delete").clicked() {
+                            remove = Some(i);
+                        }
+                        ui.end_row();
+                    }
+                });
+                if let Some(i) = remove {
+                    set.segs.remove(i);
+                }
+                ui.horizontal(|ui| {
+                    if action_button(ui, theme, "Add segment", vec2(140.0, 30.0)).clicked() {
+                        let v = self.shown_scale(None).map(|s| s.1).unwrap_or(0.0);
+                        let v = if self.view == View::Swr { 2.0 } else { v };
+                        set.segs.push(limits::Segment {
+                            start_hz: self.face.start_hz,
+                            stop_hz: self.face.stop_hz,
+                            start_v: v,
+                            stop_v: v,
+                            upper: true,
+                        });
+                    }
+                    if action_button(ui, theme, "Clear", vec2(90.0, 30.0)).clicked() {
+                        set.segs.clear();
+                    }
+                });
+            });
+        if set != before {
+            if set == limits::LimitSet::default() {
+                self.face.limits.remove(&key);
+            } else {
+                self.face.limits.insert(key, set);
+            }
+            self.dirty = true;
+        }
+        self.limits_edit = open;
+    }
+
+    /// Every zone edge of the station band plan, in Hz. Issue 53.
+    fn band_edges(&self) -> Vec<f64> {
+        let mut out: Vec<f64> = self
+            .plan
+            .zones
+            .iter()
+            .filter_map(zone_limits)
+            .flat_map(|(lo, hi)| [lo, hi])
+            .collect();
+        out.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        out.dedup_by(|a, b| (*a - *b).abs() < 1.0);
+        out
+    }
+
+    /// The selected memory trace. Issue 70.
+    fn memory(&self) -> Option<&Vec<Sample>> {
+        self.mems[self.mem_sel].as_ref()
+    }
+
+    /// Load a Touchstone (.s1p/.s2p) or CSV sweep into the selected memory. Issues 70 and 53.
+    fn import_memory(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Import a sweep into memory")
+            .add_filter("Touchstone or CSV", &["s1p", "s2p", "csv", "S1P", "S2P", "CSV"])
+            .pick_file()
+        else {
+            return;
+        };
+        let text = match fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(err) => {
+                self.note = err.to_string();
+                return;
+            }
+        };
+        let z0 = self.z0_value();
+        let csv = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("csv"));
+        let parsed = if csv { traces::parse_csv(&text, z0) } else { traces::parse_touchstone(&text) };
+        match parsed {
+            Ok(mut imp) => {
+                traces::renormalize(&mut imp.samples, imp.z0, z0);
+                let n = imp.samples.len();
+                self.mems[self.mem_sel] = Some(imp.samples);
+                self.show_memory = true;
+                self.note = format!(
+                    "MEM{} ← {} ({n} points{}).",
+                    self.mem_sel + 1,
+                    path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default(),
+                    if imp.has_s21 { ", S11 and S21" } else { ", S11 only" }
+                );
+            }
+            Err(err) => self.note = format!("Import failed: {err}"),
         }
     }
 
@@ -2961,12 +4747,16 @@ fn series(view: View, samples: &[Sample], z0: f64, velocity: f64) -> (Vec<f64>, 
             samples.iter().map(|s| s.hz).collect(),
             samples.iter().map(|s| rf::db(s.s21)).collect(),
         ),
-        View::Phase => (
+        View::Phase | View::PhaseS11 => (
             samples.iter().map(|s| s.hz).collect(),
-            samples.iter().map(|s| s.s21.arg().to_degrees()).collect(),
+            samples.iter().map(|s| param_of(view, s).arg().to_degrees()).collect(),
         ),
-        View::Unwrap => {
-            let phase = rf::unwrap_phase(&samples.iter().map(|s| s.s21).collect::<Vec<_>>());
+        View::Zabs => (
+            samples.iter().map(|s| s.hz).collect(),
+            samples.iter().map(|s| rf::derive(s, z0).z_abs).collect(),
+        ),
+        View::Unwrap | View::UnwrapS11 => {
+            let phase = rf::unwrap_phase(&samples.iter().map(|s| param_of(view, s)).collect::<Vec<_>>());
             (
                 samples.iter().map(|s| s.hz).collect(),
                 phase.into_iter().map(|rad| rad.to_degrees()).collect(),
@@ -2975,7 +4765,7 @@ fn series(view: View, samples: &[Sample], z0: f64, velocity: f64) -> (Vec<f64>, 
         View::GroupDelay => {
             let phase = rf::unwrap_phase(&samples.iter().map(|s| s.s21).collect::<Vec<_>>());
             let hz: Vec<f64> = samples.iter().map(|s| s.hz).collect();
-            let delay = rf::group_delay(&hz, &phase);
+            let delay = rf::group_delay_aperture(&hz, &phase, GD_APERTURE.with(|a| a.get()));
             (hz, delay.into_iter().map(|s| s * 1e9).collect())
         }
         View::Tdr => {
@@ -2988,17 +4778,17 @@ fn series(view: View, samples: &[Sample], z0: f64, velocity: f64) -> (Vec<f64>, 
                 (Vec::new(), Vec::new())
             }
         }
-        View::LinMag => (
+        View::LinMag | View::LinMagS21 => (
             samples.iter().map(|s| s.hz).collect(),
-            samples.iter().map(|s| s.s11.abs()).collect(),
+            samples.iter().map(|s| param_of(view, s).abs()).collect(),
         ),
-        View::ReIm => (
+        View::ReIm | View::ReImS21 => (
             samples.iter().map(|s| s.hz).collect(),
-            samples.iter().map(|s| s.s11.re).collect(),
+            samples.iter().map(|s| param_of(view, s).re).collect(),
         ),
-        View::Smith | View::Polar => (
+        View::Smith | View::SmithY | View::Polar | View::PolarS21 => (
             samples.iter().map(|s| s.hz).collect(),
-            samples.iter().map(|s| s.s11.abs()).collect(),
+            samples.iter().map(|s| param_of(view, s).abs()).collect(),
         ),
     }
 }
@@ -3007,7 +4797,7 @@ fn series(view: View, samples: &[Sample], z0: f64, velocity: f64) -> (Vec<f64>, 
 fn second_series(view: View, samples: &[Sample], z0: f64) -> Vec<f64> {
     match view {
         View::Impedance => samples.iter().map(|s| rf::derive(s, z0).x).collect(),
-        View::ReIm => samples.iter().map(|s| s.s11.im).collect(),
+        View::ReIm | View::ReImS21 => samples.iter().map(|s| param_of(view, s).im).collect(),
         _ => Vec::new(),
     }
 }
@@ -3016,6 +4806,7 @@ fn second_series(view: View, samples: &[Sample], z0: f64) -> Vec<f64> {
 fn view_meta(view: View) -> (&'static str, &'static str, &'static str) {
     match view {
         View::Smith => ("S11", "SMITH", "U"),
+        View::SmithY => ("S11", "SMITH Y", "U"),
         View::Polar => ("S11", "POLAR", "U"),
         View::Swr => ("S11", "SWR", "U"),
         View::ReturnLoss => ("S11", "RETURN LOSS", "dB"),
@@ -3027,6 +4818,12 @@ fn view_meta(view: View) -> (&'static str, &'static str, &'static str) {
         View::Unwrap => ("S21", "UNWR PHASE", "°"),
         View::GroupDelay => ("S21", "DELAY", "ns"),
         View::Tdr => ("S11", "TDR", "U"),
+        View::Zabs => ("S11", "|Z|", "Ω"),
+        View::PhaseS11 => ("S11", "PHASE", "°"),
+        View::UnwrapS11 => ("S11", "UNWR PHASE", "°"),
+        View::PolarS21 => ("S21", "POLAR", "U"),
+        View::ReImS21 => ("S21", "REAL + IMAG", "U"),
+        View::LinMagS21 => ("S21", "LIN MAG", "U"),
     }
 }
 
@@ -3034,15 +4831,19 @@ fn view_meta(view: View) -> (&'static str, &'static str, &'static str) {
 fn marker_value(view: View, sample: &Sample, z0: f64) -> String {
     let (_, _, unit) = view_meta(view);
     match view {
-        View::Smith | View::Impedance => {
+        View::Smith | View::SmithY | View::Impedance => {
             let d = rf::derive(sample, z0);
             format!("{} {:+}j Ω", num(d.r), num(d.x))
         }
-        View::Polar => format!(
+        View::Polar | View::PolarS21 => format!(
             "{} ∠ {}°",
-            fmt_g(sample.s11.abs()),
-            fmt_g(sample.s11.arg().to_degrees())
+            fmt_g(param_of(view, sample).abs()),
+            fmt_g(param_of(view, sample).arg().to_degrees())
         ),
+        View::Zabs => format!("{} Ω", num(rf::derive(sample, z0).z_abs)),
+        View::PhaseS11 => format!("{} °", num(sample.s11.arg().to_degrees())),
+        View::LinMagS21 => fmt_g(sample.s21.abs()),
+        View::ReImS21 => format!("{} {:+}j", fmt_g(sample.s21.re), fmt_g(sample.s21.im)),
         View::Swr => format!("{} : 1", num(rf::swr(sample.s11))),
         View::ReturnLoss => format!("{} dB", num(rf::return_loss_db(sample.s11))),
         View::LinMag => fmt_g(sample.s11.abs()),
@@ -3061,16 +4862,38 @@ fn cart_plot(rect: Rect) -> Rect {
     )
 }
 
-const MARKER_COLORS: [Color32; 4] = [
+/// M1..M8 then R (white). Every marker also carries its name as text.
+const MARKER_COLORS: [Color32; markers::SLOTS] = [
     Color32::from_rgb(0xFF, 0x99, 0x00),
     Color32::from_rgb(0x99, 0xCC, 0xFF),
     Color32::from_rgb(0xCC, 0x99, 0xCC),
     Color32::from_rgb(0x99, 0xDD, 0x88),
+    Color32::from_rgb(0xFF, 0xCC, 0x66),
+    Color32::from_rgb(0x66, 0xDD, 0xDD),
+    Color32::from_rgb(0xFF, 0x88, 0x88),
+    Color32::from_rgb(0xCC, 0xCC, 0x66),
+    Color32::from_rgb(0xF0, 0xF0, 0xF0),
 ];
-const GRID: Color32 = Color32::from_rgb(0x4A, 0x55, 0x66);
+/// Major grid: 3:1 on the pane (WCAG 1.4.11). Issue 73.
+const GRID: Color32 = Color32::from_rgb(0x58, 0x64, 0x76);
 const GRID_FAINT: Color32 = Color32::from_rgb(0x2C, 0x33, 0x3D);
 const TRACE1: Color32 = Color32::from_rgb(0xF2, 0xC2, 0x6B);
 const TRACE2: Color32 = Color32::from_rgb(0x78, 0xAA, 0xD2);
+/// TRC1..TRC4 colours for extra traces sharing a pane and their header chips.
+const TRACE_COLORS: [Color32; 4] = [
+    TRACE1,
+    Color32::from_rgb(0x8C, 0xC8, 0xFF),
+    Color32::from_rgb(0xE0, 0xA0, 0xE0),
+    Color32::from_rgb(0xA0, 0xE0, 0x90),
+];
+/// MATH label text: brick is too dark for text on the strip.
+/// Disconnected / lost text: brick fails 4.5:1 as text, this light red passes. Issue 73.
+const LOST_TEXT: Color32 = Color32::from_rgb(0xFF, 0x8A, 0x7A);
+const MATH_TEXT: Color32 = Color32::from_rgb(0xFF, 0x99, 0x88);
+/// Memory traces. Drawn dashed on Cartesian panes.
+const MEM_COLOR: Color32 = palette::TEAL;
+/// Ideal reference behind a calibration standard: light grey, above 3:1 on the pane. Issue 75.
+const IDEAL_COLOR: Color32 = Color32::from_rgb(0x9A, 0x9C, 0xA8);
 const PANE_BG: Color32 = Color32::from_rgb(12, 16, 22);
 
 /// Graticule, labelled ticks, reference line, and traces on one Cartesian pane.
@@ -3082,6 +4905,8 @@ fn paint_cartesian(
     traces: &[(&[f64], Color32)],
     markers: &[(usize, usize)],
     label_px: f32,
+    manual: Option<display::ManualScale>,
+    overlay: &Overlay,
 ) {
     let plot = cart_plot(rect);
     let font = egui::FontId::monospace((label_px * 0.8).max(10.0));
@@ -3089,7 +4914,7 @@ fn paint_cartesian(
     for (ys, _) in traces {
         all.extend_from_slice(ys);
     }
-    let scale = display::auto_scale(&all, 10);
+    let scale = manual.map(|m| m.to_scale(10)).unwrap_or_else(|| display::auto_scale(&all, 10));
     for (i, value) in scale.lines().into_iter().enumerate() {
         let y = plot.top() + plot.height() * i as f32 / scale.divs as f32;
         painter.line_segment(
@@ -3132,7 +4957,7 @@ fn paint_cartesian(
     }
     painter.rect_stroke(plot, 0.0, Stroke::new(1.0, GRID), egui::StrokeKind::Inside);
     // Reference line and its triangle on the right edge, like the R&S ref marker.
-    let ref_value = if scale.top >= 0.0 && scale.bottom() <= 0.0 { 0.0 } else { scale.top };
+    let ref_value = manual.map(|m| m.ref_value).unwrap_or_else(|| display::auto_ref(&scale));
     let ry = plot.top() + scale.fraction(ref_value) as f32 * plot.height();
     let ref_stroke = Stroke::new(1.0, TRACE1);
     let mut x = plot.left();
@@ -3153,6 +4978,25 @@ fn paint_cartesian(
     if !(xmax > xmin) {
         return;
     }
+    // Band-plan zone edges as dashed verticals, labelled with the frequency. Issue 53.
+    if view != View::Tdr {
+        let edge = Stroke::new(1.0, palette::TAN);
+        for hz in overlay.edges.iter().filter(|hz| **hz > xmin && **hz < xmax) {
+            let x = plot.left() + ((hz - xmin) / (xmax - xmin)) as f32 * plot.width();
+            let mut y = plot.top();
+            while y < plot.bottom() {
+                painter.line_segment([Pos2::new(x, y), Pos2::new(x, (y + 4.0).min(plot.bottom()))], edge);
+                y += 8.0;
+            }
+            painter.text(
+                Pos2::new(x + 2.0, plot.top() + 2.0),
+                egui::Align2::LEFT_TOP,
+                format!("EDGE {}", display::fmt_hz(*hz)),
+                egui::FontId::monospace((label_px * 0.65).max(9.0)),
+                palette::TAN,
+            );
+        }
+    }
     let map = |x: f64, y: f64| {
         Pos2::new(
             plot.left() + ((x - xmin) / (xmax - xmin)) as f32 * plot.width(),
@@ -3164,7 +5008,11 @@ fn paint_cartesian(
         if ys.len() != xs.len() {
             continue;
         }
-        let mut prev = None;
+        let mut prev: Option<Pos2> = None;
+        // Memory traces are drawn dashed so they read apart from live data
+        // without relying on colour. Issue 70.
+        let dashed = *color == MEM_COLOR;
+        let mut run = 0.0f32;
         for (x, y) in xs.iter().zip(ys.iter()) {
             if !y.is_finite() {
                 prev = None;
@@ -3172,10 +5020,46 @@ fn paint_cartesian(
             }
             let pos = map(*x, *y);
             if let Some(was) = prev {
-                clip.line_segment([was, pos], Stroke::new(2.0, *color));
+                let len: f32 = was.distance(pos);
+                if !dashed || (run % 12.0) < 7.0 {
+                    clip.line_segment([was, pos], Stroke::new(2.0, *color));
+                }
+                run += len.max(1.0);
             }
             prev = Some(pos);
         }
+    }
+    // Limit lines, failing points and the PASS/FAIL chip. Issue 71.
+    let limit_stroke = Stroke::new(2.0, palette::BRICK);
+    for seg in &overlay.limits {
+        let (a, b) = (seg.start_hz.max(xmin), seg.stop_hz.min(xmax));
+        if !(b >= a) {
+            continue;
+        }
+        let (va, vb) = (seg.at(a).unwrap_or(seg.start_v), seg.at(b).unwrap_or(seg.stop_v));
+        let (pa, pb) = (map(a, va), map(b, vb));
+        clip.line_segment([pa, pb], limit_stroke);
+        // Small ticks point to the failing side: up for a lower limit, down for an upper.
+        let dir = if seg.upper { -6.0 } else { 6.0 };
+        for t in [0.0f32, 0.5, 1.0] {
+            let p = pa + (pb - pa) * t;
+            clip.line_segment([p, Pos2::new(p.x, p.y + dir)], limit_stroke);
+        }
+    }
+    if let (Some(verdict), Some((ys, _))) = (&overlay.verdict, traces.first()) {
+        for i in &verdict.failing {
+            if let (Some(x), Some(y)) = (xs.get(*i), ys.get(*i)) {
+                if y.is_finite() {
+                    clip.circle_stroke(map(*x, *y), 4.0, Stroke::new(2.0, palette::BRICK));
+                }
+            }
+        }
+        let text = format!("LIMIT {}", verdict.label());
+        let fill = if verdict.pass() { palette::OLIVE } else { palette::BRICK };
+        let g = painter.layout_no_wrap(text, egui::FontId::monospace((label_px * 0.9).max(11.0)), rustcars::ink_on(fill));
+        let chip = Rect::from_min_size(Pos2::new(plot.left() + 8.0, plot.top() + 8.0), g.size() + vec2(16.0, 8.0));
+        painter.rect_filled(chip, 4.0, fill);
+        painter.galley(chip.min + vec2(8.0, 4.0), g, rustcars::ink_on(fill));
     }
     if let Some((ys, _)) = traces.first() {
         for (slot, index) in markers {
@@ -3203,7 +5087,7 @@ fn paint_marker(painter: &egui::Painter, at: Pos2, slot: usize, label_px: f32) {
     painter.text(
         Pos2::new(at.x, at.y - 12.0),
         egui::Align2::CENTER_BOTTOM,
-        format!("{}", slot + 1),
+        if slot == markers::REF { "R".to_string() } else { format!("{}", slot + 1) },
         egui::FontId::monospace((label_px * 0.8).max(10.0)),
         color,
     );
@@ -3265,6 +5149,26 @@ fn softkey(ui: &mut Ui, theme: &LcarsTheme, label: &str, lit: bool, width: f32) 
 }
 
 fn softkey_enabled(ui: &mut Ui, theme: &LcarsTheme, label: &str, lit: bool, width: f32, enabled: bool) -> bool {
+    let resp = key_cap(ui, theme, label, lit, width, enabled);
+    enabled && resp.clicked()
+}
+
+/// A key cap that hands back its response, for keys with double and triple click
+/// modes. Three pips down the right edge in the shared click-mode colours
+/// (green single, orange double, purple triple) mark it as a multi-mode key. Issue 73.
+fn softkey_response(ui: &mut Ui, theme: &LcarsTheme, label: &str, lit: bool, width: f32, enabled: bool) -> egui::Response {
+    let resp = key_cap(ui, theme, label, lit, width, enabled);
+    if enabled {
+        let x = resp.rect.right() - 5.0;
+        let y = resp.rect.center().y;
+        for (k, mode) in [rustcars::Mode::Primary, rustcars::Mode::Alt1, rustcars::Mode::Alt2].into_iter().enumerate() {
+            ui.painter().circle_filled(Pos2::new(x, y + (k as f32 - 1.0) * 6.0), 2.0, mode.colors().border);
+        }
+    }
+    resp
+}
+
+fn key_cap(ui: &mut Ui, theme: &LcarsTheme, label: &str, lit: bool, width: f32, enabled: bool) -> egui::Response {
     // A key cap: centered label with padding on every side. The label steps
     // down in size before it is allowed to touch the edge of the cap.
     const PAD: f32 = 8.0;
@@ -3300,7 +5204,7 @@ fn softkey_enabled(ui: &mut Ui, theme: &LcarsTheme, label: &str, lit: bool, widt
     }
     let at = rect.center() - galley.size() * 0.5;
     painter.galley(at, galley, ink);
-    enabled && resp.clicked()
+    resp
 }
 
 /// Height of one key cap in the left key panel.
@@ -3311,18 +5215,34 @@ fn paint_chart(
     view: View,
     samples: Option<&[Sample]>,
     memory: Option<&[Sample]>,
-    diff: bool,
+    math: Option<&[Sample]>,
     z0: f64,
     velocity: f64,
     admittance: bool,
     label_px: f32,
     markers: &[(usize, usize)],
-) -> (Option<usize>, Option<String>) {
+    info: &[(String, Color32)],
+    manual: Option<display::ManualScale>,
+    overlay: &Overlay,
+    extra: &[(Vec<f64>, Color32)],
+) -> (Option<(usize, u8)>, Option<String>, ScaleGesture) {
+    // S21 polar draws the S21 points through the S11 polar painter.
+    let as_s11 = |s: &[Sample]| -> Vec<Sample> { s.iter().map(|x| Sample { s11: x.s21, ..*x }).collect() };
+    let (mapped, mapped_mem);
+    // The admittance Smith format is the Smith painter with its Y grid.
+    let (view, admittance) = if view == View::SmithY { (View::Smith, true) } else { (view, admittance) };
+    let (view, samples, memory) = if view == View::PolarS21 {
+        mapped = samples.map(as_s11);
+        mapped_mem = memory.map(as_s11);
+        (View::Polar, mapped.as_deref(), mapped_mem.as_deref())
+    } else {
+        (view, samples, memory)
+    };
     let size = vec2(
         ui.available_width().max(240.0),
         ui.available_height().max(160.0),
     );
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
     let painter = ui.painter_at(rect);
     if view != View::Smith {
         painter.rect_filled(rect, 0.0, PANE_BG);
@@ -3340,14 +5260,29 @@ fn paint_chart(
             label_px,
         ),
         View::Polar => {
-            paint_polar(&painter, plot);
+            paint_polar(&painter, plot, label_px);
             if let Some(samples) = samples {
                 stroke_polar(&painter, plot, samples, palette::TAN);
             }
             if let Some(memory) = memory {
                 stroke_polar(&painter, plot, memory, palette::TEAL);
             }
-            None
+            // Constant-|Γ| circle through the pointer and its readout. Issue 52.
+            let center = plot.center();
+            let radius = plot.width().min(plot.height()) * 0.45;
+            resp.hover_pos().and_then(|p| {
+                let re = ((p.x - center.x) / radius) as f64;
+                let im = (-(p.y - center.y) / radius) as f64;
+                let r = polar_readout(re, im)?;
+                painter.circle_stroke(center, radius * r.mag as f32, Stroke::new(1.0, palette::TAN));
+                Some(format!(
+                    "|Γ| {:.3}  ∠ {:.1}°  SWR {}  RL {} dB",
+                    r.mag,
+                    r.angle_deg,
+                    if r.swr.is_finite() { format!("{:.2}", r.swr) } else { "INF".into() },
+                    if r.rl_db.is_finite() { format!("{:.2}", r.rl_db) } else { "INF".into() },
+                ))
+            })
         }
         _ => {
             let (xs, ys) = samples
@@ -3359,26 +5294,33 @@ fn paint_chart(
             let (mx, my) = memory
                 .map(|memory| series(view, memory, z0, velocity))
                 .unwrap_or_default();
-            let delta: Vec<f64> = if diff && my.len() == ys.len() {
-                ys.iter().zip(&my).map(|(a, b)| a - b).collect()
+            let delta: Vec<f64> = math.map(|m| series(view, m, z0, velocity).1).unwrap_or_default();
+            // A memory on another grid is resampled onto the trace's frequencies.
+            let my: Vec<f64> = if !my.is_empty() && mx != xs {
+                traces::resample(&mx, &my, &xs)
             } else {
-                Vec::new()
+                my
             };
             let mut traces: Vec<(&[f64], Color32)> = vec![(&ys, TRACE1)];
             if !second.is_empty() {
                 traces.push((&second, TRACE2));
             }
-            if my.len() == ys.len() && mx.len() == xs.len() && !my.is_empty() {
-                traces.push((&my, palette::TEAL));
+            if my.len() == ys.len() && !my.is_empty() {
+                traces.push((&my, MEM_COLOR));
             }
-            if !delta.is_empty() {
+            if delta.len() == ys.len() && !delta.is_empty() {
                 traces.push((&delta, palette::BRICK));
             }
-            paint_cartesian(&painter, rect, view, &xs, &traces, markers, label_px);
+            for (e, c) in extra {
+                if e.len() == ys.len() {
+                    traces.push((e, *c));
+                }
+            }
+            paint_cartesian(&painter, rect, view, &xs, &traces, markers, label_px, manual, overlay);
             None
         }
     };
-    if matches!(view, View::Smith | View::Polar) {
+    if is_disk(view) {
         if let Some(samples) = samples {
             let (center, radius) = if view == View::Smith {
                 let disk = smith_disk(rect);
@@ -3404,15 +5346,152 @@ fn paint_chart(
             }
         }
     }
-    let clicked = if resp.clicked() {
-        samples.and_then(|samples| hit(view, rect, samples, resp.interact_pointer_pos()?))
+    paint_marker_info(&painter, rect, info, label_px);
+    // single = active marker, double = next marker, triple = R. A drag on a
+    // Cartesian pane moves the active marker along the trace.
+    // Reference triangle drag and mouse wheel over the value axis. Issue 69.
+    let mut gesture = ScaleGesture::default();
+    let cart = !is_disk(view);
+    let plot_c = cart_plot(rect);
+    let grab_id = resp.id.with("ref-grab");
+    if cart && resp.drag_started() {
+        let near = resp
+            .interact_pointer_pos()
+            .is_some_and(|p| p.x >= plot_c.right() - 4.0 && p.x <= rect.right());
+        ui.data_mut(|d| d.insert_temp(grab_id, near));
+    }
+    let grabbing = cart && resp.dragged() && ui.data(|d| d.get_temp::<bool>(grab_id)).unwrap_or(false);
+    if grabbing && plot_c.height() > 0.0 {
+        gesture.ref_divs = -resp.drag_delta().y / plot_c.height() * 10.0;
+    }
+    if cart {
+        if let Some(p) = resp.hover_pos() {
+            if p.x < plot_c.left() {
+                let dy: f32 = ui.input(|i| {
+                    i.raw
+                        .events
+                        .iter()
+                        .map(|e| match e {
+                            egui::Event::MouseWheel { delta, .. } => delta.y,
+                            _ => 0.0,
+                        })
+                        .sum()
+                });
+                if dy > 0.0 {
+                    gesture.wheel = -1;
+                } else if dy < 0.0 {
+                    gesture.wheel = 1;
+                }
+            }
+        }
+    }
+    let clicks = if grabbing {
+        None
+    } else if resp.triple_clicked() {
+        Some(3)
+    } else if resp.double_clicked() {
+        Some(2)
+    } else if resp.clicked() || (resp.dragged() && !is_disk(view)) {
+        Some(1)
     } else {
         None
+    };
+    let clicked = clicks.and_then(|n| {
+        samples
+            .and_then(|samples| hit(view, rect, samples, resp.interact_pointer_pos()?))
+            .map(|i| (i, n))
+    });
+    // Cursor readout on Cartesian panes: SWR, RL, R and X under the pointer. Issue 53.
+    let hover = match (hover, samples, resp.hover_pos()) {
+        (None, Some(samples), Some(pos)) if !is_disk(view) && view != View::Tdr => {
+            hit(view, rect, samples, pos).and_then(|i| samples.get(i)).map(|s| {
+                let d = rf::derive(s, z0);
+                format!(
+                    "{}  SWR {}  RL {} dB  R {} Ω  X {} Ω",
+                    display::fmt_hz(s.hz),
+                    num(rf::swr(s.s11)),
+                    num(rf::return_loss_db(s.s11)),
+                    num(d.r),
+                    num(d.x)
+                )
+            })
+        }
+        (h, _, _) => h,
     };
     if let Some(text) = &hover {
         resp.on_hover_text(text);
     }
-    (clicked, hover)
+    (clicked, hover, gesture)
+}
+
+/// Band edges and limit lines drawn over a Cartesian pane. Issues 53 and 71.
+#[derive(Default)]
+struct Overlay {
+    edges: Vec<f64>,
+    limits: Vec<limits::Segment>,
+    verdict: Option<limits::Verdict>,
+}
+
+/// What the operator did to the scale on the pane this frame. Issue 69.
+#[derive(Clone, Copy, Default)]
+struct ScaleGesture {
+    /// Divisions the reference triangle was dragged up (positive) or down.
+    ref_divs: f32,
+    /// +1 coarser, -1 finer per division, from the wheel over the value axis.
+    wheel: i32,
+}
+
+/// Stable id of a format for the layout: "S11 SMITH", "S21 DB MAG". Issue 62.
+fn view_id(view: View) -> String {
+    let (param, format, _) = view_meta(view);
+    format!("{param} {format}")
+}
+
+fn view_from_id(id: &str) -> Option<View> {
+    VIEWS.iter().map(|(v, _)| *v).find(|v| view_id(*v) == id)
+}
+
+/// Key under which a trace format's manual scale is saved.
+fn scale_key(view: View) -> &'static str {
+    view_meta(view).1
+}
+
+/// The marker list in the top right of a pane, each line in its marker colour.
+fn paint_marker_info(painter: &egui::Painter, rect: Rect, info: &[(String, Color32)], label_px: f32) {
+    if info.is_empty() {
+        return;
+    }
+    let font = egui::FontId::monospace((label_px * 0.75).max(10.0));
+    let line_h = font.size + 3.0;
+    let galleys: Vec<_> = info
+        .iter()
+        .map(|(text, color)| painter.layout_no_wrap(text.clone(), font.clone(), *color))
+        .collect();
+    let w = galleys.iter().map(|g| g.size().x).fold(0.0, f32::max) + 12.0;
+    let h = line_h * galleys.len() as f32 + 8.0;
+    let boxr = Rect::from_min_size(Pos2::new(rect.right() - w - 20.0, rect.top() + 12.0), vec2(w, h));
+    painter.rect_filled(boxr, 3.0, Color32::from_rgba_unmultiplied(0, 0, 0, 200));
+    painter.rect_stroke(boxr, 3.0, Stroke::new(1.0, GRID), egui::StrokeKind::Inside);
+    for (i, g) in galleys.into_iter().enumerate() {
+        let color = info[i].1;
+        painter.galley(Pos2::new(boxr.left() + 6.0, boxr.top() + 4.0 + line_h * i as f32), g, color);
+    }
+}
+
+/// Off → D−M → D/M → off. Issue 70.
+fn next_math(m: traces::Math) -> traces::Math {
+    match m {
+        traces::Math::Off => traces::Math::Sub,
+        traces::Math::Sub => traces::Math::Div,
+        traces::Math::Div => traces::Math::Off,
+    }
+}
+
+/// "14.2" or "14.2 MHz" as Hz. Issue 66.
+fn parse_marker_mhz(text: &str) -> Option<f64> {
+    let t = text.trim().trim_end_matches("MHz").trim_end_matches("mhz").trim();
+    let mhz: f64 = t.parse().ok()?;
+    (mhz.is_finite() && mhz > 0.0).then_some(mhz * 1e6)
 }
 
 /// The two jacks, labeled the way the V2 marks them: S11 and S21.
@@ -3887,7 +5966,31 @@ fn stroke_run(painter: &egui::Painter, run: &mut Vec<Pos2>, color: Color32) {
     }
 }
 
-fn paint_polar(painter: &egui::Painter, plot: Rect) {
+/// Magnitude, angle, SWR and return loss of a point on the polar plot. Issue 52.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PolarReading {
+    mag: f64,
+    angle_deg: f64,
+    swr: f64,
+    rl_db: f64,
+}
+
+/// None outside the unit circle, where a passive load cannot be.
+fn polar_readout(re: f64, im: f64) -> Option<PolarReading> {
+    let mag = re.hypot(im);
+    if !(mag <= 1.0) {
+        return None;
+    }
+    let g = Cx::new(re, im);
+    Some(PolarReading { mag, angle_deg: im.atan2(re).to_degrees(), swr: rf::swr(g), rl_db: rf::return_loss_db(g) })
+}
+
+/// |Γ| for an SWR ring.
+fn gamma_for_swr(swr: f64) -> f64 {
+    (swr - 1.0) / (swr + 1.0)
+}
+
+fn paint_polar(painter: &egui::Painter, plot: Rect, label_px: f32) {
     let center = plot.center();
     let radius = plot.width().min(plot.height()) * 0.45;
     let ring = Stroke::new(1.0, Color32::from_rgb(70, 84, 102));
@@ -3896,9 +5999,30 @@ fn paint_polar(painter: &egui::Painter, plot: Rect) {
         [Pos2::new(center.x - radius, center.y), Pos2::new(center.x + radius, center.y)],
         ring,
     );
-    for swr in [1.5_f32, 2.0, 3.0] {
-        let gamma = (swr - 1.0) / (swr + 1.0);
+    painter.line_segment(
+        [Pos2::new(center.x, center.y - radius), Pos2::new(center.x, center.y + radius)],
+        ring,
+    );
+    let font = egui::FontId::monospace((label_px * 0.7).max(9.0));
+    for swr in [1.5_f64, 2.0, 3.0] {
+        let gamma = gamma_for_swr(swr) as f32;
         painter.circle_stroke(center, radius * gamma, ring);
+        painter.text(
+            Pos2::new(center.x + radius * gamma * 0.707 + 2.0, center.y - radius * gamma * 0.707),
+            egui::Align2::LEFT_BOTTOM,
+            format!("SWR {swr}"),
+            font.clone(),
+            palette::TEXT_MUTED,
+        );
+    }
+    for (text, at, align) in [
+        ("0°", Pos2::new(center.x + radius + 4.0, center.y), egui::Align2::LEFT_CENTER),
+        ("180°", Pos2::new(center.x - radius - 4.0, center.y), egui::Align2::RIGHT_CENTER),
+        ("+90°", Pos2::new(center.x, center.y - radius - 2.0), egui::Align2::CENTER_BOTTOM),
+        ("−90°", Pos2::new(center.x, center.y + radius + 2.0), egui::Align2::CENTER_TOP),
+        ("|Γ| = 1", Pos2::new(center.x - radius * 0.707 - 2.0, center.y - radius * 0.707), egui::Align2::RIGHT_BOTTOM),
+    ] {
+        painter.text(at, align, text, font.clone(), palette::TEXT_MUTED);
     }
 }
 
@@ -3972,6 +6096,140 @@ mod tests {
     use std::fs;
 
     #[test]
+    fn the_polar_readout_gives_magnitude_angle_swr_and_return_loss() {
+        let r = polar_readout(0.0, 0.5).unwrap();
+        assert!((r.mag - 0.5).abs() < 1e-12 && (r.angle_deg - 90.0).abs() < 1e-9);
+        assert!((r.swr - 3.0).abs() < 1e-9);
+        assert!((r.rl_db - 6.0206).abs() < 1e-3);
+        assert!(polar_readout(0.9, 0.9).is_none());
+        assert!((gamma_for_swr(2.0) - 1.0 / 3.0).abs() < 1e-12);
+        assert!((gamma_for_swr(1.5) - 0.2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn formats_are_offered_only_for_their_parameter_with_units() {
+        for (view, _) in VIEWS {
+            let (param, _, unit) = view_meta(view);
+            assert_eq!(param == "S21", uses_s21(view));
+            assert!(!unit.is_empty());
+        }
+        // SWR and impedance formats exist for S11 only.
+        for v in [View::Swr, View::Impedance, View::Zabs, View::Smith, View::Tdr] {
+            assert!(!uses_s21(v));
+        }
+        for v in [View::S21, View::Phase, View::Unwrap, View::GroupDelay, View::PolarS21, View::ReImS21] {
+            assert!(uses_s21(v));
+        }
+        assert_eq!(view_meta(View::Zabs).2, "Ω");
+        assert_eq!(view_meta(View::GroupDelay).2, "ns");
+        assert_eq!(view_meta(View::ReturnLoss).2, "dB");
+        // 100 + j50 on 50 Ω: |Z| 111.8 Ω and SWR 2.62.
+        let z = Cx::new(100.0, 50.0);
+        let g = z.sub(Cx::new(50.0, 0.0)).div(z.add(Cx::new(50.0, 0.0))).unwrap();
+        let s = Sample { hz: 1e6, s11: g, s21: Cx::new(0.0, 1.0) };
+        let (_, ys) = series(View::Zabs, &[s], 50.0, 0.66);
+        assert!((ys[0] - 111.803).abs() < 1e-3);
+        let (_, swr) = series(View::Swr, &[s], 50.0, 0.66);
+        assert!((swr[0] - 2.618).abs() < 1e-3);
+        let (_, ph) = series(View::Phase, &[s], 50.0, 0.66);
+        assert!((ph[0] - 90.0).abs() < 1e-9);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_vanished_device_node_reads_as_unplugged() {
+        assert!(device::unplugged("/dev/hamspot-no-such-nanovna"));
+        assert!(!device::unplugged("/dev/null"));
+        assert!(!device::unplugged(""));
+        assert!(!device::unplugged("COM3"));
+    }
+
+    /// WCAG 1.4.3 / 1.4.11: text 4.5:1, trace lines and marker glyphs 3:1. Issue 73.
+    #[test]
+    fn vna_colours_meet_wcag_contrast() {
+        use a11y::contrast;
+        let text = [("TEXT", palette::TEXT), ("TEXT_MUTED", palette::TEXT_MUTED), ("MATH_TEXT", MATH_TEXT), ("LOST_TEXT", LOST_TEXT)];
+        for bg in [PANE_BG, palette::STRIP] {
+            for (name, c) in text {
+                assert!(contrast(c, bg) >= 4.5, "{name} {:.2}", contrast(c, bg));
+            }
+        }
+        // Marker labels are text on the pane.
+        for (i, c) in MARKER_COLORS.iter().enumerate() {
+            assert!(contrast(*c, PANE_BG) >= 4.5, "marker {i} {:.2}", contrast(*c, PANE_BG));
+        }
+        let lines = TRACE_COLORS.iter().copied().chain([MEM_COLOR, IDEAL_COLOR, GRID]);
+        for c in lines {
+            assert!(contrast(c, PANE_BG) >= 3.0, "{c:?} {:.2}", contrast(c, PANE_BG));
+        }
+    }
+
+    #[test]
+    fn calibration_dates_round_trip_old_sets_load_and_format() {
+        let mut set = one_standard();
+        assert!(set.saved_at.is_none());
+        let old = serde_json::to_string(&set).unwrap();
+        assert!(!old.contains("saved_at"), "no field written when there is no date");
+        let back: CalSet = serde_json::from_str(&old).unwrap();
+        assert_eq!(back.saved_at, None);
+        assert_eq!(cal_date_text(None), "no date");
+        set.saved_at = Some("2026-10-25T22:40:17Z".into());
+        let back: CalSet = serde_json::from_str(&serde_json::to_string(&set).unwrap()).unwrap();
+        assert_eq!(back, set);
+        assert_eq!(cal_date_text(back.saved_at.as_deref()), "2026-10-25T22:40Z");
+        assert_eq!(cal_date_text(Some("2026-10-25T18:40:00-04:00")), "2026-10-25T22:40Z");
+        let now = cal_stamp_now();
+        assert!(chrono::DateTime::parse_from_rfc3339(&now).is_ok() && now.ends_with('Z'), "{now}");
+    }
+
+    #[test]
+    fn every_format_has_a_unique_layout_id_and_the_default_panes_resolve() {
+        let ids: Vec<String> = VIEWS.iter().map(|(v, _)| view_id(*v)).collect();
+        for (i, id) in ids.iter().enumerate() {
+            assert!(!ids[..i].contains(id), "duplicate {id}");
+            assert!(view_from_id(id) == Some(VIEWS[i].0));
+        }
+        let four = layout::Layout::default_four();
+        let views: Vec<View> = four.traces.iter().map(|t| view_from_id(&t.view).expect(&t.view)).collect();
+        assert_eq!(views, vec![View::ReturnLoss, View::S21, View::Smith, View::GroupDelay]);
+        let mut face = Face::default();
+        face.layout = four;
+        let back: Face = serde_json::from_str(&serde_json::to_string(&face).unwrap()).unwrap();
+        assert_eq!(back.layout, face.layout);
+    }
+
+    #[test]
+    fn an_older_nanovna_section_loads_with_every_new_field_defaulted() {
+        let old = r#"{"port":"/dev/ttyACM0","start_hz":1000000.0,"stop_hz":30000000.0,"points":201}"#;
+        let face: Face = serde_json::from_str(old).unwrap();
+        assert!(face.scales.is_empty() && face.limits.is_empty());
+        assert_eq!(face.gd_aperture, 4);
+        assert!(validate(&face).is_ok());
+        // A default face writes nothing new, so files without VNA settings stay unchanged.
+        assert_eq!(serde_json::to_string(&Face::default().for_station()).unwrap(), "{}");
+        let set: CalSet = serde_json::from_str(
+            r#"{"id":"a","start_hz":1.0,"step_hz":1.0,"z0":50.0,"open":[],"short":[],"load":[]}"#,
+        )
+        .unwrap();
+        assert!(set.name.is_empty());
+    }
+
+    #[test]
+    fn a_manual_scale_is_saved_per_trace_format() {
+        let mut face = Face::default();
+        face.scales.insert(
+            scale_key(View::ReturnLoss).into(),
+            display::ManualScale { ref_value: 0.0, ref_pos: 10.0, per_div: 5.0 },
+        );
+        let text = serde_json::to_string(&face).unwrap();
+        assert!(text.contains("RETURN LOSS"));
+        let back: Face = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, face);
+        assert!(back.scales.get(scale_key(View::Swr)).is_none());
+        assert!(!serde_json::to_string(&Face::default()).unwrap().contains("scales"));
+    }
+
+    #[test]
     fn a_default_face_is_the_one_the_station_file_omits() {
         assert!(Face::default().is_default());
         assert!(validate(&Face::default()).is_ok());
@@ -3984,6 +6242,7 @@ mod tests {
             id: "abc".into(),
             zone: String::new(),
             band: String::new(),
+            name: String::new(),
             start_hz: 1e6,
             step_hz: 1e6,
             z0: 50.0,
@@ -3992,6 +6251,7 @@ mod tests {
             load: vec![[0.0, 0.0], [0.0, 0.0]],
             thru: Vec::new(),
             isolation: Vec::new(),
+            saved_at: None,
         });
         assert!(validate(&face).is_err());
     }
@@ -4001,6 +6261,7 @@ mod tests {
             id: "abc".into(),
             zone: String::new(),
             band: String::new(),
+            name: String::new(),
             start_hz: 1e6,
             step_hz: 1e6,
             z0: 50.0,
@@ -4009,6 +6270,7 @@ mod tests {
             load: Vec::new(),
             thru: Vec::new(),
             isolation: Vec::new(),
+            saved_at: None,
         }
     }
 

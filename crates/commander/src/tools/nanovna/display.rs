@@ -78,6 +78,56 @@ pub fn auto_scale(values: &[f64], divs: u32) -> Scale {
     }
 }
 
+/// A fixed, operator-set scale for one trace format. Issue 69.
+/// `ref_pos` counts divisions up from the bottom graticule line, like the
+/// R&S reference position; the reference value sits on that line.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ManualScale {
+    pub ref_value: f64,
+    pub ref_pos: f64,
+    pub per_div: f64,
+}
+
+impl ManualScale {
+    pub fn to_scale(&self, divs: u32) -> Scale {
+        let per_div = if self.per_div.is_finite() && self.per_div > 0.0 { self.per_div } else { 1.0 };
+        let pos = self.ref_pos.clamp(0.0, divs as f64);
+        Scale { top: self.ref_value + (divs as f64 - pos) * per_div, per_div, divs }
+    }
+
+    /// Freeze what auto-scale shows, keeping `ref_value` on its line.
+    pub fn from_scale(scale: &Scale, ref_value: f64) -> Self {
+        let pos = scale.divs as f64 - (scale.top - ref_value) / scale.per_div;
+        Self { ref_value, ref_pos: pos.clamp(0.0, scale.divs as f64), per_div: scale.per_div }
+    }
+
+    /// Move the reference line (and the trace with it) by `divs` divisions.
+    pub fn shifted(self, by_divs: f64, divs: u32) -> Self {
+        Self { ref_pos: (self.ref_pos + by_divs).clamp(0.0, divs as f64), ..self }
+    }
+
+    /// One 1-2-5 step coarser (`up`) or finer per division.
+    pub fn stepped(self, up: bool) -> Self {
+        let per_div = if up {
+            nice_step(self.per_div * 1.000_001)
+        } else {
+            // The largest 1-2-5 value below the current one.
+            let mut s = nice_step(self.per_div / 2.6);
+            while nice_step(s * 1.000_001) < self.per_div * 0.999_999 {
+                s = nice_step(s * 1.000_001);
+            }
+            s
+        };
+        Self { per_div, ..self }
+    }
+}
+
+/// The value the reference triangle marks when auto-scale chose the scale:
+/// zero when the grid spans it, otherwise the top line.
+pub fn auto_ref(scale: &Scale) -> f64 {
+    if scale.top >= 0.0 && scale.bottom() <= 0.0 { 0.0 } else { scale.top }
+}
+
 /// Evenly spaced 1-2-5 ticks inside `lo..=hi`, about `want` of them.
 pub fn ticks(lo: f64, hi: f64, want: usize) -> Vec<f64> {
     if !(lo.is_finite() && hi.is_finite() && hi > lo) || want == 0 {
@@ -208,6 +258,34 @@ mod tests {
         assert_eq!(s.lines().len(), 11);
         assert!((s.fraction(s.top)).abs() < 1e-12);
         assert!((s.fraction(s.bottom()) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_manual_scale_holds_its_reference_and_steps() {
+        let m = ManualScale { ref_value: 0.0, ref_pos: 10.0, per_div: 10.0 };
+        let s = m.to_scale(10);
+        assert_eq!((s.top, s.bottom()), (0.0, -100.0));
+        let moved = m.shifted(-5.0, 10).to_scale(10);
+        assert_eq!((moved.top, moved.bottom()), (50.0, -50.0));
+        assert!((moved.fraction(0.0) - 0.5).abs() < 1e-12);
+        assert_eq!(m.shifted(-50.0, 10).ref_pos, 0.0);
+        assert_eq!(m.stepped(true).per_div, 20.0);
+        assert_eq!(m.stepped(false).per_div, 5.0);
+        assert_eq!(ManualScale { per_div: 2.0, ..m }.stepped(false).per_div, 1.0);
+        let auto = auto_scale(&[-31.0, -3.0], 10);
+        let frozen = ManualScale::from_scale(&auto, auto_ref(&auto));
+        assert_eq!(frozen.to_scale(10), auto);
+    }
+
+    #[test]
+    fn auto_scale_fits_every_point_inside_the_grid() {
+        for data in [vec![-42.0, -0.3, -17.0], vec![1.02, 9.7], vec![1e-9, 3e-9], vec![-180.0, 179.0]] {
+            let s = auto_scale(&data, 10);
+            for v in &data {
+                let f = s.fraction(*v);
+                assert!((0.0..=1.0).contains(&f), "{v} outside {s:?}");
+            }
+        }
     }
 
     #[test]
