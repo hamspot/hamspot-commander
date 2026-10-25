@@ -38,9 +38,18 @@ enum View {
     Tdr,
     LinMag,
     ReIm,
+    /// |Z| from S11. Issue 64.
+    Zabs,
+    PhaseS11,
+    UnwrapS11,
+    PolarS21,
+    ReImS21,
+    LinMagS21,
 }
 
-const VIEWS: [(View, &str); 12] = [
+/// Every format with its key label. FORMAT shows the ones valid for the
+/// selected parameter (S11 or S21). Issue 64.
+const VIEWS: [(View, &str); 18] = [
     (View::Smith, "Smith"),
     (View::Polar, "Polar"),
     (View::Swr, "SWR"),
@@ -48,12 +57,41 @@ const VIEWS: [(View, &str); 12] = [
     (View::LinMag, "Lin mag"),
     (View::ReIm, "Real + imag"),
     (View::Impedance, "R + X"),
-    (View::S21, "S21 dB"),
+    (View::Zabs, "|Z|"),
+    (View::PhaseS11, "Phase"),
+    (View::UnwrapS11, "Unwrap"),
+    (View::Tdr, "TDR"),
+    (View::S21, "dB mag"),
     (View::Phase, "Phase"),
     (View::Unwrap, "Unwrap"),
     (View::GroupDelay, "Group delay"),
-    (View::Tdr, "TDR"),
+    (View::PolarS21, "Polar"),
+    (View::ReImS21, "Real + imag"),
+    (View::LinMagS21, "Lin mag"),
 ];
+
+/// True when the format reads S21; the rest read S11.
+fn uses_s21(view: View) -> bool {
+    matches!(
+        view,
+        View::S21 | View::Phase | View::Unwrap | View::GroupDelay | View::PolarS21 | View::ReImS21 | View::LinMagS21
+    )
+}
+
+/// Polar and Smith draw on a disk, not a Cartesian grid.
+fn is_disk(view: View) -> bool {
+    matches!(view, View::Smith | View::Polar | View::PolarS21)
+}
+
+/// The parameter a format reads from one sample.
+fn param_of(view: View, sample: &Sample) -> Cx {
+    if uses_s21(view) { sample.s21 } else { sample.s11 }
+}
+
+thread_local! {
+    /// Group-delay aperture in points, set from the face each frame. Issue 64.
+    static GD_APERTURE: std::cell::Cell<usize> = const { std::cell::Cell::new(4) };
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Standard {
@@ -160,6 +198,16 @@ pub struct Face {
     /// Manual scales by trace format key. A format with no entry auto-scales. Issue 69.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub scales: std::collections::BTreeMap<String, display::ManualScale>,
+    /// Group-delay aperture in points. Issue 64.
+    #[serde(default = "default_aperture", skip_serializing_if = "is_default_aperture")]
+    pub gd_aperture: u32,
+}
+
+fn default_aperture() -> u32 {
+    4
+}
+fn is_default_aperture(v: &u32) -> bool {
+    *v == 4
 }
 
 fn default_start() -> f64 {
@@ -216,6 +264,7 @@ impl Default for Face {
             smooth: 1,
             cals: Vec::new(),
             scales: std::collections::BTreeMap::new(),
+            gd_aperture: 4,
         }
     }
 }
@@ -793,6 +842,7 @@ impl NanoVna {
     pub fn draw(&mut self, ui: &mut Ui) {
         let theme = LcarsTheme::default();
         let live = self.session.snapshot();
+        GD_APERTURE.with(|a| a.set(self.face.gd_aperture.clamp(2, 200) as usize));
         if live.generation != self.seen && !live.sweep.is_empty() {
             self.ingest(&live.sweep);
             self.seen = live.generation;
@@ -1258,7 +1308,7 @@ impl NanoVna {
 
     /// The scale the Cartesian pane uses: (scale, reference value, manual). Issue 69.
     fn shown_scale(&self, samples: Option<&[Sample]>) -> Option<(display::Scale, f64, bool)> {
-        if matches!(self.view, View::Smith | View::Polar) {
+        if is_disk(self.view) {
             return None;
         }
         if let Some(m) = self.face.scales.get(scale_key(self.view)) {
@@ -1336,7 +1386,7 @@ impl NanoVna {
         }
         let (_, _, unit) = view_meta(view);
         match view {
-            View::GroupDelay | View::Unwrap => {
+            View::GroupDelay | View::Unwrap | View::UnwrapS11 => {
                 let owned;
                 let ys = match ys {
                     Some(ys) => ys,
@@ -1627,13 +1677,48 @@ impl NanoVna {
         }
 
         key_caption(ui, theme, "FORMAT", width);
-        for triple in VIEWS.chunks(3) {
+        // Parameter first; only the formats valid for it are offered. Issue 64.
+        let s21 = uses_s21(self.view);
+        let mut pick_param = None;
+        ui.horizontal(|ui| {
+            if softkey(ui, theme, "S11", !s21, col4) {
+                pick_param = Some(false);
+            }
+            if softkey(ui, theme, "S21", s21, col4) {
+                pick_param = Some(true);
+            }
+        });
+        if let Some(want) = pick_param {
+            if want != s21 {
+                self.view = if want { View::S21 } else { View::Smith };
+            }
+        }
+        let valid: Vec<(View, &str)> = VIEWS.iter().copied().filter(|(v, _)| uses_s21(*v) == uses_s21(self.view)).collect();
+        for triple in valid.chunks(3) {
             ui.horizontal(|ui| {
                 for (view, label) in triple {
                     if softkey(ui, theme, label, self.view == *view, col3) {
                         self.view = *view;
                     }
                 }
+            });
+        }
+        if self.view == View::GroupDelay {
+            ui.horizontal(|ui| {
+                let ap = self.face.gd_aperture;
+                if softkey_enabled(ui, theme, "Apert ▼", false, col4, ap > 2) {
+                    self.face.gd_aperture = ap.saturating_sub(2).max(2);
+                    self.dirty = true;
+                }
+                if softkey_enabled(ui, theme, "Apert ▲", false, col4, ap < 200) {
+                    self.face.gd_aperture = (ap + 2).min(200);
+                    self.dirty = true;
+                }
+                ui.label(
+                    egui::RichText::new(format!("APERTURE {} PTS", self.face.gd_aperture))
+                        .size(theme.data_size * 0.8)
+                        .color(palette::TEXT_MUTED),
+                );
             });
         }
 
@@ -1659,7 +1744,7 @@ impl NanoVna {
         });
 
         key_caption(ui, theme, "SCALE", width);
-        let cart = !matches!(self.view, View::Smith | View::Polar);
+        let cart = !is_disk(self.view);
         let shown = self.shown_scale(samples);
         let manual = shown.is_some_and(|s| s.2);
         let mut scale_op: Option<u8> = None;
@@ -3478,12 +3563,16 @@ fn series(view: View, samples: &[Sample], z0: f64, velocity: f64) -> (Vec<f64>, 
             samples.iter().map(|s| s.hz).collect(),
             samples.iter().map(|s| rf::db(s.s21)).collect(),
         ),
-        View::Phase => (
+        View::Phase | View::PhaseS11 => (
             samples.iter().map(|s| s.hz).collect(),
-            samples.iter().map(|s| s.s21.arg().to_degrees()).collect(),
+            samples.iter().map(|s| param_of(view, s).arg().to_degrees()).collect(),
         ),
-        View::Unwrap => {
-            let phase = rf::unwrap_phase(&samples.iter().map(|s| s.s21).collect::<Vec<_>>());
+        View::Zabs => (
+            samples.iter().map(|s| s.hz).collect(),
+            samples.iter().map(|s| rf::derive(s, z0).z_abs).collect(),
+        ),
+        View::Unwrap | View::UnwrapS11 => {
+            let phase = rf::unwrap_phase(&samples.iter().map(|s| param_of(view, s)).collect::<Vec<_>>());
             (
                 samples.iter().map(|s| s.hz).collect(),
                 phase.into_iter().map(|rad| rad.to_degrees()).collect(),
@@ -3492,7 +3581,7 @@ fn series(view: View, samples: &[Sample], z0: f64, velocity: f64) -> (Vec<f64>, 
         View::GroupDelay => {
             let phase = rf::unwrap_phase(&samples.iter().map(|s| s.s21).collect::<Vec<_>>());
             let hz: Vec<f64> = samples.iter().map(|s| s.hz).collect();
-            let delay = rf::group_delay(&hz, &phase);
+            let delay = rf::group_delay_aperture(&hz, &phase, GD_APERTURE.with(|a| a.get()));
             (hz, delay.into_iter().map(|s| s * 1e9).collect())
         }
         View::Tdr => {
@@ -3505,17 +3594,17 @@ fn series(view: View, samples: &[Sample], z0: f64, velocity: f64) -> (Vec<f64>, 
                 (Vec::new(), Vec::new())
             }
         }
-        View::LinMag => (
+        View::LinMag | View::LinMagS21 => (
             samples.iter().map(|s| s.hz).collect(),
-            samples.iter().map(|s| s.s11.abs()).collect(),
+            samples.iter().map(|s| param_of(view, s).abs()).collect(),
         ),
-        View::ReIm => (
+        View::ReIm | View::ReImS21 => (
             samples.iter().map(|s| s.hz).collect(),
-            samples.iter().map(|s| s.s11.re).collect(),
+            samples.iter().map(|s| param_of(view, s).re).collect(),
         ),
-        View::Smith | View::Polar => (
+        View::Smith | View::Polar | View::PolarS21 => (
             samples.iter().map(|s| s.hz).collect(),
-            samples.iter().map(|s| s.s11.abs()).collect(),
+            samples.iter().map(|s| param_of(view, s).abs()).collect(),
         ),
     }
 }
@@ -3524,7 +3613,7 @@ fn series(view: View, samples: &[Sample], z0: f64, velocity: f64) -> (Vec<f64>, 
 fn second_series(view: View, samples: &[Sample], z0: f64) -> Vec<f64> {
     match view {
         View::Impedance => samples.iter().map(|s| rf::derive(s, z0).x).collect(),
-        View::ReIm => samples.iter().map(|s| s.s11.im).collect(),
+        View::ReIm | View::ReImS21 => samples.iter().map(|s| param_of(view, s).im).collect(),
         _ => Vec::new(),
     }
 }
@@ -3544,6 +3633,12 @@ fn view_meta(view: View) -> (&'static str, &'static str, &'static str) {
         View::Unwrap => ("S21", "UNWR PHASE", "°"),
         View::GroupDelay => ("S21", "DELAY", "ns"),
         View::Tdr => ("S11", "TDR", "U"),
+        View::Zabs => ("S11", "|Z|", "Ω"),
+        View::PhaseS11 => ("S11", "PHASE", "°"),
+        View::UnwrapS11 => ("S11", "UNWR PHASE", "°"),
+        View::PolarS21 => ("S21", "POLAR", "U"),
+        View::ReImS21 => ("S21", "REAL + IMAG", "U"),
+        View::LinMagS21 => ("S21", "LIN MAG", "U"),
     }
 }
 
@@ -3555,11 +3650,15 @@ fn marker_value(view: View, sample: &Sample, z0: f64) -> String {
             let d = rf::derive(sample, z0);
             format!("{} {:+}j Ω", num(d.r), num(d.x))
         }
-        View::Polar => format!(
+        View::Polar | View::PolarS21 => format!(
             "{} ∠ {}°",
-            fmt_g(sample.s11.abs()),
-            fmt_g(sample.s11.arg().to_degrees())
+            fmt_g(param_of(view, sample).abs()),
+            fmt_g(param_of(view, sample).arg().to_degrees())
         ),
+        View::Zabs => format!("{} Ω", num(rf::derive(sample, z0).z_abs)),
+        View::PhaseS11 => format!("{} °", num(sample.s11.arg().to_degrees())),
+        View::LinMagS21 => fmt_g(sample.s21.abs()),
+        View::ReImS21 => format!("{} {:+}j", fmt_g(sample.s21.re), fmt_g(sample.s21.im)),
         View::Swr => format!("{} : 1", num(rf::swr(sample.s11))),
         View::ReturnLoss => format!("{} dB", num(rf::return_loss_db(sample.s11))),
         View::LinMag => fmt_g(sample.s11.abs()),
@@ -3850,6 +3949,16 @@ fn paint_chart(
     info: &[(String, Color32)],
     manual: Option<display::ManualScale>,
 ) -> (Option<(usize, u8)>, Option<String>, ScaleGesture) {
+    // S21 polar draws the S21 points through the S11 polar painter.
+    let as_s11 = |s: &[Sample]| -> Vec<Sample> { s.iter().map(|x| Sample { s11: x.s21, ..*x }).collect() };
+    let (mapped, mapped_mem);
+    let (view, samples, memory) = if view == View::PolarS21 {
+        mapped = samples.map(as_s11);
+        mapped_mem = memory.map(as_s11);
+        (View::Polar, mapped.as_deref(), mapped_mem.as_deref())
+    } else {
+        (view, samples, memory)
+    };
     let size = vec2(
         ui.available_width().max(240.0),
         ui.available_height().max(160.0),
@@ -3910,7 +4019,7 @@ fn paint_chart(
             None
         }
     };
-    if matches!(view, View::Smith | View::Polar) {
+    if is_disk(view) {
         if let Some(samples) = samples {
             let (center, radius) = if view == View::Smith {
                 let disk = smith_disk(rect);
@@ -3941,7 +4050,7 @@ fn paint_chart(
     // Cartesian pane moves the active marker along the trace.
     // Reference triangle drag and mouse wheel over the value axis. Issue 69.
     let mut gesture = ScaleGesture::default();
-    let cart = !matches!(view, View::Smith | View::Polar);
+    let cart = !is_disk(view);
     let plot_c = cart_plot(rect);
     let grab_id = resp.id.with("ref-grab");
     if cart && resp.drag_started() {
@@ -3981,7 +4090,7 @@ fn paint_chart(
         Some(3)
     } else if resp.double_clicked() {
         Some(2)
-    } else if resp.clicked() || (resp.dragged() && !matches!(view, View::Smith | View::Polar)) {
+    } else if resp.clicked() || (resp.dragged() && !is_disk(view)) {
         Some(1)
     } else {
         None
@@ -4595,6 +4704,35 @@ fn nearest_gamma(samples: &[Sample], pos: Pos2, center: Pos2, radius: f32) -> Op
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn formats_are_offered_only_for_their_parameter_with_units() {
+        for (view, _) in VIEWS {
+            let (param, _, unit) = view_meta(view);
+            assert_eq!(param == "S21", uses_s21(view));
+            assert!(!unit.is_empty());
+        }
+        // SWR and impedance formats exist for S11 only.
+        for v in [View::Swr, View::Impedance, View::Zabs, View::Smith, View::Tdr] {
+            assert!(!uses_s21(v));
+        }
+        for v in [View::S21, View::Phase, View::Unwrap, View::GroupDelay, View::PolarS21, View::ReImS21] {
+            assert!(uses_s21(v));
+        }
+        assert_eq!(view_meta(View::Zabs).2, "Ω");
+        assert_eq!(view_meta(View::GroupDelay).2, "ns");
+        assert_eq!(view_meta(View::ReturnLoss).2, "dB");
+        // 100 + j50 on 50 Ω: |Z| 111.8 Ω and SWR 2.62.
+        let z = Cx::new(100.0, 50.0);
+        let g = z.sub(Cx::new(50.0, 0.0)).div(z.add(Cx::new(50.0, 0.0))).unwrap();
+        let s = Sample { hz: 1e6, s11: g, s21: Cx::new(0.0, 1.0) };
+        let (_, ys) = series(View::Zabs, &[s], 50.0, 0.66);
+        assert!((ys[0] - 111.803).abs() < 1e-3);
+        let (_, swr) = series(View::Swr, &[s], 50.0, 0.66);
+        assert!((swr[0] - 2.618).abs() < 1e-3);
+        let (_, ph) = series(View::Phase, &[s], 50.0, 0.66);
+        assert!((ph[0] - 90.0).abs() < 1e-9);
+    }
 
     #[cfg(unix)]
     #[test]
