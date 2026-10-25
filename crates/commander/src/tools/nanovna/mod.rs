@@ -6,6 +6,7 @@ mod display;
 mod markers;
 mod proto;
 mod rf;
+mod sweep;
 
 use std::collections::VecDeque;
 use std::fs;
@@ -607,6 +608,8 @@ pub struct NanoVna {
     dev_avg: String,
     view: View,
     run: bool,
+    /// Stop after the next sweep (SINGLE). Issue 68.
+    single: bool,
     run_state: Run,
     /// Marker frequencies in Hz: M1..M8 then R. Issue 66.
     markers: [Option<f64>; markers::SLOTS],
@@ -673,6 +676,7 @@ impl NanoVna {
             ports: Vec::new(),
             view: View::Smith,
             run: false,
+            single: false,
             run_state: Run::Idle,
             markers: [None; markers::SLOTS],
             marker_on: 0,
@@ -853,6 +857,10 @@ impl NanoVna {
             if self.setup_has_cal(live) {
                 if self.send_sweep() {
                     self.run_state = Run::Queued;
+                    if self.single {
+                        self.single = false;
+                        self.run = false;
+                    }
                 }
             } else {
                 self.run = false;
@@ -1400,13 +1408,17 @@ impl NanoVna {
         let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::hover());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, palette::STRIP);
-        let (start, stop, points) = match samples {
-            Some(s) if !s.is_empty() => (s[0].hz, s[s.len() - 1].hz, s.len()),
+        // The summary follows the SWEEP fields as they are edited; the
+        // shown sweep is used only when the fields do not parse. Issue 68.
+        let (start, stop, points) = match (self.parse_setup(), samples) {
+            (Ok((a, b, n)), _) => (a as f64, b as f64, n as usize),
+            (Err(_), Some(s)) if !s.is_empty() => (s[0].hz, s[s.len() - 1].hz, s.len()),
             _ => (self.face.start_hz, self.face.stop_hz, self.face.points as usize),
         };
         let avg = self.host_average_value().max(1);
+        let mode = if !self.run { "HOLD" } else if self.single { "SINGLE" } else { "CONT" };
         let mut left = format!(
-            "CH1  START {}  STOP {}  {} PTS  AVG {}",
+            "CH1  START {} · STOP {} · {} PTS · AVG {} · {mode}",
             display::fmt_hz(start),
             display::fmt_hz(stop),
             points,
@@ -1458,34 +1470,47 @@ impl NanoVna {
 
         key_caption(ui, theme, "SWEEP · CAL", width);
         let mut scan = false;
-        let mut toggle = false;
+        let mut mode: Option<u8> = None;
         let mut setup = false;
         ui.horizontal(|ui| {
-            scan = softkey(ui, theme, "Scan", false, col4 * 2.0 + 8.0);
-            let run_label = if self.run { "Stop" } else { "Run" };
-            toggle = softkey(ui, theme, run_label, self.run, col4);
-            setup = softkey(ui, theme, "Setup", self.setup_open, col4);
+            scan = softkey(ui, theme, "Scan", false, col4);
+            // RUN: single = continuous, double = single sweep, triple = hold.
+            let resp = softkey_response(ui, theme, "Run", self.run && !self.single, col4, true);
+            if resp.triple_clicked() {
+                mode = Some(2);
+            } else if resp.double_clicked() {
+                mode = Some(1);
+            } else if resp.clicked() {
+                mode = Some(0);
+            }
+            if softkey(ui, theme, "Hold", !self.run, col4) {
+                mode = Some(2);
+            }
+            if softkey(ui, theme, "Single", self.run && self.single, col4) {
+                mode = Some(1);
+            }
         });
         if scan {
             self.begin_scan(live);
         }
-        if toggle {
-            if self.run {
+        match mode {
+            Some(2) => {
                 self.run = false;
+                self.single = false;
                 self.run_state = Run::Idle;
-            } else if self.wizard.is_some() {
-                self.note = "Finish the calibration before Run.".into();
-            } else if self.setup_has_cal(live) {
-                self.sweep_zone = self.zone_name();
-                self.shown_scan = None;
-                self.shown_id.clear();
-                self.history.clear();
-                self.blank_until_sweep = true;
-                self.run = true;
-            } else {
-                self.begin_scan(live);
             }
+            Some(m) => {
+                if !self.run {
+                    self.start_run(live);
+                }
+                self.single = m == 1 && self.run;
+            }
+            None => {}
         }
+        self.sweep_panel(ui, theme, live, width, col4);
+        ui.horizontal(|ui| {
+            setup = softkey(ui, theme, "Setup", self.setup_open, col4);
+        });
         if setup {
             self.ports = device::list_ports();
             self.setup_open = true;
@@ -1648,6 +1673,166 @@ impl NanoVna {
         });
         if let Some(code) = search {
             self.marker_search(code, samples);
+        }
+    }
+
+    /// Start continuous sweeps, or ask for a zone scan when there is no calibration.
+    fn start_run(&mut self, live: &device::Live) {
+        if self.wizard.is_some() {
+            self.note = "Finish the calibration before Run.".into();
+        } else if self.setup_has_cal(live) {
+            self.sweep_zone = self.zone_name();
+            self.shown_scan = None;
+            self.shown_id.clear();
+            self.history.clear();
+            self.blank_until_sweep = true;
+            self.run = true;
+        } else {
+            self.begin_scan(live);
+        }
+    }
+
+    /// START, STOP, CENTER, SPAN, POINTS, AVG and band presets beside the
+    /// chart, so the Setup dialog is not needed for a sweep change. Issue 68.
+    fn sweep_panel(&mut self, ui: &mut Ui, theme: &LcarsTheme, live: &device::Live, width: f32, col4: f32) {
+        let max_hz = live.identity.map(|id| id.max_hz()).unwrap_or(3.0e9);
+        let floor = proto::FREQ_FLOOR_HZ as f64;
+        let start = parse_hz(&self.start).map(|v| v as f64).unwrap_or(self.face.start_hz);
+        let stop = parse_hz(&self.stop).map(|v| v as f64).unwrap_or(self.face.stop_hz);
+        let points: i64 = self.points.trim().parse().unwrap_or(self.face.points as i64);
+        let (center, span) = sweep::center_span(start, stop);
+        let field_w = col4 * 2.0 + 8.0;
+        let mut apply: Option<(f64, f64, i64)> = None;
+        let field = |ui: &mut Ui, label: &str, value: String| -> Option<String> {
+            let mut out = None;
+            ui.vertical(|ui| {
+                ui.label(egui::RichText::new(label).size(theme.data_size * 0.75).color(palette::TEXT_MUTED));
+                let id = egui::Id::unique(("vna-sweep", label));
+                let mut text = ui.data(|d| d.get_temp::<String>(id)).unwrap_or(value.clone());
+                let resp = ui.add_sized(
+                    vec2(field_w, KEY_H - 6.0),
+                    egui::TextEdit::singleline(&mut text).font(egui::TextStyle::Monospace).id(id.with("edit")),
+                );
+                if resp.has_focus() {
+                    ui.data_mut(|d| d.insert_temp(id, text.clone()));
+                } else {
+                    ui.data_mut(|d| d.remove::<String>(id));
+                }
+                if resp.lost_focus() && text.trim() != value.trim() {
+                    out = Some(text);
+                }
+            });
+            out
+        };
+        let mut bad = false;
+        ui.horizontal(|ui| {
+            if let Some(t) = field(ui, "START", display::fmt_hz(start)) {
+                match sweep::parse_freq(&t) {
+                    Some(v) => apply = Some((v, stop, points)),
+                    None => bad = true,
+                }
+            }
+            if let Some(t) = field(ui, "STOP", display::fmt_hz(stop)) {
+                match sweep::parse_freq(&t) {
+                    Some(v) => apply = Some((start, v, points)),
+                    None => bad = true,
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            if let Some(t) = field(ui, "CENTER", display::fmt_hz(center)) {
+                match sweep::parse_freq(&t) {
+                    Some(v) => {
+                        let (a, b) = sweep::start_stop(v, span);
+                        apply = Some((a, b, points));
+                    }
+                    None => bad = true,
+                }
+            }
+            if let Some(t) = field(ui, "SPAN", display::fmt_hz(span)) {
+                match sweep::parse_freq(&t) {
+                    Some(v) => {
+                        let (a, b) = sweep::start_stop(center, v);
+                        apply = Some((a, b, points));
+                    }
+                    None => bad = true,
+                }
+            }
+        });
+        let mut avg_text: Option<String> = None;
+        ui.horizontal(|ui| {
+            if let Some(t) = field(ui, "POINTS", points.to_string()) {
+                match t.trim().parse::<i64>() {
+                    Ok(n) => apply = Some((start, stop, n)),
+                    Err(_) => bad = true,
+                }
+            }
+            avg_text = field(ui, "AVG (HOST)", self.host_avg.clone());
+        });
+        if bad {
+            self.note = "Frequencies take k, M or G (a bare number is MHz). Points is a whole number.".into();
+        }
+        if let Some(t) = avg_text {
+            match t.trim().parse::<u32>() {
+                Ok(n) if n >= 1 => {
+                    self.host_avg = n.to_string();
+                    self.commit_fields();
+                }
+                _ => self.note = "AVG is a whole number of sweeps, 1 or more.".into(),
+            }
+        }
+        if let Some((a, b, n)) = apply {
+            let c = sweep::clamp(a, b, n, floor, max_hz, proto::POINTS_MAX as u16);
+            self.start = hz_field(c.start);
+            self.stop = hz_field(c.stop);
+            self.points = c.points.to_string();
+            self.note = if c.notes.is_empty() { String::new() } else { format!("Clamped: {}.", c.notes.join("; ")) };
+        }
+        // Device averaging needs firmware 1.0.2 and a start at or above 140 MHz.
+        let fw_ok = live.identity.is_some_and(|id| id.power_and_average());
+        ui.horizontal(|ui| {
+            let ok = fw_ok && start >= 140e6;
+            if softkey_enabled(ui, theme, "Dev avg", false, col4, ok) {
+                if let Ok(count) = self.dev_avg.trim().parse::<u8>() {
+                    if count >= 1 {
+                        self.session.average(count);
+                    }
+                }
+            }
+            ui.add_enabled(
+                ok,
+                egui::TextEdit::singleline(&mut self.dev_avg).desired_width(40.0).font(egui::TextStyle::Monospace),
+            );
+            let why = if !live.connected {
+                "connect first"
+            } else if !fw_ok {
+                "needs FW 1.0.2"
+            } else if start < 140e6 {
+                "start ≥ 140 MHz"
+            } else {
+                "on device"
+            };
+            ui.label(egui::RichText::new(why).size(theme.data_size * 0.75).color(palette::TEXT_MUTED));
+        });
+        let presets = sweep::band_presets(floor, max_hz);
+        let mut pick: Option<(f64, f64)> = None;
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("BAND").size(theme.data_size * 0.75).color(palette::TEXT_MUTED));
+            egui::ComboBox::from_id_salt("vna-band-preset")
+                .width((width - 60.0).max(80.0))
+                .selected_text("Ham band preset")
+                .show_ui(ui, |ui| {
+                    for (name, lo, hi) in &presets {
+                        let text = format!("{name}  {} – {}", display::fmt_hz(*lo), display::fmt_hz(*hi));
+                        if ui.selectable_label(false, text).clicked() {
+                            pick = Some((*lo, *hi));
+                        }
+                    }
+                });
+        });
+        if let Some((lo, hi)) = pick {
+            self.apply_edges(lo, hi);
+            self.note.clear();
         }
     }
 
