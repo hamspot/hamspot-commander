@@ -4,6 +4,7 @@
 mod device;
 mod cal;
 mod display;
+mod limits;
 mod markers;
 mod proto;
 mod rf;
@@ -206,6 +207,9 @@ pub struct Face {
     /// Group-delay aperture in points. Issue 64.
     #[serde(default = "default_aperture", skip_serializing_if = "is_default_aperture")]
     pub gd_aperture: u32,
+    /// Limit lines by trace format key. Issue 71.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub limits: std::collections::BTreeMap<String, limits::LimitSet>,
 }
 
 fn default_aperture() -> u32 {
@@ -270,6 +274,7 @@ impl Default for Face {
             cals: Vec::new(),
             scales: std::collections::BTreeMap::new(),
             gd_aperture: 4,
+            limits: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -707,6 +712,7 @@ pub struct NanoVna {
     sweep_count: u64,
     /// Correction off (CAL OFF) and the state of the shown trace. Issue 65.
     cal_off: bool,
+    limits_edit: bool,
     cal_state: cal::CalState,
     details_open: bool,
     last_sweep: Option<std::time::Instant>,
@@ -774,6 +780,7 @@ impl NanoVna {
             sweep_ms: None,
             sweep_count: 0,
             cal_off: false,
+            limits_edit: false,
             cal_state: cal::CalState::Uncal,
             details_open: false,
             last_sweep: None,
@@ -889,6 +896,7 @@ impl NanoVna {
         }
         self.chart(ui, &theme, &live);
         self.details_dialog(ui, &theme, &live);
+        self.limits_dialog(ui, &theme);
         self.setup_dialog(ui, &theme, &live);
         self.wizard_dialog(ui, &theme, &live);
     }
@@ -1294,7 +1302,7 @@ impl NanoVna {
             let chart_h = (ui.available_height() - table_h - status_h - 8.0).max(120.0);
             ui.allocate_ui(vec2(ui.available_width(), chart_h), |ui| {
                 let manual = self.face.scales.get(scale_key(self.view)).copied();
-                let edges = self.band_edges();
+                let overlay = self.overlay(trace.as_deref());
                 let (hit, _, gesture) = paint_chart(
                     ui,
                     self.view,
@@ -1308,7 +1316,7 @@ impl NanoVna {
                     &placed,
                     &info,
                     manual,
-                    &edges,
+                    &overlay,
                 );
                 clicked = hit;
                 scale_gesture = gesture;
@@ -1908,6 +1916,46 @@ impl NanoVna {
             Some(10) => self.edit_scale(samples, |m| m.stepped(true)),
             Some(11) => self.edit_scale(samples, |m| m.stepped(false)),
             Some(12) => self.edit_scale(samples, |m| m),
+            _ => {}
+        }
+
+        key_caption(ui, theme, "LIMITS", width);
+        let cart_lim = !is_disk(self.view) && self.view != View::Tdr;
+        let key = scale_key(self.view).to_string();
+        let lim_on = self.face.limits.get(&key).is_some_and(|s| s.on);
+        let mut lim_op = None;
+        ui.horizontal(|ui| {
+            // LIMITS: single = on/off, double = edit, triple = SWR 1.5 preset on this band.
+            let resp = softkey_response(ui, theme, if lim_on { "Limits on" } else { "Limits off" }, lim_on, col4, cart_lim);
+            if resp.triple_clicked() {
+                lim_op = Some(3);
+            } else if resp.double_clicked() {
+                lim_op = Some(2);
+            } else if resp.clicked() {
+                lim_op = Some(1);
+            }
+            if softkey_enabled(ui, theme, "Edit", self.limits_edit, col4, cart_lim) {
+                lim_op = Some(2);
+            }
+            if softkey(ui, theme, "SWR 1.5", false, col4) {
+                lim_op = Some(3);
+            }
+            if softkey(ui, theme, "SWR 2", false, col4) {
+                lim_op = Some(4);
+            }
+        });
+        match lim_op {
+            Some(1) => {
+                let set = self.face.limits.entry(key).or_default();
+                set.on = !set.on;
+                if set.segs.is_empty() {
+                    self.limits_edit = true;
+                }
+                self.dirty = true;
+            }
+            Some(2) => self.limits_edit = true,
+            Some(3) => self.limit_preset(1.5),
+            Some(4) => self.limit_preset(2.0),
             _ => {}
         }
 
@@ -3008,7 +3056,7 @@ impl NanoVna {
                     let (rect, _) = ui.allocate_exact_size(vec2((w * 0.6).max(240.0), h), Sense::hover());
                     let painter = ui.painter_at(rect);
                     painter.rect_filled(rect, 0.0, PANE_BG);
-                    paint_cartesian(&painter, rect, View::S21, &xs, &[(&mag, TRACE1)], &[], theme.data_size, None, &[]);
+                    paint_cartesian(&painter, rect, View::S21, &xs, &[(&mag, TRACE1)], &[], theme.data_size, None, &Overlay::default());
                     let (rect, _) = ui.allocate_exact_size(vec2((w * 0.38).max(160.0), h), Sense::hover());
                     let painter = ui.painter_at(rect);
                     painter.rect_filled(rect, 0.0, PANE_BG);
@@ -3497,6 +3545,114 @@ impl NanoVna {
         }
     }
 
+    /// Band edges plus this format's limit lines and verdict. Issue 71.
+    fn overlay(&self, samples: Option<&[Sample]>) -> Overlay {
+        let mut o = Overlay { edges: self.band_edges(), ..Default::default() };
+        if is_disk(self.view) || self.view == View::Tdr {
+            return o;
+        }
+        if let Some(set) = self.face.limits.get(scale_key(self.view)).filter(|s| s.on && !s.segs.is_empty()) {
+            o.limits = set.segs.clone();
+            if let Some(samples) = samples {
+                let (xs, ys) = series(self.view, samples, self.z0_value(), self.velocity_value());
+                o.verdict = Some(limits::check(&xs, &ys, &set.segs));
+            }
+        }
+        o
+    }
+
+    /// A ham band preset limit for the shown format: the band holding the
+    /// sweep centre, SWR `swr`:1 on the SWR format. Issue 71.
+    fn limit_preset(&mut self, swr: f64) {
+        let center = (self.face.start_hz + self.face.stop_hz) / 2.0;
+        let start = parse_hz(&self.start).map(|v| v as f64).unwrap_or(self.face.start_hz);
+        let stop = parse_hz(&self.stop).map(|v| v as f64).unwrap_or(self.face.stop_hz);
+        let mid = if stop > start { (start + stop) / 2.0 } else { center };
+        let Some(band) = crate::tools::ham_rf::bands::find_band(mid / 1e6) else {
+            self.note = "The sweep centre is not in a ham band, so there is no band preset.".into();
+            return;
+        };
+        self.view = View::Swr;
+        let set = self.face.limits.entry(scale_key(View::Swr).to_string()).or_default();
+        set.segs = vec![limits::swr_preset(band.lo_mhz * 1e6, band.hi_mhz * 1e6, swr)];
+        set.on = true;
+        self.dirty = true;
+        self.note = format!("Limit: SWR {swr}:1 across {}.", band.name);
+    }
+
+    /// The limit line editor for the shown format. Issue 71.
+    fn limits_dialog(&mut self, ui: &mut Ui, theme: &LcarsTheme) {
+        if !self.limits_edit {
+            return;
+        }
+        let key = scale_key(self.view).to_string();
+        let (_, _, unit) = view_meta(self.view);
+        let mut open = true;
+        let mut set = self.face.limits.get(&key).cloned().unwrap_or_default();
+        let before = set.clone();
+        egui::Window::new(format!("Limit lines · {key}"))
+            .open(&mut open)
+            .resizable(false)
+            .show(ui.ctx(), |ui| {
+                ui.checkbox(&mut set.on, "Limit test on");
+                let mut remove = None;
+                egui::Grid::new("vna-limits").striped(true).show(ui, |ui| {
+                    for h in ["START MHz", "STOP MHz", &format!("START {unit}"), &format!("STOP {unit}"), "TYPE", ""] {
+                        ui.label(egui::RichText::new(h).color(palette::TEXT_MUTED));
+                    }
+                    ui.end_row();
+                    for (i, seg) in set.segs.iter_mut().enumerate() {
+                        let mut a = seg.start_hz / 1e6;
+                        let mut b = seg.stop_hz / 1e6;
+                        if ui.add(egui::DragValue::new(&mut a).speed(0.01).max_decimals(6)).changed() {
+                            seg.start_hz = a * 1e6;
+                        }
+                        if ui.add(egui::DragValue::new(&mut b).speed(0.01).max_decimals(6)).changed() {
+                            seg.stop_hz = b * 1e6;
+                        }
+                        ui.add(egui::DragValue::new(&mut seg.start_v).speed(0.05));
+                        ui.add(egui::DragValue::new(&mut seg.stop_v).speed(0.05));
+                        let label = if seg.upper { "UPPER" } else { "LOWER" };
+                        if ui.button(label).clicked() {
+                            seg.upper = !seg.upper;
+                        }
+                        if ui.button("Delete").clicked() {
+                            remove = Some(i);
+                        }
+                        ui.end_row();
+                    }
+                });
+                if let Some(i) = remove {
+                    set.segs.remove(i);
+                }
+                ui.horizontal(|ui| {
+                    if action_button(ui, theme, "Add segment", vec2(140.0, 30.0)).clicked() {
+                        let v = self.shown_scale(None).map(|s| s.1).unwrap_or(0.0);
+                        let v = if self.view == View::Swr { 2.0 } else { v };
+                        set.segs.push(limits::Segment {
+                            start_hz: self.face.start_hz,
+                            stop_hz: self.face.stop_hz,
+                            start_v: v,
+                            stop_v: v,
+                            upper: true,
+                        });
+                    }
+                    if action_button(ui, theme, "Clear", vec2(90.0, 30.0)).clicked() {
+                        set.segs.clear();
+                    }
+                });
+            });
+        if set != before {
+            if set == limits::LimitSet::default() {
+                self.face.limits.remove(&key);
+            } else {
+                self.face.limits.insert(key, set);
+            }
+            self.dirty = true;
+        }
+        self.limits_edit = open;
+    }
+
     /// Every zone edge of the station band plan, in Hz. Issue 53.
     fn band_edges(&self) -> Vec<f64> {
         let mut out: Vec<f64> = self
@@ -3953,7 +4109,7 @@ fn paint_cartesian(
     markers: &[(usize, usize)],
     label_px: f32,
     manual: Option<display::ManualScale>,
-    edges: &[f64],
+    overlay: &Overlay,
 ) {
     let plot = cart_plot(rect);
     let font = egui::FontId::monospace((label_px * 0.8).max(10.0));
@@ -4028,7 +4184,7 @@ fn paint_cartesian(
     // Band-plan zone edges as dashed verticals, labelled with the frequency. Issue 53.
     if view != View::Tdr {
         let edge = Stroke::new(1.0, palette::TAN);
-        for hz in edges.iter().filter(|hz| **hz > xmin && **hz < xmax) {
+        for hz in overlay.edges.iter().filter(|hz| **hz > xmin && **hz < xmax) {
             let x = plot.left() + ((hz - xmin) / (xmax - xmin)) as f32 * plot.width();
             let mut y = plot.top();
             while y < plot.bottom() {
@@ -4075,6 +4231,38 @@ fn paint_cartesian(
             }
             prev = Some(pos);
         }
+    }
+    // Limit lines, failing points and the PASS/FAIL chip. Issue 71.
+    let limit_stroke = Stroke::new(2.0, palette::BRICK);
+    for seg in &overlay.limits {
+        let (a, b) = (seg.start_hz.max(xmin), seg.stop_hz.min(xmax));
+        if !(b >= a) {
+            continue;
+        }
+        let (va, vb) = (seg.at(a).unwrap_or(seg.start_v), seg.at(b).unwrap_or(seg.stop_v));
+        let (pa, pb) = (map(a, va), map(b, vb));
+        clip.line_segment([pa, pb], limit_stroke);
+        // Small ticks point to the failing side: up for a lower limit, down for an upper.
+        let dir = if seg.upper { -6.0 } else { 6.0 };
+        for t in [0.0f32, 0.5, 1.0] {
+            let p = pa + (pb - pa) * t;
+            clip.line_segment([p, Pos2::new(p.x, p.y + dir)], limit_stroke);
+        }
+    }
+    if let (Some(verdict), Some((ys, _))) = (&overlay.verdict, traces.first()) {
+        for i in &verdict.failing {
+            if let (Some(x), Some(y)) = (xs.get(*i), ys.get(*i)) {
+                if y.is_finite() {
+                    clip.circle_stroke(map(*x, *y), 4.0, Stroke::new(2.0, palette::BRICK));
+                }
+            }
+        }
+        let text = format!("LIMIT {}", verdict.label());
+        let fill = if verdict.pass() { palette::OLIVE } else { palette::BRICK };
+        let g = painter.layout_no_wrap(text, egui::FontId::monospace((label_px * 0.9).max(11.0)), rustcars::ink_on(fill));
+        let chip = Rect::from_min_size(Pos2::new(plot.left() + 8.0, plot.top() + 8.0), g.size() + vec2(16.0, 8.0));
+        painter.rect_filled(chip, 4.0, fill);
+        painter.galley(chip.min + vec2(8.0, 4.0), g, rustcars::ink_on(fill));
     }
     if let Some((ys, _)) = traces.first() {
         for (slot, index) in markers {
@@ -4224,7 +4412,7 @@ fn paint_chart(
     markers: &[(usize, usize)],
     info: &[(String, Color32)],
     manual: Option<display::ManualScale>,
-    edges: &[f64],
+    overlay: &Overlay,
 ) -> (Option<(usize, u8)>, Option<String>, ScaleGesture) {
     // S21 polar draws the S21 points through the S11 polar painter.
     let as_s11 = |s: &[Sample]| -> Vec<Sample> { s.iter().map(|x| Sample { s11: x.s21, ..*x }).collect() };
@@ -4294,7 +4482,7 @@ fn paint_chart(
             if delta.len() == ys.len() && !delta.is_empty() {
                 traces.push((&delta, palette::BRICK));
             }
-            paint_cartesian(&painter, rect, view, &xs, &traces, markers, label_px, manual, edges);
+            paint_cartesian(&painter, rect, view, &xs, &traces, markers, label_px, manual, overlay);
             None
         }
     };
@@ -4400,6 +4588,14 @@ fn paint_chart(
         resp.on_hover_text(text);
     }
     (clicked, hover, gesture)
+}
+
+/// Band edges and limit lines drawn over a Cartesian pane. Issues 53 and 71.
+#[derive(Default)]
+struct Overlay {
+    edges: Vec<f64>,
+    limits: Vec<limits::Segment>,
+    verdict: Option<limits::Verdict>,
 }
 
 /// What the operator did to the scale on the pane this frame. Issue 69.
