@@ -3,6 +3,7 @@
 
 mod device;
 mod display;
+mod markers;
 mod proto;
 mod rf;
 
@@ -603,8 +604,11 @@ pub struct NanoVna {
     view: View,
     run: bool,
     run_state: Run,
-    markers: [Option<usize>; 4],
+    /// Marker frequencies in Hz: M1..M8 then R. Issue 66.
+    markers: [Option<f64>; markers::SLOTS],
     marker_on: usize,
+    readout_fmt: markers::Readout,
+    marker_freq: String,
     memory: Option<Vec<Sample>>,
     show_memory: bool,
     show_diff: bool,
@@ -666,8 +670,10 @@ impl NanoVna {
             view: View::Smith,
             run: false,
             run_state: Run::Idle,
-            markers: [None; 4],
+            markers: [None; markers::SLOTS],
             marker_on: 0,
+            readout_fmt: markers::Readout::Trace,
+            marker_freq: String::new(),
             memory: None,
             show_memory: false,
             show_diff: false,
@@ -1014,7 +1020,7 @@ impl NanoVna {
                 format!("Not connected to {}.", self.face.port)
             };
         };
-        let Some(index) = self.markers[self.marker_on] else {
+        let Some(index) = self.marker_index(self.marker_on, samples) else {
             return self.cal_label(live);
         };
         let Some(sample) = samples.get(index) else {
@@ -1022,8 +1028,8 @@ impl NanoVna {
         };
         let d = rf::derive(sample, self.z0_value());
         format!(
-            "M{}  {} Hz  SWR {}  RL {} dB  |Z| {} Ω  {} {:+}j Ω  Q {}  S21 {} dB  series {}  parallel {}",
-            self.marker_on + 1,
+            "{}  {} Hz  SWR {}  RL {} dB  |Z| {} Ω  {} {:+}j Ω  Q {}  S21 {} dB  series {}  parallel {}",
+            markers::slot_name(self.marker_on),
             sample.hz.round(),
             num(rf::swr(sample.s11)),
             num(rf::return_loss_db(sample.s11)),
@@ -1111,12 +1117,8 @@ impl NanoVna {
                 });
         });
         let mut clicked = None;
-        let placed: Vec<(usize, usize)> = self
-            .markers
-            .iter()
-            .enumerate()
-            .filter_map(|(slot, at)| at.map(|at| (slot, at)))
-            .collect();
+        let placed = self.placed(trace.as_deref());
+        let info = self.marker_info(trace.as_deref(), &placed);
         let cal = trace.as_deref().and_then(|t| self.matched_cal(t)).cloned();
         show_frame(ui, theme, right, Side::Right, |ui| {
             self.trace_header(ui, theme, trace.as_deref(), cal.as_ref());
@@ -1135,6 +1137,7 @@ impl NanoVna {
                     self.admittance,
                     theme.data_size,
                     &placed,
+                    &info,
                 );
                 clicked = hit;
             });
@@ -1143,8 +1146,77 @@ impl NanoVna {
             }
             self.status_bar(ui, theme, live, trace.as_deref(), cal.as_ref());
         });
-        if let Some(index) = clicked {
-            self.markers[self.marker_on] = Some(index);
+        if let (Some((index, clicks)), Some(samples)) = (clicked, trace.as_deref()) {
+            let slot = markers::click_slot(self.marker_on, clicks);
+            if let Some(sample) = samples.get(index) {
+                self.markers[slot] = Some(sample.hz);
+                if clicks == 2 {
+                    self.marker_on = slot;
+                }
+            }
+        }
+    }
+
+    /// Sweep index of a marker slot on this trace. Issue 66.
+    fn marker_index(&self, slot: usize, samples: &[Sample]) -> Option<usize> {
+        markers::nearest_index(samples, self.markers.get(slot).copied().flatten()?)
+    }
+
+    /// (slot, index) for every placed marker, R last.
+    fn placed(&self, samples: Option<&[Sample]>) -> Vec<(usize, usize)> {
+        let Some(samples) = samples else {
+            return Vec::new();
+        };
+        (0..markers::SLOTS)
+            .filter_map(|slot| self.marker_index(slot, samples).map(|i| (slot, i)))
+            .collect()
+    }
+
+    /// The small marker list painted in the top right of the pane.
+    fn marker_info(&self, samples: Option<&[Sample]>, placed: &[(usize, usize)]) -> Vec<(String, Color32)> {
+        let Some(samples) = samples else {
+            return Vec::new();
+        };
+        let z0 = self.z0_value();
+        placed
+            .iter()
+            .filter_map(|(slot, i)| {
+                let sample = samples.get(*i)?;
+                Some((
+                    format!(
+                        "{:<3}{:>14}  {}",
+                        markers::slot_name(*slot),
+                        display::fmt_hz(sample.hz),
+                        self.value_text(self.view, sample, *i, z0, None)
+                    ),
+                    MARKER_COLORS[*slot % MARKER_COLORS.len()],
+                ))
+            })
+            .collect()
+    }
+
+    /// VALUE column text: the chosen readout, or the trace format.
+    fn value_text(&self, view: View, sample: &Sample, index: usize, z0: f64, ys: Option<&[f64]>) -> String {
+        if self.readout_fmt != markers::Readout::Trace {
+            let (param, _, _) = view_meta(view);
+            return markers::readout_text(self.readout_fmt, sample, z0, index, param == "S21");
+        }
+        let (_, _, unit) = view_meta(view);
+        match view {
+            View::GroupDelay | View::Unwrap => {
+                let owned;
+                let ys = match ys {
+                    Some(ys) => ys,
+                    None => {
+                        owned = series(view, std::slice::from_ref(sample), z0, 0.66).1;
+                        &owned
+                    }
+                };
+                let v = if ys.len() == 1 { ys.first() } else { ys.get(index) };
+                v.map(|v| format!("{} {unit}", num(*v))).unwrap_or_default()
+            }
+            View::Tdr => "-".into(),
+            view => marker_value(view, sample, z0),
         }
     }
 
@@ -1215,22 +1287,23 @@ impl NanoVna {
         }
     }
 
-    /// One row per placed marker under the chart. Issue 68.
+    /// One row per placed marker under the chart, with delta to R. Issue 66.
     fn marker_table(&self, ui: &mut Ui, theme: &LcarsTheme, samples: &[Sample], placed: &[(usize, usize)]) {
         if placed.is_empty() {
             return;
         }
         let z0 = self.z0_value();
-        let (_, ys) = series(self.view, samples, z0, self.velocity_value());
+        let (hz, ys) = series(self.view, samples, z0, self.velocity_value());
         let (_, _, unit) = view_meta(self.view);
+        let reference = placed.iter().find(|(slot, _)| *slot == markers::REF).map(|(_, i)| *i);
         let font = egui::FontId::monospace(theme.data_size * 0.85);
-        let row = |ui: &mut Ui, cells: [String; 5], color: Color32, lit: bool| {
+        let row = |ui: &mut Ui, cells: [String; 7], color: Color32, lit: bool| {
             let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::hover());
             let painter = ui.painter_at(rect);
             if lit {
                 painter.rect_filled(rect, 0.0, palette::STRIP);
             }
-            let widths = [0.07, 0.2, 0.25, 0.28, 0.2];
+            let widths = [0.05, 0.04, 0.15, 0.2, 0.2, 0.1, 0.26];
             let mut x = rect.left() + 6.0;
             for (cell, w) in cells.iter().zip(widths) {
                 painter.text(
@@ -1245,31 +1318,33 @@ impl NanoVna {
         };
         row(
             ui,
-            ["MKR".into(), "STIMULUS".into(), "VALUE".into(), "Z = R + jX".into(), "SWR".into()],
+            ["MKR".into(), "TRC".into(), "FREQ".into(), "VALUE".into(), "Z = R + jX".into(), "SWR".into(), "DELTA TO R".into()],
             palette::TEXT_MUTED,
             false,
         );
+        let tdr = self.view == View::Tdr;
         for (slot, index) in placed {
             let Some(sample) = samples.get(*index) else {
                 continue;
             };
-            let value = match self.view {
-                View::GroupDelay | View::Unwrap => ys
-                    .get(*index)
-                    .map(|v| format!("{} {unit}", num(*v)))
-                    .unwrap_or_default(),
-                View::Tdr => "-".into(),
-                view => marker_value(view, sample, z0),
-            };
             let d = rf::derive(sample, z0);
+            let delta = match reference {
+                _ if *slot == markers::REF || tdr => "-".to_string(),
+                Some(r) => markers::delta(&ys, &hz, *index, r)
+                    .map(|(df, dv)| markers::delta_text(df, dv, unit))
+                    .unwrap_or_else(|| "-".into()),
+                None => "no R".into(),
+            };
             row(
                 ui,
                 [
-                    format!("M{}", slot + 1),
+                    markers::slot_name(*slot),
+                    "1".into(),
                     display::fmt_hz(sample.hz),
-                    value,
+                    self.value_text(self.view, sample, *index, z0, Some(&ys)),
                     format!("{} {:+}j Ω", num(d.r), num(d.x)),
                     format!("{} : 1", num(rf::swr(sample.s11))),
+                    delta,
                 ],
                 MARKER_COLORS[*slot % MARKER_COLORS.len()],
                 *slot == self.marker_on,
@@ -1406,14 +1481,51 @@ impl NanoVna {
         });
 
         key_caption(ui, theme, "MARKER", width);
+        for row in [[0usize, 1, 2, 3], [4, 5, 6, 7]] {
+            ui.horizontal(|ui| {
+                for slot in row {
+                    let placed = self.markers[slot].is_some();
+                    let title = if placed { markers::slot_name(slot) } else { format!("{}·", markers::slot_name(slot)) };
+                    if softkey(ui, theme, &title, self.marker_on == slot, col4) {
+                        self.marker_on = slot;
+                    }
+                }
+            });
+        }
         ui.horizontal(|ui| {
-            for slot in 0..4 {
-                let title = format!("M{}", slot + 1);
-                if softkey(ui, theme, &title, self.marker_on == slot, col4) {
-                    self.marker_on = slot;
+            if softkey(ui, theme, "Ref R", self.marker_on == markers::REF, col4) {
+                self.marker_on = markers::REF;
+            }
+            if softkey(ui, theme, "Clr all", false, col4) {
+                self.markers = [None; markers::SLOTS];
+            }
+            // Typed exact frequency for the active marker. Enter applies it.
+            let resp = ui.add_sized(
+                vec2(col4 * 2.0 + 8.0, KEY_H),
+                egui::TextEdit::singleline(&mut self.marker_freq)
+                    .hint_text("FREQ MHz")
+                    .font(egui::TextStyle::Monospace),
+            );
+            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                match parse_marker_mhz(&self.marker_freq) {
+                    Some(hz) => {
+                        self.markers[self.marker_on] = Some(hz);
+                        self.note.clear();
+                    }
+                    None => self.note = "Marker frequency is a number in MHz, for example 14.2.".into(),
                 }
             }
         });
+        key_caption(ui, theme, "MKR READOUT", width);
+        for row in markers::READOUTS.chunks(4) {
+            ui.horizontal(|ui| {
+                for (fmt, label) in row {
+                    if softkey(ui, theme, label, self.readout_fmt == *fmt, col4) {
+                        self.readout_fmt = *fmt;
+                    }
+                }
+            });
+        }
         let mut search: Option<u8> = None;
         ui.horizontal(|ui| {
             let ok = samples.is_some();
@@ -1443,14 +1555,14 @@ impl NanoVna {
             return;
         }
         let (_, ys) = series(self.view, samples, self.z0_value(), self.velocity_value());
-        let at = self.markers[self.marker_on];
+        let at = self.marker_index(self.marker_on, samples);
         let found = match code {
             0 => display::search_max(&ys),
             1 => display::search_min(&ys),
             _ => display::next_peak(&ys, at),
         };
         match found {
-            Some(index) => self.markers[self.marker_on] = Some(index),
+            Some(index) => self.markers[self.marker_on] = samples.get(index).map(|s| s.hz),
             None => self.note = "No further peak on this trace.".into(),
         }
     }
@@ -1461,7 +1573,7 @@ impl NanoVna {
             readout(ui, theme, "No calibrated sweep yet.", false);
             return;
         };
-        let Some(index) = self.markers[self.marker_on] else {
+        let Some(index) = self.marker_index(self.marker_on, samples) else {
             readout(ui, theme, "Click the chart to place the selected marker.", false);
             return;
         };
@@ -1504,7 +1616,7 @@ impl NanoVna {
         readout(
             ui,
             theme,
-            &format!("M{}  {} MHz", self.marker_on + 1, fmt_g(sample.hz / 1.0e6)),
+            &format!("{}  {} MHz", markers::slot_name(self.marker_on), fmt_g(sample.hz / 1.0e6)),
             true,
         );
         for (name, value) in [
@@ -1531,7 +1643,7 @@ impl NanoVna {
     }
 
     fn finder_readout(&self, ui: &mut Ui, theme: &LcarsTheme, samples: &[Sample]) {
-        if let (Some(a), Some(b)) = (self.markers[0], self.markers[1]) {
+        if let (Some(a), Some(b)) = (self.marker_index(0, samples), self.marker_index(1, samples)) {
             if let (Some(left), Some(right)) = (samples.get(a), samples.get(b)) {
                 readout(
                     ui,
@@ -3061,11 +3173,17 @@ fn cart_plot(rect: Rect) -> Rect {
     )
 }
 
-const MARKER_COLORS: [Color32; 4] = [
+/// M1..M8 then R (white). Every marker also carries its name as text.
+const MARKER_COLORS: [Color32; markers::SLOTS] = [
     Color32::from_rgb(0xFF, 0x99, 0x00),
     Color32::from_rgb(0x99, 0xCC, 0xFF),
     Color32::from_rgb(0xCC, 0x99, 0xCC),
     Color32::from_rgb(0x99, 0xDD, 0x88),
+    Color32::from_rgb(0xFF, 0xCC, 0x66),
+    Color32::from_rgb(0x66, 0xDD, 0xDD),
+    Color32::from_rgb(0xFF, 0x88, 0x88),
+    Color32::from_rgb(0xCC, 0xCC, 0x66),
+    Color32::from_rgb(0xF0, 0xF0, 0xF0),
 ];
 const GRID: Color32 = Color32::from_rgb(0x4A, 0x55, 0x66);
 const GRID_FAINT: Color32 = Color32::from_rgb(0x2C, 0x33, 0x3D);
@@ -3203,7 +3321,7 @@ fn paint_marker(painter: &egui::Painter, at: Pos2, slot: usize, label_px: f32) {
     painter.text(
         Pos2::new(at.x, at.y - 12.0),
         egui::Align2::CENTER_BOTTOM,
-        format!("{}", slot + 1),
+        if slot == markers::REF { "R".to_string() } else { format!("{}", slot + 1) },
         egui::FontId::monospace((label_px * 0.8).max(10.0)),
         color,
     );
@@ -3317,12 +3435,13 @@ fn paint_chart(
     admittance: bool,
     label_px: f32,
     markers: &[(usize, usize)],
-) -> (Option<usize>, Option<String>) {
+    info: &[(String, Color32)],
+) -> (Option<(usize, u8)>, Option<String>) {
     let size = vec2(
         ui.available_width().max(240.0),
         ui.available_height().max(160.0),
     );
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
     let painter = ui.painter_at(rect);
     if view != View::Smith {
         painter.rect_filled(rect, 0.0, PANE_BG);
@@ -3404,15 +3523,56 @@ fn paint_chart(
             }
         }
     }
-    let clicked = if resp.clicked() {
-        samples.and_then(|samples| hit(view, rect, samples, resp.interact_pointer_pos()?))
+    paint_marker_info(&painter, rect, info, label_px);
+    // single = active marker, double = next marker, triple = R. A drag on a
+    // Cartesian pane moves the active marker along the trace.
+    let clicks = if resp.triple_clicked() {
+        Some(3)
+    } else if resp.double_clicked() {
+        Some(2)
+    } else if resp.clicked() || (resp.dragged() && !matches!(view, View::Smith | View::Polar)) {
+        Some(1)
     } else {
         None
     };
+    let clicked = clicks.and_then(|n| {
+        samples
+            .and_then(|samples| hit(view, rect, samples, resp.interact_pointer_pos()?))
+            .map(|i| (i, n))
+    });
     if let Some(text) = &hover {
         resp.on_hover_text(text);
     }
     (clicked, hover)
+}
+
+/// The marker list in the top right of a pane, each line in its marker colour.
+fn paint_marker_info(painter: &egui::Painter, rect: Rect, info: &[(String, Color32)], label_px: f32) {
+    if info.is_empty() {
+        return;
+    }
+    let font = egui::FontId::monospace((label_px * 0.75).max(10.0));
+    let line_h = font.size + 3.0;
+    let galleys: Vec<_> = info
+        .iter()
+        .map(|(text, color)| painter.layout_no_wrap(text.clone(), font.clone(), *color))
+        .collect();
+    let w = galleys.iter().map(|g| g.size().x).fold(0.0, f32::max) + 12.0;
+    let h = line_h * galleys.len() as f32 + 8.0;
+    let boxr = Rect::from_min_size(Pos2::new(rect.right() - w - 20.0, rect.top() + 12.0), vec2(w, h));
+    painter.rect_filled(boxr, 3.0, Color32::from_rgba_unmultiplied(0, 0, 0, 200));
+    painter.rect_stroke(boxr, 3.0, Stroke::new(1.0, GRID), egui::StrokeKind::Inside);
+    for (i, g) in galleys.into_iter().enumerate() {
+        let color = info[i].1;
+        painter.galley(Pos2::new(boxr.left() + 6.0, boxr.top() + 4.0 + line_h * i as f32), g, color);
+    }
+}
+
+/// "14.2" or "14.2 MHz" as Hz. Issue 66.
+fn parse_marker_mhz(text: &str) -> Option<f64> {
+    let t = text.trim().trim_end_matches("MHz").trim_end_matches("mhz").trim();
+    let mhz: f64 = t.parse().ok()?;
+    (mhz.is_finite() && mhz > 0.0).then_some(mhz * 1e6)
 }
 
 /// The two jacks, labeled the way the V2 marks them: S11 and S21.
