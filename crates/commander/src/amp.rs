@@ -40,6 +40,11 @@ const COL_MACRO: usize = 85;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AmplifierSpec {
+    /// Stable unique id (32 hex digits, random at creation, never derived
+    /// from the name). Patch bay boxes bind to this. Old files without it
+    /// get one on load (`repair_ids`).
+    #[serde(default)]
+    pub id: String,
     pub name: String,
     pub model: i32,
     #[serde(default)]
@@ -62,6 +67,7 @@ impl AmplifierSpec {
     #[cfg(test)]
     pub fn dummy() -> Self {
         Self {
+            id: "0123456789abcdef0123456789abcdef".into(),
             name: "Dummy".into(),
             model: 1,
             device: String::new(),
@@ -422,6 +428,60 @@ pub fn parse_set_level_names(lines: &[String]) -> Vec<String> {
         .filter(|name| *name != "?")
         .map(str::to_string)
         .collect()
+}
+
+/// A fresh 128-bit random id as 32 lowercase hex digits.
+pub fn new_id() -> String {
+    let mut buf = [0u8; 16];
+    let ok = std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf)).is_ok();
+    if !ok {
+        // Fallback: time and a counter through the std hasher. Still unique
+        // per process run; /dev/urandom is always there on Linux.
+        use std::collections::hash_map::RandomState;
+        use std::hash::{BuildHasher, Hasher};
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        for half in buf.chunks_mut(8) {
+            let mut h = RandomState::new().build_hasher();
+            h.write_u64(N.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+            h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
+            half.copy_from_slice(&h.finish().to_le_bytes());
+        }
+    }
+    buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Give every amplifier row a unique id. Rows with no id get one; a row
+/// whose id repeats an earlier row's gets a new one. Returns the ids that
+/// were duplicated, so bindings to them can be dropped.
+pub fn repair_ids(specs: &mut [AmplifierSpec]) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut dup = Vec::new();
+    for spec in specs.iter_mut() {
+        let id = spec.id.trim().to_string();
+        if id.is_empty() {
+            spec.id = new_id();
+        } else if !seen.insert(id.clone()) {
+            if !dup.contains(&id) {
+                dup.push(id);
+            }
+            spec.id = new_id();
+        }
+        seen.insert(spec.id.clone());
+    }
+    dup
+}
+
+/// Displayed level step 1..=10 to Hamlib's 0.0..=1.0 (10 is 1.0).
+pub fn level_from_step(n: u8) -> f64 {
+    f64::from(n.clamp(1, 10)) / 10.0
+}
+
+/// Hamlib 0.0..=1.0 to the displayed step, rounded and held to 1..=10.
+pub fn step_from_level(value: f64) -> u8 {
+    if !value.is_finite() {
+        return 1;
+    }
+    (value * 10.0).round().clamp(1.0, 10.0) as u8
 }
 
 /// A typed frequency in MHz, as Hz. Blank, zero, negative or junk is None.
@@ -1006,6 +1066,7 @@ mod tests {
     #[test]
     fn argv_is_loopback_and_omits_empty_options() {
         let spec = AmplifierSpec {
+            id: new_id(),
             name: "KPA".into(),
             model: 201,
             device: "/dev/ttyUSB1".into(),
@@ -1122,6 +1183,48 @@ mod tests {
         release_port(port);
         let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
         assert!(TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_err());
+    }
+
+    #[test]
+    fn level_steps_convert_both_ways() {
+        assert_eq!(level_from_step(10), 1.0);
+        assert_eq!(level_from_step(1), 0.1);
+        assert_eq!(level_from_step(5), 0.5);
+        assert_eq!(level_from_step(0), 0.1);
+        assert_eq!(level_from_step(42), 1.0);
+        assert_eq!(step_from_level(1.0), 10);
+        assert_eq!(step_from_level(0.0), 1);
+        assert_eq!(step_from_level(0.34), 3);
+        assert_eq!(step_from_level(0.35), 4);
+        assert_eq!(step_from_level(2.0), 10);
+        assert_eq!(step_from_level(-1.0), 1);
+        assert_eq!(step_from_level(f64::NAN), 1);
+        for n in 1..=10 {
+            assert_eq!(step_from_level(level_from_step(n)), n);
+        }
+    }
+
+    #[test]
+    fn ids_are_random_and_repaired() {
+        let a = new_id();
+        assert_eq!(a.len(), 32);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, new_id());
+        let mut specs = vec![
+            AmplifierSpec { id: String::new(), ..AmplifierSpec::dummy() },
+            AmplifierSpec { id: "x".into(), ..AmplifierSpec::dummy() },
+            AmplifierSpec { id: "x".into(), name: "B".into(), ..AmplifierSpec::dummy() },
+        ];
+        assert_eq!(repair_ids(&mut specs), ["x"]);
+        assert_eq!(specs[0].id.len(), 32);
+        assert_eq!(specs[1].id, "x", "the first holder keeps its id");
+        assert_ne!(specs[2].id, "x", "the later row is regenerated");
+        let mut again = specs.clone();
+        assert!(repair_ids(&mut again).is_empty());
+        assert_eq!(again, specs);
+        // Old file without an id loads.
+        let old: AmplifierSpec = serde_json::from_str(r#"{"name":"A","model":1}"#).unwrap();
+        assert!(old.id.is_empty());
     }
 
     #[test]

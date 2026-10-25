@@ -225,7 +225,7 @@ struct App {
     amp_edit: Option<AmpDraft>,
     amp_follow: std::collections::HashMap<u64, amp::FollowRig>,
     amp_freq_text: String,
-    amp_level_vals: std::collections::HashMap<String, f64>,
+    amp_level_vals: std::collections::HashMap<String, u8>,
     /// Apply was sent. The station file is written once the hub has that command.
     rx_pipe_pending: Option<(u64, String)>,
     tx_pipe_pending: Option<(u64, String)>,
@@ -4063,8 +4063,11 @@ impl App {
                         self.amplifiers.add(spec);
                     }
                 }
-                // An explicit Standby/Operate click on a bound box.
-                patchbay::Action::Control(id, cmd) => self.amplifiers.control(id, cmd),
+                // An explicit Standby/Operate click on a bound box. The id
+                // is resolved now; a missing or ambiguous id sends nothing.
+                patchbay::Action::Control(amp_id, cmd) => {
+                    self.send_amp(&amp_id, cmd);
+                }
             }
         }
     }
@@ -5696,7 +5699,7 @@ impl App {
                 };
                 if ui.add_enabled(live.is_some(), egui::Button::new(text)).clicked() {
                     if let Some(row) = live {
-                        self.amplifiers.control(row.id, cmd);
+                        self.send_amp(&row.spec.id, cmd);
                     }
                 }
             }
@@ -5722,6 +5725,19 @@ impl App {
         }
     }
 
+    /// Send one command to the amplifier with this fixed id, looked up now.
+    /// A missing or ambiguous id sends nothing (#96).
+    fn send_amp(&self, amp_id: &str, cmd: amp::Control) -> bool {
+        let rows = self.amplifiers.view().rows;
+        match patchbay::bind::resolve(amp_id, &rows) {
+            Some(row) => {
+                self.amplifiers.control(row.id, cmd);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Mirror the active rig's frequency to amplifiers with "follow rig
     /// frequency" ticked (#103). Opt-in per amplifier, debounced, and only
     /// `set_freq`: never power or levels.
@@ -5735,7 +5751,7 @@ impl App {
             let f = self.amp_follow.entry(row.id).or_default();
             let on = row.spec.follow_rig && row.port.is_some();
             if let Some(hz) = f.step(on, rig_hz, now) {
-                self.amplifiers.control(row.id, amp::Control::SetFreq(hz));
+                self.send_amp(&row.spec.id, amp::Control::SetFreq(hz));
             }
             pending |= on;
         }
@@ -5753,7 +5769,7 @@ impl App {
             let hz = amp::parse_mhz(&self.amp_freq_text);
             if ui.add_enabled(hz.is_some(), egui::Button::new("Set")).clicked() {
                 if let Some(hz) = hz {
-                    self.amplifiers.control(row.id, amp::Control::SetFreq(hz));
+                    self.send_amp(&row.spec.id, amp::Control::SetFreq(hz));
                 }
             }
             let mut follow = row.spec.follow_rig;
@@ -5772,11 +5788,17 @@ impl App {
         for name in &row.settable {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(name).monospace());
-                let current = row.state.level(name).and_then(|v| v.trim().parse::<f64>().ok()).unwrap_or(0.0);
-                let value = self.amp_level_vals.entry(format!("{}/{name}", row.id)).or_insert(current);
-                ui.add(egui::Slider::new(value, 0.0..=1.0).fixed_decimals(2));
+                let raw = row.state.level(name).and_then(|v| v.trim().parse::<f64>().ok());
+                let current = amp::step_from_level(raw.unwrap_or(0.0));
+                let value = self.amp_level_vals.entry(format!("{}/{name}", row.spec.id)).or_insert(current);
+                ui.add(egui::Slider::new(value, 1..=10).text("1–10")).on_hover_text(format!(
+                    "Sends {:.1} to Hamlib (step ÷ 10). Amplifier reads {}.",
+                    amp::level_from_step(*value),
+                    raw.map(|v| format!("{v:.3} (step {current})")).unwrap_or_else(|| "—".into())
+                ));
+                let send = amp::level_from_step(*value);
                 if ui.button("Set").clicked() {
-                    self.amplifiers.control(row.id, amp::Control::SetLevel(name.clone(), format!("{value:.3}")));
+                    self.send_amp(&row.spec.id, amp::Control::SetLevel(name.clone(), format!("{send:.1}")));
                 }
             });
         }
@@ -5907,6 +5929,8 @@ impl App {
             .and_then(|id| self.amplifiers.view().rows.into_iter().find(|r| r.id == id))
             .map(|r| r.spec);
         let spec = amp::AmplifierSpec {
+            // Kept across edits; a new row gets a fresh random id.
+            id: old.as_ref().map(|s| s.id.clone()).filter(|id| !id.is_empty()).unwrap_or_else(amp::new_id),
             name: edit.name.trim().to_string(),
             model: edit.model,
             device: edit.device.trim().to_string(),
@@ -5919,10 +5943,6 @@ impl App {
                 edit.error = err;
             }
             return;
-        }
-        if let Some(old) = &old {
-            // Patch bay boxes bound by name follow the rename (#96).
-            patchbay::bind::rename_amp(&mut self.patchbay, &old.name, &spec.name);
         }
         match edit.id {
             Some(id) => self.amplifiers.update(id, spec),
@@ -6600,7 +6620,7 @@ impl App {
             radios,
             audio,
             rotators,
-            amplifiers,
+            mut amplifiers,
             selected,
             page,
             tabs,
@@ -6618,9 +6638,13 @@ impl App {
             nanovna,
             pulse,
             pulse_secs,
-            patchbay,
+            mut patchbay,
             ..
         } = file;
+        // Every amplifier gets a unique fixed id; bindings to a duplicated
+        // id or an ambiguous old name are dropped with a note (#96).
+        let dup = amp::repair_ids(&mut amplifiers);
+        patchbay::bind::migrate(&mut patchbay, &amplifiers, &dup);
         self.patchbay = patchbay;
         self.patchbay_ui = Default::default();
         self.pulse_on = pulse;

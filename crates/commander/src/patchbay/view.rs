@@ -28,8 +28,9 @@ impl UiState {
 pub enum Action {
     /// "Add to Automation list": a new configured amplifier row.
     AddAmplifier(AmplifierSpec),
-    /// Standby / Operate key on a bound box.
-    Control(u64, Control),
+    /// Standby / Operate key on a bound box, by amplifier id. The caller
+    /// resolves the id at send time and sends nothing if it is missing.
+    Control(String, Control),
 }
 
 /// Configured amplifiers (live rows) and the single-sourced model list.
@@ -173,13 +174,26 @@ fn model_name(m: &AmpModel) -> String {
 /// the selected amplifier box. Nothing here sends on its own.
 fn amp_controls(ui: &mut egui::Ui, dev: &mut model::Device, st: &mut UiState, link: &AmpLink) {
     ui.label("Configured amplifier");
-    let shown = if dev.amp.is_empty() { "unbound (visual only)".to_string() } else { dev.amp.clone() };
+    let label = |row: &AmplifierRow| format!("{}  [{}]", row.spec.name, &row.spec.id[..row.spec.id.len().min(6)]);
+    let shown = match bind::binding(dev, link.rows) {
+        Binding::Unbound => "unbound (visual only)".to_string(),
+        Binding::Missing => "amplifier missing".to_string(),
+        Binding::Bound(row) => label(row),
+    };
+    let before = dev.amp_id.clone();
     egui::ComboBox::from_id_salt(("patchbay_bind", dev.id)).selected_text(shown).show_ui(ui, |ui| {
-        ui.selectable_value(&mut dev.amp, String::new(), "unbound (visual only)");
+        ui.selectable_value(&mut dev.amp_id, String::new(), "unbound (visual only)");
         for row in link.rows {
-            ui.selectable_value(&mut dev.amp, row.spec.name.clone(), &row.spec.name);
+            ui.selectable_value(&mut dev.amp_id, row.spec.id.clone(), label(row))
+                .on_hover_text(format!("amplifier id {}", row.spec.id));
         }
     });
+    if dev.amp_id != before {
+        dev.note.clear();
+    }
+    if !dev.note.is_empty() {
+        ui.label(egui::RichText::new(format!("⚠ {}", dev.note)).color(TX));
+    }
     match bind::binding(dev, link.rows) {
         Binding::Unbound => {
             if ui
@@ -188,25 +202,26 @@ fn amp_controls(ui: &mut egui::Ui, dev: &mut model::Device, st: &mut UiState, li
                 .clicked()
             {
                 let taken: Vec<String> = link.rows.iter().map(|r| r.spec.name.clone()).collect();
-                let spec = bind::spec_for(dev, &taken);
-                dev.amp = spec.name.clone();
+                let spec = bind::spec_for(dev, &taken, amp::new_id());
+                dev.amp_id = spec.id.clone();
+                dev.note.clear();
                 st.actions.push(Action::AddAmplifier(spec));
             }
         }
-        Binding::Missing(name) => {
-            ui.label(egui::RichText::new(format!("⚠ no configured amplifier named {name}")).color(TX));
+        Binding::Missing => {
+            ui.label(egui::RichText::new("⚠ amplifier missing: its configured amplifier was removed. Nothing is sent.").color(TX));
         }
         Binding::Bound(row) => {
             let live = row.port.is_some();
             if ui.add_enabled(live, egui::Button::new("Standby")).clicked() {
-                st.actions.push(Action::Control(row.id, Control::SetPower(Power::Standby)));
+                st.actions.push(Action::Control(row.spec.id.clone(), Control::SetPower(Power::Standby)));
             }
             if ui
                 .add_enabled(live, egui::Button::new(egui::RichText::new("Operate").color(TX)))
                 .on_hover_text("Sends set_powerstat Operate to this amplifier. Only on this click.")
                 .clicked()
             {
-                st.actions.push(Action::Control(row.id, Control::SetPower(Power::Operate)));
+                st.actions.push(Action::Control(row.spec.id.clone(), Control::SetPower(Power::Operate)));
             }
         }
     }
@@ -237,7 +252,7 @@ fn draw_amp_status(p: &egui::Painter, dev: &model::Device, r: Rect, link: &AmpLi
                 power,
             )
         }
-        Binding::Missing(name) => (format!("?    not configured: {name}"), String::new(), None),
+        Binding::Missing => ("?    amplifier missing".to_string(), "sends nothing".to_string(), None),
         Binding::Unbound => return,
     };
     let led = pos2(r.min.x + 12.0, top + 7.0);
@@ -484,12 +499,7 @@ fn draw_cable(p: &egui::Painter, curve: [[f32; 2]; 4], role: Role, lit: bool, ti
 
 fn status(ui: &mut egui::Ui, bay: &PatchBay, st: &UiState, link: &AmpLink) {
     let rep = model::trace(bay);
-    let power = |name: &str| {
-        link.rows
-            .iter()
-            .find(|r| r.spec.name == name && r.port.is_some())
-            .and_then(|r| r.state.power)
-    };
+    let power = |id: &str| bind::resolve(id, link.rows).filter(|r| r.port.is_some()).and_then(|r| r.state.power);
     let amp_warn = bind::amp_warnings(bay, &rep, power);
     if rep.lines.is_empty() {
         ui.label("Drag from a jack to another jack to patch a cable. Drag a plugged end to move or unplug it. Right-click a cable, or click it and press Delete, to remove it.");
@@ -497,7 +507,13 @@ fn status(ui: &mut egui::Ui, bay: &PatchBay, st: &UiState, link: &AmpLink) {
     for line in &rep.lines {
         ui.label(egui::RichText::new(line).color(LABEL));
     }
-    for w in rep.warnings.iter().chain(&amp_warn) {
+    let notes: Vec<String> = bay
+        .devices
+        .iter()
+        .filter(|d| !d.note.is_empty())
+        .map(|d| format!("{}: {}", d.name, d.note))
+        .collect();
+    for w in rep.warnings.iter().chain(&amp_warn).chain(&notes) {
         ui.label(egui::RichText::new(format!("⚠ {w}")).color(TX));
     }
     if !st.note.is_empty() {

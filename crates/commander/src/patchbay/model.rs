@@ -67,10 +67,18 @@ pub struct Device {
     /// Radio row name in the station this device stands for.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub radio: String,
-    /// Configured amplifier (station `amplifiers` row name) this box shows
-    /// live state for (#96). Empty means unbound, visual only.
+    /// Configured amplifier id (`AmplifierSpec::id`) this box shows live
+    /// state for (#96). Empty means unbound, visual only. Never matched by
+    /// name or position.
     #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub amp: String,
+    pub amp_id: String,
+    /// Earlier format of this branch: bound by name. Read once, migrated by
+    /// `bind::migrate`, never written.
+    #[serde(default, rename = "amp", skip_serializing)]
+    pub amp_legacy_name: String,
+    /// Why a binding was dropped (migration or duplicate id). Not saved.
+    #[serde(skip)]
+    pub note: String,
     /// The radio can transmit in this station.
     #[serde(default)]
     pub tx: bool,
@@ -105,7 +113,9 @@ impl Device {
             name: name.into(),
             model: 0,
             radio: String::new(),
-            amp: String::new(),
+            amp_id: String::new(),
+            amp_legacy_name: String::new(),
+            note: String::new(),
             tx: false,
             bands: String::new(),
             ways: default_ways(),
