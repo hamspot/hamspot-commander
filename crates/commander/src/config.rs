@@ -749,6 +749,7 @@ mod tests {
             id: "device".into(),
             zone: String::new(),
             band: String::new(),
+            name: String::new(),
             start_hz: 50_000_000.0,
             step_hz: 1_000_000.0,
             z0: 50.0,

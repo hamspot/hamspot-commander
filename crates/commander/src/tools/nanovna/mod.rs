@@ -2,6 +2,7 @@
 //! The device is optional. Nothing is polled until Connect.
 
 mod device;
+mod cal;
 mod display;
 mod markers;
 mod proto;
@@ -161,6 +162,9 @@ pub struct CalSet {
     /// Band or subband name. A subband is `band / segment`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub band: String,
+    /// Operator's name for the set. Empty shows the zone. Issue 65.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
     pub start_hz: f64,
     pub step_hz: f64,
     pub z0: f64,
@@ -701,6 +705,9 @@ pub struct NanoVna {
     sweep_ms: Option<f64>,
     /// Sweeps received since connect, and the device details popover. Issue 72.
     sweep_count: u64,
+    /// Correction off (CAL OFF) and the state of the shown trace. Issue 65.
+    cal_off: bool,
+    cal_state: cal::CalState,
     details_open: bool,
     last_sweep: Option<std::time::Instant>,
     /// A stored calibration standard shown in its own window. Issue 75.
@@ -766,6 +773,8 @@ impl NanoVna {
             archive_dirty: false,
             sweep_ms: None,
             sweep_count: 0,
+            cal_off: false,
+            cal_state: cal::CalState::Uncal,
             details_open: false,
             last_sweep: None,
             cal_graph: None,
@@ -1273,7 +1282,11 @@ impl NanoVna {
         let mut scale_gesture = ScaleGesture::default();
         let placed = self.placed(trace.as_deref());
         let info = self.marker_info(trace.as_deref(), &placed);
-        let cal = trace.as_deref().and_then(|t| self.matched_cal(t)).cloned();
+        let (cal, state) = match trace.as_deref() {
+            Some(t) => self.cal_for(t, None),
+            None => (None, if self.cal_off { cal::CalState::Off } else { cal::CalState::Uncal }),
+        };
+        self.cal_state = state;
         show_frame(ui, theme, right, Side::Right, |ui| {
             self.trace_header(ui, theme, trace.as_deref(), cal.as_ref());
             let table_h = if placed.is_empty() { 0.0 } else { 22.0 * (placed.len() as f32 + 1.0) + 6.0 };
@@ -1422,7 +1435,7 @@ impl NanoVna {
     }
 
     /// The R&S trace-list line over the pane: name, parameter chip, format, scale, channel, cal.
-    fn trace_header(&self, ui: &mut Ui, theme: &LcarsTheme, samples: Option<&[Sample]>, cal: Option<&CalSet>) {
+    fn trace_header(&mut self, ui: &mut Ui, theme: &LcarsTheme, samples: Option<&[Sample]>, cal: Option<&CalSet>) {
         let (param, format, unit) = view_meta(self.view);
         let shown = self.shown_scale(samples);
         let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::hover());
@@ -1465,17 +1478,41 @@ impl NanoVna {
             traces::Math::Div if self.show_memory => put(&mut x, "MATH D/M", palette::BRICK),
             _ => {}
         }
-        let (badge, fill) = match cal {
-            Some(set) if set.thru.is_empty() => ("CAL OSL".to_string(), palette::OLIVE),
-            Some(_) => ("CAL OSL+THRU".to_string(), palette::OLIVE),
-            None if samples.is_some() => ("CAL ON".to_string(), palette::OLIVE),
-            None => ("UNCAL".to_string(), palette::BRICK),
+        // CAL, CAL INT, CAL OFF or UNCAL, with the kind and range of the set. Issue 65.
+        let state = self.cal_state;
+        let kind = match cal {
+            Some(set) if set.thru.is_empty() => " OSL",
+            Some(_) => " OSL+THRU",
+            None => "",
+        };
+        let range = cal
+            .map(|set| {
+                let hi = set.start_hz + set.step_hz * (set.open.len().saturating_sub(1)) as f64;
+                format!(" · {}-{}", display::fmt_hz(set.start_hz), display::fmt_hz(hi))
+            })
+            .unwrap_or_default();
+        let badge = format!("{}{kind}{range}", if samples.is_none() && state != cal::CalState::Off { "UNCAL" } else { state.label() });
+        let fill = match state {
+            cal::CalState::Exact if samples.is_some() => palette::OLIVE,
+            cal::CalState::Interp => palette::TAN,
+            cal::CalState::Off => palette::SLATE,
+            _ => palette::BRICK,
         };
         let g = painter.layout_no_wrap(badge, font.clone(), rustcars::ink_on(fill));
         let chip = Rect::from_min_size(
             Pos2::new(rect.right() - g.size().x - 20.0, rect.top() + 3.0),
             vec2(g.size().x + 12.0, rect.height() - 6.0),
         );
+        // Badge: single = Cal tab (wizard), double = restore a saved set, triple = correction on/off.
+        let badge_resp = ui.interact(chip, egui::Id::unique("vna-cal-badge"), Sense::click());
+        if badge_resp.triple_clicked() {
+            self.cal_off = !self.cal_off;
+            self.note = if self.cal_off { "Correction is off (CAL OFF).".into() } else { "Correction is on.".into() };
+        } else if badge_resp.double_clicked() {
+            self.restore_cal();
+        } else if badge_resp.clicked() {
+            self.cal_page = true;
+        }
         if chip.left() > x {
             painter.rect_filled(chip, 4.0, fill);
             painter.galley(
@@ -1572,9 +1609,11 @@ impl NanoVna {
             points,
             avg,
         );
+        left.push_str(&format!("  {}", self.cal_state.label()));
         if let Some(set) = cal {
-            if !set.zone.is_empty() {
-                left.push_str(&format!("  CAL {}", set.zone));
+            let name = if set.name.is_empty() { &set.zone } else { &set.name };
+            if !name.is_empty() {
+                left.push_str(&format!(" {name}"));
             }
         }
         let device = if live.connected {
@@ -2426,6 +2465,7 @@ impl NanoVna {
                 id,
                 zone,
                 band: name,
+                name: String::new(),
                 start_hz: start,
                 step_hz: step,
                 z0,
@@ -2494,11 +2534,14 @@ impl NanoVna {
         let step = ((stop - start) as f64 / f64::from(points - 1))
             .round()
             .max(1.0);
+        if self.cal_off {
+            return true;
+        }
         self.face.cals.iter().any(|set| {
             set.id == id
                 && cal_complete(set)
-                && set.open.len() == points as usize
-                && same_grid(set, start as f64, step, points as usize)
+                && ((set.open.len() == points as usize && same_grid(set, start as f64, step, points as usize))
+                    || cal::covers(set, start as f64, stop as f64))
         })
     }
 
@@ -2804,10 +2847,16 @@ impl NanoVna {
                     .color(palette::TEXT_MUTED),
             );
         }
-        if action_button(ui, theme, "Rescan all", vec2(140.0, 32.0)).clicked() {
-            let spans = self.all_zone_spans();
-            self.start_wizard(live, spans, WizStep::Open, false);
-        }
+        ui.horizontal(|ui| {
+            if action_button(ui, theme, "Rescan all", vec2(140.0, 32.0)).clicked() {
+                let spans = self.all_zone_spans();
+                self.start_wizard(live, spans, WizStep::Open, false);
+            }
+            let label = if self.cal_off { "Correction: OFF" } else { "Correction: ON" };
+            if action_button(ui, theme, label, vec2(170.0, 32.0)).clicked() {
+                self.cal_off = !self.cal_off;
+            }
+        });
         let rows: Vec<(String, f64, f64)> = self
             .plan
             .zones
@@ -2831,6 +2880,35 @@ impl NanoVna {
                             .color(theme.text_hi),
                     );
                     let stored = self.zone_cal(id.as_deref(), name).cloned();
+                    if let Some(set) = &stored {
+                        // Rename and delete the stored set. Delete needs a double click. Issue 65.
+                        let at = self.face.cals.iter().rposition(|c| c == set);
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("NAME").color(palette::TEXT_MUTED));
+                            let mut text = set.name.clone();
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(&mut text)
+                                    .hint_text(name.as_str())
+                                    .desired_width(180.0)
+                                    .font(egui::TextStyle::Monospace),
+                            );
+                            if resp.changed() {
+                                if let Some(i) = at {
+                                    self.face.cals[i].name = text.trim().to_string();
+                                    self.archive_dirty = true;
+                                }
+                            }
+                            let del = action_button(ui, theme, "Delete", vec2(90.0, 26.0))
+                                .on_hover_text("Double-click to delete this calibration set");
+                            if del.double_clicked() {
+                                if let Some(i) = at {
+                                    self.face.cals.remove(i);
+                                    self.archive_dirty = true;
+                                    self.note = format!("Deleted the {name} calibration.");
+                                }
+                            }
+                        });
+                    }
                     for step in [WizStep::Open, WizStep::Short, WizStep::Load, WizStep::Thru, WizStep::Isol]
                     {
                         let summary = step_summary(stored.as_ref(), step);
@@ -3212,10 +3290,11 @@ impl NanoVna {
                 s21: s21[index],
             });
         }
-        if self.matched_cal_for(&samples, stored_id.as_deref()).is_none() && self.wizard.is_none() {
+        let (found, state) = self.cal_for(&samples, stored_id.as_deref());
+        if found.is_none() && state != cal::CalState::Off && self.wizard.is_none() {
             return None;
         }
-        if let Some(set) = self.matched_cal_for(&samples, stored_id.as_deref()) {
+        if let Some(set) = found.as_ref() {
             if let Ok(terms) = rf::solve_osl(&pairs(&set.open), &pairs(&set.short), &pairs(&set.load))
             {
                 let n = samples.len();
@@ -3265,6 +3344,48 @@ impl NanoVna {
         Some((vec![live.sweep.clone()], None))
     }
 
+    /// The calibration for a sweep: exact grid, else interpolated from a
+    /// covering set, else none. CAL OFF wins over both. Issue 65.
+    fn cal_for(&self, samples: &[Sample], stored_id: Option<&str>) -> (Option<CalSet>, cal::CalState) {
+        if self.cal_off {
+            return (None, cal::CalState::Off);
+        }
+        if let Some(set) = self.matched_cal_for(samples, stored_id) {
+            return (Some(set.clone()), cal::CalState::Exact);
+        }
+        if samples.len() >= 2 {
+            if let Some(id) = self.cal_device_id(stored_id) {
+                let hz: Vec<f64> = samples.iter().map(|s| s.hz).collect();
+                // Narrowest covering set first: it has the finest grid.
+                let mut sets: Vec<&CalSet> = self
+                    .face
+                    .cals
+                    .iter()
+                    .filter(|set| set.id == id && cal::covers(set, hz[0], hz[hz.len() - 1]))
+                    .collect();
+                sets.sort_by(|a, b| a.step_hz.partial_cmp(&b.step_hz).unwrap_or(std::cmp::Ordering::Equal));
+                if let Some(set) = sets.first().and_then(|set| cal::interpolate(set, &hz)) {
+                    return (Some(set), cal::CalState::Interp);
+                }
+            }
+        }
+        (None, cal::CalState::Uncal)
+    }
+
+    fn cal_device_id(&self, stored_id: Option<&str>) -> Option<String> {
+        let live_id = self
+            .session
+            .snapshot()
+            .device_id
+            .map(|raw| proto::device_id_hex(&raw));
+        let prefer_stored = self.shown_scan.is_some() && self.history.is_empty();
+        if prefer_stored {
+            stored_id.map(str::to_string).or(live_id)
+        } else {
+            live_id.or_else(|| stored_id.map(str::to_string))
+        }
+    }
+
     fn matched_cal(&self, samples: &[Sample]) -> Option<&CalSet> {
         self.matched_cal_for(samples, None)
     }
@@ -3306,8 +3427,12 @@ impl NanoVna {
         };
         let id = proto::device_id_hex(&id);
         let any = self.face.cals.iter().any(|set| set.id == id);
-        if self.matched_cal(samples).is_some() {
+        if self.cal_off {
+            "Correction is off (CAL OFF). The trace is raw.".into()
+        } else if self.matched_cal(samples).is_some() {
             "Calibrated for this device and this sweep.".into()
+        } else if self.cal_for(samples, None).1 == cal::CalState::Interp {
+            "CAL INT: the sweep grid differs, so a covering calibration is interpolated.".into()
         } else if any {
             "Outside the calibrated range. The trace is uncalibrated.".into()
         } else {
@@ -4951,6 +5076,7 @@ mod tests {
             id: "abc".into(),
             zone: String::new(),
             band: String::new(),
+            name: String::new(),
             start_hz: 1e6,
             step_hz: 1e6,
             z0: 50.0,
@@ -4968,6 +5094,7 @@ mod tests {
             id: "abc".into(),
             zone: String::new(),
             band: String::new(),
+            name: String::new(),
             start_hz: 1e6,
             step_hz: 1e6,
             z0: 50.0,
