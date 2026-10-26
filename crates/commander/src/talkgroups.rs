@@ -17,6 +17,28 @@ pub struct Talkgroup {
     /// Transcribed from a listing. With no filled key, follow does not play it.
     #[serde(default)]
     pub encrypted: bool,
+    /// A priority talkgroup may take a receiver off a held call when the
+    /// station allows emergency/priority overrides. Absent means not priority.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub priority: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// Talkgroups marked priority, in every zone.
+pub fn priority_tgs(file: &TalkgroupFile) -> Vec<u32> {
+    let mut out: Vec<u32> = file
+        .zones
+        .iter()
+        .flat_map(|zone| zone.talkgroups.iter())
+        .filter(|row| row.priority)
+        .map(|row| row.tg)
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -111,6 +133,7 @@ pub fn note_seen(file: &mut TalkgroupFile, tg: u32, encrypted: bool) -> bool {
         name: tg.to_string(),
         tg,
         encrypted,
+        priority: false,
     });
     true
 }
@@ -159,6 +182,7 @@ mod tests {
                     name: "Dispatch".into(),
                     tg: 100,
                     encrypted: false,
+                    priority: false,
                 }],
             }],
         };
@@ -185,6 +209,7 @@ mod tests {
             name: "Dispatch".into(),
             tg: 100,
             encrypted: false,
+            priority: false,
         });
         assert!(!note_seen(&mut file, 100, true));
         assert!(!is_encrypted(&file, 100));
