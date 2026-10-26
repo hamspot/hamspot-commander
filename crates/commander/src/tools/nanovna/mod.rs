@@ -428,7 +428,10 @@ pub fn save_file(path: &Path, file: &VnaFile) -> Result<(), String> {
             fs::create_dir_all(dir).map_err(|err| err.to_string())?;
         }
     }
-    fs::write(path, text).map_err(|err| format!("{}: {err}", path.display()))
+    // Temp file and rename, so a crash mid-write never leaves half a file.
+    let tmp = path.with_extension("HSVNA.tmp");
+    fs::write(&tmp, text).map_err(|err| format!("{}: {err}", tmp.display()))?;
+    fs::rename(&tmp, path).map_err(|err| format!("{}: {err}", path.display()))
 }
 
 /// Read the VNA file. An older station that still carries `cals` donates
@@ -437,11 +440,24 @@ pub fn save_file(path: &Path, file: &VnaFile) -> Result<(), String> {
 pub struct LoadedVna {
     pub archive: VnaFile,
     pub stripped_station: bool,
+    /// Set when the VNA file could not be read and was moved aside.
+    pub note: Option<String>,
 }
 
 pub fn load_beside(station: &Path, face: &mut Face) -> Result<LoadedVna, String> {
     let path = path_beside(station);
-    let mut archive = load_file(&path)?;
+    let mut note = None;
+    let mut archive = match load_file(&path) {
+        Ok(file) => file,
+        // A damaged file is moved aside, never overwritten by the next save.
+        Err(err) if path.exists() => {
+            let aside = path.with_extension(format!("HSVNA.corrupt-{}", cal_stamp_now().replace(':', "")));
+            fs::rename(&path, &aside).map_err(|e| format!("{}: {e}", path.display()))?;
+            note = Some(format!("{} could not be read ({err}); moved to {} and started empty.", path.display(), aside.display()));
+            VnaFile::empty()
+        }
+        Err(err) => return Err(err),
+    };
     let station_had_cals = !face.cals.is_empty();
     if archive.cals.is_empty() && station_had_cals {
         archive.cals = face.cals.clone();
@@ -454,6 +470,7 @@ pub fn load_beside(station: &Path, face: &mut Face) -> Result<LoadedVna, String>
     Ok(LoadedVna {
         archive,
         stripped_station: station_had_cals,
+        note,
     })
 }
 
@@ -770,6 +787,8 @@ pub struct NanoVna {
     /// Arrow-key marker step waiting for the chart: -1 / +1.
     kbd_step: i32,
     cal_compare: Option<usize>,
+    /// ISO 8601 time this screen was created; sets saved earlier show RESTORED.
+    run_started: String,
     /// Markers placed on that window's graph (point indices; M1 first). Issue 75.
     cal_graph_marks: Vec<usize>,
     cal_terms: bool,
@@ -851,6 +870,7 @@ impl NanoVna {
             kbd: Vec::new(),
             kbd_step: 0,
             cal_compare: None,
+            run_started: cal_stamp_now(),
             cal_graph_marks: Vec::new(),
             cal_terms: false,
             cal_graph: None,
@@ -1830,7 +1850,14 @@ impl NanoVna {
         };
         // The long badge first; the short label when the pane is narrow.
         let date = cal.map(|set| format!(" · {}", cal_date_text(set.saved_at.as_deref()))).unwrap_or_default();
-        let long = format!("{label}{kind}{range}{date}");
+        // RESTORED: loaded from the VNA file; OTHER ID: saved under another device id. Issue 65.
+        let live_id = self.session.snapshot().device_id.map(|raw| proto::device_id_hex(&raw));
+        let origin = match cal {
+            Some(set) if other_device(set, live_id.as_deref()) => " · RESTORED · OTHER ID",
+            Some(set) if restored(set, &self.run_started) => " · RESTORED",
+            _ => "",
+        };
+        let long = format!("{label}{kind}{range}{date}{origin}");
         let mut g = painter.layout_no_wrap(long, font.clone(), rustcars::ink_on(fill));
         if g.size().x > rect.width() * 0.45 {
             g = painter.layout_no_wrap(label.to_string(), font.clone(), rustcars::ink_on(fill));
@@ -3232,9 +3259,9 @@ impl NanoVna {
         if self.cal_off {
             return true;
         }
+        let _ = &id;
         self.face.cals.iter().any(|set| {
-            set.id == id
-                && cal_complete(set)
+            cal_complete(set)
                 && ((set.open.len() == points as usize && same_grid(set, start as f64, step, points as usize))
                     || cal::covers(set, start as f64, stop as f64))
         })
@@ -3348,7 +3375,18 @@ impl NanoVna {
             self.shown_id.clear();
             self.history.clear();
             self.blank_until_sweep = true;
-            self.note = format!("Scanning {zone} with the stored calibration.");
+            self.note = if other_device(&cal, Some(&id)) {
+                format!(
+                    "Scanning {zone} with the calibration saved {} under device id {} (this connection reports {}). The V2.2 id is not stable; check a known load if in doubt.",
+                    cal_date_text(cal.saved_at.as_deref()),
+                    cal.id,
+                    id
+                )
+            } else if restored(&cal, &self.run_started) {
+                format!("Scanning {zone} with the restored calibration saved {}.", cal_date_text(cal.saved_at.as_deref()))
+            } else {
+                format!("Scanning {zone} with the stored calibration.")
+            };
             if self.send_sweep() {
                 self.run_state = Run::Queued;
             } else {
@@ -3940,11 +3978,7 @@ impl NanoVna {
     }
 
     fn zone_cal(&self, id: Option<&str>, zone: &str) -> Option<&CalSet> {
-        self.face.cals.iter().rev().find(|set| {
-            set.zone == zone
-                && set.band.is_empty()
-                && id.is_none_or(|id| set.id == id)
-        })
+        pick_cal(&self.face.cals, id, |set| set.zone == zone && set.band.is_empty())
     }
 
     fn wizard_dialog(&mut self, ui: &mut Ui, theme: &LcarsTheme, live: &device::Live) {
@@ -4290,12 +4324,11 @@ impl NanoVna {
             if let Some(id) = self.cal_device_id(stored_id) {
                 let hz: Vec<f64> = samples.iter().map(|s| s.hz).collect();
                 // Narrowest covering set first: it has the finest grid.
-                let mut sets: Vec<&CalSet> = self
-                    .face
-                    .cals
-                    .iter()
-                    .filter(|set| set.id == id && cal::covers(set, hz[0], hz[hz.len() - 1]))
-                    .collect();
+                let covering = |set: &&CalSet| cal_complete(set) && cal::covers(set, hz[0], hz[hz.len() - 1]);
+                let mut sets: Vec<&CalSet> = self.face.cals.iter().filter(|set| set.id == id).filter(covering).collect();
+                if sets.is_empty() {
+                    sets = self.face.cals.iter().filter(covering).collect();
+                }
                 sets.sort_by(|a, b| a.step_hz.partial_cmp(&b.step_hz).unwrap_or(std::cmp::Ordering::Equal));
                 if let Some(set) = sets.first().and_then(|set| cal::interpolate(set, &hz)) {
                     return (Some(set), cal::CalState::Interp);
@@ -4341,9 +4374,8 @@ impl NanoVna {
         }
         let start = samples[0].hz;
         let step = samples[1].hz - samples[0].hz;
-        self.face.cals.iter().find(|set| {
-            set.id == id
-                && set.open.len() == samples.len()
+        pick_cal(&self.face.cals, Some(&id), |set| {
+            set.open.len() == samples.len()
                 && (set.start_hz - start).abs() < 1.0
                 && (set.step_hz - step).abs() < 1.0
                 && set.short.len() == samples.len()
@@ -4686,10 +4718,38 @@ fn edges_match(set: &CalSet, lo: f64, hi: f64) -> bool {
     (set.start_hz - lo).abs() <= slop && (stop - hi).abs() <= slop
 }
 
+/// The NanoVNA V2.2 does not report a stable device id: register 0xd0 reads
+/// differently from one connection to the next (often all zeros). So a set is
+/// chosen for this device's id first, and otherwise the newest matching set
+/// from any id. The caller shows the second case (OTHER ID). Issue 65.
+fn pick_cal<'a>(cals: &'a [CalSet], id: Option<&str>, ok: impl Fn(&CalSet) -> bool) -> Option<&'a CalSet> {
+    if let Some(id) = id {
+        if let Some(set) = cals.iter().rev().find(|set| set.id == id && ok(set)) {
+            return Some(set);
+        }
+    }
+    // Newest saved first; sets without a date (older Commander) last, in file order.
+    cals.iter()
+        .enumerate()
+        .filter(|(_, set)| ok(set))
+        .max_by(|(i, a), (j, b)| a.saved_at.cmp(&b.saved_at).then(i.cmp(j)))
+        .map(|(_, set)| set)
+}
+
+/// True when a set was stored under a different, real device id than `live`.
+fn other_device(set: &CalSet, live: Option<&str>) -> bool {
+    let real = |id: &str| !id.is_empty() && id.bytes().any(|b| b != b'0');
+    live.is_some_and(|live| set.id != live && real(&set.id) && real(live))
+}
+
+/// Restored = saved before this run started (or saved by a Commander without dates).
+fn restored(set: &CalSet, run_started: &str) -> bool {
+    set.saved_at.as_deref().is_none_or(|at| at < run_started)
+}
+
 fn find_zone_cal<'a>(cals: &'a [CalSet], id: &str, zone: &str, lo: f64, hi: f64) -> Option<&'a CalSet> {
-    cals.iter().rev().find(|set| {
-        set.id == id
-            && set.zone == zone
+    pick_cal(cals, Some(id), |set| {
+        set.zone == zone
             && set.band.is_empty()
             && cal_complete(set)
             && edges_match(set, lo, hi)
@@ -6445,6 +6505,78 @@ mod tests {
         assert!(validate(&face).is_err());
     }
 
+    fn dated(id: &str, zone: &str, at: Option<&str>) -> CalSet {
+        let mut set = one_standard();
+        set.id = id.into();
+        set.zone = zone.into();
+        set.band.clear();
+        set.saved_at = at.map(str::to_string);
+        set
+    }
+
+    #[test]
+    fn pick_prefers_this_device_then_newest_saved_set() {
+        let cals = vec![
+            dated("aa", "HF", Some("2026-10-20T10:00:00Z")),
+            dated("bb", "HF", Some("2026-10-26T22:48:35Z")),
+            dated("cc", "HF", None),
+            dated("aa", "VHF", Some("2026-10-27T00:00:00Z")),
+        ];
+        let hf = |s: &CalSet| s.zone == "HF";
+        assert_eq!(pick_cal(&cals, Some("aa"), hf).unwrap().id, "aa");
+        assert_eq!(pick_cal(&cals, Some("zz"), hf).unwrap().id, "bb");
+        assert_eq!(pick_cal(&cals, None, hf).unwrap().id, "bb");
+        assert!(pick_cal(&cals, Some("aa"), |s| s.zone == "UHF").is_none());
+    }
+
+    #[test]
+    fn device_mismatch_and_restored_flags() {
+        let set = dated("20b381000000000000000000", "HF", Some("2026-10-26T22:48:35Z"));
+        assert!(other_device(&set, Some("808b08000000000000000000")));
+        assert!(!other_device(&set, Some("20b381000000000000000000")));
+        // An all-zero id says nothing about the device.
+        assert!(!other_device(&set, Some("000000000000000000000000")));
+        assert!(!other_device(&dated("000000000000000000000000", "HF", None), Some("808b08000000000000000000")));
+        assert!(!other_device(&set, None));
+        assert!(restored(&set, "2026-10-26T23:40:00Z"));
+        assert!(!restored(&set, "2026-10-26T22:00:00Z"));
+        assert!(restored(&dated("aa", "HF", None), "2026-10-26T22:00:00Z"));
+    }
+
+    #[test]
+    fn vna_file_round_trip_corrupt_file_and_old_station() {
+        let dir = std::env::temp_dir().join(format!("hamspot-vna-persist-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let station = dir.join("SAFE-T.HSCommander");
+        let path = path_beside(&station);
+        // Missing file: empty, nothing written.
+        let mut face = Face::default();
+        let loaded = load_beside(&station, &mut face).unwrap();
+        assert!(loaded.archive.cals.is_empty() && loaded.note.is_none() && !path.exists());
+        // Round trip keeps saved_at; no temp file is left behind.
+        let mut archive = VnaFile::empty();
+        archive.cals.push(dated("aa", "HF", Some("2026-10-26T22:48:35Z")));
+        save_file(&path, &archive).unwrap();
+        assert!(!path.with_extension("HSVNA.tmp").exists());
+        let back = load_beside(&station, &mut face).unwrap();
+        assert_eq!(back.archive.cals, archive.cals);
+        assert_eq!(back.archive.cals[0].saved_at.as_deref(), Some("2026-10-26T22:48:35Z"));
+        // Corrupt file: moved aside, never overwritten, load still succeeds.
+        fs::write(&path, "{ not json").unwrap();
+        let bad = load_beside(&station, &mut face).unwrap();
+        assert!(bad.archive.cals.is_empty());
+        assert!(bad.note.as_deref().unwrap().contains("corrupt"));
+        assert!(!path.exists());
+        let aside: Vec<_> = fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).filter(|e| e.file_name().to_string_lossy().contains("corrupt")).collect();
+        assert_eq!(aside.len(), 1);
+        assert_eq!(fs::read_to_string(aside[0].path()).unwrap(), "{ not json");
+        // An old station with no nanovna fields still loads with defaults.
+        let old: Face = serde_json::from_str("{}").unwrap();
+        assert!(old.is_default());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     fn one_standard() -> CalSet {
         CalSet {
             id: "abc".into(),
@@ -6478,7 +6610,8 @@ mod tests {
         let cals = vec![other, complete];
         let found = find_zone_cal(&cals, "abc", "VHF", 25_000_000.0, hi).unwrap();
         assert_eq!(found.id, "abc");
-        assert!(find_zone_cal(&cals, "missing", "VHF", 25_000_000.0, hi).is_none());
+        // Another id falls back to the newest matching set (the V2.2 id is not stable).
+        assert!(find_zone_cal(&cals, "missing", "VHF", 25_000_000.0, hi).is_some());
         assert!(find_zone_cal(&cals, "abc", "HF", 25_000_000.0, hi).is_none());
         assert!(find_zone_cal(&cals, "abc", "VHF", 30_000_000.0, 50_000_000.0).is_none());
         assert!(find_zone_cal(&[one_standard()], "abc", "", 1e6, 2e6).is_none());

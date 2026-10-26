@@ -2414,6 +2414,11 @@ impl eframe::App for App {
         // The close prompt writes the station when the operator says to.
         // A crash never reaches either path. Edits that must survive a crash
         // are still written when they happen.
+        // Calibration and scans are never left only in memory. Issue 65.
+        let vna_dirty = self.tools.lock().map(|mut t| t.take_vna_dirty()).unwrap_or(false);
+        if vna_dirty && self.station_saved.is_some() {
+            self.save_vna();
+        }
         self.hub.shutdown();
         self.rotators.shutdown();
         self.amplifiers.shutdown();
@@ -6242,6 +6247,9 @@ impl App {
                 let station_path = Path::new(&self.config_path);
                 match crate::tools::nanovna::load_beside(station_path, &mut file.nanovna) {
                     Ok(loaded) => {
+                        if let Some(note) = &loaded.note {
+                            self.config_note = note.clone();
+                        }
                         if loaded.stripped_station {
                             if let Err(err) = config::save_file(station_path, &file) {
                                 self.config_note = err;
