@@ -87,6 +87,55 @@ pub fn bandfilter(xs: &[f64], db: &[f64]) -> Option<Filter> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Notch {
+    /// Frequency of the deepest point.
+    pub hz: f64,
+    /// Reference (pass-band) level minus the minimum, dB, positive.
+    pub depth_db: f64,
+    /// Pass-band reference level, dB: the higher of the two sweep ends.
+    pub ref_db: f64,
+    /// Where the trace falls 3 dB below the reference.
+    pub lo3: f64,
+    pub hi3: f64,
+    /// Where the trace crosses half the depth; None when outside the sweep.
+    pub lo_half: Option<f64>,
+    pub hi_half: Option<f64>,
+}
+
+impl Notch {
+    pub fn bw3(&self) -> f64 {
+        self.hi3 - self.lo3
+    }
+    pub fn q(&self) -> f64 {
+        self.hz / self.bw3()
+    }
+}
+
+/// Notch (band-stop) analysis of an S21 dB trace: the deepest point, its depth
+/// below the pass-band (the higher sweep end), and the 3 dB and half-depth widths.
+/// None when the dip is under 3 dB or a 3 dB edge falls outside the sweep.
+pub fn notch(xs: &[f64], db: &[f64]) -> Option<Notch> {
+    let n = xs.len().min(db.len());
+    if n < 3 {
+        return None;
+    }
+    let at = (0..n).filter(|&i| db[i].is_finite()).min_by(|a, b| db[*a].total_cmp(&db[*b]))?;
+    let ref_db = db[0].max(db[n - 1]);
+    let depth = ref_db - db[at];
+    if !(depth > 3.0) {
+        return None;
+    }
+    let edge = |level: f64| -> (Option<f64>, Option<f64>) {
+        let lo = (0..at).rev().find(|&i| db[i] >= level).map(|i| cross(xs, db, i, level));
+        let hi = (at..n - 1).find(|&i| db[i + 1] >= level).map(|i| cross(xs, db, i, level));
+        (lo, hi)
+    };
+    let (lo3, hi3) = edge(ref_db - 3.0);
+    let (lo_half, hi_half) = edge(ref_db - depth / 2.0);
+    Some(Notch { hz: xs[at], depth_db: depth, ref_db, lo3: lo3?, hi3: hi3?, lo_half, hi_half })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SwrBand {
     pub min_hz: f64,
     pub min_swr: f64,
@@ -142,6 +191,25 @@ mod tests {
         assert!(f.bw6() > f.bw3());
         assert!(f.q() > 100.0);
         assert!(bandfilter(&xs, &vec![-1.0; 11]).is_none());
+    }
+
+    #[test]
+    fn notch_finds_depth_frequency_and_widths() {
+        // Synthetic notch: 0 dB pass-band, -30 dB at 100 Hz, 1 dB per Hz each side.
+        let xs: Vec<f64> = (0..201).map(|i| i as f64).collect();
+        let db: Vec<f64> = xs.iter().map(|x| -(30.0 - (x - 100.0).abs()).max(0.0)).collect();
+        let n = notch(&xs, &db).unwrap();
+        assert_eq!(n.hz, 100.0);
+        assert!((n.depth_db - 30.0).abs() < 1e-9);
+        assert!((n.lo3 - 73.0).abs() < 1e-6 && (n.hi3 - 127.0).abs() < 1e-6, "{n:?}");
+        assert!((n.bw3() - 54.0).abs() < 1e-6);
+        assert!((n.lo_half.unwrap() - 85.0).abs() < 1e-6 && (n.hi_half.unwrap() - 115.0).abs() < 1e-6);
+        assert!((n.q() - 100.0 / 54.0).abs() < 1e-9);
+        // A flat trace has no notch.
+        assert!(notch(&xs, &vec![-1.0; 201]).is_none());
+        // Edge outside the sweep.
+        let half: Vec<f64> = (0..20).map(|i| -(30.0 - i as f64)).collect();
+        assert!(notch(&xs[..20], &half).is_none());
     }
 
     #[test]
