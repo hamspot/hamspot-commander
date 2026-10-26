@@ -770,6 +770,8 @@ pub struct NanoVna {
     /// Arrow-key marker step waiting for the chart: -1 / +1.
     kbd_step: i32,
     cal_compare: Option<usize>,
+    /// Markers placed on that window's graph (point indices; M1 first). Issue 75.
+    cal_graph_marks: Vec<usize>,
     cal_terms: bool,
 }
 
@@ -849,6 +851,7 @@ impl NanoVna {
             kbd: Vec::new(),
             kbd_step: 0,
             cal_compare: None,
+            cal_graph_marks: Vec::new(),
             cal_terms: false,
             cal_graph: None,
         }
@@ -3649,6 +3652,7 @@ impl NanoVna {
                                 };
                                 self.cal_graph = Some((set, step));
                                 self.cal_compare = None;
+                                self.cal_graph_marks.clear();
                             }
                             if reload_button(ui, theme).clicked() {
                                 self.start_wizard(
@@ -3806,11 +3810,49 @@ impl NanoVna {
                     )
                 };
                 ui.label(egui::RichText::new(legend).size(theme.data_size * 0.8).color(palette::TEXT_MUTED));
+                // Marker readout first, so the graph keeps the rest of the height.
+                if !self.cal_terms && !self.cal_graph_marks.is_empty() {
+                    let view = self.cal_graph_view;
+                    let text = self
+                        .cal_graph_marks
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(k, i)| pts.get(*i).map(|p| format!("M{} {} {}", k + 1, display::fmt_hz(p.hz), marker_value(view, p, set.z0))))
+                        .collect::<Vec<_>>()
+                        .join("  ·  ");
+                    ui.label(egui::RichText::new(text).monospace().size(theme.data_size * 0.85).color(palette::TEXT));
+                }
                 let h = (ui.available_height() - 4.0).max(240.0);
-                let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width().max(320.0), h), Sense::hover());
+                let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width().max(320.0), h), Sense::click());
+                let resp = resp.on_hover_text("Click: place M1 · Double-click or Shift+click: add a marker · Triple-click or Ctrl+click: clear markers");
                 let painter = ui.painter_at(rect);
                 painter.rect_filled(rect, 0.0, PANE_BG);
                 let xs: Vec<f64> = pts.iter().map(|s| s.hz).collect();
+                // Clicking the graph places markers as on the live sweep. Issue 75.
+                let op = click_n(ui, &resp);
+                if op > 0 && !self.cal_terms {
+                    let at = resp.interact_pointer_pos();
+                    let index = at.and_then(|p| match self.cal_graph_view {
+                        View::Smith => {
+                            let d = smith_disk(rect);
+                            calstd::nearest_gamma(&values, Cx::new(((p.x - d.center.x) / d.rad) as f64, (-(p.y - d.center.y) / d.rad) as f64))
+                        }
+                        View::PolarS21 => {
+                            let plot = rect.shrink(16.0);
+                            let r = plot.width().min(plot.height()) * 0.45;
+                            let c = plot.center();
+                            calstd::nearest_gamma(&values, Cx::new(((p.x - c.x) / r) as f64, (-(p.y - c.y) / r) as f64))
+                        }
+                        _ => {
+                            let plot = cart_plot(rect);
+                            let (lo, hi) = (xs.first().copied()?, xs.last().copied()?);
+                            let f = ((p.x - plot.left()) / plot.width()).clamp(0.0, 1.0) as f64;
+                            calstd::nearest_x(&xs, lo + f * (hi - lo))
+                        }
+                    });
+                    calstd::place_marker(&mut self.cal_graph_marks, op, index, markers::NORMAL);
+                }
+                let placed: Vec<(usize, usize)> = self.cal_graph_marks.iter().enumerate().map(|(k, i)| (k, *i)).collect();
                 if self.cal_terms {
                     if let Some(t) = &terms {
                         let d = calstd::term_db(&t.directivity);
@@ -3839,6 +3881,11 @@ impl NanoVna {
                         let p = disk.center + vec2(w.s11.re as f32 * disk.rad, -(w.s11.im as f32) * disk.rad);
                         paint_marker(&painter, p, markers::REF, theme.data_size);
                     }
+                    for (slot, i) in &placed {
+                        if let Some(s) = pts.get(*i) {
+                            paint_marker(&painter, disk.center + vec2(s.s11.re as f32 * disk.rad, -(s.s11.im as f32) * disk.rad), *slot, theme.data_size);
+                        }
+                    }
                 } else if self.cal_graph_view == View::PolarS21 {
                     let plot = rect.shrink(16.0);
                     paint_polar(&painter, plot, theme.data_size);
@@ -3847,6 +3894,14 @@ impl NanoVna {
                         stroke_polar(&painter, plot, c, MEM_COLOR);
                     }
                     stroke_polar(&painter, plot, &pts, TRACE1);
+                    let (c, r) = (plot.center(), plot.width().min(plot.height()) * 0.45);
+                    for (slot, i) in &placed {
+                        if let Some(s) = pts.get(*i) {
+                            let m = s.s11.re.hypot(s.s11.im);
+                            let g = if m > 1.0 { Cx::new(s.s11.re / m, s.s11.im / m) } else { s.s11 };
+                            paint_marker(&painter, c + vec2(g.re as f32 * r, -(g.im as f32) * r), *slot, theme.data_size);
+                        }
+                    }
                 } else {
                     let view = self.cal_graph_view;
                     let ys = series(view, &pts, set.z0, 0.66).1;
@@ -3857,7 +3912,8 @@ impl NanoVna {
                         let n = c.len().min(xs.len());
                         traces.push((&c[..n], MEM_COLOR));
                     }
-                    let marks: Vec<(usize, usize)> = worst.map(|w| vec![(markers::REF, w.index)]).unwrap_or_default();
+                    let mut marks: Vec<(usize, usize)> = worst.map(|w| vec![(markers::REF, w.index)]).unwrap_or_default();
+                    marks.extend(placed.iter().copied());
                     paint_cartesian(&painter, rect, view, &xs, &traces, &marks, theme.data_size, None, &Overlay::default());
                 }
             });
