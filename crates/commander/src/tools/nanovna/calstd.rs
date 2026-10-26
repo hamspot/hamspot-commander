@@ -88,6 +88,45 @@ pub fn term_db(values: &[Cx]) -> Vec<f64> {
     values.iter().map(|v| mag_db(*v)).collect()
 }
 
+/// Index of the point nearest a frequency. Issue 75.
+pub fn nearest_x(xs: &[f64], hz: f64) -> Option<usize> {
+    (0..xs.len()).filter(|&i| xs[i].is_finite()).min_by(|a, b| (xs[*a] - hz).abs().total_cmp(&(xs[*b] - hz).abs()))
+}
+
+/// Index of the point nearest a clicked reflection coefficient (Smith or polar). Issue 75.
+pub fn nearest_gamma(values: &[Cx], at: Cx) -> Option<usize> {
+    (0..values.len())
+        .filter(|&i| values[i].re.is_finite() && values[i].im.is_finite())
+        .min_by(|a, b| {
+            let d = |c: Cx| (c.re - at.re).hypot(c.im - at.im);
+            d(values[*a]).total_cmp(&d(values[*b]))
+        })
+}
+
+/// Markers on the calibration graph after a click of mode `op` at point `index`:
+/// 1 (click) moves M1, 2 (double / Shift) adds the next marker up to `max`
+/// (the last one moves when all are placed), 3 (triple / Ctrl) clears them. Issue 75.
+pub fn place_marker(marks: &mut Vec<usize>, op: u8, index: Option<usize>, max: usize) {
+    match (op, index) {
+        (3, _) => marks.clear(),
+        (1, Some(i)) => {
+            if marks.is_empty() {
+                marks.push(i);
+            } else {
+                marks[0] = i;
+            }
+        }
+        (2, Some(i)) => {
+            if marks.len() < max {
+                marks.push(i);
+            } else if let Some(last) = marks.last_mut() {
+                *last = i;
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,5 +163,30 @@ mod tests {
         let text = csv(1e6, 1e3, &a, Some(&a[..1]));
         assert_eq!(text, "hz,re,im,compare_re,compare_im\n1000000,1,0.5,1,0.5\n1001000,0.25,-1,,\n");
         assert_eq!(csv(1e6, 1e3, &a[..1], None), "hz,re,im\n1000000,1,0.5\n");
+    }
+
+    #[test]
+    fn graph_clicks_place_add_and_clear_markers() {
+        let xs = [1.0, 2.0, 3.0, 4.0];
+        assert_eq!(nearest_x(&xs, 2.4), Some(1));
+        assert_eq!(nearest_x(&xs, 9.0), Some(3));
+        assert_eq!(nearest_x(&[], 1.0), None);
+        let g = [Cx::new(1.0, 0.0), Cx::new(-1.0, 0.0), Cx::new(0.0, 0.1)];
+        assert_eq!(nearest_gamma(&g, Cx::new(0.1, 0.0)), Some(2));
+        assert_eq!(nearest_gamma(&g, Cx::new(-0.8, 0.1)), Some(1));
+        let mut m = Vec::new();
+        place_marker(&mut m, 1, Some(2), 3);
+        assert_eq!(m, vec![2]);
+        place_marker(&mut m, 1, Some(0), 3);
+        assert_eq!(m, vec![0]);
+        place_marker(&mut m, 2, Some(1), 3);
+        place_marker(&mut m, 2, Some(3), 3);
+        assert_eq!(m, vec![0, 1, 3]);
+        place_marker(&mut m, 2, Some(2), 3);
+        assert_eq!(m, vec![0, 1, 2]);
+        place_marker(&mut m, 1, None, 3);
+        assert_eq!(m, vec![0, 1, 2]);
+        place_marker(&mut m, 3, None, 3);
+        assert!(m.is_empty());
     }
 }

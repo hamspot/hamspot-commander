@@ -756,6 +756,7 @@ pub struct NanoVna {
     track: Option<u8>,
     /// Band-filter readout on S21 panes, SWR-bandwidth readout on S11 panes.
     filter_on: bool,
+    notch_on: bool,
     swr_bw_on: bool,
     cal_state: cal::CalState,
     details_open: bool,
@@ -769,6 +770,8 @@ pub struct NanoVna {
     /// Arrow-key marker step waiting for the chart: -1 / +1.
     kbd_step: i32,
     cal_compare: Option<usize>,
+    /// Markers placed on that window's graph (point indices; M1 first). Issue 75.
+    cal_graph_marks: Vec<usize>,
     cal_terms: bool,
 }
 
@@ -839,6 +842,7 @@ impl NanoVna {
             target_text: "-3".into(),
             track: None,
             filter_on: false,
+            notch_on: false,
             swr_bw_on: false,
             cal_state: cal::CalState::Uncal,
             details_open: false,
@@ -847,6 +851,7 @@ impl NanoVna {
             kbd: Vec::new(),
             kbd_step: 0,
             cal_compare: None,
+            cal_graph_marks: Vec::new(),
             cal_terms: false,
             cal_graph: None,
         }
@@ -1876,15 +1881,24 @@ impl NanoVna {
             traces::Math::Div if self.show_memory => put(&mut x, "MATH D/M", MATH_TEXT),
             _ => {}
         }
+        // Averaging and limit verdict flags. Issue 63.
+        let avg = self.host_average_value();
+        if avg > 1 {
+            put(&mut x, &format!("AVG {avg}"), palette::TEXT);
+        }
+        if let Some(v) = self.overlay(samples).verdict {
+            let (text, color) = header_verdict(&v);
+            put(&mut x, &text, color);
+        }
         put(&mut x, "CH1", palette::TEXT_MUTED);
         // Badge: single = Cal tab (wizard), double = restore a saved set, triple = correction on/off.
         let badge_resp = ui.interact(chip, egui::Id::unique(("vna-cal-badge", trc)), Sense::click());
-        if badge_resp.triple_clicked() {
+        if click_n(ui, &badge_resp) == 3 {
             self.cal_off = !self.cal_off;
             self.note = if self.cal_off { "Correction is off (CAL OFF).".into() } else { "Correction is on.".into() };
-        } else if badge_resp.double_clicked() {
+        } else if click_n(ui, &badge_resp) == 2 {
             self.restore_cal();
-        } else if badge_resp.clicked() {
+        } else if click_n(ui, &badge_resp) == 1 {
             self.cal_page = true;
         }
         painter.rect_filled(chip, 4.0, fill);
@@ -2028,13 +2042,13 @@ impl NanoVna {
         }
         // single = details, double = reconnect, triple = copy the status line.
         let key = self.key_op(keys::Group::Status);
-        if resp.triple_clicked() || key == Some(3) {
+        if click_n(ui, &resp) == 3 || key == Some(3) {
             ui.ctx().copy_text(status_line.clone());
             self.note = "Status line copied.".into();
-        } else if resp.double_clicked() || key == Some(2) {
+        } else if click_n(ui, &resp) == 2 || key == Some(2) {
             self.details_open = false;
             self.reconnect();
-        } else if resp.clicked() || key == Some(1) {
+        } else if click_n(ui, &resp) == 1 || key == Some(1) {
             self.details_open = !self.details_open;
         }
         let resp = resp.on_hover_text(keys::hint(keys::Group::Status));
@@ -2073,11 +2087,11 @@ impl NanoVna {
             // RUN: single = continuous, double = single sweep, triple = hold.
             let resp = softkey_response(ui, theme, "Run", self.run && !self.single, col4, true)
                 .on_hover_text(keys::hint(keys::Group::Run));
-            if resp.triple_clicked() {
+            if click_n(ui, &resp) == 3 {
                 mode = Some(2);
-            } else if resp.double_clicked() {
+            } else if click_n(ui, &resp) == 2 {
                 mode = Some(1);
-            } else if resp.clicked() {
+            } else if click_n(ui, &resp) == 1 {
                 mode = Some(0);
             } else if let Some(m) = self.key_op(keys::Group::Run) {
                 mode = Some(m - 1);
@@ -2122,11 +2136,11 @@ impl NanoVna {
             for n in [1u8, 2, 4] {
                 let resp = softkey_response(ui, theme, &format!("Layout·{n}"), self.face.layout.panes == n, col3, true)
                     .on_hover_text(keys::hint(keys::Group::Layout));
-                if resp.triple_clicked() {
+                if click_n(ui, &resp) == 3 {
                     lay = Some((n, 3));
-                } else if resp.double_clicked() {
+                } else if click_n(ui, &resp) == 2 {
                     lay = Some((n, 2));
-                } else if resp.clicked() {
+                } else if click_n(ui, &resp) == 1 {
                     lay = Some((n, 1));
                 }
             }
@@ -2167,11 +2181,11 @@ impl NanoVna {
                 let label = if hidden { format!("TRC{} off", t + 1) } else { format!("TRC{}", t + 1) };
                 let resp = softkey_response(ui, theme, &label, t == self.active_trc, col4, true)
                     .on_hover_text(keys::hint(keys::Group::Trace));
-                if resp.triple_clicked() {
+                if click_n(ui, &resp) == 3 {
                     tr_op = Some((t, 3));
-                } else if resp.double_clicked() {
+                } else if click_n(ui, &resp) == 2 {
                     tr_op = Some((t, 2));
-                } else if resp.clicked() {
+                } else if click_n(ui, &resp) == 1 {
                     tr_op = Some((t, 1));
                 }
             }
@@ -2220,6 +2234,21 @@ impl NanoVna {
         ui.horizontal(|ui| {
             if softkey_enabled(ui, theme, "Pane →", false, col4, self.face.layout.panes > 1) {
                 self.face.layout.move_next(self.active_trc);
+                self.dirty = true;
+            }
+            // MAX: single = maximize/restore the active trace's pane, double = next pane, triple = grid. Issue 62.
+            let multi = self.face.layout.panes > 1;
+            let lit = self.face.layout.maximized.is_some();
+            let resp = softkey_response(ui, theme, if lit { "Restore" } else { "Max" }, lit, col4, multi)
+                .on_hover_text(keys::hint(keys::Group::Max));
+            let mut op = if multi { click_n(ui, &resp) } else { 0 };
+            if op == 0 {
+                op = self.key_op(keys::Group::Max).unwrap_or(0);
+            }
+            if op > 0 {
+                let pane = self.face.layout.traces.get(self.active_trc).map(|t| t.pane).unwrap_or(0);
+                let l = &mut self.face.layout;
+                l.maximized = keys::max_op(op, l.panes, l.maximized, pane);
                 self.dirty = true;
             }
             if softkey(ui, theme, if self.couple { "Couple on" } else { "Couple off" }, self.couple, col4) {
@@ -2279,11 +2308,11 @@ impl NanoVna {
             let resp = softkey_response(ui, theme, "Store", false, col4, samples.is_some())
                 .on_hover_text(keys::hint(keys::Group::Store));
             let key = if samples.is_some() { self.key_op(keys::Group::Store) } else { None };
-            if resp.triple_clicked() || key == Some(3) {
+            if click_n(ui, &resp) == 3 || key == Some(3) {
                 self.math = next_math(self.math);
-            } else if resp.double_clicked() || key == Some(2) {
+            } else if click_n(ui, &resp) == 2 || key == Some(2) {
                 self.show_memory = !self.show_memory;
-            } else if resp.clicked() || key == Some(1) {
+            } else if click_n(ui, &resp) == 1 || key == Some(1) {
                 if let Some(trace) = samples {
                     self.mems[self.mem_sel] = Some(trace.to_vec());
                     self.show_memory = true;
@@ -2341,11 +2370,11 @@ impl NanoVna {
             // pane (one trace today), triple = reset every saved scale.
             let resp = softkey_response(ui, theme, "Auto", cart && !manual, col4, cart)
                 .on_hover_text(keys::hint(keys::Group::Auto));
-            if resp.triple_clicked() {
+            if click_n(ui, &resp) == 3 {
                 scale_op = Some(3);
-            } else if resp.double_clicked() {
+            } else if click_n(ui, &resp) == 2 {
                 scale_op = Some(2);
-            } else if resp.clicked() {
+            } else if click_n(ui, &resp) == 1 {
                 scale_op = Some(1);
             } else if cart {
                 scale_op = self.key_op(keys::Group::Auto);
@@ -2410,11 +2439,11 @@ impl NanoVna {
             // LIMITS: single = on/off, double = edit, triple = SWR 1.5 preset on this band.
             let resp = softkey_response(ui, theme, if lim_on { "Limits on" } else { "Limits off" }, lim_on, col4, cart_lim)
                 .on_hover_text(keys::hint(keys::Group::Limits));
-            if resp.triple_clicked() {
+            if click_n(ui, &resp) == 3 {
                 lim_op = Some(3);
-            } else if resp.double_clicked() {
+            } else if click_n(ui, &resp) == 2 {
                 lim_op = Some(2);
-            } else if resp.clicked() {
+            } else if click_n(ui, &resp) == 1 {
                 lim_op = Some(1);
             } else if cart_lim {
                 lim_op = self.key_op(keys::Group::Limits);
@@ -2536,8 +2565,17 @@ impl NanoVna {
             if softkey_enabled(ui, theme, "Peaks→M", false, col4, ok) {
                 self.peaks_to_markers(samples);
             }
-            if softkey(ui, theme, "Filter", self.filter_on, col4) {
-                self.filter_on = !self.filter_on;
+            // FILTER: single = band-pass analysis, double = notch analysis, triple = both off.
+            let resp = softkey_response(ui, theme, if self.notch_on { "Notch" } else { "Filter" }, self.filter_on || self.notch_on, col4, true)
+                .on_hover_text("Click: band-pass analysis on/off\nDouble-click [Shift+click]: notch analysis on/off\nTriple-click [Ctrl+click]: analysis off");
+            match click_n(ui, &resp) {
+                1 => self.filter_on = !self.filter_on,
+                2 => self.notch_on = !self.notch_on,
+                3 => {
+                    self.filter_on = false;
+                    self.notch_on = false;
+                }
+                _ => {}
             }
             if softkey(ui, theme, "SWR BW", self.swr_bw_on, col4) {
                 self.swr_bw_on = !self.swr_bw_on;
@@ -2599,6 +2637,19 @@ impl NanoVna {
                     out.push((format!("     6dB {}–{} ({})", display::fmt_hz(f.lo6), display::fmt_hz(f.hi6), display::fmt_hz(f.bw6())), palette::TEXT));
                 }
                 None => out.push(("FLT  edges outside the sweep".into(), palette::TEXT_MUTED)),
+            }
+        }
+        if self.notch_on && s21 {
+            let db: Vec<f64> = samples.iter().map(|s| 20.0 * s.s21.norm().max(1e-12).log10()).collect();
+            match search::notch(&xs, &db) {
+                Some(n) => {
+                    out.push((format!("NOTCH {}  DEPTH {:.1} dB  Q {:.1}", display::fmt_hz(n.hz), n.depth_db, n.q()), palette::TEXT));
+                    out.push((format!("     3dB {}–{} ({})", display::fmt_hz(n.lo3), display::fmt_hz(n.hi3), display::fmt_hz(n.bw3())), palette::TEXT));
+                    if let (Some(lo), Some(hi)) = (n.lo_half, n.hi_half) {
+                        out.push((format!("     half-depth {}–{} ({})", display::fmt_hz(lo), display::fmt_hz(hi), display::fmt_hz(hi - lo)), palette::TEXT));
+                    }
+                }
+                None => out.push(("NOTCH none (or edges outside the sweep)".into(), palette::TEXT_MUTED)),
             }
         }
         if self.swr_bw_on && !s21 {
@@ -3580,11 +3631,11 @@ impl NanoVna {
                                 step.step_name()
                             ));
                             // Single, double and triple click pick the first view. Issue 75.
-                            let pick = if graph.triple_clicked() {
+                            let pick = if click_n(ui, &graph) == 3 {
                                 Some(2)
-                            } else if graph.double_clicked() {
+                            } else if click_n(ui, &graph) == 2 {
                                 Some(1)
-                            } else if graph.clicked() {
+                            } else if click_n(ui, &graph) == 1 {
                                 Some(0)
                             } else {
                                 None
@@ -3601,6 +3652,7 @@ impl NanoVna {
                                 };
                                 self.cal_graph = Some((set, step));
                                 self.cal_compare = None;
+                                self.cal_graph_marks.clear();
                             }
                             if reload_button(ui, theme).clicked() {
                                 self.start_wizard(
@@ -3758,11 +3810,49 @@ impl NanoVna {
                     )
                 };
                 ui.label(egui::RichText::new(legend).size(theme.data_size * 0.8).color(palette::TEXT_MUTED));
+                // Marker readout first, so the graph keeps the rest of the height.
+                if !self.cal_terms && !self.cal_graph_marks.is_empty() {
+                    let view = self.cal_graph_view;
+                    let text = self
+                        .cal_graph_marks
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(k, i)| pts.get(*i).map(|p| format!("M{} {} {}", k + 1, display::fmt_hz(p.hz), marker_value(view, p, set.z0))))
+                        .collect::<Vec<_>>()
+                        .join("  ·  ");
+                    ui.label(egui::RichText::new(text).monospace().size(theme.data_size * 0.85).color(palette::TEXT));
+                }
                 let h = (ui.available_height() - 4.0).max(240.0);
-                let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width().max(320.0), h), Sense::hover());
+                let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width().max(320.0), h), Sense::click());
+                let resp = resp.on_hover_text("Click: place M1 · Double-click or Shift+click: add a marker · Triple-click or Ctrl+click: clear markers");
                 let painter = ui.painter_at(rect);
                 painter.rect_filled(rect, 0.0, PANE_BG);
                 let xs: Vec<f64> = pts.iter().map(|s| s.hz).collect();
+                // Clicking the graph places markers as on the live sweep. Issue 75.
+                let op = click_n(ui, &resp);
+                if op > 0 && !self.cal_terms {
+                    let at = resp.interact_pointer_pos();
+                    let index = at.and_then(|p| match self.cal_graph_view {
+                        View::Smith => {
+                            let d = smith_disk(rect);
+                            calstd::nearest_gamma(&values, Cx::new(((p.x - d.center.x) / d.rad) as f64, (-(p.y - d.center.y) / d.rad) as f64))
+                        }
+                        View::PolarS21 => {
+                            let plot = rect.shrink(16.0);
+                            let r = plot.width().min(plot.height()) * 0.45;
+                            let c = plot.center();
+                            calstd::nearest_gamma(&values, Cx::new(((p.x - c.x) / r) as f64, (-(p.y - c.y) / r) as f64))
+                        }
+                        _ => {
+                            let plot = cart_plot(rect);
+                            let (lo, hi) = (xs.first().copied()?, xs.last().copied()?);
+                            let f = ((p.x - plot.left()) / plot.width()).clamp(0.0, 1.0) as f64;
+                            calstd::nearest_x(&xs, lo + f * (hi - lo))
+                        }
+                    });
+                    calstd::place_marker(&mut self.cal_graph_marks, op, index, markers::NORMAL);
+                }
+                let placed: Vec<(usize, usize)> = self.cal_graph_marks.iter().enumerate().map(|(k, i)| (k, *i)).collect();
                 if self.cal_terms {
                     if let Some(t) = &terms {
                         let d = calstd::term_db(&t.directivity);
@@ -3791,6 +3881,11 @@ impl NanoVna {
                         let p = disk.center + vec2(w.s11.re as f32 * disk.rad, -(w.s11.im as f32) * disk.rad);
                         paint_marker(&painter, p, markers::REF, theme.data_size);
                     }
+                    for (slot, i) in &placed {
+                        if let Some(s) = pts.get(*i) {
+                            paint_marker(&painter, disk.center + vec2(s.s11.re as f32 * disk.rad, -(s.s11.im as f32) * disk.rad), *slot, theme.data_size);
+                        }
+                    }
                 } else if self.cal_graph_view == View::PolarS21 {
                     let plot = rect.shrink(16.0);
                     paint_polar(&painter, plot, theme.data_size);
@@ -3799,6 +3894,14 @@ impl NanoVna {
                         stroke_polar(&painter, plot, c, MEM_COLOR);
                     }
                     stroke_polar(&painter, plot, &pts, TRACE1);
+                    let (c, r) = (plot.center(), plot.width().min(plot.height()) * 0.45);
+                    for (slot, i) in &placed {
+                        if let Some(s) = pts.get(*i) {
+                            let m = s.s11.re.hypot(s.s11.im);
+                            let g = if m > 1.0 { Cx::new(s.s11.re / m, s.s11.im / m) } else { s.s11 };
+                            paint_marker(&painter, c + vec2(g.re as f32 * r, -(g.im as f32) * r), *slot, theme.data_size);
+                        }
+                    }
                 } else {
                     let view = self.cal_graph_view;
                     let ys = series(view, &pts, set.z0, 0.66).1;
@@ -3809,7 +3912,8 @@ impl NanoVna {
                         let n = c.len().min(xs.len());
                         traces.push((&c[..n], MEM_COLOR));
                     }
-                    let marks: Vec<(usize, usize)> = worst.map(|w| vec![(markers::REF, w.index)]).unwrap_or_default();
+                    let mut marks: Vec<(usize, usize)> = worst.map(|w| vec![(markers::REF, w.index)]).unwrap_or_default();
+                    marks.extend(placed.iter().copied());
                     paint_cartesian(&painter, rect, view, &xs, &traces, &marks, theme.data_size, None, &Overlay::default());
                 }
             });
@@ -4331,6 +4435,11 @@ impl NanoVna {
         let mut o = Overlay { edges: self.band_edges(), ..Default::default() };
         if is_disk(self.view) || self.view == View::Tdr {
             return o;
+        }
+        if let Some(samples) = samples.filter(|_| uses_s21(self.view) && (self.filter_on || self.notch_on)) {
+            let xs: Vec<f64> = samples.iter().map(|s| s.hz).collect();
+            let db: Vec<f64> = samples.iter().map(|s| 20.0 * s.s21.norm().max(1e-12).log10()).collect();
+            o.analysis = analysis_marks(&xs, &db, self.filter_on, self.notch_on);
         }
         if let Some(set) = self.face.limits.get(self.key().as_str()).filter(|s| s.on && !s.segs.is_empty()) {
             o.limits = set.segs.clone();
@@ -4997,6 +5106,21 @@ fn paint_cartesian(
             );
         }
     }
+    // Filter / notch edges as solid verticals with a label. Issue 67.
+    if view != View::Tdr {
+        let st = Stroke::new(1.5, palette::PLUM.gamma_multiply(1.6));
+        for (k, (hz, label)) in overlay.analysis.iter().enumerate().filter(|(_, (hz, _))| *hz > xmin && *hz < xmax) {
+            let x = plot.left() + ((hz - xmin) / (xmax - xmin)) as f32 * plot.width();
+            painter.line_segment([Pos2::new(x, plot.top()), Pos2::new(x, plot.bottom())], st);
+            painter.text(
+                Pos2::new(x + 2.0, plot.bottom() - 14.0 - (k % 2) as f32 * 12.0),
+                egui::Align2::LEFT_TOP,
+                *label,
+                egui::FontId::monospace((label_px * 0.65).max(9.0)),
+                palette::TEXT,
+            );
+        }
+    }
     let map = |x: f64, y: f64| {
         Pos2::new(
             plot.left() + ((x - xmin) / (xmax - xmin)) as f32 * plot.width(),
@@ -5144,6 +5268,25 @@ fn key_caption(ui: &mut Ui, theme: &LcarsTheme, text: &str, width: f32) {
 }
 
 /// A uniform key cap. Lit keys are tan, idle keys slate.
+/// Click mode 1 / 2 / 3 for a key or plot click, 0 = none. Shift+click is a
+/// double click and Ctrl+click a triple click (rustcars convention). Issue 73.
+/// Light green / light red on the header strip; the words carry the state.
+const PASS_TEXT: Color32 = Color32::from_rgb(0xA8, 0xE0, 0x8C);
+const FAIL_TEXT: Color32 = Color32::from_rgb(0xFF, 0xA0, 0x90);
+
+/// "LIMIT PASS" / "LIMIT FAIL" / "LIMIT: NO POINTS" for the trace header. Issue 63.
+fn header_verdict(v: &limits::Verdict) -> (String, Color32) {
+    let label = v.label();
+    let text = if label.starts_with("LIMIT") { label.to_string() } else { format!("LIMIT {label}") };
+    let color = if v.tested == 0 { palette::TEXT_MUTED } else if v.pass() { PASS_TEXT } else { FAIL_TEXT };
+    (text, color)
+}
+
+fn click_n(ui: &Ui, resp: &egui::Response) -> u8 {
+    let m = ui.input(|i| i.modifiers);
+    keys::click_mode(resp.clicked(), resp.double_clicked(), resp.triple_clicked(), m.shift, m.ctrl || m.command)
+}
+
 fn softkey(ui: &mut Ui, theme: &LcarsTheme, label: &str, lit: bool, width: f32) -> bool {
     softkey_enabled(ui, theme, label, lit, width, true)
 }
@@ -5387,11 +5530,11 @@ fn paint_chart(
     }
     let clicks = if grabbing {
         None
-    } else if resp.triple_clicked() {
+    } else if click_n(ui, &resp) == 3 {
         Some(3)
-    } else if resp.double_clicked() {
+    } else if click_n(ui, &resp) == 2 {
         Some(2)
-    } else if resp.clicked() || (resp.dragged() && !is_disk(view)) {
+    } else if click_n(ui, &resp) == 1 || (resp.dragged() && !is_disk(view)) {
         Some(1)
     } else {
         None
@@ -5428,8 +5571,26 @@ fn paint_chart(
 #[derive(Default)]
 struct Overlay {
     edges: Vec<f64>,
+    /// Filter / notch analysis verticals: frequency and short label. Issue 67.
+    analysis: Vec<(f64, &'static str)>,
     limits: Vec<limits::Segment>,
     verdict: Option<limits::Verdict>,
+}
+
+/// Vertical lines for the filter and notch analysis. Issue 67.
+fn analysis_marks(xs: &[f64], db: &[f64], filter: bool, notch: bool) -> Vec<(f64, &'static str)> {
+    let mut v = Vec::new();
+    if filter {
+        if let Some(f) = search::bandfilter(xs, db) {
+            v.extend([(f.lo3, "-3dB"), (f.center_hz, "CF"), (f.hi3, "-3dB"), (f.lo6, "-6dB"), (f.hi6, "-6dB")]);
+        }
+    }
+    if notch {
+        if let Some(n) = search::notch(xs, db) {
+            v.extend([(n.lo3, "N-3dB"), (n.hz, "NOTCH"), (n.hi3, "N-3dB")]);
+        }
+    }
+    v
 }
 
 /// What the operator did to the scale on the pane this frame. Issue 69.
@@ -6094,6 +6255,34 @@ fn nearest_gamma(samples: &[Sample], pos: Pos2, center: Pos2, radius: f32) -> Op
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn header_flags_show_limit_verdict_with_readable_colours() {
+        let pass = limits::Verdict { tested: 5, failing: vec![] };
+        let fail = limits::Verdict { tested: 5, failing: vec![2] };
+        let none = limits::Verdict { tested: 0, failing: vec![] };
+        assert_eq!(header_verdict(&pass), ("LIMIT PASS".to_string(), PASS_TEXT));
+        assert_eq!(header_verdict(&fail), ("LIMIT FAIL".to_string(), FAIL_TEXT));
+        assert_eq!(header_verdict(&none).0, "LIMIT: NO POINTS");
+        for bg in [palette::STRIP, rustcars::tint(palette::STRIP, -0.4)] {
+            assert!(a11y::contrast(PASS_TEXT, bg) >= 4.5);
+            assert!(a11y::contrast(FAIL_TEXT, bg) >= 4.5);
+        }
+    }
+
+    #[test]
+    fn analysis_marks_place_filter_and_notch_lines() {
+        let xs: Vec<f64> = (0..201).map(|i| i as f64).collect();
+        let notch_db: Vec<f64> = xs.iter().map(|x| -(30.0 - (x - 100.0).abs()).max(0.0)).collect();
+        let m = analysis_marks(&xs, &notch_db, false, true);
+        assert_eq!(m.len(), 3);
+        assert_eq!(m[1], (100.0, "NOTCH"));
+        assert!(analysis_marks(&xs, &notch_db, false, false).is_empty());
+        let bp: Vec<f64> = xs.iter().map(|x| -((x - 100.0).abs() * 0.5)).collect();
+        let f = analysis_marks(&xs, &bp, true, false);
+        assert_eq!(f.len(), 5);
+        assert!((f[0].0 - 94.0).abs() < 1e-6 && (f[2].0 - 106.0).abs() < 1e-6, "{f:?}");
+    }
 
     #[test]
     fn the_polar_readout_gives_magnitude_angle_swr_and_return_loss() {
