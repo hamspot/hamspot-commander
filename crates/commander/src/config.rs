@@ -112,9 +112,13 @@ pub struct ConfigFile {
     pub pulse_secs: f64,
     /// Milliseconds a trunk follower stays on a voice channel after the call
     /// looks finished (terminator, dead carrier, sync loss), so butt-keys and
-    /// push-to-talk gaps do not drop the audio. Absent means 2500.
+    /// push-to-talk gaps do not drop the audio. Absent means 500.
     #[serde(default = "default_voice_hang_ms", skip_serializing_if = "is_default_voice_hang_ms")]
     pub voice_hang_ms: u32,
+    /// Emergency grants and priority talkgroups may take a receiver off the
+    /// call it is holding. Absent means allowed.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub override_hold_emergency_priority: bool,
     /// RF patch bay (#95): devices, panel positions and cables. Visual only.
     /// Absent in a station written before the patch bay existed.
     #[serde(default, skip_serializing_if = "crate::patchbay::PatchBay::is_empty")]
@@ -131,6 +135,14 @@ fn is_pulse_on(value: &bool) -> bool {
 
 fn default_pulse_secs() -> f64 {
     crate::pulse::PERIOD_DEFAULT
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 fn default_voice_hang_ms() -> u32 {
@@ -658,6 +670,7 @@ mod tests {
             pulse: true,
             pulse_secs: crate::pulse::PERIOD_DEFAULT,
             voice_hang_ms: default_voice_hang_ms(),
+            override_hold_emergency_priority: true,
             patchbay: Default::default(),
         }
     }
@@ -684,12 +697,23 @@ mod tests {
     fn voice_hang_defaults_and_a_set_value_round_trips() {
         let text = to_string(&sample()).unwrap();
         assert!(!text.contains("voice_hang_ms"));
-        assert_eq!(parse(&text).unwrap().voice_hang_ms, 2500);
+        assert!(!text.contains("override_hold_emergency_priority"));
+        let back = parse(&text).unwrap();
+        assert_eq!(back.voice_hang_ms, 500);
+        assert!(back.override_hold_emergency_priority);
         let mut file = sample();
-        file.voice_hang_ms = 4000;
+        file.voice_hang_ms = 1500;
+        file.override_hold_emergency_priority = false;
         let text = to_string(&file).unwrap();
-        assert!(text.contains("\"voice_hang_ms\": 4000"));
-        assert_eq!(parse(&text).unwrap().voice_hang_ms, 4000);
+        assert!(text.contains("\"voice_hang_ms\": 1500"));
+        assert!(text.contains("\"override_hold_emergency_priority\": false"));
+        let back = parse(&text).unwrap();
+        assert_eq!(back.voice_hang_ms, 1500);
+        assert!(!back.override_hold_emergency_priority);
+        // A file written by the earlier build kept 2500, not a button now.
+        let mut value: serde_json::Value = serde_json::from_str(&to_string(&sample()).unwrap()).unwrap();
+        value.as_object_mut().unwrap().insert("voice_hang_ms".into(), 2500.into());
+        assert_eq!(parse(&value.to_string()).unwrap().voice_hang_ms, 2500);
         file.voice_hang_ms = 60_000;
         assert!(validate(&file).is_err());
     }
@@ -886,6 +910,7 @@ mod tests {
             name: "01-LEDISP — Law: Dispatch (County)".into(),
             tg: 10006,
             encrypted: false,
+            priority: false,
         });
         file.radios.push(crate::cat::RadioSpec {
             driver: crate::cat::RadioDriver::Hamlib,

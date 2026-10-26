@@ -360,6 +360,16 @@ Channel zones and band-plan zones are different lists. They are not matched by n
 
 `SCAN` and `DWELL` themselves are not stored. A double-click marks a zone for the limited scan, and those marks are stored. An empty mark list scans the zone you have open.
 
+### Holding a followed call
+
+Once a receiver is on a voice channel, it holds that call. Grants for other talkgroups, housekeeping and other control traffic do not move the radio or change the readout. The readout keeps the talkgroup, source radio ID and alias of the call being decoded. Control-channel lines are still written to the decoder log and the radio ID list. A receiver set to the Control role keeps watching the control channel the whole time.
+
+A terminator, a sync loss or a dead carrier starts the **voice hang**. The readout shows `· HANG` and the audio stays routed. Voice on that channel inside the hang picks the same call back up, which covers butt-keys and push-to-talk gaps. When the hang runs out, the radio goes back to the control channel it left. A channel that syncs but decodes no voice for 6 seconds is let go as well. Encrypted voice with no filled key still leaves at once.
+
+On the Config page, `Trunk voice hang` sets the hang to 500 ms (the default), 1500 ms or 3000 ms. The value is stored as `voice_hang_ms` and is written only when it is not 500. A station file with another value up to 15000 still loads, and its value is shown as an extra choice.
+
+`Emergency/priority override` is on by default (`override_hold_emergency_priority`). While it is on, only an emergency grant (the emergency bit in the grant's service options) or a talkgroup ticked `Priority` on its talkgroup page can take a receiver off a held call. The switch is made in one step, and the decoder log gets a `hamspot: emergency override` or `hamspot: priority override` line. Turn the box off to hold every call until its hang ends.
+
 ---
 
 # 7. Meters and levels

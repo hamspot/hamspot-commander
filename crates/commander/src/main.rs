@@ -290,6 +290,10 @@ struct App {
     pulse_secs: f64,
     /// Trunk voice hang in milliseconds, from the station file.
     voice_hang_ms: u32,
+    /// Emergency and priority traffic may take a receiver off a held call.
+    override_hold: bool,
+    /// Emergency grants heard on control receivers this update.
+    trunk_emergency: Vec<(u64, f64, u32)>,
     /// RF patch bay on Config (#98). Visual only.
     patchbay: patchbay::PatchBay,
     patchbay_ui: patchbay::UiState,
@@ -402,6 +406,8 @@ struct App {
     /// Last decoder stderr lines per radio. The hub queue is drained for
     /// the follower, so this is what the Automation frame shows.
     cc_tail: HashMap<u64, Vec<String>>,
+    /// Talkgroup each receiver's readout is holding.
+    held_call: HashMap<u64, Option<u32>>,
     /// Show registration, authentication, and other housekeeping lines in
     /// the decoder log. Off at launch; the radio list keeps their facts.
     show_housekeeping: bool,
@@ -834,6 +840,7 @@ mod talkgroup_tab_tests {
             name: "ISP".into(),
             tg: 10006,
             encrypted: false,
+            priority: false,
         });
         assert_eq!(talkgroup_radio_ids(&rows, true), vec![3]);
         let tabs = super::page_tabs(&rows, &file, &[]);
@@ -916,6 +923,7 @@ mod talkgroup_tab_tests {
             name: "ISP".into(),
             tg: 10006,
             encrypted: false,
+            priority: false,
         });
         let units = vec![crate::units::Unit::named(42)];
         let default_tabs = super::page_tabs(&rows, &file, &units);
@@ -1875,6 +1883,8 @@ impl App {
             pulse_on: true,
             pulse_secs: pulse::PERIOD_DEFAULT,
             voice_hang_ms: follow::VOICE_HANG_DEFAULT.as_millis() as u32,
+            override_hold: true,
+            trunk_emergency: Vec::new(),
             patchbay: Default::default(),
             patchbay_ui: Default::default(),
             reduced_motion: pulse::system_reduced_motion(),
@@ -1940,6 +1950,7 @@ impl App {
             hackrf_scan_center: 0.0,
             feeds: HashMap::new(),
             cc_tail: HashMap::new(),
+            held_call: HashMap::new(),
             show_housekeeping: false,
             tg_recent: pulse::Recent::default(),
             direct_seen: HashMap::new(),
@@ -4035,12 +4046,26 @@ impl App {
         ui.horizontal(|ui| {
             ui.label("Trunk voice hang")
                 .on_hover_text("How long a followed call is held after the talker stops, so butt-keys and dead carriers do not drop the audio.");
-            for (label, ms) in [("1.5 s", 1500), ("2.5 s", 2500), ("4 s", 4000), ("6 s", 6000)] {
+            const HANGS: [u32; 3] = [500, 1500, 3000];
+            for ms in HANGS {
                 let on = self.voice_hang_ms == ms;
-                if ui.selectable_label(on, label).clicked() && !on {
+                if ui.selectable_label(on, format!("{ms} ms")).clicked() && !on {
                     self.voice_hang_ms = ms;
                     self.store_pulse(snap);
                 }
+            }
+            if !HANGS.contains(&self.voice_hang_ms) {
+                // A station file may hold another value. Show it and keep it.
+                let _ = ui.selectable_label(true, format!("{} ms", self.voice_hang_ms));
+            }
+            let mut allow = self.override_hold;
+            if ui
+                .checkbox(&mut allow, "Emergency/priority override")
+                .on_hover_text("An emergency grant or a talkgroup marked Priority may take the receiver off the call it is holding.")
+                .changed()
+            {
+                self.override_hold = allow;
+                self.store_pulse(snap);
             }
         });
         ui.add_space(8.0);
@@ -6471,6 +6496,7 @@ impl App {
             pulse: self.pulse_on,
             pulse_secs: self.pulse_secs,
             voice_hang_ms: self.voice_hang_ms,
+            override_hold_emergency_priority: self.override_hold,
             patchbay: self.patchbay.clone(),
         })
     }
@@ -6539,6 +6565,7 @@ impl App {
             pulse,
             pulse_secs,
             voice_hang_ms,
+            override_hold_emergency_priority,
             patchbay,
             ..
         } = file;
@@ -6547,6 +6574,7 @@ impl App {
         self.pulse_on = pulse;
         self.pulse_secs = pulse_secs;
         self.voice_hang_ms = voice_hang_ms;
+        self.override_hold = override_hold_emergency_priority;
         self.plan = bsp;
         self.channels = channels;
         self.talkgroups = talkgroups;
@@ -8208,6 +8236,26 @@ impl App {
         }
     }
 
+    /// Write follower overrides to the decoder log, and clear the readout
+    /// when the held call has been let go or replaced.
+    fn after_follow(&mut self, id: u64) {
+        let Some(follower) = self.followers.get_mut(&id) else {
+            return;
+        };
+        let notes = follower.take_overrides();
+        let held = follower.holding().then(|| follower.active_tg()).flatten();
+        let was = self.held_call.get(&id).copied().flatten();
+        if was.is_some() && was != held {
+            if let Some(ident) = self.cc_identity.get_mut(&id) {
+                follow::clear_call(ident);
+            }
+        }
+        self.held_call.insert(id, held);
+        if !notes.is_empty() {
+            self.cc_tail.entry(id).or_default().extend(notes);
+        }
+    }
+
     /// Trunking decoder lines. Only call evidence reaches the glass; a
     /// terminator clears the last call so an idle control channel is idle.
     fn note_trunk_identity(&mut self, id: u64, lines: &[String]) {
@@ -8228,12 +8276,28 @@ impl App {
                 admitted.push(line.clone());
             }
         }
-        if ended {
+        // A held call keeps its readout. A terminator inside the hang does
+        // not blank it, and another talkgroup's lines do not replace it. The
+        // decoder log and the radio list still get every line.
+        let held = self
+            .followers
+            .get(&id)
+            .filter(|follower| follower.holding())
+            .and_then(|follower| follower.active_tg());
+        if ended && held.is_none() {
             if let Some(ident) = self.cc_identity.get_mut(&id) {
                 follow::clear_call(ident);
             }
         }
+        let before = self.cc_identity.get(&id).cloned();
         self.note_identity(id, &admitted);
+        if let Some(tg) = held {
+            if let Some(ident) = self.cc_identity.get_mut(&id) {
+                if !follow::readout_keeps(ident, tg) {
+                    *ident = before.unwrap_or_default();
+                }
+            }
+        }
     }
 
     fn note_identity(&mut self, id: u64, lines: &[String]) {
@@ -8252,6 +8316,8 @@ impl App {
         self.sync_key_csv();
         self.apply_saved_control_follow();
         self.trunk_pool.clear();
+        self.trunk_emergency.clear();
+        let priority = talkgroups::priority_tgs(&self.talkgroups);
         let rows = self.hub.view().rows;
         let trunk: Vec<(u64, bool, bool, String)> = rows
             .iter()
@@ -8359,6 +8425,9 @@ impl App {
                 if follower.hang() != hang {
                     follower.set_hang(hang);
                 }
+                if !follower.override_matches(self.override_hold, &priority) {
+                    follower.set_override(self.override_hold, priority.clone());
+                }
                 if !follower.controls_match(&control_hz) {
                     follower.set_controls(control_hz.clone());
                 }
@@ -8379,6 +8448,11 @@ impl App {
                 let zones: Vec<usize> = self.monitor_zones.iter().copied().collect();
                 let marked: Vec<u32> = self.monitor_talkgroups.iter().copied().collect();
                 for event in &parsed {
+                    if let follow::CcEvent::Emergency { hz, tg } = event {
+                        if hz.is_finite() && *hz >= 1_000_000.0 {
+                            self.trunk_emergency.push((id, *hz, *tg));
+                        }
+                    }
                     if let follow::CcEvent::Grant { hz, tg, alg } = event {
                         if !self.hear_grant(*alg, *tg, *hz) || !hz.is_finite() || *hz < 1_000_000.0
                         {
@@ -8438,6 +8512,7 @@ impl App {
                 // The hang runs out on time even when the decoder is silent.
                 follower.tick(now);
             }
+            self.after_follow(id);
             // The S-meter on the snapshot is the selected radio only.
             // A scan of any other radio would rank channels it is not hearing.
             if selected {
@@ -8789,6 +8864,7 @@ impl App {
     fn steer_voice_radios(&mut self) {
         let rows = self.hub.view().rows;
         let grants = self.trunk_pool.clone();
+        let emergencies = self.trunk_emergency.clone();
         for (index, row) in rows.iter().enumerate() {
             if row.spec.driver == cat::RadioDriver::Hackrf || !hears_trunk_pipe(row) {
                 continue;
@@ -8808,7 +8884,24 @@ impl App {
             let Some(follower) = self.followers.get_mut(&row.id) else {
                 continue;
             };
-            if follower.role() == follow::Role::Voice || follower.voice_hz().is_some() {
+            if follower.role() == follow::Role::Voice {
+                // A held call stays. Only an emergency or a priority talkgroup
+                // from another receiver may take it.
+                if let Some((_, ehz, etg)) =
+                    emergencies.iter().rev().find(|(from, _, _)| *from != row.id)
+                {
+                    follower.push(follow::CcEvent::Emergency { hz: *ehz, tg: *etg });
+                } else {
+                    follower.push(follow::CcEvent::Grant {
+                        hz: *hz,
+                        tg: *tg,
+                        alg: follow::CLEAR_ALG,
+                    });
+                }
+                self.after_follow(row.id);
+                continue;
+            }
+            if follower.voice_hz().is_some() {
                 continue;
             }
             follower.push(follow::CcEvent::Grant {
@@ -10018,6 +10111,7 @@ impl App {
         let mut name = row.name.clone();
         let mut tg = row.tg;
         let mut encrypted = row.encrypted;
+        let mut priority = row.priority;
         let mut name_changed = false;
         let mut add = false;
         let mut delete = false;
@@ -10041,6 +10135,8 @@ impl App {
             });
             ui.checkbox(&mut encrypted, "Encrypted")
                 .on_hover_text("No encryption key is stored, so this is not scanned or played.");
+            ui.checkbox(&mut priority, "Priority")
+                .on_hover_text("May take a receiver off a held call when emergency/priority override is on.");
             ui.horizontal(|ui| {
                 if ui.button("Add").clicked() {
                     add = true;
@@ -10061,6 +10157,7 @@ impl App {
             }
             row.tg = tg;
             row.encrypted = encrypted;
+            row.priority = priority;
         }
         if delete {
             self.delete_talkgroup();
@@ -10078,6 +10175,7 @@ impl App {
             name: String::new(),
             tg: next,
             encrypted: false,
+            priority: false,
         });
         self.talkgroup_sel = zone.talkgroups.len() - 1;
         self.talkgroup_note.clear();

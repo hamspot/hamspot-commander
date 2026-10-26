@@ -39,13 +39,13 @@ pub const SCAN_DWELL: std::time::Duration = std::time::Duration::from_millis(120
 /// Default voice hang. A P25 talker who unkeys and rekeys (a butt-key, a
 /// push-to-talk gap, a dead carrier between overs) is held this long on the
 /// voice channel before the radio goes back to the control channel.
-pub const VOICE_HANG_DEFAULT: std::time::Duration = std::time::Duration::from_millis(2500);
+pub const VOICE_HANG_DEFAULT: std::time::Duration = std::time::Duration::from_millis(500);
 /// Longest hang a station file may ask for.
 pub const VOICE_HANG_MAX_MS: u32 = 15_000;
-/// A voice channel that prints nothing at all (no frame, sync, or terminator)
-/// for the hang plus this long is treated as ended. Without it a channel
-/// that went silent with no terminator would hold the radio forever.
-pub const VOICE_SILENCE_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+/// A voice channel with no decoded voice frame for this long is treated as
+/// ended, even while it still syncs. Without it a dead carrier that never
+/// sends a terminator would hold the radio forever.
+pub const VOICE_SILENCE_LIMIT: std::time::Duration = std::time::Duration::from_millis(6000);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
@@ -64,6 +64,10 @@ pub enum CcEvent {
     Alg(u16),
     /// P25 terminator.
     End,
+    /// The grant that follows carries the emergency bit. Sent just before
+    /// its [`CcEvent::Grant`]. Only this and a priority talkgroup may take a
+    /// receiver off a call it is holding.
+    Emergency { hz: f64, tg: u32 },
     /// A decoded voice frame: Phase 1 `LDU1`/`LDU2`, Phase 2 `4V`/`2V`.
     /// This is the evidence that audio is on the air, not just a grant.
     Voice,
@@ -157,6 +161,12 @@ pub struct Follower {
     /// When the call looked finished (terminator, sync loss, dead carrier).
     /// The radio stays on the voice channel until the hang has run from here.
     ending: Option<std::time::Instant>,
+    /// Emergency and priority traffic may take the radio off a held call.
+    override_hold: bool,
+    /// Talkgroups marked priority in the station file.
+    priority: Vec<u32>,
+    /// Overrides not yet written to the decoder log.
+    overrides: Vec<String>,
 }
 
 /// One pass across the control list, in list order.
@@ -194,6 +204,9 @@ impl Follower {
             hang: VOICE_HANG_DEFAULT,
             voice_at: None,
             ending: None,
+            override_hold: true,
+            priority: Vec::new(),
+            overrides: Vec::new(),
         };
         follower.set_controls(controls);
         follower
@@ -278,6 +291,53 @@ impl Follower {
 
     pub fn hang(&self) -> std::time::Duration {
         self.hang
+    }
+
+    /// Whether emergency and priority traffic may take the radio off a held
+    /// call, and which talkgroups are priority.
+    pub fn set_override(&mut self, allow: bool, priority: Vec<u32>) {
+        self.override_hold = allow;
+        self.priority = priority;
+    }
+
+    pub fn override_matches(&self, allow: bool, priority: &[u32]) -> bool {
+        self.override_hold == allow && self.priority == priority
+    }
+
+    /// Log lines for overrides since the last call.
+    pub fn take_overrides(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.overrides)
+    }
+
+    /// True while a call is being held on a voice channel. Its readout
+    /// stays on that call.
+    pub fn holding(&self) -> bool {
+        self.role == Role::Voice && self.pending.is_some()
+    }
+
+    /// Leave the held call for an emergency or priority grant. The switch is
+    /// whole: the old call is released and the new one is pending in one step.
+    fn try_override(&mut self, hz: f64, tg: u32, why: &str) -> bool {
+        if !self.override_hold || !hz.is_finite() || hz <= 0.0 {
+            return false;
+        }
+        let Some(current) = self.pending.clone() else {
+            return false;
+        };
+        if current.tg == tg || (current.hz - hz).abs() < 1.0 {
+            return false;
+        }
+        self.overrides.push(format!(
+            "hamspot: {why} override: talkgroup {} -> talkgroup {tg} at {:.4} MHz",
+            current.tg,
+            hz / 1_000_000.0
+        ));
+        self.back_to_control();
+        self.heard = Some(Heard { tg, hz, alg: CLEAR_ALG });
+        self.pending = Some(Pending { hz, tg });
+        self.sent = None;
+        self.status = format!("voice talkgroup {tg}");
+        true
     }
 
     /// True while a finished-looking call is being held for the hang.
@@ -527,7 +587,7 @@ impl Follower {
             return;
         }
         if let Some(at) = self.voice_at {
-            if now.saturating_duration_since(at) >= self.hang + VOICE_SILENCE_GRACE {
+            if now.saturating_duration_since(at) >= VOICE_SILENCE_LIMIT {
                 self.back_to_control();
             }
         }
@@ -540,7 +600,7 @@ impl Follower {
             self.ending = Some(now);
         }
         if let Some(tg) = self.active_tg() {
-            self.status = format!("voice talkgroup {tg} hang");
+            self.status = format!("voice talkgroup {tg} · HANG");
         }
         if self.hang.is_zero() {
             self.back_to_control();
@@ -570,6 +630,11 @@ impl Follower {
                 }
             }
             CcEvent::Grant { hz, tg, alg } => self.on_grant(hz, tg, alg),
+            CcEvent::Emergency { hz, tg } => {
+                if self.role == Role::Voice && self.scan.is_none() {
+                    self.try_override(hz, tg, "emergency");
+                }
+            }
             CcEvent::Alg(alg) => {
                 if self.role == Role::Voice && alg != CLEAR_ALG {
                     self.heard = self.heard.as_ref().map(|heard| Heard {
@@ -629,7 +694,11 @@ impl Follower {
         }
         // A grant heard while the radio is already on a voice channel is
         // from that channel's link control, not a new control-channel hop.
+        // The held call keeps the radio unless this is a priority talkgroup.
         if self.role == Role::Voice {
+            if alg == CLEAR_ALG && self.priority.contains(&tg) {
+                self.try_override(hz, tg, "priority");
+            }
             return;
         }
         self.heard = Some(Heard { tg, hz, alg });
@@ -919,6 +988,9 @@ impl DsdFeed {
                         push_direct(&mut out, &grant, Some(hz));
                     }
                     if let Some(tg) = grant.tg {
+                        if hz > 0.0 && grant.emergency && !grant.encrypted {
+                            out.push(CcEvent::Emergency { hz, tg });
+                        }
                         if hz > 0.0 {
                             out.push(CcEvent::Grant {
                                 hz,
@@ -1093,6 +1165,9 @@ impl DmrFeed {
             }
             if let Some(open) = self.open.take() {
                 if let Some(tg) = open.tg {
+                    if tg != 0 && hz > 0.0 && open.emergency {
+                        out.push(CcEvent::Emergency { hz, tg });
+                    }
                     if tg != 0 && hz > 0.0 {
                         out.push(CcEvent::Grant {
                             hz,
@@ -1439,6 +1514,12 @@ pub fn is_non_call(line: &str) -> bool {
 /// A terminator or the decoder losing sync: the last call is over.
 pub fn is_call_end(line: &str) -> bool {
     is_tdu(line) || line.contains("Sync: no sync") || line.contains("Call Termination")
+}
+
+/// True when the readout still shows the held talkgroup `tg` (or no
+/// talkgroup yet), so a line from other traffic did not replace it.
+pub fn readout_keeps(id: &AirIdentity, tg: u32) -> bool {
+    id.tg.is_none_or(|shown| shown == tg)
 }
 
 /// Forget the talker, talkgroup, and encryption of the last call. The
@@ -1816,7 +1897,7 @@ pub fn call_status(status: String, live: bool, encrypted: bool, voice: bool) -> 
     }
     if encrypted {
         format!("{status} · ENC")
-    } else if voice {
+    } else if voice || status.ends_with("HANG") {
         status
     } else {
         format!("{status} · NO AUDIO")
@@ -2225,7 +2306,124 @@ mod tests {
     fn the_default_voice_hang_suits_p25_gaps() {
         let follow = Follower::new(vec![851_012_500.0]);
         assert_eq!(follow.hang(), VOICE_HANG_DEFAULT);
-        assert!(VOICE_HANG_DEFAULT >= ms(2000) && VOICE_HANG_DEFAULT <= ms(3000));
+        assert_eq!(VOICE_HANG_DEFAULT, ms(500));
+        assert_eq!(VOICE_SILENCE_LIMIT, ms(6000));
+    }
+
+    fn emergency_grant_lines() -> Vec<&'static str> {
+        vec![
+            " Emergency Group Voice Channel Grant",
+            "  SVC [80] CHAN [0123] Group [777] Source [12345]",
+            "  Frequency [854.100000] MHz",
+        ]
+    }
+
+    #[test]
+    fn an_emergency_grant_line_sends_an_emergency_event() {
+        let mut feed = DsdFeed::default();
+        let mut out = Vec::new();
+        for line in emergency_grant_lines() {
+            out.extend(feed.push_line(line));
+        }
+        let at = out.iter().position(|e| matches!(e, CcEvent::Emergency { tg: 777, .. }));
+        let grant = out.iter().position(|e| matches!(e, CcEvent::Grant { tg: 777, .. }));
+        assert!(at.is_some() && grant.is_some(), "{out:?}");
+        assert!(at < grant);
+    }
+
+    #[test]
+    fn an_emergency_overrides_a_held_call_cleanly_and_is_logged() {
+        let t = std::time::Instant::now();
+        let mut follow = on_voice(500, t);
+        follow.push_at(CcEvent::Voice, t);
+        follow.push_at(CcEvent::Emergency { hz: 854_100_000.0, tg: 777 }, t);
+        follow.push_at(clear(854_100_000.0, 777), t);
+        assert_eq!(follow.active_tg(), Some(777));
+        assert_eq!(follow.target_hz(), Some(854_100_000.0));
+        assert_eq!(follow.role(), Role::Watch);
+        assert_eq!(follow.sent(), None);
+        assert_eq!(follow.control_hz(), Some(851_012_500.0));
+        follow.note_sent_at(854_100_000.0, t);
+        assert_eq!(follow.role(), Role::Voice);
+        let notes = follow.take_overrides();
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("emergency override") && notes[0].contains("777"));
+        assert!(follow.take_overrides().is_empty());
+    }
+
+    #[test]
+    fn a_priority_talkgroup_overrides_but_an_ordinary_one_does_not() {
+        let t = std::time::Instant::now();
+        let mut follow = on_voice(500, t);
+        follow.set_override(true, vec![555]);
+        follow.push_at(clear(854_000_000.0, 99), t);
+        assert_eq!(follow.active_tg(), Some(20));
+        assert!(follow.take_overrides().is_empty());
+        follow.push_at(clear(854_200_000.0, 555), t);
+        assert_eq!(follow.active_tg(), Some(555));
+        assert!(follow.take_overrides()[0].contains("priority override"));
+    }
+
+    #[test]
+    fn override_off_keeps_the_held_call() {
+        let t = std::time::Instant::now();
+        let mut follow = on_voice(500, t);
+        follow.set_override(false, vec![555]);
+        follow.push_at(CcEvent::Emergency { hz: 854_100_000.0, tg: 777 }, t);
+        follow.push_at(clear(854_200_000.0, 555), t);
+        assert_eq!(follow.active_tg(), Some(20));
+        assert_eq!(follow.target_hz(), Some(853_500_000.0));
+        assert!(follow.take_overrides().is_empty());
+    }
+
+    #[test]
+    fn the_held_readout_does_not_change_for_other_traffic() {
+        let t = std::time::Instant::now();
+        let mut follow = on_voice(500, t);
+        let heard = follow.heard().cloned();
+        follow.push_at(clear(854_000_000.0, 99), t);
+        follow.push_at(CcEvent::Unit(UnitSight {
+            id: 4242, last_tg: Some(99), peer: None, emergency: false,
+            encrypted: false, site: None, wacn: None, sys: None, reg: None,
+        }), t);
+        follow.push_at(CcEvent::End, t);
+        assert!(follow.holding());
+        assert_eq!(follow.active_tg(), Some(20));
+        assert_eq!(follow.heard().cloned(), heard);
+        assert_eq!(follow.status(), "voice talkgroup 20 · HANG");
+        let mut ident = AirIdentity { tg: Some(20), ..AirIdentity::default() };
+        assert!(readout_keeps(&ident, 20));
+        ident.tg = Some(99);
+        assert!(!readout_keeps(&ident, 20));
+        ident.tg = None;
+        assert!(readout_keeps(&ident, 20));
+    }
+
+    #[test]
+    fn control_lines_still_reach_the_log_while_a_call_is_held() {
+        // The feed is independent of the follower: every control line still
+        // becomes events for the radio list and decoder log during a hold.
+        let t = std::time::Instant::now();
+        let mut follow = on_voice(500, t);
+        let mut feed = DsdFeed::default();
+        let mut out = Vec::new();
+        for line in emergency_grant_lines() {
+            out.extend(feed.push_line(line));
+        }
+        assert!(out.iter().any(|e| matches!(e, CcEvent::Unit(UnitSight { id: 12345, .. }))), "{out:?}");
+        follow.set_override(false, Vec::new());
+        for event in out {
+            follow.push_at(event, t);
+        }
+        assert_eq!(follow.active_tg(), Some(20));
+    }
+
+    #[test]
+    fn a_hang_status_is_not_marked_no_audio() {
+        assert_eq!(
+            call_status("voice talkgroup 20 · HANG".into(), true, false, false),
+            "voice talkgroup 20 · HANG"
+        );
     }
 
     #[test]
@@ -3035,6 +3233,7 @@ mod tests {
                     sys: None,
                     reg: None,
                 }),
+                CcEvent::Emergency { hz: 851_012_500.0, tg: 9 },
                 clear(851_012_500.0, 9),
             ]
         );
