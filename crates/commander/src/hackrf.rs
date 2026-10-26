@@ -384,6 +384,37 @@ pub fn excursion_done(
     (false, synced, searches)
 }
 
+/// Keep the held call in the remembered list so [`follow_capture`] keeps
+/// choosing it while no new grant is offered.
+pub fn keep_open(open: &mut Vec<(f64, u32, u64)>, call: (f64, u32), seq: u64) {
+    if !open.iter().any(|row| row.1 == call.1) {
+        open.push((call.0, call.1, seq));
+    }
+}
+
+/// Inputs for [`follow_capture`] after the shared hold has decided.
+/// A kept call offers no new grant and no end hint, so a butt-key, a dead
+/// carrier or another talkgroup's grant cannot move it. A release forces the
+/// end. A switch offers only the emergency or priority call.
+pub fn hold_inputs(
+    step: &crate::follow::WideHold,
+    fresh: Vec<(f64, u32)>,
+    seen: (bool, bool, bool, bool),
+    open: &mut Vec<(f64, u32, u64)>,
+    seq: u64,
+) -> (Vec<(f64, u32)>, bool, bool, bool, bool) {
+    use crate::follow::WideHold;
+    match step {
+        WideHold::Free => (fresh, seen.0, seen.1, seen.2, seen.3),
+        WideHold::Keep(call) => {
+            keep_open(open, *call, seq);
+            (Vec::new(), false, false, false, false)
+        }
+        WideHold::Release => (fresh, false, false, true, false),
+        WideHold::Switch(call) => (vec![*call], false, false, false, false),
+    }
+}
+
 /// Pick the capture and the voice frequency for one radio.
 /// `fresh` is newest-last and already limited to clear selected grants from
 /// radios that are still on a control channel. `scan` wins over a voice
@@ -1948,6 +1979,152 @@ mod tests {
     fn cluster() -> (f64, Vec<f64>) {
         let controls = vec![854_437_500.0, 859_962_500.0];
         place(&controls).expect("cluster")
+    }
+
+    /// One HackRF update the way `service_hackrf` runs it.
+    fn wide_update(
+        hold: &mut crate::follow::VoiceHold,
+        state: &mut (Option<(f64, u32)>, Vec<(f64, u32, u64)>, Option<VoiceAway>, u64),
+        fresh: &[(f64, u32)],
+        emergencies: &[(f64, u32)],
+        events: &[crate::follow::CcEvent],
+        now: std::time::Instant,
+    ) -> FollowCapture {
+        use crate::follow::CcEvent;
+        let (center, controls) = cluster();
+        let mut candidates: Vec<(f64, u32, bool)> =
+            fresh.iter().map(|(hz, tg)| (*hz, *tg, false)).collect();
+        candidates.extend(emergencies.iter().map(|(hz, tg)| (*hz, *tg, true)));
+        let step = crate::follow::wide_hold_step(
+            hold, state.0, events, false, &candidates, &|_| true, now,
+        );
+        let saw = |f: fn(&CcEvent) -> bool| events.iter().any(f);
+        let mut open = std::mem::take(&mut state.1);
+        let (fresh, a, b, c, d) = hold_inputs(
+            &step,
+            fresh.to_vec(),
+            (
+                saw(|e| matches!(e, CcEvent::Sync)),
+                saw(|e| matches!(e, CcEvent::SyncLost)),
+                saw(|e| matches!(e, CcEvent::End)),
+                saw(|e| matches!(e, CcEvent::Search)),
+            ),
+            &mut open,
+            state.3,
+        );
+        let picked = follow_capture(
+            center, &controls, None, true, true, open, state.3, state.0, &fresh, state.2, a, b, c, d,
+        );
+        if picked.call != state.0 {
+            if picked.call.is_some() { hold.begin(now); } else { hold.clear(); }
+        }
+        state.0 = picked.call;
+        state.1 = picked.open.clone();
+        state.2 = picked.away;
+        state.3 = picked.seq;
+        picked
+    }
+
+    fn ms(n: u64) -> std::time::Duration {
+        std::time::Duration::from_millis(n)
+    }
+
+    #[test]
+    fn wide_follow_holds_a_call_against_new_grants() {
+        use crate::follow::{CcEvent, VoiceHold};
+        let t = std::time::Instant::now();
+        let mut hold = VoiceHold::default();
+        let mut state = (None, Vec::new(), None, 0);
+        let a = 858_512_500.0;
+        let b = 857_000_000.0;
+        wide_update(&mut hold, &mut state, &[(a, 100)], &[], &[], t);
+        assert_eq!(state.0, Some((a, 100)));
+        let picked = wide_update(&mut hold, &mut state, &[(b, 200)], &[], &[CcEvent::Voice], t + ms(100));
+        assert_eq!(picked.call, Some((a, 100)));
+        assert_eq!(picked.voice_hz, a.round() as u64);
+        // Control decoders keep running: the cluster capture is unchanged.
+        let (_, controls) = cluster();
+        assert_eq!(picked.controls, controls);
+    }
+
+    #[test]
+    fn wide_follow_holds_through_a_butt_key_and_a_dead_carrier() {
+        use crate::follow::{CcEvent, VoiceHold};
+        let t = std::time::Instant::now();
+        let mut hold = VoiceHold::default();
+        let mut state = (None, Vec::new(), None, 0);
+        let a = 858_512_500.0;
+        wide_update(&mut hold, &mut state, &[(a, 100)], &[], &[], t);
+        wide_update(&mut hold, &mut state, &[], &[], &[CcEvent::Voice], t + ms(50));
+        let p = wide_update(&mut hold, &mut state, &[], &[], &[CcEvent::End, CcEvent::SyncLost], t + ms(100));
+        assert_eq!(p.call, Some((a, 100)));
+        assert!(hold.in_hang());
+        let p = wide_update(&mut hold, &mut state, &[], &[], &[CcEvent::Voice], t + ms(400));
+        assert_eq!(p.call, Some((a, 100)));
+        assert!(!hold.in_hang());
+        let p = wide_update(&mut hold, &mut state, &[], &[], &[CcEvent::Search], t + ms(500));
+        assert_eq!(p.call, Some((a, 100)));
+        let p = wide_update(&mut hold, &mut state, &[], &[], &[], t + ms(999));
+        assert_eq!(p.call, Some((a, 100)));
+        let p = wide_update(&mut hold, &mut state, &[], &[], &[], t + ms(1000));
+        assert_eq!(p.call, None);
+        assert_eq!(p.voice_hz, 0);
+    }
+
+    #[test]
+    fn wide_follow_releases_sync_without_voice_after_the_limit() {
+        use crate::follow::{CcEvent, VoiceHold};
+        let t = std::time::Instant::now();
+        let mut hold = VoiceHold::default();
+        let mut state = (None, Vec::new(), None, 0);
+        let a = 858_512_500.0;
+        wide_update(&mut hold, &mut state, &[(a, 100)], &[], &[], t);
+        let p = wide_update(&mut hold, &mut state, &[], &[], &[CcEvent::Sync], t + ms(5900));
+        assert_eq!(p.call, Some((a, 100)));
+        let p = wide_update(&mut hold, &mut state, &[], &[], &[CcEvent::Sync], t + ms(6000));
+        assert_eq!(p.call, None);
+    }
+
+    #[test]
+    fn wide_follow_switches_for_an_emergency_and_logs_it() {
+        use crate::follow::{CcEvent, VoiceHold};
+        let t = std::time::Instant::now();
+        let mut hold = VoiceHold::default();
+        let mut state = (None, Vec::new(), None, 0);
+        let a = 858_512_500.0;
+        let e = 857_000_000.0;
+        wide_update(&mut hold, &mut state, &[(a, 100)], &[], &[], t);
+        // The emergency talkgroup is not monitored: it is only in the
+        // emergency list, not the selected grants.
+        let p = wide_update(&mut hold, &mut state, &[], &[(e, 777)], &[CcEvent::Voice], t + ms(10));
+        assert_eq!(p.call, Some((e, 777)));
+        assert_eq!(p.voice_hz, e.round() as u64);
+        let notes = hold.take_overrides();
+        assert!(notes.len() == 1 && notes[0].contains("emergency override"));
+        let p = wide_update(&mut hold, &mut state, &[], &[], &[], t + ms(20));
+        assert_eq!(p.call, Some((e, 777)));
+    }
+
+    #[test]
+    fn wide_follow_priority_overrides_and_the_option_off_blocks_it() {
+        use crate::follow::VoiceHold;
+        let t = std::time::Instant::now();
+        let a = 858_512_500.0;
+        let pr = 857_000_000.0;
+        let mut hold = VoiceHold::default();
+        hold.set_override(true, vec![555]);
+        let mut state = (None, Vec::new(), None, 0);
+        wide_update(&mut hold, &mut state, &[(a, 100)], &[], &[], t);
+        let p = wide_update(&mut hold, &mut state, &[(pr, 555)], &[], &[], t + ms(10));
+        assert_eq!(p.call, Some((pr, 555)));
+
+        let mut hold = VoiceHold::default();
+        hold.set_override(false, vec![555]);
+        let mut state = (None, Vec::new(), None, 0);
+        wide_update(&mut hold, &mut state, &[(a, 100)], &[], &[], t);
+        let p = wide_update(&mut hold, &mut state, &[(pr, 555)], &[(pr, 777)], &[], t + ms(10));
+        assert_eq!(p.call, Some((a, 100)));
+        assert!(hold.take_overrides().is_empty());
     }
 
     #[test]

@@ -370,6 +370,10 @@ On the Config page, `Trunk voice hang` sets the hang to 500 ms (the default), 15
 
 `Emergency/priority override` is on by default (`override_hold_emergency_priority`). While it is on, only an emergency grant (the emergency bit in the grant's service options) or a talkgroup ticked `Priority` on its talkgroup page can take a receiver off a held call. The switch is made in one step, and the decoder log gets a `hamspot: emergency override` or `hamspot: priority override` line. Turn the box off to hold every call until its hang ends.
 
+An emergency overrides even on a talkgroup you are not monitoring, as long as the override box is on. A priority talkgroup is one you have ticked, so it is already one you chose.
+
+The HackRF wideband follow uses the same hold, hang, silence limit and override rules. A voice channel inside the capture window is decoded while every control decoder in the window keeps running, so control traffic is still logged during the call. A voice channel outside the window takes the whole capture for the call, as before, and the hold keeps that capture until the hang or the silence limit ends it.
+
 ---
 
 # 7. Meters and levels

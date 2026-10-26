@@ -362,6 +362,8 @@ struct App {
     hackrf_open: HashMap<u64, Vec<HeardGrant>>,
     /// The grant on the voice discriminator. `None` is silence.
     hackrf_call: HashMap<u64, Option<(f64, u32)>>,
+    /// Hold and hang for the call each HackRF is decoding.
+    hackrf_hold: HashMap<u64, follow::VoiceHold>,
     /// A HackRF that left its control cluster for one voice call.
     /// Cleared when that call ends. Not written to the station file.
     hackrf_away: HashMap<u64, crate::hackrf::VoiceAway>,
@@ -1925,6 +1927,7 @@ impl App {
             followers: HashMap::new(),
             hackrf_open: HashMap::new(),
             hackrf_call: HashMap::new(),
+            hackrf_hold: HashMap::new(),
             hackrf_away: HashMap::new(),
             trunk_pool: Vec::new(),
             trunk_receivers: Vec::new(),
@@ -6629,6 +6632,7 @@ impl App {
         self.monitor_talkgroups = monitor_talkgroups.into_iter().collect();
         self.hackrf_open.clear();
         self.hackrf_call.clear();
+        self.hackrf_hold.clear();
         self.hackrf_away.clear();
         self.trunk_pool.clear();
         self.hackrf_cc_feeds.clear();
@@ -8283,7 +8287,15 @@ impl App {
             .followers
             .get(&id)
             .filter(|follower| follower.holding())
-            .and_then(|follower| follower.active_tg());
+            .and_then(|follower| follower.active_tg())
+            .or_else(|| {
+                self.hackrf_call
+                    .get(&id)
+                    .copied()
+                    .flatten()
+                    .filter(|_| self.hackrf_hold.get(&id).is_some_and(|hold| hold.active()))
+                    .map(|(_, tg)| tg)
+            });
         if ended && held.is_none() {
             if let Some(ident) = self.cc_identity.get_mut(&id) {
                 follow::clear_call(ident);
@@ -8593,6 +8605,7 @@ impl App {
         let ids: Vec<u64> = direct.iter().map(|row| row.1).collect();
         self.hackrf_open.retain(|id, _| ids.contains(id));
         self.hackrf_call.retain(|id, _| ids.contains(id));
+        self.hackrf_hold.retain(|id, _| ids.contains(id));
         self.hackrf_away.retain(|id, _| ids.contains(id));
         self.hackrf_cc_feeds.retain(|id, _| ids.contains(id));
         self.hackrf_voice_feed.retain(|id, _| ids.contains(id));
@@ -8688,6 +8701,11 @@ impl App {
                     .is_some_and(|hz| !crate::hackrf::inside(cluster, hz));
             if !away_now.contains(&id) && !parked_outside {
                 for event in &parsed {
+                    if let follow::CcEvent::Emergency { hz, tg } = event {
+                        if hz.is_finite() && *hz >= 1_000_000.0 {
+                            self.trunk_emergency.push((id, *hz, *tg));
+                        }
+                    }
                     if let follow::CcEvent::Grant { hz, tg, alg } = event {
                         if !self.hear_grant(*alg, *tg, *hz) || !hz.is_finite() || *hz < 1_000_000.0
                         {
@@ -8761,6 +8779,59 @@ impl App {
                 follow::CcEvent::Alg(alg) => *alg != follow::CLEAR_ALG && !keyed,
                 _ => false,
             });
+            // The shared hold decides whether the call being decoded stays.
+            // Control decoders keep running inside the capture and their
+            // lines are logged above; only the choice of call is held.
+            let now = std::time::Instant::now();
+            let hang = std::time::Duration::from_millis(u64::from(self.voice_hang_ms));
+            let priority = talkgroups::priority_tgs(&self.talkgroups);
+            let encrypted_end = tick.voice_events.iter().any(|event| {
+                matches!(event, follow::CcEvent::Alg(alg) if *alg != follow::CLEAR_ALG && !keyed)
+            });
+            let mut candidates: Vec<(f64, u32, bool)> =
+                fresh.iter().map(|(hz, tg)| (*hz, *tg, false)).collect();
+            for (from, hz, tg) in &self.trunk_emergency {
+                if !away_now.contains(&tick.id) || *from != tick.id {
+                    candidates.push((*hz, *tg, true));
+                }
+            }
+            let step = {
+                let hold = self.hackrf_hold.entry(tick.id).or_default();
+                if hold.hang() != hang {
+                    hold.set_hang(hang);
+                }
+                if !hold.override_matches(self.override_hold, &priority) {
+                    hold.set_override(self.override_hold, priority);
+                }
+                if may_play && !tick.scanning {
+                    let reachable = |hz: f64| may_leave || crate::hackrf::inside(cluster, hz);
+                    follow::wide_hold_step(
+                        hold,
+                        previous,
+                        &tick.voice_events,
+                        encrypted_end,
+                        &candidates,
+                        &reachable,
+                        now,
+                    )
+                } else {
+                    hold.clear();
+                    follow::WideHold::Free
+                }
+            };
+            let mut open = open;
+            let (fresh, sync, lost, end, search) = crate::hackrf::hold_inputs(
+                &step,
+                fresh,
+                (
+                    saw(|event| matches!(event, follow::CcEvent::Sync)),
+                    saw(|event| matches!(event, follow::CcEvent::SyncLost)),
+                    saw_end,
+                    saw(|event| matches!(event, follow::CcEvent::Search)),
+                ),
+                &mut open,
+                self.hackrf_seq,
+            );
             let picked = crate::hackrf::follow_capture(
                 cluster,
                 &cluster_controls,
@@ -8772,11 +8843,29 @@ impl App {
                 previous,
                 &fresh,
                 self.hackrf_away.get(&tick.id).copied(),
-                saw(|event| matches!(event, follow::CcEvent::Sync)),
-                saw(|event| matches!(event, follow::CcEvent::SyncLost)),
-                saw_end,
-                saw(|event| matches!(event, follow::CcEvent::Search)),
+                sync,
+                lost,
+                end,
+                search,
             );
+            if picked.call != previous {
+                if let Some(ident) = self.cc_identity.get_mut(&tick.id) {
+                    follow::clear_call(ident);
+                }
+                if let Some(hold) = self.hackrf_hold.get_mut(&tick.id) {
+                    if picked.call.is_some() {
+                        hold.begin(now);
+                    } else {
+                        hold.clear();
+                    }
+                }
+            }
+            if let Some(hold) = self.hackrf_hold.get_mut(&tick.id) {
+                let notes = hold.take_overrides();
+                if !notes.is_empty() {
+                    self.cc_tail.entry(tick.id).or_default().extend(notes);
+                }
+            }
             self.hackrf_seq = picked.seq;
             self.hackrf_open.insert(
                 tick.id,
@@ -9138,7 +9227,11 @@ impl App {
             } else if !follow {
                 "follow is off".to_string()
             } else if let Some(tg) = tg {
-                format!("voice talkgroup {tg}")
+                if self.hackrf_hold.get(&id).is_some_and(|hold| hold.in_hang()) {
+                    format!("voice talkgroup {tg} · HANG")
+                } else {
+                    format!("voice talkgroup {tg}")
+                }
             } else if self.cc_site.contains_key(&id) {
                 "locked".to_string()
             } else {

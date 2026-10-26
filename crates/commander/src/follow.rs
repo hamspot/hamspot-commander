@@ -154,19 +154,185 @@ pub struct Follower {
     next_scan: Option<std::time::Instant>,
     /// Strength pass in progress. The home index stays put until it finishes.
     scan: Option<StrengthScan>,
-    /// How long a voice channel is held after the talker stops.
+    /// Hold, hang and override state for the call on the voice channel.
+    hold: VoiceHold,
+}
+
+/// Hold, hang and override rules for one call being decoded. Shared by the
+/// one-radio [`Follower`] and the HackRF wideband follow path, so both keep
+/// a call through butt-keys and dead carriers the same way.
+#[derive(Clone, Debug)]
+pub struct VoiceHold {
     hang: std::time::Duration,
-    /// Last sign of life on the voice channel: the tune or a voice frame.
+    /// Last sign of life: the start of the call or a decoded voice frame.
     voice_at: Option<std::time::Instant>,
     /// When the call looked finished (terminator, sync loss, dead carrier).
-    /// The radio stays on the voice channel until the hang has run from here.
     ending: Option<std::time::Instant>,
-    /// Emergency and priority traffic may take the radio off a held call.
     override_hold: bool,
-    /// Talkgroups marked priority in the station file.
     priority: Vec<u32>,
-    /// Overrides not yet written to the decoder log.
     overrides: Vec<String>,
+}
+
+impl Default for VoiceHold {
+    fn default() -> Self {
+        Self {
+            hang: VOICE_HANG_DEFAULT,
+            voice_at: None,
+            ending: None,
+            override_hold: true,
+            priority: Vec::new(),
+            overrides: Vec::new(),
+        }
+    }
+}
+
+impl VoiceHold {
+    pub fn set_hang(&mut self, hang: std::time::Duration) {
+        self.hang = hang;
+    }
+
+    pub fn hang(&self) -> std::time::Duration {
+        self.hang
+    }
+
+    pub fn set_override(&mut self, allow: bool, priority: Vec<u32>) {
+        self.override_hold = allow;
+        self.priority = priority;
+    }
+
+    pub fn override_matches(&self, allow: bool, priority: &[u32]) -> bool {
+        self.override_hold == allow && self.priority == priority
+    }
+
+    pub fn take_overrides(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.overrides)
+    }
+
+    pub fn is_priority(&self, tg: u32) -> bool {
+        self.priority.contains(&tg)
+    }
+
+    /// A call started, or the radio landed on its channel.
+    pub fn begin(&mut self, now: std::time::Instant) {
+        self.voice_at = Some(now);
+        self.ending = None;
+    }
+
+    /// The call was let go.
+    pub fn clear(&mut self) {
+        self.voice_at = None;
+        self.ending = None;
+    }
+
+    pub fn active(&self) -> bool {
+        self.voice_at.is_some() || self.ending.is_some()
+    }
+
+    /// A voice frame. `true` when it ended a hang.
+    pub fn voice(&mut self, now: std::time::Instant) -> bool {
+        self.voice_at = Some(now);
+        self.ending.take().is_some()
+    }
+
+    /// A terminator, sync loss or dead-carrier search. Starts the hang.
+    pub fn end(&mut self, now: std::time::Instant) {
+        if self.ending.is_none() {
+            self.ending = Some(now);
+        }
+    }
+
+    pub fn in_hang(&self) -> bool {
+        self.ending.is_some()
+    }
+
+    /// The hang ran out, or no voice frame for [`VOICE_SILENCE_LIMIT`].
+    pub fn expired(&self, now: std::time::Instant) -> bool {
+        if let Some(ending) = self.ending {
+            return now.saturating_duration_since(ending) >= self.hang;
+        }
+        self.voice_at
+            .is_some_and(|at| now.saturating_duration_since(at) >= VOICE_SILENCE_LIMIT)
+    }
+
+    /// Whether a grant may take the radio off the held `current` call. Only
+    /// an emergency or a priority talkgroup may, and only with the option on.
+    pub fn may_override(&self, current: (f64, u32), hz: f64, tg: u32, emergency: bool) -> bool {
+        if !self.override_hold || !hz.is_finite() || hz <= 0.0 {
+            return false;
+        }
+        if current.1 == tg || (current.0 - hz).abs() < 1.0 {
+            return false;
+        }
+        emergency || self.is_priority(tg)
+    }
+
+    pub fn log_override(&mut self, why: &str, from_tg: u32, hz: f64, tg: u32) {
+        self.overrides.push(format!(
+            "hamspot: {why} override: talkgroup {from_tg} -> talkgroup {tg} at {:.4} MHz",
+            hz / 1_000_000.0
+        ));
+    }
+}
+
+/// What the HackRF follow path does with one held call on one update.
+#[derive(Clone, Debug, PartialEq)]
+pub enum WideHold {
+    /// Nothing is held. Follow picks as before.
+    Free,
+    /// Keep this call. New grants and end hints do not move it.
+    Keep((f64, u32)),
+    /// The held call is over. Let it go this update.
+    Release,
+    /// Switch to this emergency or priority call in one step.
+    Switch((f64, u32)),
+}
+
+/// One update of the HackRF wideband hold. `held` is the call the radio is
+/// decoding. `voice_events` are this update's voice-decoder events.
+/// `candidates` are grants heard on any control decoder this update with
+/// their emergency bit; `reachable` says whether the capture can play one.
+pub fn wide_hold_step(
+    hold: &mut VoiceHold,
+    held: Option<(f64, u32)>,
+    voice_events: &[CcEvent],
+    encrypted_end: bool,
+    candidates: &[(f64, u32, bool)],
+    reachable: &dyn Fn(f64) -> bool,
+    now: std::time::Instant,
+) -> WideHold {
+    let Some(call) = held else {
+        hold.clear();
+        return WideHold::Free;
+    };
+    if !hold.active() {
+        hold.begin(now);
+    }
+    if encrypted_end {
+        hold.clear();
+        return WideHold::Release;
+    }
+    for event in voice_events {
+        match event {
+            CcEvent::Voice => {
+                hold.voice(now);
+            }
+            CcEvent::End | CcEvent::SyncLost | CcEvent::Search => hold.end(now),
+            _ => {}
+        }
+    }
+    for (hz, tg, emergency) in candidates.iter().rev() {
+        if reachable(*hz) && hold.may_override(call, *hz, *tg, *emergency) {
+            let why = if *emergency { "emergency" } else { "priority" };
+            hold.log_override(why, call.1, *hz, *tg);
+            hold.begin(now);
+            return WideHold::Switch((*hz, *tg));
+        }
+    }
+    if hold.expired(now) {
+        hold.clear();
+        return WideHold::Release;
+    }
+    WideHold::Keep(call)
 }
 
 /// One pass across the control list, in list order.
@@ -201,12 +367,7 @@ impl Follower {
             held: false,
             next_scan: None,
             scan: None,
-            hang: VOICE_HANG_DEFAULT,
-            voice_at: None,
-            ending: None,
-            override_hold: true,
-            priority: Vec::new(),
-            overrides: Vec::new(),
+            hold: VoiceHold::default(),
         };
         follower.set_controls(controls);
         follower
@@ -286,27 +447,26 @@ impl Follower {
 
     /// Set the voice hang. A station file value in milliseconds.
     pub fn set_hang(&mut self, hang: std::time::Duration) {
-        self.hang = hang;
+        self.hold.set_hang(hang);
     }
 
     pub fn hang(&self) -> std::time::Duration {
-        self.hang
+        self.hold.hang()
     }
 
     /// Whether emergency and priority traffic may take the radio off a held
     /// call, and which talkgroups are priority.
     pub fn set_override(&mut self, allow: bool, priority: Vec<u32>) {
-        self.override_hold = allow;
-        self.priority = priority;
+        self.hold.set_override(allow, priority);
     }
 
     pub fn override_matches(&self, allow: bool, priority: &[u32]) -> bool {
-        self.override_hold == allow && self.priority == priority
+        self.hold.override_matches(allow, priority)
     }
 
     /// Log lines for overrides since the last call.
     pub fn take_overrides(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.overrides)
+        self.hold.take_overrides()
     }
 
     /// True while a call is being held on a voice channel. Its readout
@@ -318,20 +478,13 @@ impl Follower {
     /// Leave the held call for an emergency or priority grant. The switch is
     /// whole: the old call is released and the new one is pending in one step.
     fn try_override(&mut self, hz: f64, tg: u32, why: &str) -> bool {
-        if !self.override_hold || !hz.is_finite() || hz <= 0.0 {
-            return false;
-        }
         let Some(current) = self.pending.clone() else {
             return false;
         };
-        if current.tg == tg || (current.hz - hz).abs() < 1.0 {
+        if !self.hold.may_override((current.hz, current.tg), hz, tg, why == "emergency") {
             return false;
         }
-        self.overrides.push(format!(
-            "hamspot: {why} override: talkgroup {} -> talkgroup {tg} at {:.4} MHz",
-            current.tg,
-            hz / 1_000_000.0
-        ));
+        self.hold.log_override(why, current.tg, hz, tg);
         self.back_to_control();
         self.heard = Some(Heard { tg, hz, alg: CLEAR_ALG });
         self.pending = Some(Pending { hz, tg });
@@ -342,7 +495,7 @@ impl Follower {
 
     /// True while a finished-looking call is being held for the hang.
     pub fn in_hang(&self) -> bool {
-        self.role == Role::Voice && self.ending.is_some()
+        self.role == Role::Voice && self.hold.in_hang()
     }
 
     pub fn note_sent(&mut self, hz: f64) {
@@ -352,8 +505,7 @@ impl Follower {
     pub fn note_sent_at(&mut self, hz: f64, now: std::time::Instant) {
         self.sent = Some(hz);
         if self.pending.is_some() && self.role != Role::Voice {
-            self.voice_at = Some(now);
-            self.ending = None;
+            self.hold.begin(now);
         }
         // The next search line may already have been counted on the
         // frequency this tune is leaving. Arm on that line. Hop on the next.
@@ -580,29 +732,19 @@ impl Follower {
         if self.role != Role::Voice {
             return;
         }
-        if let Some(ending) = self.ending {
-            if now.saturating_duration_since(ending) >= self.hang {
-                self.back_to_control();
-            }
-            return;
-        }
-        if let Some(at) = self.voice_at {
-            if now.saturating_duration_since(at) >= VOICE_SILENCE_LIMIT {
-                self.back_to_control();
-            }
+        if self.hold.expired(now) {
+            self.back_to_control();
         }
     }
 
     /// The call looks finished. Hold the voice channel for the hang; a later
     /// voice frame or sync on this channel picks the same call back up.
     fn start_hang(&mut self, now: std::time::Instant) {
-        if self.ending.is_none() {
-            self.ending = Some(now);
-        }
+        self.hold.end(now);
         if let Some(tg) = self.active_tg() {
             self.status = format!("voice talkgroup {tg} · HANG");
         }
-        if self.hang.is_zero() {
+        if self.hold.expired(now) {
             self.back_to_control();
         }
     }
@@ -611,8 +753,7 @@ impl Follower {
         if self.role != Role::Voice {
             return;
         }
-        self.voice_at = Some(now);
-        if self.ending.take().is_some() {
+        if self.hold.voice(now) {
             self.refresh_status();
         }
     }
@@ -696,7 +837,7 @@ impl Follower {
         // from that channel's link control, not a new control-channel hop.
         // The held call keeps the radio unless this is a priority talkgroup.
         if self.role == Role::Voice {
-            if alg == CLEAR_ALG && self.priority.contains(&tg) {
+            if alg == CLEAR_ALG && self.hold.is_priority(tg) {
                 self.try_override(hz, tg, "priority");
             }
             return;
@@ -766,8 +907,7 @@ impl Follower {
     }
 
     fn back_to_control(&mut self) {
-        self.ending = None;
-        self.voice_at = None;
+        self.hold.clear();
         self.pending = None;
         self.role = Role::Watch;
         self.synced = false;
