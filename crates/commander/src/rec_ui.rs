@@ -519,15 +519,21 @@ impl App {
         let sources = self.rec.db.as_ref().and_then(|db| db.sources().ok()).unwrap_or_default();
         let tabs = meta::source_tabs(&sources);
         let current = self.rec_source();
-        ui.horizontal(|ui| {
-            for (index, s) in tabs.iter().enumerate() {
-                if folder_tab(ui, *s == current, index, &meta::source_label(s), index == 0).clicked() && *s != current {
-                    self.rec.face.source_tab = s.clone();
-                    self.rec.face_dirty = true;
-                    self.rec.selected = None;
-                }
-            }
-        });
+        let labels: Vec<String> = tabs.iter().map(|s| meta::source_label(s)).collect();
+        let sel = tabs.iter().position(|s| *s == current);
+        let picked = crate::tools::overflow_tab_row(
+            ui,
+            "rec-sources",
+            &labels,
+            sel,
+            |ui, i| super::folder_tab_width(ui, &labels[i], false),
+            |ui, i, lead| folder_tab(ui, Some(i) == sel, i, &labels[i], lead),
+        );
+        if let Some(s) = picked.map(|i| &tabs[i]).filter(|s| **s != current) {
+            self.rec.face.source_tab = s.clone();
+            self.rec.face_dirty = true;
+            self.rec.selected = None;
+        }
         ui.add_space(4.0);
         self.rec_status_row(ui);
         self.rec_job_row(ui);

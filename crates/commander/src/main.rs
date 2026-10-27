@@ -1349,6 +1349,21 @@ fn folder_tab(
     folder_tab_colored(ui, selected, index, label, lead, None, None)
 }
 
+/// The width a [`folder_tab_colored`] tab takes in the row.
+pub(crate) fn folder_tab_width(ui: &egui::Ui, label: &str, speaker: bool) -> f32 {
+    let theme = rustcars::LcarsTheme::default();
+    let width = if speaker {
+        voice_tab_width(ui.painter(), &theme, label)
+    } else {
+        label
+            .chars()
+            .map(|ch| if (ch as u32) >= 0x1F000 { 22.0 } else { 11.0 })
+            .sum::<f32>()
+            + 28.0
+    };
+    width.max(72.0)
+}
+
 /// Same tab, with a fill that replaces the zone color. NanoVNA uses this
 /// while a zone sweep is running.
 pub(crate) fn folder_tab_colored(
@@ -1368,16 +1383,7 @@ pub(crate) fn folder_tab_colored(
             tab_color(index)
         }
     });
-    let width = if speaker.is_some() {
-        voice_tab_width(ui.painter(), &theme, label)
-    } else {
-        label
-            .chars()
-            .map(|ch| if (ch as u32) >= 0x1F000 { 22.0 } else { 11.0 })
-            .sum::<f32>()
-            + 28.0
-    };
-    let width = width.max(72.0);
+    let width = folder_tab_width(ui, label, speaker.is_some());
     let cap = if lead {
         rustcars::Cap::Left
     } else {
@@ -3411,16 +3417,28 @@ impl App {
             .iter()
             .map(|zone| zone.name.clone())
             .collect();
-        ui.horizontal_wrapped(|ui| {
-            for (idx, name) in names.iter().enumerate() {
-                let response = folder_tab(ui, self.zone_sel == idx, idx, name, idx == 0);
-                if response.clicked() || response.secondary_clicked() {
+        // Zones that do not fit go into the list on the elbow's end cap.
+        let sel = self.zone_sel;
+        let picked = tools::overflow_tab_row(
+            ui,
+            "plan-zones",
+            &names,
+            Some(sel),
+            |ui, i| folder_tab_width(ui, &names[i], false),
+            |ui, idx, lead| {
+                let response = folder_tab(ui, sel == idx, idx, &names[idx], lead);
+                if response.secondary_clicked() {
                     self.zone_sel = idx;
                     self.band_sel = 0;
                 }
                 response.context_menu(|ui| self.zone_menu(ui, idx));
-            }
-        });
+                response
+            },
+        );
+        if let Some(idx) = picked {
+            self.zone_sel = idx;
+            self.band_sel = 0;
+        }
     }
 
     fn zone_menu(&mut self, ui: &mut egui::Ui, idx: usize) {
