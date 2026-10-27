@@ -171,6 +171,42 @@ pub fn columns(total_w: f32, label_w: f32) -> Columns {
     Columns { label_w, grid_x, grid_w: (total_w - grid_x).max(1.0) }
 }
 
+/// Lane-label shelf drawn over the left of the full-width timeline.
+pub const SHELF_W: f32 = 340.0;
+/// The shelf never covers more than this share of the timeline.
+pub const SHELF_MAX_FRAC: f32 = 0.45;
+/// Share of the shelf that is fully opaque; the rest fades to transparent.
+pub const SHELF_OPAQUE_FRAC: f32 = 0.65;
+
+/// Shelf width for a timeline `total_w` wide.
+pub fn shelf_width(total_w: f32) -> f32 {
+    SHELF_W.min(total_w * SHELF_MAX_FRAC).max(0.0)
+}
+
+/// Shelf opacity at `x` px from its left edge: 1.0 over the opaque part,
+/// then linear to 0.0 at the right edge.
+pub fn shelf_alpha(x: f32, shelf_w: f32) -> f32 {
+    let solid = shelf_w * SHELF_OPAQUE_FRAC;
+    if x <= solid {
+        1.0
+    } else if x >= shelf_w {
+        0.0
+    } else {
+        1.0 - (x - solid) / (shelf_w - solid).max(1e-3)
+    }
+}
+
+/// Whether a pointer at `x` belongs to the shelf (lane labels). Only the
+/// opaque part is the shelf; the fade passes clicks and wheel to the timeline.
+pub fn on_shelf(x: f32, shelf_w: f32) -> bool {
+    x >= 0.0 && x < shelf_w * SHELF_OPAQUE_FRAC
+}
+
+/// Vertical lane scroll clamped to the content.
+pub fn clamp_scroll(offset: f32, content_h: f32, viewport_h: f32) -> f32 {
+    offset.clamp(0.0, (content_h - viewport_h).max(0.0))
+}
+
 /// Lane under `y` (relative to the top of the lane body).
 pub fn lane_at(y: f32, lane_top: &[f32], lane_h: &[f32]) -> Option<usize> {
     lane_top.iter().zip(lane_h).position(|(t, h)| y >= *t && y < t + h)
@@ -308,5 +344,26 @@ mod tests {
         assert_eq!(v.t(300.0, 600.0), 30_000);
         assert_eq!(ellipsize("abcdef", 4), "abc\u{2026}");
         assert_eq!(ellipsize("abc", 4), "abc");
+    }
+
+    #[test]
+    fn shelf_math() {
+        assert_eq!(shelf_width(2000.0), SHELF_W);
+        assert_eq!(shelf_width(400.0), 400.0 * SHELF_MAX_FRAC);
+        let w = 340.0;
+        let mut last = 1.0f32;
+        for i in 0..=340 {
+            let a = shelf_alpha(i as f32, w);
+            assert!(a <= last + 1e-6 && (0.0..=1.0).contains(&a));
+            last = a;
+        }
+        assert_eq!(shelf_alpha(0.0, w), 1.0);
+        assert_eq!(shelf_alpha(w, w), 0.0);
+        assert!(on_shelf(10.0, w));
+        assert!(!on_shelf(w * 0.8, w)); // fade passes through to the grid
+        assert!(!on_shelf(w + 5.0, w));
+        assert_eq!(clamp_scroll(-5.0, 300.0, 100.0), 0.0);
+        assert_eq!(clamp_scroll(500.0, 300.0, 100.0), 200.0);
+        assert_eq!(clamp_scroll(50.0, 80.0, 100.0), 0.0);
     }
 }

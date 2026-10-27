@@ -21,7 +21,6 @@ use std::time::{Duration, Instant};
 pub const ROW_HOVER: &str = "Right-click: mark or unmark for recording (● REC).";
 pub const PRIVACY: &str = "Recording radio traffic may be regulated where you are; that is your responsibility. \
 Encrypted traffic is never recorded. Nothing is uploaded.";
-const LANE_W: f32 = 220.0;
 /// Room left under the timeline for the detail panel and privacy line.
 const TIMELINE_RESERVE: f32 = 110.0;
 const LANE_H: f32 = 22.0;
@@ -847,8 +846,9 @@ impl App {
         };
         view.follow(now);
         let width_all = ui.available_width();
-        let cols = timeline::columns(width_all, LANE_W);
-        let width = cols.grid_w;
+        // The timeline spans the full width; the lane shelf is drawn over its left side.
+        let width = width_all.max(1.0);
+        let shelf_w = timeline::shelf_width(width_all);
         ui.horizontal(|ui| {
             if ui.button("◀ Day").clicked() {
                 view.day(view.start + view.span / 2, -1);
@@ -902,8 +902,7 @@ impl App {
         {
             let painter = ui.painter_at(axis);
             painter.rect_filled(axis, egui::CornerRadius::ZERO, bg);
-            painter.text(axis.left_center() + egui::vec2(6.0, 0.0), egui::Align2::LEFT_CENTER, "Lane", egui::FontId::monospace(11.0), weak);
-            let grid = egui::Rect::from_min_max(egui::pos2(axis.left() + cols.grid_x, axis.top()), axis.max);
+            let grid = axis;
             let gp = ui.painter_at(grid);
             let fmt = if step >= 86_400_000 { "%a %m-%d" } else if step >= 60_000 { "%H:%M" } else { "%H:%M:%S" };
             for t in &ticks {
@@ -911,9 +910,27 @@ impl App {
                 let local = chrono::DateTime::from_timestamp_millis(*t).unwrap_or_default().with_timezone(&chrono::Local);
                 gp.text(egui::pos2(x + 2.0, grid.top() + 2.0), egui::Align2::LEFT_TOP, local.format(fmt).to_string(), egui::FontId::monospace(11.0), weak);
             }
+            paint_shelf(&painter, egui::Rect::from_min_size(axis.min, egui::vec2(shelf_w, AXIS_H)), bg);
+            painter.text(axis.left_center() + egui::vec2(6.0, 0.0), egui::Align2::LEFT_CENTER, "Lane", egui::FontId::monospace(11.0), weak);
         }
+        // Wheel: over the opaque shelf it scrolls the lanes (the scroll area
+        // does that); over the grid, the fade, or the axis it zooms time, so
+        // take it away from the scroll area there.
+        let body_view = egui::Rect::from_min_size(egui::pos2(axis.left(), axis.bottom()), egui::vec2(width_all, viewport_h));
+        let wheel_pos = ui.input(|i| i.pointer.hover_pos());
+        let zoom_here = wheel_pos.is_some_and(|p| {
+            (axis.contains(p) || body_view.contains(p)) && !timeline::on_shelf(p.x - axis.left(), shelf_w)
+        });
+        let zoom_scroll = if zoom_here {
+            ui.input_mut(|i| {
+                let d = i.smooth_scroll_delta.y;
+                i.smooth_scroll_delta.y = 0.0;
+                d
+            })
+        } else {
+            0.0
+        };
         let mut drag_dx = if axis_resp.dragged() { axis_resp.drag_delta().x } else { 0.0 };
-        let mut hover_grid = axis_resp.hovered();
         let mut hit: Option<(i64, u64)> = None;
         let mut want_wf = Vec::new();
         let mut lane_click: Option<String> = None;
@@ -926,35 +943,25 @@ impl App {
             .id_salt(("rec-timeline", source.clone()))
             .max_height(viewport_h)
             .auto_shrink([false, true])
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
             .show(ui, |ui| {
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(width_all, body_h), egui::Sense::hover());
-                let label_rect = egui::Rect::from_min_size(rect.min, egui::vec2(cols.label_w, body_h));
-                let grid = egui::Rect::from_min_max(egui::pos2(rect.left() + cols.grid_x, rect.top()), rect.max);
+                let label_rect = egui::Rect::from_min_size(rect.min, egui::vec2(shelf_w, body_h));
+                let grid = rect;
                 ui.painter_at(rect).rect_filled(rect, egui::CornerRadius::ZERO, bg);
                 let gp = ui.painter_at(grid);
                 for t in &ticks {
                     let x = grid.left() + view.x(*t, width);
                     gp.line_segment([egui::pos2(x, grid.top()), egui::pos2(x, grid.bottom())], egui::Stroke::new(1.0, egui::Color32::from_gray(40)));
                 }
-                // Label column: one clickable cell per lane, clipped, with ellipsis.
-                let max_chars = ((cols.label_w - 10.0) / 7.3).max(4.0) as usize;
                 for (i, name) in lanes.iter().enumerate() {
                     let y = rect.top() + lane_top[i];
                     let full = egui::Rect::from_min_size(egui::pos2(rect.left(), y), egui::vec2(width_all, lane_h[i]));
-                    let selected = sel_lane.as_deref() == Some(name.as_str());
-                    if selected {
-                        ui.painter_at(rect).rect_filled(full, egui::CornerRadius::ZERO, egui::Color32::from_rgb(40, 40, 70));
+                    if sel_lane.as_deref() == Some(name.as_str()) {
+                        gp.rect_filled(full, egui::CornerRadius::ZERO, egui::Color32::from_rgb(40, 40, 70));
                     } else if i % 2 == 1 {
-                        ui.painter_at(rect).rect_filled(full, egui::CornerRadius::ZERO, egui::Color32::from_rgb(20, 20, 26));
+                        gp.rect_filled(full, egui::CornerRadius::ZERO, egui::Color32::from_rgb(20, 20, 26));
                     }
-                    let cell = egui::Rect::from_min_size(egui::pos2(label_rect.left(), y), egui::vec2(cols.label_w, LANE_H));
-                    let resp = ui.interact(cell, ui.scope_id().with(("rec-lane", i)), egui::Sense::click());
-                    let ink = if selected || resp.hovered() { egui::Color32::WHITE } else { ui.visuals().text_color() };
-                    ui.painter_at(label_rect).text(cell.left_center() + egui::vec2(6.0, 0.0), egui::Align2::LEFT_CENTER, timeline::ellipsize(name, max_chars), egui::FontId::monospace(12.0), ink);
-                    if resp.clicked() {
-                        lane_click = Some(name.clone());
-                    }
-                    resp.on_hover_text(format!("{name}\nClick to highlight this lane."));
                 }
                 if lanes.is_empty() {
                     gp.text(grid.center(), egui::Align2::CENTER_CENTER, "No recordings in this view.", egui::FontId::proportional(14.0), weak);
@@ -962,7 +969,6 @@ impl App {
                 // Grid interaction: drag pans, scroll zooms, click plays a block.
                 let gresp = ui.interact(grid, ui.scope_id().with("rec-grid"), egui::Sense::click_and_drag());
                 if gresp.dragged() { drag_dx += gresp.drag_delta().x; }
-                hover_grid |= gresp.hovered();
                 let pointer = gresp.interact_pointer_pos();
                 let hover = gresp.hover_pos();
                 let mut block_tip: Option<String> = None;
@@ -1038,6 +1044,24 @@ impl App {
                 if let Some(tip) = block_tip {
                     gresp.on_hover_text(tip);
                 }
+                // Shelf over the grid: opaque on the left, fading out. Labels are
+                // clickable only on the opaque part; the fade passes through.
+                paint_shelf(&ui.painter_at(rect), label_rect, bg);
+                let max_chars = ((shelf_w * 0.85 - 10.0) / 7.3).max(4.0) as usize;
+                for (i, name) in lanes.iter().enumerate() {
+                    let y = rect.top() + lane_top[i];
+                    let full = egui::Rect::from_min_size(egui::pos2(rect.left(), y), egui::vec2(width_all, lane_h[i]));
+                    let selected = sel_lane.as_deref() == Some(name.as_str());
+                    let _ = full;
+                    let cell = egui::Rect::from_min_size(egui::pos2(label_rect.left(), y), egui::vec2(shelf_w * timeline::SHELF_OPAQUE_FRAC, LANE_H));
+                    let resp = ui.interact(cell, ui.scope_id().with(("rec-lane", i)), egui::Sense::click());
+                    let ink = if selected || resp.hovered() { egui::Color32::WHITE } else { ui.visuals().text_color() };
+                    ui.painter_at(label_rect).text(cell.left_center() + egui::vec2(6.0, 0.0), egui::Align2::LEFT_CENTER, timeline::ellipsize(name, max_chars), egui::FontId::monospace(12.0), ink);
+                    if resp.clicked() {
+                        lane_click = Some(name.clone());
+                    }
+                    resp.on_hover_text(format!("{name}\nClick to highlight this lane."));
+                }
             });
         if let Some(name) = lane_click {
             if self.rec.lane_sel.get(&source) == Some(&name) {
@@ -1049,16 +1073,10 @@ impl App {
         if drag_dx != 0.0 {
             view.pan_px(drag_dx, width);
         }
-        if hover_grid {
-            // Ctrl+scroll or plain scroll over the grid zooms; the scroll area
-            // still scrolls lanes when the pointer is over the label column.
-            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-            if scroll.abs() > 0.5 {
-                let left = axis.left() + cols.grid_x;
-                let anchor = ui.input(|i| i.pointer.hover_pos()).map(|p| p.x - left).unwrap_or(width).clamp(0.0, width);
-                view.zoom(if scroll > 0.0 { 0.8 } else { 1.25 }, anchor, width);
-                view.live = false;
-            }
+        if zoom_scroll.abs() > 0.5 {
+            let anchor = wheel_pos.map(|p| p.x - axis.left()).unwrap_or(width).clamp(0.0, width);
+            view.zoom(if zoom_scroll > 0.0 { 0.8 } else { 1.25 }, anchor, width);
+            view.live = false;
         }
         // Store only once there is something to frame, so the first rows fit.
         if !recs.is_empty() || self.rec.views.contains_key(&source) {
@@ -1077,7 +1095,7 @@ impl App {
 
     fn rec_detail(&mut self, ui: &mut egui::Ui) {
         let Some(id) = self.rec.selected else {
-            ui.label(egui::RichText::new("Click a block to play it from that point. Drag to pan, scroll to zoom.").weak());
+            ui.label(egui::RichText::new("Click a block to play it from that point. Drag to pan. Wheel over the lane names scrolls lanes; wheel over the timeline zooms.").weak());
             if let Some((rec, _, _)) = &self.rec.undo {
                 let label = format!("Undo delete of {}", rec.meta.lane());
                 if ui.button(label).clicked() {
@@ -1322,4 +1340,22 @@ mod tests {
         let old: config::RecFace = serde_json::from_str("{}").unwrap();
         assert_eq!(old.cap_gb, 20.0);
     }
+}
+
+/// Lane shelf: theme-dark fill, opaque on the left and fading to clear on the
+/// right (see `timeline::shelf_alpha`).
+fn paint_shelf(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let solid_w = rect.width() * timeline::SHELF_OPAQUE_FRAC;
+    let solid = egui::Rect::from_min_size(rect.min, egui::vec2(solid_w, rect.height()));
+    painter.rect_filled(solid, egui::CornerRadius::ZERO, color);
+    let mut mesh = egui::Mesh::default();
+    let clear = egui::Color32::TRANSPARENT;
+    let (x0, x1, y0, y1) = (solid.right(), rect.right(), rect.top(), rect.bottom());
+    mesh.colored_vertex(egui::pos2(x0, y0), color);
+    mesh.colored_vertex(egui::pos2(x1, y0), clear);
+    mesh.colored_vertex(egui::pos2(x1, y1), clear);
+    mesh.colored_vertex(egui::pos2(x0, y1), color);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    painter.add(egui::Shape::mesh(mesh));
 }
