@@ -186,6 +186,23 @@ fn worker(rx: Receiver<Cmd>, live: Arc<Mutex<Live>>, ctx: egui::Context) {
         if matches!(cmd, Cmd::Stop) {
             break;
         }
+        // E-STOP choke point: no sweep and no power change while it is
+        // engaged, so Commander asks the V2 for no RF stimulus. Connect,
+        // disconnect and capture still work. After RELEASE sweeps resume.
+        if crate::estop::engaged() && matches!(cmd, Cmd::Sweep { .. } | Cmd::Power(_)) {
+            let mut guard = live.lock().expect("nanovna");
+            guard.status = "E-STOP engaged: sweep blocked".into();
+            drop(guard);
+            crate::estop::report(
+                crate::estop::generation(),
+                crate::estop::Kind::Transmitter,
+                "NanoVNA sweep",
+                crate::estop::Outcome::Stopped,
+            );
+            ctx.request_repaint_of(egui::ViewportId::ROOT);
+            ctx.request_repaint_of(super::super::viewport_id());
+            continue;
+        }
         set_busy(&live, true);
         let result = match cmd {
             Cmd::Connect(path) => {

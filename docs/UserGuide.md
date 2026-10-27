@@ -210,18 +210,21 @@ A frequency the radio refuses doesn't move the readout.
 
 ## 4.4 E-STOP
 
-The red **E-STOP** button with a black stop-sign octagon sits at the right end of the tan top bar of every main page (Tune, Plan, Channels, Talkgroups, Radio IDs, Keys, Meters, Levels, REC and Config). It is also at the right end of the Tools tab row when Rotator is open, and in the bar of the Config groups Radio, Rotator, Amplifier, Automation patch and RF patch. Every copy is the same switch.
+The red **E-STOP** button with a black stop-sign octagon sits at the right end of the tan top bar of every main page (Tune, Plan, Channels, Talkgroups, Radio IDs, Keys, Meters, Levels, REC and Config). It is also at the right end of the Tools tab row when Rotator or NanoVNA is open (in the torn-off Tools window too), and in the bar of the Config groups Radio, Rotator, Amplifier, Automation patch and RF patch. Every copy is the same switch.
 
 Press it and it latches. Every copy then reads **E-STOP ENGAGED**, and Commander:
 
 - unkeys the selected radio and refuses PTT and MOX (the key reads "TX blocked: E-STOP"),
 - stops every transmitter pipe,
 - puts every amplifier in standby and refuses operate,
-- stops every rotator and refuses new moves from you, Gpredict or Follow. While it is engaged, Commander sends the stop again every second.
+- stops every rotator and refuses new moves from you, Gpredict or Follow. While it is engaged, Commander sends the stop again every second,
+- stops NanoVNA sweeps, so Commander asks the NanoVNA for no RF stimulus.
 
 Hover over **RELEASE** to see each device and whether it confirmed: stopped, FAILED (still being retried) or no stop support. A device that does not answer does not hold up the others.
 
-Press **RELEASE** to re-arm. Nothing starts moving or transmitting by itself. You start each device again yourself. Transmitter pipes are the one exception: they come back, but they do not key the radio. If Commander is closed while the E-STOP is engaged, it starts with the E-STOP engaged.
+Press **RELEASE** to return to normal operation. Commander stops blocking: transmitter pipes and NanoVNA sweeps come back as they were, and every device is usable again without a restart. RELEASE does not key a radio, put an amplifier in operate, or start a rotator moving; you do that. If Commander is closed while the E-STOP is engaged, it starts with the E-STOP engaged.
+
+**Keyboard:** hold **F9 + F10 + F11 + F12** together to engage the E-STOP. The chord only engages, once per press; letting go does not release it. It works only while a Commander window has keyboard focus. A window manager or desktop may take F11 or F12 for itself, and some keyboards cannot register four keys at once. The on-screen buttons are the main control.
 
 **This is a software stop.** It is not a hardware or mains emergency stop and does not replace one. It can only act on devices Commander controls, through their control programs (rigctld, ampctld and rotctld). A program that talks to a radio or rotator directly, a stuck relay, or a device that ignores the command is outside its reach. Keep a hardware stop within reach of anything that moves or transmits.
 

@@ -3,7 +3,8 @@
 //! One global latched state. While it is engaged every transmitter, amplifier
 //! and motorized device Commander controls is told to stop, and new transmit,
 //! operate and motion requests are refused at the device hubs (the choke
-//! points), not only greyed out in the window. Releasing it restarts nothing.
+//! points), not only greyed out in the window. Releasing it returns to normal
+//! operation; it does not itself key anything or start motion.
 //!
 //! This is a software stop. It is not a hardware or mains emergency stop.
 //!
@@ -253,6 +254,43 @@ impl Retry {
     }
 }
 
+// ---- Keyboard chord ----
+
+/// The four keys that engage the E-STOP when all are held at once.
+pub const CHORD: [egui::Key; 4] = [egui::Key::F9, egui::Key::F10, egui::Key::F11, egui::Key::F12];
+
+/// True when every chord key is down in this viewport's input. One `input`
+/// closure, nothing else called inside it. egui clears its held keys when the
+/// window loses focus, so a key left "down" by a focus change does not count.
+pub fn chord_down(ctx: &egui::Context) -> bool {
+    ctx.input(|i| CHORD.iter().all(|k| i.key_down(*k)))
+}
+
+/// Edge trigger for the chord: fires once when the fourth key goes down.
+/// Holding (or key repeat) does not fire again; letting go releases nothing.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Chord {
+    held: bool,
+}
+
+impl Chord {
+    /// Feed this frame's [`chord_down`]. True on the frame it should engage.
+    pub fn update(&mut self, down: bool) -> bool {
+        let fire = down && !self.held;
+        self.held = down;
+        fire
+    }
+
+    /// Read the keys once for `ctx` and engage on the press edge. Only ever
+    /// engages; the chord never releases.
+    pub fn poll(&mut self, ctx: &egui::Context) {
+        let down = chord_down(ctx);
+        if self.update(down) && !engaged() {
+            engage();
+        }
+    }
+}
+
 // ---- Widget ----
 
 /// Button height. The hit target is never shorter than this.
@@ -326,7 +364,7 @@ pub fn button(ui: &mut egui::Ui) -> bool {
                 let st = snapshot();
                 let failed = st.devices.iter().filter(|d| !d.outcome.settled()).count();
                 let rel = rel.on_hover_ui(|ui| {
-                    ui.label("Re-arm. Nothing restarts by itself.");
+                    ui.label("Release: back to normal operation. Nothing is keyed or moved by it.");
                     if st.devices.is_empty() {
                         ui.label("No devices were commanded.");
                     }
@@ -396,9 +434,9 @@ mod tests {
     }
 
     #[test]
-    fn release_does_not_restart_anything() {
-        // Release only clears the latch; the retry clock asks for no new stop
-        // and nothing is re-keyed (no stored "resume" action exists).
+    fn release_returns_to_normal_without_keying() {
+        // Release clears the latch: requests are allowed again (normal
+        // operation), no new stop is asked for, and nothing is keyed by it.
         let now = Instant::now();
         let mut st = State::default();
         st.engage();
@@ -410,6 +448,9 @@ mod tests {
         st.release();
         assert!(!r.due(false, g, now));
         assert!(st.devices.is_empty());
+        assert!(allows_rig(&rigctl::Command::SetPtt(true), st.engaged));
+        assert!(allows_rot(&crate::rot::Control::SetPos(1.0, 0.0), st.engaged));
+        assert!(allows_amp(&crate::amp::Control::SetPower(crate::amp::Power::Operate), st.engaged));
     }
 
     #[test]
@@ -448,6 +489,53 @@ mod tests {
         std::fs::write(&path, "armed\n").unwrap();
         assert!(!persisted_engaged(&path));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn frame(ctx: &egui::Context, events: Vec<egui::Event>) -> bool {
+        let input = egui::RawInput { events, ..Default::default() };
+        let mut down = false;
+        let mut out = ctx.run_ui(input, |ui| {
+            down = chord_down(ui.ctx());
+        });
+        out.textures_delta.clear();
+        down
+    }
+
+    fn key(k: egui::Key, pressed: bool) -> egui::Event {
+        egui::Event::Key {
+            key: k,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn chord_needs_all_four_and_fires_once() {
+        let ctx = egui::Context::default();
+        let mut chord = Chord::default();
+        // Three keys: nothing.
+        let three = CHORD[..3].iter().map(|k| key(*k, true)).collect();
+        assert!(!chord.update(frame(&ctx, three)));
+        // Fourth key: fires once.
+        assert!(chord.update(frame(&ctx, vec![key(egui::Key::F12, true)])));
+        // Still held (with a repeat event): no second fire.
+        let rep = egui::Event::Key {
+            key: egui::Key::F12,
+            physical_key: None,
+            pressed: true,
+            repeat: true,
+            modifiers: egui::Modifiers::NONE,
+        };
+        assert!(!chord.update(frame(&ctx, vec![rep])));
+        assert!(!chord.update(frame(&ctx, vec![])));
+        // Let one go, press it again: fires again (a new press).
+        assert!(!chord.update(frame(&ctx, vec![key(egui::Key::F10, false)])));
+        assert!(chord.update(frame(&ctx, vec![key(egui::Key::F10, true)])));
+        // Focus loss clears held keys: no fire, and no stuck "down".
+        assert!(!chord.update(frame(&ctx, vec![egui::Event::WindowFocused(false)])));
+        assert!(!chord.update(frame(&ctx, vec![egui::Event::WindowFocused(true)])));
     }
 
     #[test]

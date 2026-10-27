@@ -308,6 +308,8 @@ struct App {
     /// True when `plan_note` is a transmit refusal. Load and save errors stay
     /// until the next load or save.
     plan_note_ptt: bool,
+    /// F9+F10+F11+F12 edge trigger for the E-STOP (main window).
+    estop_chord: estop::Chord,
     /// Text in the open zone-tab rename field. The plan keeps the previous
     /// name while this is empty or only spaces.
     zone_rename: Option<(usize, String)>,
@@ -2027,6 +2029,7 @@ impl App {
             plan_dir,
             plan_note: String::new(),
             plan_note_ptt: false,
+            estop_chord: estop::Chord::default(),
             zone_rename: None,
             mode_hold: None,
             sub_freq_hold: None,
@@ -2627,6 +2630,8 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // E-STOP chord: read once, act after the input closure.
+        self.estop_chord.poll(ui.ctx());
         {
             let mut meters = self.meters.lock().expect("meters");
             if meters.dock {
