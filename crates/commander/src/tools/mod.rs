@@ -428,16 +428,112 @@ pub fn viewport_id() -> egui::ViewportId {
 }
 
 /// Paint one page inside an LCARS frame. Instrument paint stays in the content well.
-pub fn frame(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+pub fn frame(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) -> egui::Rect {
     let theme = LcarsTheme::default();
     let mut frame = rustcars::LcarsFrame::new(&theme, Side::Left, 1.0);
     frame.min_height = ui.available_height();
-    frame.show(ui, &theme, add);
+    frame.show(ui, &theme, add).1
+}
+
+/// The straight run of the bottom elbow's horizontal bar: right of the
+/// elbow's curve, left of the end cap. Mirrors rustcars' LcarsFrame geometry
+/// for `Side::Left` at scale 1.
+pub fn bottom_bar_run(frame_rect: egui::Rect) -> egui::Rect {
+    let t = LcarsTheme::default();
+    let cap_len = 48.0;
+    egui::Rect::from_min_max(
+        egui::pos2(frame_rect.left() + t.bar_thick + t.bar_thin, frame_rect.bottom() - t.bar_thin),
+        egui::pos2(frame_rect.right() - cap_len - 2.0 * t.frame_gap, frame_rect.bottom()),
+    )
+}
+
+/// Split `text` at the word boundary nearest its middle. Never cuts a word.
+pub fn split_two_lines(text: &str) -> (String, String) {
+    let mid = text.len() / 2;
+    let best = text
+        .char_indices()
+        .filter(|(_, c)| *c == ' ')
+        .map(|(i, _)| i)
+        .min_by_key(|i| i.abs_diff(mid));
+    match best {
+        Some(i) => (text[..i].trim_end().to_string(), text[i + 1..].trim_start().to_string()),
+        None => (text.to_string(), String::new()),
+    }
+}
+
+/// Faint watermark ink on a frame bar: the theme background at low alpha,
+/// so it reads as a darker shade of the bar colour.
+pub const WATERMARK_ALPHA: f32 = 0.22;
+pub fn watermark_color() -> egui::Color32 {
+    LcarsTheme::default().bg.gamma_multiply(WATERMARK_ALPHA)
+}
+
+/// Paint `text` as a faint watermark centred in the bottom elbow's bar.
+/// One line if it fits, else two lines split at a word, shrinking the font
+/// as needed. Hover shows the full text; it senses hover only, never clicks.
+pub fn bottom_bar_watermark(ui: &mut egui::Ui, frame_rect: egui::Rect, text: &str) {
+    let run = bottom_bar_run(frame_rect).shrink2(egui::vec2(8.0, 2.0));
+    if run.width() < 60.0 || run.height() < 8.0 {
+        return;
+    }
+    let color = watermark_color();
+    let painter = ui.painter().with_clip_rect(run);
+    let fits = |size: f32, s: &str| {
+        ui.fonts_mut(|f| f.layout_no_wrap(s.to_string(), egui::FontId::proportional(size), color))
+    };
+    let mut painted = false;
+    for size in [12.0_f32, 11.0, 10.0] {
+        let g = fits(size, text);
+        if g.size().x <= run.width() {
+            painter.galley(run.center() - g.size() / 2.0, g, color);
+            painted = true;
+            break;
+        }
+    }
+    if !painted {
+        let (a, b) = split_two_lines(text);
+        for size in [11.0_f32, 10.0, 9.0, 8.0] {
+            let ga = fits(size, &a);
+            let gb = fits(size, &b);
+            let w = ga.size().x.max(gb.size().x);
+            let h = ga.size().y + gb.size().y;
+            if (w <= run.width() && h <= run.height()) || size <= 8.0 {
+                let top = run.center().y - h / 2.0;
+                let ha = ga.size();
+                painter.galley(egui::pos2(run.center().x - ha.x / 2.0, top), ga, color);
+                painter.galley(egui::pos2(run.center().x - gb.size().x / 2.0, top + ha.y), gb, color);
+                break;
+            }
+        }
+    }
+    let id = ui.scope_id().with("bottom-bar-watermark");
+    let resp = ui.interact(run, id, egui::Sense::hover());
+    resp.on_hover_text(text);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn watermark_splits_at_a_word_near_the_middle() {
+        let text = crate::rec_ui::PRIVACY;
+        let (a, b) = split_two_lines(text);
+        assert_eq!(format!("{a} {b}"), text);
+        assert!(a.len().abs_diff(b.len()) < 20);
+        assert_eq!(split_two_lines("one"), ("one".to_string(), String::new()));
+    }
+
+    #[test]
+    fn watermark_is_faint_and_sits_in_the_bottom_bar() {
+        let c = watermark_color();
+        assert!(c.a() > 20 && c.a() < 80, "alpha {}", c.a());
+        let f = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1280.0, 800.0));
+        let r = bottom_bar_run(f);
+        assert_eq!(r.bottom(), 800.0);
+        assert_eq!(r.height(), 40.0);
+        assert!(r.left() >= 120.0 && r.right() <= 1280.0 - 48.0);
+    }
 
     #[test]
     fn the_station_log_sits_in_the_tool_list() {
