@@ -581,6 +581,35 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_fm_record_db_replay_round_trip() {
+        let dir = tempdir("writer6");
+        let mut w = worker(&dir);
+        let cs8 = crate::dsp::synth_fm_cs8(-40_000.0, 1_200.0, 2_500.0, 0.5, 100.0);
+        let mut ch = crate::dsp::Channelizer::new(-40_000.0);
+        let mut m = m();
+        m.modulation = "fm".into();
+        w.command(Cmd::Open { key: 3, meta: m });
+        for block in cs8.chunks(16_384) {
+            let mut iq = Vec::new();
+            for p in block.chunks_exact(2) {
+                ch.push(p[0] as i8 as f32, p[1] as i8 as f32, &mut iq);
+            }
+            w.chunk(Chunk { key: 3, hz: 1, data: iq });
+        }
+        w.command(Cmd::Close { key: 3, keep: true });
+        w.tick();
+        std::thread::sleep(Duration::from_millis(1100));
+        w.tick();
+        let db = w.db.as_ref().unwrap();
+        let rec = db.all().unwrap().pop().unwrap();
+        assert_eq!(rec.meta.duration_ms, 500);
+        let path = dir.join("S.recordings").join(&rec.raw_path);
+        let audio = crate::replay::decode_all(&path, &rec.meta).unwrap();
+        let hz = crate::dsp::zero_cross_hz(&audio[2_400..], 48_000.0);
+        assert!((hz - 1_200.0).abs() < 30.0, "{hz}");
+    }
+
+    #[test]
     fn full_queue_drops_and_counts() {
         let (stx, _srx) = mpsc::sync_channel(1);
         let (ctx, _crx) = mpsc::channel();
