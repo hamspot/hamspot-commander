@@ -1057,7 +1057,11 @@ impl NanoVna {
             line(&mut out, "DEV AVG/POWER", if id.power_and_average() { "yes".into() } else { "needs FW 1.0.2".into() });
         }
         if let Some(dev) = live.device_id {
-            line(&mut out, "DEVICE ID", proto::device_id_hex(&dev));
+            if live.id_reliable {
+                line(&mut out, "DEVICE SN", proto::device_id_sn(&dev));
+            } else {
+                line(&mut out, "DEVICE ID", "ID unreliable (reads disagreed)".into());
+            }
         }
         line(&mut out, "MAX POINTS", proto::POINTS_MAX.to_string());
         line(&mut out, "SWEEPS", self.sweep_count.to_string());

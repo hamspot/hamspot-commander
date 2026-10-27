@@ -48,6 +48,8 @@ pub struct Live {
     pub connected: bool,
     pub identity: Option<Identity>,
     pub device_id: Option<[u8; 12]>,
+    /// False when the id reads did not agree; `device_id` is then all zeros.
+    pub id_reliable: bool,
     pub sweep: Vec<Sample>,
     pub generation: u64,
     pub busy: bool,
@@ -65,6 +67,7 @@ impl Default for Live {
             connected: false,
             identity: None,
             device_id: None,
+            id_reliable: false,
             sweep: Vec::new(),
             generation: 0,
             busy: false,
@@ -198,7 +201,8 @@ fn worker(rx: Receiver<Cmd>, live: Arc<Mutex<Live>>, ctx: egui::Context) {
                     let id = identify(&mut *opened)?;
                     Ok((opened, id.0, id.1))
                 }) {
-                    Ok((opened, id, device_id)) => {
+                    Ok((opened, id, id_read)) => {
+                        let device_id = id_read.id;
                         if let Err(err) = accept_v2(id) {
                             let _ = opened;
                             Err(err)
@@ -208,12 +212,16 @@ fn worker(rx: Receiver<Cmd>, live: Arc<Mutex<Live>>, ctx: egui::Context) {
                             let mut guard = live.lock().expect("nanovna");
                             guard.identity = Some(id);
                             guard.device_id = Some(device_id);
+                            guard.id_reliable = id_read.reliable;
                             guard.connected = true;
+                            if let Some(note) = &id_read.note {
+                                eprintln!("nanovna: {note}");
+                            }
                             guard.status = format!(
-                                "NanoVNA V2  firmware {}  board {}  id {}",
+                                "NanoVNA V2  firmware {}  board {}  {}",
                                 id.version_label(),
                                 id.board,
-                                proto::device_id_hex(&device_id)
+                                id_text(&device_id, id_read.reliable)
                             );
                             Ok(())
                         }
@@ -228,6 +236,7 @@ fn worker(rx: Receiver<Cmd>, live: Arc<Mutex<Live>>, ctx: egui::Context) {
                 guard.connected = false;
                 guard.identity = None;
                 guard.device_id = None;
+                guard.id_reliable = false;
                 guard.status = "Not connected.".into();
                 Ok(())
             }
@@ -245,11 +254,11 @@ fn worker(rx: Receiver<Cmd>, live: Arc<Mutex<Live>>, ctx: egui::Context) {
                             let points = guard.sweep.len();
                             let id_hex = guard
                                 .device_id
-                                .map(|bytes| proto::device_id_hex(&bytes))
+                                .map(|bytes| id_text(&bytes, guard.id_reliable))
                                 .unwrap_or_default();
                             if let Some(id) = guard.identity {
                                 guard.status = format!(
-                                    "NanoVNA V2  firmware {}  board {}  id {}  {points} points",
+                                    "NanoVNA V2  firmware {}  board {}  {}  {points} points",
                                     id.version_label(),
                                     id.board,
                                     id_hex
@@ -353,7 +362,76 @@ fn open_port(path: &str) -> Result<Box<dyn serialport::SerialPort>, String> {
         .map_err(|err| format!("{path}: {err}"))
 }
 
-fn identify(port: &mut dyn serialport::SerialPort) -> Result<(Identity, [u8; 12]), String> {
+/// Status text for an id: the About-screen SN, or a clear unreliable flag.
+pub fn id_text(id: &[u8; 12], reliable: bool) -> String {
+    if reliable {
+        format!("SN {}", proto::device_id_sn(id))
+    } else {
+        "ID unreliable".into()
+    }
+}
+
+/// Result of the voted device id read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdRead {
+    pub id: [u8; 12],
+    pub reliable: bool,
+    /// Log line for odd outcomes.
+    pub note: Option<String>,
+}
+
+/// Two reads; a third only when they disagree. All-zero or all-0xff ids
+/// are accepted only when all three reads give the same value. A failed
+/// (timed out) read counts as a read that matches nothing. With no
+/// agreement the id is all zeros and flagged unreliable.
+pub fn vote_device_id(mut read: impl FnMut() -> Result<[u8; 12], String>) -> IdRead {
+    let a = read().ok();
+    let b = read().ok();
+    if let (Some(a), Some(b)) = (a, b) {
+        if a == b && !proto::device_id_suspect(&a) {
+            return IdRead { id: a, reliable: true, note: None };
+        }
+    }
+    let c = read().ok();
+    if let Some(c) = c {
+        if proto::device_id_suspect(&c) {
+            if a == Some(c) && b == Some(c) {
+                return IdRead {
+                    id: c,
+                    reliable: true,
+                    note: Some(format!(
+                        "device id read {} three times; the firmware may not report an id",
+                        proto::device_id_hex(&c)
+                    )),
+                };
+            }
+        } else if a == Some(c) || b == Some(c) {
+            return IdRead {
+                id: c,
+                reliable: true,
+                note: Some("device id reads disagreed; the third read settled it".into()),
+            };
+        }
+    }
+    IdRead {
+        id: [0u8; 12],
+        reliable: false,
+        note: Some("device id reads did not agree; the id is unreliable".into()),
+    }
+}
+
+fn read_device_id_once(port: &mut dyn serialport::SerialPort) -> Result<[u8; 12], String> {
+    // Drop anything stale before and after the resync so the 12 bytes line up.
+    resync(port)?;
+    std::thread::sleep(Duration::from_millis(20));
+    let _ = port.clear(serialport::ClearBuffer::Input);
+    write_cmd(port, &proto::read_device_id())?;
+    let mut raw = [0u8; 12];
+    read_exact(port, &mut raw, Duration::from_millis(400))?;
+    proto::parse_device_id(&raw)
+}
+
+fn identify(port: &mut dyn serialport::SerialPort) -> Result<(Identity, IdRead), String> {
     resync(port)?;
     write_cmd(port, &proto::indicate())?;
     let mut mark = [0u8; 1];
@@ -365,10 +443,8 @@ fn identify(port: &mut dyn serialport::SerialPort) -> Result<(Identity, [u8; 12]
     let mut ident = [0u8; 5];
     read_exact(port, &mut ident, Duration::from_millis(400))?;
     let id = Identity::parse(&ident)?;
-    write_cmd(port, &proto::read_device_id())?;
-    let mut raw = [0u8; 12];
-    read_exact(port, &mut raw, Duration::from_millis(400))?;
-    Ok((id, proto::parse_device_id(&raw)?))
+    let ids = vote_device_id(|| read_device_id_once(port));
+    Ok((id, ids))
 }
 
 fn read_sweep(
@@ -528,6 +604,77 @@ mod tests {
             ..seen
         })
         .is_err());
+    }
+
+    fn run(reads: Vec<Result<[u8; 12], String>>) -> (IdRead, usize) {
+        let mut it = reads.into_iter();
+        let mut n = 0;
+        let got = vote_device_id(|| {
+            n += 1;
+            it.next().expect("too many reads")
+        });
+        (got, n)
+    }
+
+    const A: [u8; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+    const B: [u8; 12] = [9; 12];
+    const C: [u8; 12] = [7; 12];
+    const Z: [u8; 12] = [0; 12];
+    const F: [u8; 12] = [0xff; 12];
+    fn t() -> Result<[u8; 12], String> {
+        Err("timed out after 0 of 12 bytes".into())
+    }
+
+    #[test]
+    fn two_matching_reads_are_accepted_without_a_third() {
+        let (got, n) = run(vec![Ok(A), Ok(A)]);
+        assert_eq!((got.id, got.reliable, n), (A, true, 2));
+    }
+
+    #[test]
+    fn a_third_read_settles_a_disagreement() {
+        let (got, n) = run(vec![Ok(A), Ok(B), Ok(A)]);
+        assert_eq!((got.id, got.reliable, n), (A, true, 3));
+        let (got, _) = run(vec![Ok(A), Ok(B), Ok(B)]);
+        assert_eq!((got.id, got.reliable), (B, true));
+    }
+
+    #[test]
+    fn three_different_reads_give_an_unreliable_zero_id() {
+        let (got, _) = run(vec![Ok(A), Ok(B), Ok(C)]);
+        assert_eq!((got.id, got.reliable), (Z, false));
+    }
+
+    #[test]
+    fn timeouts_count_as_failed_reads() {
+        let (got, _) = run(vec![t(), Ok(A), Ok(A)]);
+        assert_eq!((got.id, got.reliable), (A, true));
+        let (got, _) = run(vec![t(), t(), Ok(A)]);
+        assert_eq!((got.id, got.reliable), (Z, false));
+        let (got, _) = run(vec![t(), t(), t()]);
+        assert_eq!((got.id, got.reliable), (Z, false));
+    }
+
+    #[test]
+    fn all_zero_or_all_ff_needs_three_reads() {
+        let (got, n) = run(vec![Ok(Z), Ok(Z), Ok(Z)]);
+        assert_eq!((got.id, got.reliable, n), (Z, true, 3));
+        assert!(got.note.is_some());
+        let (got, _) = run(vec![Ok(Z), Ok(Z), Ok(A)]);
+        assert_eq!((got.id, got.reliable), (Z, false));
+        let (got, _) = run(vec![Ok(F), Ok(F), Ok(F)]);
+        assert_eq!((got.id, got.reliable), (F, true));
+        let (got, _) = run(vec![Ok(F), Ok(A), Ok(F)]);
+        assert_eq!((got.id, got.reliable), (Z, false));
+        let (got, _) = run(vec![Ok(Z), Ok(A), Ok(A)]);
+        assert_eq!((got.id, got.reliable), (A, true));
+    }
+
+    #[test]
+    fn id_text_uses_the_about_screen_format() {
+        let id = [0x78, 0x56, 0x34, 0x12, 1, 0, 0, 0, 0xef, 0xbe, 0xad, 0xde];
+        assert_eq!(id_text(&id, true), "SN 12345678-00000001-deadbeef");
+        assert_eq!(id_text(&id, false), "ID unreliable");
     }
 
     #[test]
