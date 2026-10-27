@@ -13,3 +13,12 @@ Brief record of decisions and why. Dated when recorded here (2026-10-27) unless 
 - **Layout reference:** the Tune face loosely follows the Ham Radio Deluxe 5.21 rig screen (behaviour only; no icons, bitmaps or text copied).
 - **Data layout (proposal, not built):** `Foo.HSCommander` plus a `Foo.HSData/` folder; see `docs/design/data-layout.md` on branch `design-data-layout` and epic #148.
 - **Manual style (2026-10-27):** operator-only content, second person, tables for reference, screenshot placeholders as HTML comments with #149 ids.
+
+## HF data decode window (#217)
+
+- Code lives in `crates/commander/src/hfdata/`. One **HF Data** page (not one window per decoder) with mode toggles; a tabbed or per-decoder split can come later.
+- Plug-in point: `registry::DecodeMode` (turns one decoder stdout line into a `Decode`) plus a `Factory` registered with `Registry::register`. `Session` drains an `mpsc::Receiver<String>` of decoder lines into the shared `DecodeList`. The rxpipe/patch bay wiring that feeds that channel belongs to the first mode issue (#206) and #171/#172.
+- `registry::parse_wsjt_line` parses `HHMMSS SNR DT FREQ ~ MSG`; time of day is resolved to the latest instant not in the future (midnight rollover). Rows stamped more than 2 s ahead are refused and counted on screen.
+- Slots count from the Unix epoch; lengths must divide a UTC day (`SlotLen::new`).
+- Clock check: `chronyc -c tracking`, then `timedatectl`, on a thread once a minute. Warn above 1.0 s, when unsynchronised, or when neither answers.
+- Presets: `share/hfdata/presets.json` (embedded, `deny_unknown_fields`, no paths). All `checked: false`. Several common dials sit in the ARRL plan's CW segments (e.g. FT8 7.074, FT4 7.0475, WSPR 7.0386); the page states the segment rather than hiding it.
