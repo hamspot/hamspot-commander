@@ -69,6 +69,9 @@ pub struct CallKey {
     pub talkgroup: Option<u32>,
     pub channel: String,
     pub hz: u64,
+    /// Capture centre the IQ is tapped from. A retune starts a new segment,
+    /// so the stored offset always matches the samples.
+    pub centre: u64,
 }
 
 #[derive(Debug, PartialEq)]
@@ -136,7 +139,7 @@ mod tests {
     use super::*;
 
     fn k(tg: u32) -> CallKey {
-        CallKey { talkgroup: Some(tg), channel: String::new(), hz: 851_000_000 }
+        CallKey { talkgroup: Some(tg), channel: String::new(), hz: 851_000_000, centre: 851_500_000 }
     }
 
     #[test]

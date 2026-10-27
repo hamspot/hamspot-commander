@@ -13,6 +13,7 @@ const USAGE: &str = "usage: commander-rec <archive|unarchive|list|verify|stats|e
   verify    [--archived-only]
   stats     [--cap-gb 20]
   export    --to DIR [--label NAME] [--move] [--older-than AGE] [--dry-run]
+  render-wav RAW OUT.wav [--decoder SCRIPT] [--env K=V]   (no --station; re-demod one file)
 example crontab:
   15 3 * * * nice -n 19 ionice -c3 commander-rec archive --older-than 7d --station ~/stations/SAFE-T.HSCommander";
 
@@ -64,8 +65,66 @@ fn expand(p: &str) -> String {
     }
 }
 
+/// `commander-rec render-wav RAW OUT.wav [--decoder SCRIPT] [--env K=V]...`
+/// Re-demodulates one recording (sidecar `RAW` with .json beside it) the way
+/// playback does and writes the speaker audio to a WAV. Reads nothing else.
+fn render_wav(args: &[String]) -> u8 {
+    let mut pos = Vec::new();
+    let mut decoder: Option<hsrec::replay::DecoderCmd> = None;
+    let mut env = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--decoder" => {
+                let Some(script) = it.next() else { eprintln!("--decoder needs a path"); return 2 };
+                decoder = Some(hsrec::replay::DecoderCmd { argv: vec![script.clone(), "23999".into()], env: Vec::new() });
+            }
+            "--env" => {
+                let Some(kv) = it.next().and_then(|kv| kv.split_once('=')) else { eprintln!("--env K=V"); return 2 };
+                env.push((kv.0.to_string(), kv.1.to_string()));
+            }
+            _ => pos.push(a.clone()),
+        }
+    }
+    let [raw, out] = pos.as_slice() else {
+        eprintln!("usage: commander-rec render-wav RAW OUT.wav [--decoder SCRIPT] [--env K=V]");
+        return 2;
+    };
+    let raw = std::path::PathBuf::from(raw);
+    let side = raw.with_extension("json");
+    let meta: hsrec::meta::Meta = match std::fs::read_to_string(&side).map_err(|e| e.to_string()).and_then(|t| serde_json::from_str(&t).map_err(|e| e.to_string())) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("commander-rec: {}: {e}", side.display());
+            return 1;
+        }
+    };
+    if let Some(d) = decoder.as_mut() {
+        d.env = env;
+    }
+    match hsrec::replay::render(&raw, &meta, decoder.as_ref()) {
+        Ok(r) => {
+            let _ = hsrec::replay::write_wav(std::path::Path::new(out), &r.audio, if decoder.is_some() { hsrec::replay::OUT_RATE } else { hsrec::replay::OUT_RATE });
+            println!("disc_samples={} disc_peak={} audio_samples={} audio_peak={} voice={} decoder_status={:?}",
+                r.disc.len(), hsrec::replay::peak(&r.disc), r.audio.len(), hsrec::replay::peak(&r.audio),
+                hsrec::replay::peak(&r.audio) > hsrec::replay::VOICE_PEAK, r.decoder_status);
+            if !r.decoder_stderr.is_empty() {
+                println!("decoder stderr (tail):\n{}", r.decoder_stderr);
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("commander-rec: render: {e}");
+            1
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().map(String::as_str) == Some("render-wav") {
+        return ExitCode::from(render_wav(&argv[1..]));
+    }
     let a = match parse(&argv) {
         Ok(a) => a,
         Err(e) => {

@@ -15,6 +15,16 @@ pub const LIVE_BOX: usize = 500;
 pub const REC_BOX: usize = LIVE_BOX / 2;
 /// Recorded complex sample rate: 32 ksps.
 pub const REC_RATE: u32 = CAPTURE_RATE / REC_BOX as u32;
+
+/// Usable width of the HackRF capture (its baseband filter; must match
+/// `hackrf::FILTER_HZ`). A channel outside it is not in the samples at all.
+pub const USABLE_HZ: f64 = 6_000_000.0;
+
+/// Whether a channel `offset_hz` from the capture centre lies inside the
+/// usable capture with its whole recorder bandwidth.
+pub fn in_capture(offset_hz: f64) -> bool {
+    offset_hz.is_finite() && offset_hz.abs() + REC_RATE as f64 / 2.0 <= USABLE_HZ / 2.0
+}
 /// Discriminator rate: 16 kHz.
 pub const MID_RATE: f32 = CAPTURE_RATE as f32 / LIVE_BOX as f32;
 /// Scale from mean of i8 samples to stored i16.
@@ -158,6 +168,16 @@ pub fn zero_cross_hz(samples: &[i16], rate: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn capture_window() {
+        assert!(super::in_capture(-537_500.0));
+        assert!(super::in_capture(2_900_000.0));
+        // SAFE-T recordings that replayed to noise: grants 4.3 and 5.2 MHz away.
+        assert!(!super::in_capture(-4_337_500.0));
+        assert!(!super::in_capture(-5_212_500.0));
+        assert!(!super::in_capture(f64::NAN));
+    }
+
     use super::*;
 
     fn channelise(cs8: &[u8], offset: f64) -> Vec<i16> {

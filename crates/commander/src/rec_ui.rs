@@ -143,6 +143,8 @@ pub struct RecUi {
     rows_source: String,
     rows_at: Option<Instant>,
     views: HashMap<String, View>,
+    /// Recordings whose last replay decoded no voice (tagged on the timeline).
+    no_voice: HashSet<i64>,
     /// Highlighted lane per source tab.
     lane_sel: HashMap<String, String>,
     query: String,
@@ -372,7 +374,13 @@ impl App {
                 let marked = found.is_some_and(|t| t.record);
                 let enc = found.is_some_and(|t| t.encrypted);
                 if segment::wanted(face.talkgroups, marked, enc) {
-                    let key = CallKey { talkgroup: Some(tg), channel: String::new(), hz: hz.round() as u64 };
+                    // A grant outside the capture is not in these samples. The follower
+                    // retunes for it; record once the new centre is live (the key
+                    // carries the centre, so that starts a fresh segment).
+                    if !hsrec::dsp::in_capture(hz - row.center_hz) {
+                        return (None, None);
+                    }
+                    let key = CallKey { talkgroup: Some(tg), channel: String::new(), hz: hz.round() as u64, centre: row.center_hz.round() as u64 };
                     let mut m = base(meta::SOURCE_HACKRF_TG);
                     m.talkgroup = Some(tg);
                     m.talkgroup_name = found.map(|t| t.name.clone()).unwrap_or_default();
@@ -390,8 +398,8 @@ impl App {
         if row.selected && face.channels.armed() {
             if let Some((z, i)) = self.memory_scan.hold_memory() {
                 if let Some(ch) = self.channels.zones.get(z).and_then(|zone| zone.channels.get(i)) {
-                    if !ch.control && segment::wanted(face.channels, ch.record, ch.encrypted) {
-                        let key = CallKey { talkgroup: None, channel: ch.name.clone(), hz: ch.hz.round() as u64 };
+                    if !ch.control && segment::wanted(face.channels, ch.record, ch.encrypted) && hsrec::dsp::in_capture(ch.hz - row.center_hz) {
+                        let key = CallKey { talkgroup: None, channel: ch.name.clone(), hz: ch.hz.round() as u64, centre: row.center_hz.round() as u64 };
                         let mut m = base(meta::SOURCE_HACKRF_CHANNELS);
                         m.channel_name = ch.name.clone();
                         m.channel_hz = ch.hz;
@@ -763,9 +771,21 @@ impl App {
             if p.finished() {
                 let id = *id;
                 let err = p.error.lock().expect("replay").clone();
+                let outcome = p.outcome();
                 self.rec.player = None;
+                let rec = self.rec.rows.iter().find(|r| r.id == id).cloned();
                 if !err.is_empty() {
-                    self.rec.note = format!("Playback: {err}");
+                    self.rec.note = format!("Playback failed: {err}");
+                    self.rec_log(self.rec.note.clone());
+                } else if let (Some(msg), Some(rec)) = (outcome.no_voice_text(), rec.as_ref()) {
+                    self.rec.no_voice.insert(id);
+                    let band = if hsrec::dsp::in_capture(rec.meta.offset_hz) {
+                        String::new()
+                    } else {
+                        format!(" The channel was {:.3} MHz from the capture centre, outside the HackRF's usable 6 MHz, so the call is not in this recording.", rec.meta.offset_hz / 1e6)
+                    };
+                    self.rec.note = format!("{msg}{band}");
+                    self.rec_log(self.rec.note.clone());
                 } else if self.rec.play_next {
                     if let Some(next) = timeline::next_after(&self.rec.rows, id) {
                         self.rec.selected = Some(next);
@@ -938,6 +958,7 @@ impl App {
         let by_id: HashMap<i64, &Recording> = recs.iter().map(|r| (r.id, r)).collect();
         let selected_id = self.rec.selected;
         let waveforms = &self.rec.waveforms;
+        let no_voice = &self.rec.no_voice;
         let player = self.rec.player.as_ref().map(|(id, pl)| (*id, pl.pos_ms.load(Ordering::Relaxed) as i64));
         egui::ScrollArea::vertical()
             .id_salt(("rec-timeline", source.clone()))
@@ -1007,6 +1028,8 @@ impl App {
                     if r.star { tag.push('★'); }
                     if r.offline() { tag = format!("{tag}offline"); }
                     if r.missing { tag = format!("{tag}MISSING"); }
+                    if !hsrec::dsp::in_capture(r.meta.offset_hz) && r.meta.source_kind != meta::KIND_DEMOD_AUDIO { tag = format!("{tag} OUT OF BAND"); }
+                    if no_voice.contains(&b.id) { tag = format!("{tag} no voice"); }
                     if !tag.is_empty() && br.width() > 30.0 {
                         gp.text(br.left_center() + egui::vec2(3.0, 0.0), egui::Align2::LEFT_CENTER, tag.trim(), egui::FontId::monospace(10.0), egui::Color32::WHITE);
                     }

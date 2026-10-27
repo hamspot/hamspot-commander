@@ -163,15 +163,156 @@ pub fn default_play_argv() -> Vec<String> {
         .collect()
 }
 
+/// Result of an offline render of one recording.
+#[derive(Debug, Default)]
+pub struct Render {
+    /// 48 kHz discriminator samples fed to the decoder (or played for analog).
+    pub disc: Vec<i16>,
+    /// Speaker audio: the decoder's output for digital modes, else `disc`.
+    pub audio: Vec<i16>,
+    /// Decoder exit code, when a decoder ran.
+    pub decoder_status: Option<i32>,
+    /// Last lines of the decoder's stderr.
+    pub decoder_stderr: String,
+}
+
+/// Peak-to-mean level a decoded voice stream must exceed to count as voice.
+pub const VOICE_PEAK: i64 = 600;
+
+/// Peak of `samples` around their mean (0 for silence).
+pub fn peak(samples: &[i16]) -> i64 {
+    if samples.is_empty() {
+        return 0;
+    }
+    let mean = samples.iter().map(|s| *s as i64).sum::<i64>() / samples.len() as i64;
+    samples.iter().map(|s| (*s as i64 - mean).abs()).max().unwrap_or(0)
+}
+
+/// Re-demodulate a recording offline, through the same chain playback uses,
+/// and return the audio instead of playing it (`commander-rec render-wav`).
+pub fn render(path: &Path, meta: &Meta, decoder: Option<&DecoderCmd>) -> std::io::Result<Render> {
+    let disc = decode_all(path, meta)?;
+    let digital = meta.is_digital() && meta.source_kind != KIND_DEMOD_AUDIO;
+    let Some(cmd) = decoder.filter(|c| digital && !c.argv.is_empty()) else {
+        return Ok(Render { audio: disc.clone(), disc, ..Default::default() });
+    };
+    let mut c = Command::new(&cmd.argv[0]);
+    c.args(&cmd.argv[1..])
+        .envs(cmd.env.iter().cloned())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut child = c.spawn()?;
+    let mut so = child.stdout.take().ok_or_else(|| std::io::Error::other("decoder stdout"))?;
+    let mut se = child.stderr.take().ok_or_else(|| std::io::Error::other("decoder stderr"))?;
+    let out = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = so.read_to_end(&mut v);
+        v
+    });
+    let err = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = se.read_to_end(&mut v);
+        v
+    });
+    let mut stdin = child.stdin.take().ok_or_else(|| std::io::Error::other("decoder stdin"))?;
+    let feed = disc.clone();
+    let writer = std::thread::spawn(move || {
+        // Real-time-ish pacing so the UDP voice hop inside the script keeps up,
+        // then two seconds of silence to flush the vocoder before EOF.
+        let t0 = Instant::now();
+        let mut sent = 0usize;
+        let tail = vec![0i16; OUT_RATE as usize * 2];
+        for chunk in feed.chunks(4800).chain(tail.chunks(4800)) {
+            let mut bytes = Vec::with_capacity(chunk.len() * 2);
+            for v in chunk {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            if stdin.write_all(&bytes).is_err() {
+                break;
+            }
+            sent += chunk.len();
+            // Up to 8x real time.
+            let due = Duration::from_micros((sent as u64 * 1_000_000 / OUT_RATE as u64) / 8);
+            if let Some(wait) = due.checked_sub(t0.elapsed()) {
+                std::thread::sleep(wait);
+            }
+        }
+    });
+    let _ = writer.join();
+    let status = child.wait()?;
+    let bytes = out.join().unwrap_or_default();
+    let stderr = String::from_utf8_lossy(&err.join().unwrap_or_default()).to_string();
+    let tail: Vec<&str> = stderr.lines().rev().take(12).collect();
+    let audio = bytes.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
+    Ok(Render {
+        disc,
+        audio,
+        decoder_status: status.code(),
+        decoder_stderr: tail.into_iter().rev().collect::<Vec<_>>().join("\n"),
+    })
+}
+
 pub struct Player {
     pub stop: Arc<AtomicBool>,
     pub done: Arc<AtomicBool>,
     /// Playback position in ms from the start of the recording.
     pub pos_ms: Arc<AtomicU64>,
     pub error: Arc<std::sync::Mutex<String>>,
+    /// Bytes and peak of what reached the speaker, and the decoder's exit.
+    pub heard_bytes: Arc<AtomicU64>,
+    pub heard_peak: Arc<AtomicU64>,
+    pub decoder_ran: Arc<AtomicBool>,
+    pub decoder_status: Arc<std::sync::Mutex<Option<i32>>>,
+    pub decoder_stderr: Arc<std::sync::Mutex<String>>,
+    pub played_ms: Arc<AtomicU64>,
+}
+
+/// What a finished playback produced, for the REC status line.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Outcome {
+    pub decoder_ran: bool,
+    pub heard_bytes: u64,
+    pub heard_peak: u64,
+    pub played_ms: u64,
+    pub decoder_status: Option<i32>,
+    pub decoder_stderr: String,
+}
+
+impl Outcome {
+    /// Text when a digital replay ran but decoded no voice; None otherwise.
+    pub fn no_voice_text(&self) -> Option<String> {
+        if !self.decoder_ran || self.heard_peak as i64 > VOICE_PEAK {
+            return None;
+        }
+        let secs = self.played_ms as f64 / 1000.0;
+        let mut t = format!(
+            "No voice decoded: the replay re-demodulated {secs:.1} s of this recording and the decoder produced {}.",
+            if self.heard_bytes == 0 { "no audio".to_string() } else { "only silence".to_string() }
+        );
+        if let Some(code) = self.decoder_status.filter(|c| *c != 0) {
+            t.push_str(&format!(" Decoder exit {code}."));
+        }
+        if let Some(line) = self.decoder_stderr.lines().rev().find(|l| !l.trim().is_empty() && !l.contains("exiting on signal")) {
+            t.push_str(&format!(" Last decoder message: {}", line.trim()));
+        }
+        Some(t)
+    }
 }
 
 impl Player {
+    pub fn outcome(&self) -> Outcome {
+        Outcome {
+            decoder_ran: self.decoder_ran.load(Ordering::Relaxed),
+            heard_bytes: self.heard_bytes.load(Ordering::Relaxed),
+            heard_peak: self.heard_peak.load(Ordering::Relaxed),
+            played_ms: self.played_ms.load(Ordering::Relaxed),
+            decoder_status: *self.decoder_status.lock().expect("status"),
+            decoder_stderr: self.decoder_stderr.lock().expect("stderr").clone(),
+        }
+    }
+
     /// Start playback at `from_ms`. Runs in its own process group and never
     /// touches the radio RX sinks.
     pub fn start(path: &Path, meta: &Meta, from_ms: u64, decoder: Option<DecoderCmd>, play_argv: Vec<String>) -> std::io::Result<Self> {
@@ -181,13 +322,23 @@ impl Player {
         let done = Arc::new(AtomicBool::new(false));
         let pos = Arc::new(AtomicU64::new(from_ms));
         let error = Arc::new(std::sync::Mutex::new(String::new()));
+        let heard_bytes = Arc::new(AtomicU64::new(0));
+        let heard_peak = Arc::new(AtomicU64::new(0));
+        let decoder_ran = Arc::new(AtomicBool::new(false));
+        let decoder_status = Arc::new(std::sync::Mutex::new(None));
+        let decoder_stderr = Arc::new(std::sync::Mutex::new(String::new()));
+        let played_ms = Arc::new(AtomicU64::new(0));
+        let (hb, hp, dr, ds, dse, pm) = (heard_bytes.clone(), heard_peak.clone(), decoder_ran.clone(), decoder_status.clone(), decoder_stderr.clone(), played_ms.clone());
         let (s, d, p, e) = (stop.clone(), done.clone(), pos.clone(), error.clone());
         std::thread::Builder::new().name("rec-replay".into()).spawn(move || {
             let result = (|| -> std::io::Result<()> {
                 if !stream.skip_ms(from_ms, &meta)? {
                     return Ok(());
                 }
-                let mut player = spawn(&play_argv, Stdio::piped(), None)?;
+                let mut player = spawn(&play_argv, Stdio::piped(), None)
+                    .map_err(|err| std::io::Error::other(format!("audio output {:?}: {err}", play_argv.first().cloned().unwrap_or_default())))?;
+                let mut copier: Option<std::thread::JoinHandle<()>> = None;
+                let mut err_reader: Option<std::thread::JoinHandle<String>> = None;
                 let mut dec: Option<Child> = None;
                 let mut sink: Box<dyn Write> = match &decoder {
                     Some(cmd) if meta.is_digital() && meta.source_kind != KIND_DEMOD_AUDIO && !cmd.argv.is_empty() => {
@@ -196,14 +347,32 @@ impl Player {
                             .envs(cmd.env.iter().cloned())
                             .stdin(Stdio::piped())
                             .stdout(Stdio::piped())
-                            .stderr(Stdio::null())
+                            .stderr(Stdio::piped())
                             .process_group(0);
-                        let mut child = c.spawn()?;
-                        // Copy decoder speech to the player.
+                        let mut child = c.spawn().map_err(|err| std::io::Error::other(format!("decoder {}: {err}", cmd.argv[0])))?;
+                        dr.store(true, Ordering::Relaxed);
+                        if let Some(mut se) = child.stderr.take() {
+                            err_reader = Some(std::thread::spawn(move || {
+                                let mut v = Vec::new();
+                                let _ = se.read_to_end(&mut v);
+                                let text = String::from_utf8_lossy(&v).to_string();
+                                let tail: Vec<&str> = text.lines().rev().take(8).collect();
+                                tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+                            }));
+                        }
+                        // Copy decoder speech to the player, measuring what is heard.
                         if let (Some(mut so), Some(mut pin)) = (child.stdout.take(), player.stdin.take()) {
-                            std::thread::spawn(move || {
-                                let _ = std::io::copy(&mut so, &mut pin);
-                            });
+                            let (hb, hp) = (hb.clone(), hp.clone());
+                            copier = Some(std::thread::spawn(move || {
+                                let mut buf = vec![0u8; 8192];
+                                loop {
+                                    let n = match so.read(&mut buf) { Ok(0) | Err(_) => break, Ok(n) => n };
+                                    let samples: Vec<i16> = buf[..n - n % 2].chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
+                                    hb.fetch_add(n as u64, Ordering::Relaxed);
+                                    hp.fetch_max(peak(&samples) as u64, Ordering::Relaxed);
+                                    if pin.write_all(&buf[..n]).is_err() { break; }
+                                }
+                            }));
                         }
                         let w = child.stdin.take().ok_or_else(|| std::io::Error::other("decoder stdin"))?;
                         dec = Some(child);
@@ -228,6 +397,7 @@ impl Player {
                     }
                     sent += block.len() as u64;
                     let ahead_ms = sent * 1000 / OUT_RATE as u64;
+                    pm.store(ahead_ms, Ordering::Relaxed);
                     p.store(from_ms + ahead_ms, Ordering::Relaxed);
                     // Pace to real time, about 200 ms ahead of the speaker.
                     let el = t0.elapsed().as_millis() as u64;
@@ -238,8 +408,11 @@ impl Player {
                 drop(sink);
                 if let Some(mut c) = dec {
                     if s.load(Ordering::Relaxed) { kill(&mut c) }
-                    let _ = c.wait();
+                    let st = c.wait().ok().and_then(|st| st.code());
+                    *ds.lock().expect("status") = st;
                 }
+                if let Some(h) = copier { let _ = h.join(); }
+                if let Some(h) = err_reader { *dse.lock().expect("stderr") = h.join().unwrap_or_default(); }
                 if s.load(Ordering::Relaxed) { kill(&mut player) }
                 let _ = player.wait();
                 Ok(())
@@ -249,7 +422,7 @@ impl Player {
             }
             d.store(true, Ordering::Relaxed);
         })?;
-        Ok(Self { stop, done, pos_ms: pos, error })
+        Ok(Self { stop, done, pos_ms: pos, error, heard_bytes, heard_peak, decoder_ran, decoder_status, decoder_stderr, played_ms })
     }
 
     pub fn stop(&self) {
@@ -357,6 +530,26 @@ mod tests {
     }
 
     #[test]
+    fn outcome_text() {
+        let silent = Outcome { decoder_ran: true, played_ms: 2000, decoder_stderr: "Sync: no sync\nsocat W exiting on signal 15".into(), ..Default::default() };
+        let t = silent.no_voice_text().unwrap();
+        assert!(t.starts_with("No voice decoded") && t.contains("2.0 s") && t.contains("no audio") && t.contains("Sync: no sync"));
+        let voiced = Outcome { decoder_ran: true, heard_bytes: 1000, heard_peak: 9000, ..Default::default() };
+        assert_eq!(voiced.no_voice_text(), None);
+        assert_eq!(Outcome::default().no_voice_text(), None); // analog: no decoder
+        assert_eq!(peak(&[0, 0, 0]), 0);
+    }
+
+    #[test]
+    fn missing_audio_output_is_an_error() {
+        let dir = tempdir("replay-noout");
+        let (path, meta) = fm_file(&dir, 1000.0);
+        let p = Player::start(&path, &meta, 0, None, vec!["/nonexistent/pw-cat".into()]).unwrap();
+        while !p.finished() { std::thread::sleep(Duration::from_millis(10)); }
+        assert!(p.error.lock().unwrap().contains("audio output"));
+    }
+
+    #[test]
     fn wav_header() {
         let dir = tempdir("replay5");
         let p = dir.join("x.wav");
@@ -364,5 +557,28 @@ mod tests {
         let b = std::fs::read(&p).unwrap();
         assert_eq!(&b[0..4], b"RIFF");
         assert_eq!(b.len(), 44 + 6);
+    }
+}
+
+#[cfg(test)]
+mod live_player {
+    use super::*;
+    /// Runs the real Player (as the GUI does) on a recording, with the
+    /// speaker replaced by a file. `HSREC_RAW=... HSREC_SCRIPT=... cargo test -- --ignored`
+    #[test]
+    #[ignore]
+    fn player_on_real_recording() {
+        let (Ok(raw), Ok(script)) = (std::env::var("HSREC_RAW"), std::env::var("HSREC_SCRIPT")) else { return };
+        let raw = std::path::PathBuf::from(raw);
+        let meta: Meta = serde_json::from_str(&std::fs::read_to_string(raw.with_extension("json")).unwrap()).unwrap();
+        let out = std::env::temp_dir().join("hsrec-player-out.raw");
+        let play = vec!["sh".into(), "-c".into(), format!("cat > {}", out.display())];
+        let dec = DecoderCmd { argv: vec![script, "23998".into()], env: Vec::new() };
+        let p = Player::start(&raw, &meta, 0, Some(dec), play).unwrap();
+        while !p.finished() {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let n = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+        eprintln!("player wrote {n} bytes, error={:?}", p.error.lock().unwrap());
     }
 }
