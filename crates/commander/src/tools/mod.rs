@@ -58,6 +58,7 @@ impl Tools {
         let theme = LcarsTheme::default();
         rustcars::install_lcars_font(ctx);
         rustcars::apply_theme(ctx, &theme);
+        no_scroll_fade(ctx);
         Self {
             screen: Screen::Log,
             detached: false,
@@ -429,6 +430,35 @@ pub fn viewport_id() -> egui::ViewportId {
 
 /// Paint one page inside an LCARS frame. Instrument paint stays in the content well.
 pub fn frame(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) -> egui::Rect {
+    frame_with_slot(ui, None, add).0
+}
+
+/// The opened gap in the top elbow bar, right before the end cap.
+/// Returns (black cover, where controls go). The cover is `slot_w` wide and
+/// ends at the cap's left edge; the controls sit inside it with
+/// `frame_gap` of black on each side, at the bar's full height.
+pub fn top_slot(outer: egui::Rect, cap_len: f32, thin: f32, slot_w: f32) -> (egui::Rect, egui::Rect) {
+    let gap = LcarsTheme::default().frame_gap;
+    let right = outer.right() - cap_len;
+    let cover = egui::Rect::from_min_max(
+        egui::pos2(right - gap - slot_w, outer.top()),
+        egui::pos2(right, outer.top() + thin),
+    );
+    let inner = egui::Rect::from_min_max(
+        egui::pos2(cover.left() + gap, cover.top()),
+        egui::pos2(right - gap, cover.bottom()),
+    );
+    (cover, inner)
+}
+
+/// `frame`, optionally opening a `slot_w` gap in the top bar before the end
+/// cap. The tan bar then runs from the elbow to the gap, and the gap is
+/// returned for the caller to put controls in. `None` keeps the bar closed.
+pub fn frame_with_slot(
+    ui: &mut egui::Ui,
+    slot_w: Option<f32>,
+    add: impl FnOnce(&mut egui::Ui),
+) -> (egui::Rect, Option<egui::Rect>) {
     let theme = LcarsTheme::default();
     let mut frame = rustcars::LcarsFrame::new(&theme, Side::Left, 1.0);
     frame.min_height = ui.available_height();
@@ -441,7 +471,22 @@ pub fn frame(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) -> egui::Rect {
     );
     let id = top_cap_id(ui.ctx());
     ui.ctx().data_mut(|d| d.insert_temp(id, cap));
-    frame.show(ui, &theme, add).1
+    let slot = slot_w.map(|w| top_slot(outer, frame.cap_len, frame.thin, w));
+    let rect = frame.show(ui, &theme, add).1;
+    // Paint-over: the frame's chrome sits behind content, so this black
+    // cover lands on top of the tan and opens the gap.
+    let inner = slot.map(|(cover, inner)| {
+        ui.painter().rect_filled(cover, 0.0, theme.bg);
+        inner
+    });
+    (rect, inner)
+}
+
+/// egui 0.37 paints a dark fade at the edges of every scroll area that has
+/// more content. On the page-tab strip it reads as a drop shadow, so turn
+/// it off everywhere.
+pub(crate) fn no_scroll_fade(ctx: &egui::Context) {
+    ctx.global_style_mut(|s| s.spacing.scroll.fade.strength = 0.0);
 }
 
 fn top_cap_id(ctx: &egui::Context) -> egui::Id {
@@ -712,6 +757,20 @@ mod tests {
 }
 
 #[cfg(test)]
+mod top_slot_tests {
+    #[test]
+    fn slot_sits_before_the_cap_with_gaps() {
+        let outer = egui::Rect::from_min_size(egui::pos2(8.0, 50.0), egui::vec2(1264.0, 700.0));
+        let (cover, inner) = super::top_slot(outer, 48.0, 40.0, 100.0);
+        assert_eq!(cover.right(), outer.right() - 48.0);
+        assert_eq!(inner.right(), cover.right() - 4.0);
+        assert_eq!(inner.left(), cover.left() + 4.0);
+        assert_eq!(inner.width(), 100.0 - 4.0);
+        assert_eq!((inner.top(), inner.height()), (50.0, 40.0));
+    }
+}
+
+#[cfg(test)]
 mod top_cap_deadlock_tests {
     /// Regression: computing the cap id inside `data_mut` re-locked the egui
     /// context and hung the app on its first frame (b928260).
@@ -763,5 +822,45 @@ mod top_cap_deadlock_tests {
         });
         rx.recv_timeout(std::time::Duration::from_secs(10))
             .expect("headless frame/overflow_tab_row did not finish in 10 s (deadlock?)");
+    }
+
+    /// Same watchdog for the opened top-bar gap with buttons in it, plus
+    /// the overflow key on the end cap.
+    #[test]
+    fn frame_with_slot_runs_headless_without_deadlock() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let ctx = egui::Context::default();
+            let labels: Vec<String> = (0..40).map(|i| format!("TAB {i}")).collect();
+            let mut got = None;
+            for _ in 0..3 {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 400.0))),
+                    ..Default::default()
+                };
+                let mut out = ctx.run_ui(input, |ui| {
+                    let (_, slot) = super::frame_with_slot(ui, Some(300.0), |ui| {
+                        super::overflow_tab_row(ui, "smoke2", &labels, Some(0), |_, _| 120.0, |ui, i, sel| {
+                            ui.selectable_label(sel, &labels[i])
+                        });
+                    });
+                    if let Some(r) = slot {
+                        ui.scope_builder(egui::UiBuilder::new().max_rect(r), |ui| {
+                            ui.horizontal(|ui| {
+                                let _ = ui.button("A");
+                                let _ = ui.button("B");
+                            });
+                        });
+                    }
+                    got = slot;
+                });
+                out.textures_delta.clear();
+            }
+            let _ = tx.send(got);
+        });
+        let slot = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("headless frame_with_slot did not finish in 10 s (deadlock?)");
+        assert!(slot.is_some());
     }
 }
