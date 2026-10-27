@@ -21,7 +21,9 @@ use std::time::{Duration, Instant};
 pub const ROW_HOVER: &str = "Right-click: mark or unmark for recording (● REC).";
 pub const PRIVACY: &str = "Recording radio traffic may be regulated where you are; that is your responsibility. \
 Encrypted traffic is never recorded. Nothing is uploaded.";
-const LANE_W: f32 = 170.0;
+const LANE_W: f32 = 220.0;
+/// Room left under the timeline for the detail panel and privacy line.
+const TIMELINE_RESERVE: f32 = 110.0;
 const LANE_H: f32 = 22.0;
 const AXIS_H: f32 = 20.0;
 
@@ -44,11 +46,30 @@ pub fn icon_state(armed: bool, writing: bool) -> IconState {
     }
 }
 
+/// Same tones as the speaker glyph: black off, dark red armed, and a modest
+/// red while writing. No glow; the glyph never grows.
 pub fn icon_color(state: IconState) -> egui::Color32 {
     match state {
         IconState::Off => egui::Color32::from_rgb(0, 0, 0),
-        IconState::Armed => egui::Color32::from_rgb(110, 10, 8),
-        IconState::Writing => egui::Color32::from_rgb(255, 28, 20),
+        IconState::Armed => egui::Color32::from_rgb(110, 14, 10),
+        IconState::Writing => egui::Color32::from_rgb(196, 28, 20),
+    }
+}
+
+/// Width of the speaker emoji's slot on a voice tab.
+pub const TAB_GLYPH_SLOT: f32 = 22.0;
+/// Record glyph: a thin ring with a small core, inside the speaker's footprint.
+pub const TAB_GLYPH_RING: f32 = 5.0;
+pub const TAB_GLYPH_CORE: f32 = 2.5;
+pub const TAB_GLYPH_STROKE: f32 = 1.25;
+
+/// Small, static record glyph. Off is a hollow ring; armed and writing fill
+/// the core so the state also shows in shape, not only colour.
+pub fn paint_tab_glyph(painter: &egui::Painter, center: egui::Pos2, state: IconState) {
+    let color = icon_color(state);
+    painter.circle_stroke(center, TAB_GLYPH_RING, egui::Stroke::new(TAB_GLYPH_STROKE, color));
+    if state != IconState::Off {
+        painter.circle_filled(center, TAB_GLYPH_CORE, color);
     }
 }
 
@@ -68,14 +89,26 @@ pub fn key_lamp(mode: RecMode) -> KeyLamp {
     }
 }
 
-/// Red "● REC" at the right end of a marked row (text, not colour alone).
+/// Left gutter reserved on every talkgroup and channel row, marked or not,
+/// so the columns never shift. The row text starts at `rect.left() + ROW_GUTTER`.
+pub const ROW_GUTTER: f32 = 16.0;
+/// Row mark: a small muted red dot centred in the gutter.
+pub const ROW_DOT_RADIUS: f32 = 3.5;
+pub const ROW_DOT_X: f32 = 9.0;
+pub const ROW_DOT_COLOR: egui::Color32 = egui::Color32::from_rgb(170, 40, 32);
+pub const ROW_MARKED_HOVER: &str = "Marked for recording \u{2014} right-click to unmark.";
+
+/// Hover text for a row, by its mark.
+pub fn row_hover(marked: bool) -> &'static str {
+    if marked { ROW_MARKED_HOVER } else { ROW_HOVER }
+}
+
+/// Small dot in the left gutter of a marked row. No text, never over the name.
 pub fn paint_row_mark(ui: &egui::Ui, rect: egui::Rect) {
-    ui.painter().text(
-        rect.right_center() - egui::vec2(10.0, 0.0),
-        egui::Align2::RIGHT_CENTER,
-        "● REC",
-        egui::FontId::monospace(13.0),
-        egui::Color32::from_rgb(232, 40, 30),
+    ui.painter().circle_filled(
+        egui::pos2(rect.left() + ROW_DOT_X, rect.center().y),
+        ROW_DOT_RADIUS,
+        ROW_DOT_COLOR,
     );
 }
 
@@ -111,6 +144,8 @@ pub struct RecUi {
     rows_source: String,
     rows_at: Option<Instant>,
     views: HashMap<String, View>,
+    /// Highlighted lane per source tab.
+    lane_sel: HashMap<String, String>,
     query: String,
     selected: Option<i64>,
     player: Option<(i64, hsrec::replay::Player)>,
@@ -139,18 +174,19 @@ impl App {
         self.rec.face.armed()
     }
 
-    fn rec_icon(&self) -> IconState {
+    pub(super) fn rec_icon(&self) -> IconState {
         let writing = self.rec.db.is_some()
             && crate::rec_live::recorder().status.writing.load(Ordering::Relaxed);
         icon_state(self.rec_armed(), writing)
     }
 
-    /// Draw the record icon over the REC page tab, left of the name.
-    pub(super) fn paint_rec_icon(&self, ui: &egui::Ui, resp: egui::Response) -> egui::Response {
-        let state = self.rec_icon();
-        let c = egui::pos2(resp.rect.left() + 20.0, resp.rect.center().y);
-        ui.painter().circle_filled(c, 7.0, icon_color(state));
-        ui.painter().circle_stroke(c, 7.0, egui::Stroke::new(1.0, egui::Color32::from_gray(150)));
+    /// Tooltip text for the REC page tab (warnings carry text, never colour alone).
+    pub(super) fn rec_icon_hover(
+        &self,
+        ui: &egui::Ui,
+        resp: egui::Response,
+        state: IconState,
+    ) -> egui::Response {
         if state == IconState::Writing {
             ui.ctx().request_repaint_after(Duration::from_millis(250));
         }
@@ -444,9 +480,8 @@ impl App {
         let status = &crate::rec_live::recorder().status;
         let state = self.rec_icon();
         ui.horizontal_wrapped(|ui| {
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
-            ui.painter().circle_filled(rect.center(), 6.0, icon_color(state));
-            ui.painter().circle_stroke(rect.center(), 6.0, egui::Stroke::new(1.0, egui::Color32::from_gray(150)));
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+            paint_tab_glyph(ui.painter(), rect.center(), state);
             ui.label(icon_text(state));
             ui.label(format!(
                 "   TG: {}   Channels: {}",
@@ -801,13 +836,19 @@ impl App {
     fn rec_timeline(&mut self, ui: &mut egui::Ui) {
         let now = chrono::Utc::now().timestamp_millis();
         let source = self.rec_source();
-        let mut view = *self.rec.views.entry(source.clone()).or_insert_with(|| View::live(now, 3_600_000));
-        view.follow(now);
-        let width_all = ui.available_width();
-        let width = (width_all - LANE_W).max(100.0);
         let query = self.rec.query.clone();
         let recs: Vec<Recording> = self.rec.rows.iter().filter(|r| timeline::matches(r, &query)).cloned().collect();
         let lanes = timeline::lanes(&recs);
+        // First look at a source frames its most recent recordings.
+        let mut view = match self.rec.views.get(&source) {
+            Some(v) => *v,
+            None if !recs.is_empty() => timeline::fit(&recs, now),
+            None => View::live(now, 3_600_000),
+        };
+        view.follow(now);
+        let width_all = ui.available_width();
+        let cols = timeline::columns(width_all, LANE_W);
+        let width = cols.grid_w;
         ui.horizontal(|ui| {
             if ui.button("◀ Day").clicked() {
                 view.day(view.start + view.span / 2, -1);
@@ -819,151 +860,210 @@ impl App {
                 view.day(view.start + view.span / 2, 1);
             }
             if ui.button("−").on_hover_text("Zoom out").clicked() {
-                view.zoom(2.0, width, width);
+                view.zoom(2.0, width / 2.0, width);
+                view.live = false;
             }
             if ui.button("+").on_hover_text("Zoom in").clicked() {
-                view.zoom(0.5, width, width);
+                view.zoom(0.5, width / 2.0, width);
+                view.live = false;
+            }
+            if ui.button("Fit").on_hover_text("Fit to the most recent recordings").clicked() {
+                view = timeline::fit(&recs, now);
             }
             if ui.selectable_label(view.live, "● Live / Now").clicked() {
                 view = View::live(now, view.span);
             }
-            ui.label(format!("{} recordings, {} lanes", recs.len(), lanes.len()));
+            let shown = timeline::layout(&recs, &lanes, &view, width, now).len();
+            ui.label(format!("{} recordings ({shown} in view), {} lanes", recs.len(), lanes.len()));
             ui.checkbox(&mut self.rec.play_next, "Play next");
         });
         let blocks = timeline::layout(&recs, &lanes, &view, width, now);
         let subs: Vec<usize> = (0..lanes.len())
             .map(|l| blocks.iter().filter(|b| b.lane == l).map(|b| b.sub + 1).max().unwrap_or(1))
             .collect();
-        let lane_top: Vec<f32> = subs.iter().scan(0.0, |y, n| { let top = *y; *y += *n as f32 * LANE_H; Some(top) }).collect();
-        let body_h: f32 = subs.iter().map(|n| *n as f32 * LANE_H).sum::<f32>().max(LANE_H * 2.0);
-        let height = (AXIS_H + body_h).min(ui.available_height() - 140.0).max(AXIS_H + LANE_H * 2.0);
-        let (rect, resp) = ui.allocate_exact_size(egui::vec2(width_all, height), egui::Sense::click_and_drag());
-        let painter = ui.painter_at(rect);
-        let area = egui::Rect::from_min_max(egui::pos2(rect.left() + LANE_W, rect.top()), rect.max);
-        painter.rect_filled(rect, egui::CornerRadius::ZERO, egui::Color32::from_rgb(14, 14, 18));
-        // Axis.
-        let step = timeline::tick_step(view.span, width);
-        let mut t = view.start - view.start.rem_euclid(step);
+        let lane_h: Vec<f32> = subs.iter().map(|n| *n as f32 * LANE_H).collect();
+        let lane_top: Vec<f32> = lane_h.iter().scan(0.0, |y, h| { let top = *y; *y += *h; Some(top) }).collect();
+        let body_h: f32 = lane_h.iter().sum::<f32>().max(LANE_H * 2.0);
+        let viewport_h = (ui.available_height() - AXIS_H - TIMELINE_RESERVE).max(LANE_H * 3.0);
         let weak = ui.visuals().weak_text_color();
-        while t <= view.end() {
-            let x = area.left() + view.x(t, width);
-            if x >= area.left() {
-                painter.line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())], egui::Stroke::new(1.0, egui::Color32::from_gray(40)));
-                let local = chrono::DateTime::from_timestamp_millis(t).unwrap_or_default().with_timezone(&chrono::Local);
-                let fmt = if step >= 86_400_000 { "%a %m-%d" } else if step >= 60_000 { "%H:%M" } else { "%H:%M:%S" };
-                painter.text(egui::pos2(x + 2.0, rect.top() + 2.0), egui::Align2::LEFT_TOP, local.format(fmt).to_string(), egui::FontId::monospace(11.0), weak);
+        let bg = egui::Color32::from_rgb(14, 14, 18);
+        let step = timeline::tick_step(view.span, width);
+        let ticks: Vec<i64> = {
+            let mut v = Vec::new();
+            let mut t = view.start - view.start.rem_euclid(step);
+            while t <= view.end() {
+                if t >= view.start { v.push(t); }
+                t += step;
             }
-            t += step;
-        }
-        // Lanes.
-        for (i, name) in lanes.iter().enumerate() {
-            let y = rect.top() + AXIS_H + lane_top[i];
-            let h = subs[i] as f32 * LANE_H;
-            if i % 2 == 1 {
-                painter.rect_filled(egui::Rect::from_min_size(egui::pos2(rect.left(), y), egui::vec2(width_all, h)), egui::CornerRadius::ZERO, egui::Color32::from_rgb(20, 20, 26));
+            v
+        };
+        // Axis row: label column header, then tick labels over the grid only.
+        let (axis, axis_resp) = ui.allocate_exact_size(egui::vec2(width_all, AXIS_H), egui::Sense::click_and_drag());
+        {
+            let painter = ui.painter_at(axis);
+            painter.rect_filled(axis, egui::CornerRadius::ZERO, bg);
+            painter.text(axis.left_center() + egui::vec2(6.0, 0.0), egui::Align2::LEFT_CENTER, "Lane", egui::FontId::monospace(11.0), weak);
+            let grid = egui::Rect::from_min_max(egui::pos2(axis.left() + cols.grid_x, axis.top()), axis.max);
+            let gp = ui.painter_at(grid);
+            let fmt = if step >= 86_400_000 { "%a %m-%d" } else if step >= 60_000 { "%H:%M" } else { "%H:%M:%S" };
+            for t in &ticks {
+                let x = grid.left() + view.x(*t, width);
+                let local = chrono::DateTime::from_timestamp_millis(*t).unwrap_or_default().with_timezone(&chrono::Local);
+                gp.text(egui::pos2(x + 2.0, grid.top() + 2.0), egui::Align2::LEFT_TOP, local.format(fmt).to_string(), egui::FontId::monospace(11.0), weak);
             }
-            painter.text(egui::pos2(rect.left() + 6.0, y + LANE_H / 2.0), egui::Align2::LEFT_CENTER, name, egui::FontId::monospace(12.0), ui.visuals().text_color());
         }
-        if lanes.is_empty() {
-            painter.text(area.center(), egui::Align2::CENTER_CENTER, "No recordings in this view.", egui::FontId::proportional(14.0), weak);
-        }
-        // Blocks.
-        let mut want_wf = Vec::new();
+        let mut drag_dx = if axis_resp.dragged() { axis_resp.drag_delta().x } else { 0.0 };
+        let mut hover_grid = axis_resp.hovered();
         let mut hit: Option<(i64, u64)> = None;
-        let pointer = resp.interact_pointer_pos();
+        let mut want_wf = Vec::new();
+        let mut lane_click: Option<String> = None;
+        let sel_lane = self.rec.lane_sel.get(&source).cloned();
         let by_id: HashMap<i64, &Recording> = recs.iter().map(|r| (r.id, r)).collect();
-        for b in &blocks {
-            let Some(r) = by_id.get(&b.id) else { continue };
-            let y = rect.top() + AXIS_H + lane_top[b.lane] + b.sub as f32 * LANE_H;
-            let br = egui::Rect::from_min_max(egui::pos2(area.left() + b.x0.max(0.0), y + 3.0), egui::pos2(area.left() + b.x1.min(width), y + LANE_H - 3.0));
-            if br.width() <= 0.0 {
-                continue;
-            }
-            let selected = self.rec.selected == Some(b.id);
-            let fill = if r.offline() || r.missing {
-                egui::Color32::from_gray(70)
-            } else if b.live {
-                egui::Color32::from_rgb(170, 24, 18)
-            } else if r.meta.source_kind == meta::KIND_DEMOD_AUDIO {
-                egui::Color32::from_rgb(40, 90, 120)
+        let selected_id = self.rec.selected;
+        let waveforms = &self.rec.waveforms;
+        let player = self.rec.player.as_ref().map(|(id, pl)| (*id, pl.pos_ms.load(Ordering::Relaxed) as i64));
+        egui::ScrollArea::vertical()
+            .id_salt(("rec-timeline", source.clone()))
+            .max_height(viewport_h)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(width_all, body_h), egui::Sense::hover());
+                let label_rect = egui::Rect::from_min_size(rect.min, egui::vec2(cols.label_w, body_h));
+                let grid = egui::Rect::from_min_max(egui::pos2(rect.left() + cols.grid_x, rect.top()), rect.max);
+                ui.painter_at(rect).rect_filled(rect, egui::CornerRadius::ZERO, bg);
+                let gp = ui.painter_at(grid);
+                for t in &ticks {
+                    let x = grid.left() + view.x(*t, width);
+                    gp.line_segment([egui::pos2(x, grid.top()), egui::pos2(x, grid.bottom())], egui::Stroke::new(1.0, egui::Color32::from_gray(40)));
+                }
+                // Label column: one clickable cell per lane, clipped, with ellipsis.
+                let max_chars = ((cols.label_w - 10.0) / 7.3).max(4.0) as usize;
+                for (i, name) in lanes.iter().enumerate() {
+                    let y = rect.top() + lane_top[i];
+                    let full = egui::Rect::from_min_size(egui::pos2(rect.left(), y), egui::vec2(width_all, lane_h[i]));
+                    let selected = sel_lane.as_deref() == Some(name.as_str());
+                    if selected {
+                        ui.painter_at(rect).rect_filled(full, egui::CornerRadius::ZERO, egui::Color32::from_rgb(40, 40, 70));
+                    } else if i % 2 == 1 {
+                        ui.painter_at(rect).rect_filled(full, egui::CornerRadius::ZERO, egui::Color32::from_rgb(20, 20, 26));
+                    }
+                    let cell = egui::Rect::from_min_size(egui::pos2(label_rect.left(), y), egui::vec2(cols.label_w, LANE_H));
+                    let resp = ui.interact(cell, ui.scope_id().with(("rec-lane", i)), egui::Sense::click());
+                    let ink = if selected || resp.hovered() { egui::Color32::WHITE } else { ui.visuals().text_color() };
+                    ui.painter_at(label_rect).text(cell.left_center() + egui::vec2(6.0, 0.0), egui::Align2::LEFT_CENTER, timeline::ellipsize(name, max_chars), egui::FontId::monospace(12.0), ink);
+                    if resp.clicked() {
+                        lane_click = Some(name.clone());
+                    }
+                    resp.on_hover_text(format!("{name}\nClick to highlight this lane."));
+                }
+                if lanes.is_empty() {
+                    gp.text(grid.center(), egui::Align2::CENTER_CENTER, "No recordings in this view.", egui::FontId::proportional(14.0), weak);
+                }
+                // Grid interaction: drag pans, scroll zooms, click plays a block.
+                let gresp = ui.interact(grid, ui.scope_id().with("rec-grid"), egui::Sense::click_and_drag());
+                if gresp.dragged() { drag_dx += gresp.drag_delta().x; }
+                hover_grid |= gresp.hovered();
+                let pointer = gresp.interact_pointer_pos();
+                let hover = gresp.hover_pos();
+                let mut block_tip: Option<String> = None;
+                for b in &blocks {
+                    let Some(r) = by_id.get(&b.id) else { continue };
+                    let y = rect.top() + lane_top[b.lane] + b.sub as f32 * LANE_H;
+                    let br = egui::Rect::from_min_max(egui::pos2(grid.left() + b.x0.max(0.0), y + 3.0), egui::pos2(grid.left() + b.x1.min(width), y + LANE_H - 3.0));
+                    if br.width() <= 0.0 {
+                        continue;
+                    }
+                    let fill = if r.offline() || r.missing {
+                        egui::Color32::from_gray(70)
+                    } else if b.live {
+                        egui::Color32::from_rgb(170, 24, 18)
+                    } else if r.meta.source_kind == meta::KIND_DEMOD_AUDIO {
+                        egui::Color32::from_rgb(40, 90, 120)
+                    } else {
+                        egui::Color32::from_rgb(46, 120, 70)
+                    };
+                    gp.rect_filled(br, egui::CornerRadius::same(2), fill);
+                    if let Some(wf) = waveforms.get(&b.id) {
+                        let n = wf.len().max(1) as f32;
+                        for (k, v) in wf.iter().enumerate() {
+                            let x = br.left() + br.width() * k as f32 / n;
+                            let a = br.height() * 0.45 * (*v as f32 / 255.0);
+                            gp.line_segment([egui::pos2(x, br.center().y - a), egui::pos2(x, br.center().y + a)], egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(220, 240, 220, 120)));
+                        }
+                    } else if br.width() > 20.0 {
+                        want_wf.push(b.id);
+                    }
+                    let mut tag = String::new();
+                    if r.meta.emergency { tag.push_str("EMERG "); }
+                    if r.meta.priority { tag.push_str("PRI "); }
+                    if r.archived { tag.push_str("zst "); }
+                    if r.protected { tag.push_str("🔒"); }
+                    if r.star { tag.push('★'); }
+                    if r.offline() { tag = format!("{tag}offline"); }
+                    if r.missing { tag = format!("{tag}MISSING"); }
+                    if !tag.is_empty() && br.width() > 30.0 {
+                        gp.text(br.left_center() + egui::vec2(3.0, 0.0), egui::Align2::LEFT_CENTER, tag.trim(), egui::FontId::monospace(10.0), egui::Color32::WHITE);
+                    }
+                    if r.meta.emergency {
+                        gp.rect_stroke(br, egui::CornerRadius::same(2), egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 60, 40)), egui::StrokeKind::Outside);
+                    }
+                    if selected_id == Some(b.id) {
+                        gp.rect_stroke(br, egui::CornerRadius::same(2), egui::Stroke::new(2.0, egui::Color32::WHITE), egui::StrokeKind::Outside);
+                    }
+                    let t0 = timeline::parse_ms(&r.meta.start_utc).unwrap_or(0);
+                    if let Some(p) = pointer {
+                        if gresp.clicked() && br.expand(2.0).contains(p) {
+                            let at = (view.t(p.x - grid.left(), width) - t0).max(0) as u64;
+                            hit = Some((b.id, at));
+                        }
+                    }
+                    if hover.is_some_and(|p| br.expand(2.0).contains(p)) {
+                        let start = chrono::DateTime::from_timestamp_millis(t0).unwrap_or_default().with_timezone(&chrono::Local);
+                        let unit = r.meta.radio_unit_id.map(|u| format!("\nRadio ID {u}")).unwrap_or_default();
+                        let tip = format!("{}\n{} ({:.1} s){unit}", r.meta.lane(), start.format("%Y-%m-%d %H:%M:%S"), r.meta.duration_ms as f64 / 1000.0);
+                        block_tip = Some(tip);
+                    }
+                    if let Some((pid, pos)) = player {
+                        if pid == b.id {
+                            let x = grid.left() + view.x(t0 + pos, width);
+                            gp.line_segment([egui::pos2(x, br.top() - 2.0), egui::pos2(x, br.bottom() + 2.0)], egui::Stroke::new(2.0, egui::Color32::YELLOW));
+                        }
+                    }
+                }
+                let now_x = grid.left() + view.x(now, width);
+                if now_x >= grid.left() && now_x <= grid.right() {
+                    gp.line_segment([egui::pos2(now_x, grid.top()), egui::pos2(now_x, grid.bottom())], egui::Stroke::new(1.0, egui::Color32::from_rgb(240, 60, 50)));
+                    gp.text(egui::pos2(now_x - 2.0, grid.bottom() - 2.0), egui::Align2::RIGHT_BOTTOM, "NOW", egui::FontId::monospace(10.0), egui::Color32::from_rgb(240, 60, 50));
+                }
+                if let Some(tip) = block_tip {
+                    gresp.on_hover_text(tip);
+                }
+            });
+        if let Some(name) = lane_click {
+            if self.rec.lane_sel.get(&source) == Some(&name) {
+                self.rec.lane_sel.remove(&source);
             } else {
-                egui::Color32::from_rgb(46, 120, 70)
-            };
-            painter.rect_filled(br, egui::CornerRadius::same(2), fill);
-            if let Some(wf) = self.rec.waveforms.get(&b.id) {
-                let n = wf.len().max(1) as f32;
-                for (k, v) in wf.iter().enumerate() {
-                    let x = br.left() + br.width() * k as f32 / n;
-                    let a = br.height() * 0.45 * (*v as f32 / 255.0);
-                    painter.line_segment([egui::pos2(x, br.center().y - a), egui::pos2(x, br.center().y + a)], egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(220, 240, 220, 120)));
-                }
-            } else if br.width() > 20.0 {
-                want_wf.push(b.id);
-            }
-            let mut tag = String::new();
-            if r.meta.emergency {
-                tag.push_str("EMERG ");
-            }
-            if r.meta.priority {
-                tag.push_str("PRI ");
-            }
-            if r.archived {
-                tag.push_str("zst ");
-            }
-            if r.protected {
-                tag.push_str("🔒");
-            }
-            if r.star {
-                tag.push('★');
-            }
-            if r.offline() {
-                tag = format!("{tag}offline");
-            }
-            if r.missing {
-                tag = format!("{tag}MISSING");
-            }
-            if !tag.is_empty() && br.width() > 30.0 {
-                painter.text(br.left_center() + egui::vec2(3.0, 0.0), egui::Align2::LEFT_CENTER, tag.trim(), egui::FontId::monospace(10.0), egui::Color32::WHITE);
-            }
-            if r.meta.emergency {
-                painter.rect_stroke(br, egui::CornerRadius::same(2), egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 60, 40)), egui::StrokeKind::Outside);
-            }
-            if selected {
-                painter.rect_stroke(br, egui::CornerRadius::same(2), egui::Stroke::new(2.0, egui::Color32::WHITE), egui::StrokeKind::Outside);
-            }
-            if let Some(p) = pointer {
-                if resp.clicked() && br.expand(2.0).contains(p) {
-                    let t0 = timeline::parse_ms(&r.meta.start_utc).unwrap_or(0);
-                    let at = (view.t(p.x - area.left(), width) - t0).max(0) as u64;
-                    hit = Some((b.id, at));
-                }
-            }
-            // Play head.
-            if let Some((pid, pl)) = &self.rec.player {
-                if *pid == b.id {
-                    let t0 = timeline::parse_ms(&r.meta.start_utc).unwrap_or(0);
-                    let x = area.left() + view.x(t0 + pl.pos_ms.load(Ordering::Relaxed) as i64, width);
-                    painter.line_segment([egui::pos2(x, br.top() - 2.0), egui::pos2(x, br.bottom() + 2.0)], egui::Stroke::new(2.0, egui::Color32::YELLOW));
-                }
+                self.rec.lane_sel.insert(source.clone(), name);
             }
         }
-        if let Some(now_x) = Some(area.left() + view.x(now, width)).filter(|x| *x >= area.left() && *x <= area.right()) {
-            painter.line_segment([egui::pos2(now_x, rect.top()), egui::pos2(now_x, rect.bottom())], egui::Stroke::new(1.0, egui::Color32::from_rgb(240, 60, 50)));
-            painter.text(egui::pos2(now_x - 2.0, rect.bottom() - 2.0), egui::Align2::RIGHT_BOTTOM, "NOW", egui::FontId::monospace(10.0), egui::Color32::from_rgb(240, 60, 50));
+        if drag_dx != 0.0 {
+            view.pan_px(drag_dx, width);
         }
-        // Pan / zoom.
-        if resp.dragged() {
-            view.pan_px(resp.drag_delta().x, width);
-        }
-        if resp.hovered() {
+        if hover_grid {
+            // Ctrl+scroll or plain scroll over the grid zooms; the scroll area
+            // still scrolls lanes when the pointer is over the label column.
             let scroll = ui.input(|i| i.smooth_scroll_delta.y);
             if scroll.abs() > 0.5 {
-                let anchor = ui.input(|i| i.pointer.hover_pos()).map(|p| p.x - area.left()).unwrap_or(width).clamp(0.0, width);
+                let left = axis.left() + cols.grid_x;
+                let anchor = ui.input(|i| i.pointer.hover_pos()).map(|p| p.x - left).unwrap_or(width).clamp(0.0, width);
                 view.zoom(if scroll > 0.0 { 0.8 } else { 1.25 }, anchor, width);
                 view.live = false;
             }
         }
-        self.rec.views.insert(source, view);
+        // Store only once there is something to frame, so the first rows fit.
+        if !recs.is_empty() || self.rec.views.contains_key(&source) {
+            self.rec.views.insert(source, view);
+        }
         if let Some((id, at)) = hit {
             if self.rec.selected != Some(id) {
                 self.rec.notes_edit = self.rec.rows.iter().find(|r| r.id == id).map(|r| r.notes.clone()).unwrap_or_default();
@@ -1168,6 +1268,17 @@ mod tests {
         assert_eq!(icon_state(true, true), IconState::Writing);
         assert_eq!(icon_color(IconState::Off), egui::Color32::BLACK);
         assert_ne!(icon_color(IconState::Armed), icon_color(IconState::Writing));
+        // The row dot fits inside the gutter, left of the row text.
+        assert!(ROW_DOT_X + ROW_DOT_RADIUS < ROW_GUTTER);
+        assert!(ROW_DOT_X - ROW_DOT_RADIUS > 3.0);
+        assert!(ROW_DOT_COLOR.r() < 200);
+        assert_eq!(row_hover(true), ROW_MARKED_HOVER);
+        assert_eq!(row_hover(false), ROW_HOVER);
+        // Writing is a modest brightening of armed, not a glare.
+        let (a, w) = (icon_color(IconState::Armed), icon_color(IconState::Writing));
+        assert!(w.r() > a.r() && w.r() < 220);
+        // The glyph stays inside the speaker emoji's slot.
+        assert!(2.0 * (TAB_GLYPH_RING + TAB_GLYPH_STROKE) <= TAB_GLYPH_SLOT * 0.6);
         assert!(icon_text(IconState::Writing).contains("recording"));
     }
 

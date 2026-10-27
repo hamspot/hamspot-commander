@@ -124,6 +124,67 @@ pub fn layout(recs: &[Recording], lanes: &[String], view: &View, width: f32, now
     out
 }
 
+/// Most recent window shown by default and by "Fit": at most this far back
+/// from the last recording.
+pub const FIT_BACK_MS: i64 = 6 * 3_600_000;
+
+/// View that frames the most recent recordings: from the earliest start inside
+/// the last [`FIT_BACK_MS`] to the latest end, with 5% padding each side.
+/// No recordings gives the live last hour.
+pub fn fit(recs: &[Recording], now: i64) -> View {
+    let spans: Vec<(i64, i64)> = recs
+        .iter()
+        .filter_map(|r| {
+            let t0 = parse_ms(&r.meta.start_utc)?;
+            let t1 = if r.meta.end_utc.is_empty() {
+                now.max(t0)
+            } else {
+                parse_ms(&r.meta.end_utc).unwrap_or(t0 + r.meta.duration_ms)
+            };
+            Some((t0, t1.max(t0)))
+        })
+        .collect();
+    let Some(last) = spans.iter().map(|s| s.1).max() else {
+        return View::live(now, 3_600_000);
+    };
+    let first = spans.iter().map(|s| s.0).filter(|t| *t >= last - FIT_BACK_MS).min().unwrap_or(last);
+    let raw = (last - first).max(MIN_SPAN_MS);
+    let span = (raw + raw / 10).clamp(MIN_SPAN_MS, MAX_SPAN_MS);
+    let mid = first + (last - first) / 2;
+    View { start: mid - span / 2, span, live: false }
+}
+
+/// Split of the timeline canvas: a fixed label column on the left and the
+/// grid to its right. They never overlap.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Columns {
+    pub label_w: f32,
+    pub grid_x: f32,
+    pub grid_w: f32,
+}
+
+pub const LABEL_GAP: f32 = 4.0;
+
+pub fn columns(total_w: f32, label_w: f32) -> Columns {
+    let label_w = label_w.min((total_w * 0.4).max(60.0)).max(0.0);
+    let grid_x = label_w + LABEL_GAP;
+    Columns { label_w, grid_x, grid_w: (total_w - grid_x).max(1.0) }
+}
+
+/// Lane under `y` (relative to the top of the lane body).
+pub fn lane_at(y: f32, lane_top: &[f32], lane_h: &[f32]) -> Option<usize> {
+    lane_top.iter().zip(lane_h).position(|(t, h)| y >= *t && y < t + h)
+}
+
+/// Truncate `name` to `max` chars, ending in an ellipsis when cut.
+pub fn ellipsize(name: &str, max: usize) -> String {
+    if name.chars().count() <= max {
+        return name.to_string();
+    }
+    let keep: String = name.chars().take(max.saturating_sub(1)).collect();
+    format!("{keep}\u{2026}")
+}
+
 /// Case-insensitive filter on lane, channel, TG number, radio id, notes.
 pub fn matches(r: &Recording, query: &str) -> bool {
     let q = query.trim().to_lowercase();
@@ -206,5 +267,46 @@ mod tests {
         assert_eq!(next_after(&r, r[0].id), Some(r[1].id));
         assert_eq!(next_after(&r, r[2].id), None);
         assert_eq!(tick_step(3_600_000, 900.0), 600_000);
+    }
+
+    #[test]
+    fn fit_frames_recent_recordings() {
+        // Finished calls only: an unfinished one grows to now by design.
+        let r: Vec<Recording> = recs().into_iter().filter(|r| !r.meta.end_utc.is_empty()).collect();
+        let t0 = parse_ms("2026-01-01T00:00:00Z").unwrap();
+        // Long after the calls: the view still frames them, not now.
+        let v = fit(&r, t0 + 10 * 86_400_000);
+        assert!(!v.live);
+        let b = layout(&r, &lanes(&r), &v, 600.0, t0 + 10 * 86_400_000);
+        assert_eq!(b.len(), 2);
+        assert!(b.iter().all(|b| b.x0 >= 0.0 && b.x0 <= 600.0));
+        // A week-old call does not stretch the view past FIT_BACK_MS.
+        let db = Db::open_in_memory().unwrap();
+        db.insert("old", &meta("hackrf_tg", Some(9), "2025-12-20T00:00:00Z", "2025-12-20T00:00:05Z")).unwrap();
+        let mut all = r.clone();
+        all.extend(db.all().unwrap());
+        let v2 = fit(&all, t0 + 60_000);
+        assert!(v2.span <= FIT_BACK_MS + FIT_BACK_MS / 10);
+        assert_eq!(fit(&[], 5_000_000), View::live(5_000_000, 3_600_000));
+    }
+
+    #[test]
+    fn columns_never_overlap_and_hit_test() {
+        for w in [120.0f32, 400.0, 1200.0] {
+            let c = columns(w, 220.0);
+            assert!(c.label_w < c.grid_x);
+            assert!(c.grid_x + c.grid_w <= w.max(c.grid_x + 1.0) + 0.01);
+        }
+        let tops = [0.0, 22.0, 66.0];
+        let hs = [22.0, 44.0, 22.0];
+        assert_eq!(lane_at(5.0, &tops, &hs), Some(0));
+        assert_eq!(lane_at(50.0, &tops, &hs), Some(1));
+        assert_eq!(lane_at(70.0, &tops, &hs), Some(2));
+        assert_eq!(lane_at(90.0, &tops, &hs), None);
+        // Click x maps back to time in the grid.
+        let v = View { start: 0, span: 60_000, live: false };
+        assert_eq!(v.t(300.0, 600.0), 30_000);
+        assert_eq!(ellipsize("abcdef", 4), "abc\u{2026}");
+        assert_eq!(ellipsize("abc", 4), "abc");
     }
 }

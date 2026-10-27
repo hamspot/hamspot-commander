@@ -1306,6 +1306,15 @@ fn tab_color(index: usize) -> egui::Color32 {
 /// It is not a separate caution role. See the rustcars issue for that gap.
 /// Steady amber edge on a talkgroup or zone row with recent traffic. It is
 /// the non-motion cue and fades with the traffic level.
+/// Alpha of the talkgroup and channel details panels: mostly opaque, so list
+/// text never bleeds through, but not a solid slab.
+const DETAILS_PANEL_ALPHA: f32 = 0.94;
+
+/// Group frame for the details panels, filled with the theme panel colour.
+fn details_frame(ui: &egui::Ui) -> egui::Frame {
+    egui::Frame::group(ui.style()).fill(ui.visuals().panel_fill.gamma_multiply(DETAILS_PANEL_ALPHA))
+}
+
 fn recent_bar(ui: &egui::Ui, rect: egui::Rect, level: f32) {
     if level <= 0.0 {
         return;
@@ -1390,6 +1399,67 @@ pub(crate) fn folder_tab_colored(
     resp
 }
 
+/// The REC page tab. Same width, inset and name placement as a speaker tab,
+/// with the small record glyph in the speaker's slot.
+pub(crate) fn folder_tab_rec(
+    ui: &mut egui::Ui,
+    selected: bool,
+    index: usize,
+    label: &str,
+    lead: bool,
+    fill: Option<egui::Color32>,
+    state: rec_ui::IconState,
+) -> egui::Response {
+    let theme = rustcars::LcarsTheme::default();
+    let fill = fill.unwrap_or_else(|| {
+        if selected {
+            rustcars::tint(tab_color(index), 0.35)
+        } else {
+            tab_color(index)
+        }
+    });
+    let width = voice_tab_width(ui.painter(), &theme, label).max(72.0);
+    let cap = if lead { rustcars::Cap::Left } else { rustcars::Cap::None };
+    let resp = rustcars::lcars_button(
+        ui,
+        &theme,
+        "",
+        fill,
+        egui::vec2(width, theme.bar_thin),
+        cap,
+        true,
+    );
+    paint_rec_caption(ui.painter(), resp.rect, &theme, label, fill, state);
+    resp
+}
+
+/// Name on the right like [`paint_voice_caption`], and a small record glyph
+/// centred in the 22px slot the speaker emoji uses.
+fn paint_rec_caption(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    theme: &rustcars::LcarsTheme,
+    label: &str,
+    fill: egui::Color32,
+    state: rec_ui::IconState,
+) {
+    let font = egui::FontId::proportional(theme.header_size);
+    let upper = label.to_uppercase();
+    let ink = rustcars::ink_on(fill);
+    let galley = painter.layout_no_wrap(upper.clone(), font.clone(), ink);
+    let pad = 4.0;
+    painter.text(
+        egui::pos2(rect.right() - pad, rect.bottom() - theme.frame_gap),
+        egui::Align2::RIGHT_BOTTOM,
+        upper,
+        font,
+        ink,
+    );
+    let slot_right = rect.right() - pad - galley.rect.width() - 2.0;
+    let center = egui::pos2(slot_right - rec_ui::TAB_GLYPH_SLOT / 2.0, rect.center().y);
+    rec_ui::paint_tab_glyph(painter, center, state);
+}
+
 /// Right inset used when a tab has no speaker. Matches `lcars_button`.
 fn tab_text_pad(theme: &rustcars::LcarsTheme) -> f32 {
     (theme.bar_thin / 2.0).min(theme.main_gap)
@@ -1443,6 +1513,7 @@ fn paint_floating_tab(
     index: usize,
     label: &str,
     speaker: Option<f32>,
+    rec: Option<rec_ui::IconState>,
 ) {
     let theme = rustcars::LcarsTheme::default();
     let fill = if selected {
@@ -1462,6 +1533,10 @@ fn paint_floating_tab(
     painter.rect_filled(rect, rustcars::cap_radius(cap, rect.height()), fill);
     if let Some(alpha) = speaker {
         paint_voice_caption(&painter, rect, &theme, label, fill, alpha);
+        return;
+    }
+    if let Some(state) = rec {
+        paint_rec_caption(&painter, rect, &theme, label, fill, state);
         return;
     }
     let pad = tab_text_pad(&theme);
@@ -2656,17 +2731,29 @@ impl eframe::App for App {
                                     pulse::brighten(base, lift)
                                 });
                                 let rec_tab = page == Page::Rec;
-                                let shown = if rec_tab { format!("    {label}") } else { label.clone() };
-                                let resp = folder_tab_colored(
-                                    ui,
-                                    self.page == page,
-                                    index,
-                                    &shown,
-                                    index == 0,
-                                    fill,
-                                    speaker,
-                                );
-                                let resp = if rec_tab { self.paint_rec_icon(ui, resp) } else { resp };
+                                let resp = if rec_tab {
+                                    let state = self.rec_icon();
+                                    let resp = folder_tab_rec(
+                                        ui,
+                                        self.page == page,
+                                        index,
+                                        &label,
+                                        index == 0,
+                                        fill,
+                                        state,
+                                    );
+                                    self.rec_icon_hover(ui, resp, state)
+                                } else {
+                                    folder_tab_colored(
+                                        ui,
+                                        self.page == page,
+                                        index,
+                                        &label,
+                                        index == 0,
+                                        fill,
+                                        speaker,
+                                    )
+                                };
                                 hits.push((name, resp.rect));
                                 if resp.clicked() {
                                     clicked_page = Some(page);
@@ -2711,6 +2798,7 @@ impl eframe::App for App {
                                         press.index,
                                         &press.label,
                                         self.speaker_alpha(press.page, now),
+                                        (press.page == Page::Rec).then(|| self.rec_icon()),
                                     );
                                 }
                             }
@@ -7031,7 +7119,8 @@ impl App {
         let name = channel.name.clone();
         let (rect, response) =
             ui.allocate_exact_size(egui::vec2(ui.available_width(), 26.0), egui::Sense::click());
-        let painter = ui.painter();
+        // Clipped to the row so long names never run under the details panel.
+        let painter = ui.painter_at(rect);
         if self.channel_sel == idx {
             painter.rect_filled(rect, egui::CornerRadius::same(4), HAM.gamma_multiply(0.28));
         } else if idx % 2 == 1 {
@@ -7045,7 +7134,7 @@ impl App {
             text.push_str("  enc");
         }
         painter.text(
-            rect.left_center() + egui::vec2(8.0, 0.0),
+            rect.left_center() + egui::vec2(rec_ui::ROW_GUTTER, 0.0),
             egui::Align2::LEFT_CENTER,
             text,
             egui::FontId::monospace(14.0),
@@ -7054,16 +7143,16 @@ impl App {
         if channel.record {
             rec_ui::paint_row_mark(ui, rect);
         }
+        let response = response.on_hover_text(rec_ui::row_hover(channel.record));
         if self.channel_list_follow && idx == self.channel_sel {
             response.scroll_to_me(Some(egui::Align::Center));
         }
         let marked = response.secondary_clicked();
-        let response = response.on_hover_text(rec_ui::ROW_HOVER);
         (response.clicked(), marked)
     }
 
     fn channel_editor(&mut self, ui: &mut egui::Ui, snap: &Snapshot, width: f32) {
-        let frame = egui::Frame::group(ui.style());
+        let frame = details_frame(ui);
         let chrome =
             frame.inner_margin.sum().x + frame.stroke.width * 2.0 + frame.outer_margin.sum().x;
         let inner = (width - chrome).max(0.0);
@@ -10338,8 +10427,8 @@ impl App {
         if !followed {
             recent_bar(ui, rect, recent);
         }
-        ui.painter().text(
-            rect.left_center() + egui::vec2(8.0, 0.0),
+        ui.painter_at(rect).text(
+            rect.left_center() + egui::vec2(rec_ui::ROW_GUTTER, 0.0),
             egui::Align2::LEFT_CENTER,
             label,
             egui::FontId::monospace(14.0),
@@ -10349,12 +10438,12 @@ impl App {
             rec_ui::paint_row_mark(ui, rect);
         }
         let marked = response.secondary_clicked();
-        let response = response.on_hover_text(rec_ui::ROW_HOVER);
+        let response = response.on_hover_text(rec_ui::row_hover(row.record));
         (response.clicked(), response.double_clicked(), marked)
     }
 
     fn talkgroup_editor(&mut self, ui: &mut egui::Ui, width: f32) {
-        let frame = egui::Frame::group(ui.style());
+        let frame = details_frame(ui);
         let chrome =
             frame.inner_margin.sum().x + frame.stroke.width * 2.0 + frame.outer_margin.sum().x;
         let inner = (width - chrome).max(0.0);
