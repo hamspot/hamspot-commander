@@ -101,6 +101,10 @@ Rules:
 4. `keys/` is 700 and the runtime CSV moves to `HSData/tmp/` (600), unique per station, and is removed at exit.
 5. Imports go into a staging folder under `HSData/tmp/import-*`, are verified, then renamed into place.
 
+### Pipe files are an asset kind (added 2026-10-27)
+
+Since `pipe-files-only`, RX/TX pipe files are an *asset kind*, not station data. They live in the installed `modems/` folder (read-only) and the user's `modems.d/` folder, both app-level under `~/.local/share/hamspot-commander/` (or beside the portable binary), and stay **outside** `Foo.HSData/`. Station files and recordings hold only `modems/<name>`; the resolver finds the file. Any new kind (for example flowgraphs) is one more entry in the registry `hsrec::safepath::KINDS`, with the same name, symlink and permission checks.
+
 ## 3. Effect on open issues
 - **REC epic #119 (#120–#133):** paths in storage/DB/export/CLI change to `HSData/rec/…`. The thumb drive becomes `HamSpot-REC/<station>/…` with `index.json` per station, so two stations don't collide. The old `HamSpot-REC/index.json` is still importable.
 - **TV epic #134 (#135–#147):** TV baseband goes into `rec/files/tv_<std>/…` (it shows as a "TV" source). The GNU Radio flowgraphs are app assets (`modems/` or `flowgraphs/`), never stored by path. Presets and AUX stay in the station file (#147), as decided. Any per-station GNU Radio prefs go to `HSData/tv/`, not to the shared `gnuradio/prefs`.
