@@ -43,7 +43,7 @@ Commander puts the controls of one or more radios in one dark, LCARS-style windo
 - **Scanning** a local channel file, and **following a trunked system** (P25 and others) from its control channel, with talkgroup lists and the radio IDs heard on the air.
 - **Digital voice** through RX pipes, small scripts that run decoders such as `dsd-fme`.
 - **REC**, which records HackRF traffic as raw radio data and re-decodes it every time you play it back.
-- **Automation**: Hamlib rotators and amplifiers, and an RF patch bay drawing of your station.
+- **Automation**: Hamlib rotators and amplifiers, and an RF patch drawing of your station.
 - **Tools**: a NanoVNA V2 vector network analyzer screen, a Smith chart, RF and general calculators, a hex viewer, a logbook and a rotator display. The **Timers** page has station clocks, an ID timer, a countdown and a stopwatch.
 
 Everything about a station (radios, band plan, channels, talkgroups, levels, layout) is kept in one **station file**, `Name.HSCommander`. Key material, VNA calibration, the logbook and recordings are kept in separate files beside it ([chapter 15](#ch15)).
@@ -86,7 +86,7 @@ Supported test equipment is the **NanoVNA V2** (V2.2, USB id `04b4:0008`). Suppo
 2. **Start it** from the desktop menu (**Hamspot Commander**) or with `~/.local/bin/commander`. The window opens on **Tune**. With no station loaded, Commander runs Hamlib's dummy radio (model 1), so the controls work straight away.
 3. **Save a station.** Open **Config** and press **Save**. Choose a folder and a name such as `Home.HSCommander`. Pages such as Keys, Logbook and REC need a saved station, because their files go beside it.
 4. **Add your radio.** On **Config**, press **Add hamlib** for a CAT radio, **Add GQRX** for an SDR through GQRX, or **Add HackRF** for a HackRF. Fill in the window and press **Save** ([chapter 11](#ch11)). Click the row to make it the radio that Tune drives. Wait for its **Status** to stop saying `starting`.
-5. **Listen.** On **Tune**, click a band chip, or type a frequency under the digits and press Enter ([chapter 5](#ch5)). Wire the radio's RX card to your speakers in the **Audio** frame on Config ([11.6](#s11-6)).
+5. **Listen.** On **Tune**, click a band chip, or type a frequency under the digits and press Enter ([chapter 5](#ch5)). Wire the radio's RX card to your speakers in the **Audio Patch** group on Config ([11.6](#s11-6)).
 6. **Scan.** On **Channels**, press **LOAD** to open a channel file or **Add** to store the current frequency, then press **SCAN** ([chapter 7](#ch7)).
 7. **Save again** on Config when you have changed things you want to keep. When you close the window with unsaved changes, Commander asks **Save**, **Don't save** or **Cancel**.
 
@@ -640,13 +640,13 @@ The page is split into groups. Each group sits inside a thin elbow: a bar across
 |---|---|
 | **STATION** | **Load**, **Save**, the station file name, the band plan, and the channel and talkgroup zone counts ([11.1](#ch11)). |
 | **DISPLAY** | **Pulse busy tabs** and **Pulse speed**. |
-| **TRUNKING** | **Trunk voice hang** and **Emergency/priority override**. |
 | **RADIO** | The CAT Control table of radios and its buttons ([11.2](#ch11)). |
-| **AUDIO** | Audio wiring and pipes ([11.6](#s11-6)). |
-| **AUTOMATION** | Gpredict, the Control view, **Follow** and the decoder log. |
 | **ROTATOR** | The rotator table with **Add**, **Edit** and **Remove**. |
 | **AMPLIFIER** | The amplifier table. |
-| **PATCH BAY** | The RF patch bay ([11.8](#ch11)). |
+| **TRUNKING** | **Trunk voice hang** and **Emergency/priority override**. |
+| **AUDIO PATCH** | Audio wiring and pipes ([11.6](#s11-6)). |
+| **AUTOMATION PATCH** | Gpredict, the Control view, **Follow** and the decoder log. |
+| **RF PATCH** | The RF patch drawing ([11.8](#ch11)). |
 
 The groups only separate the page visually. Every setting works as before.
 
@@ -700,11 +700,11 @@ GQRX is receive-only here: one VFO, no transmit, RIT or split.
 
 <a id="s11-6"></a>
 
-## 11.6 Audio
+## 11.6 Audio Patch
 
 Each radio gets two PipeWire devices while Commander runs: an RX sink `hamspot_<id>_rx` that the radio plays into and a TX source `hamspot_<id>_tx` that it transmits from. GQRX is started on them. Hamlib radios still get them so you can wire a speaker and a microphone.
 
-The **Audio** frame shows each radio with a playback and a capture drop-down, and a three-column picture: microphones, the radio, speakers. **Drag a wire** between a device and a radio; it's the same as choosing in the drop-down. **Helvum** opens the Helvum patchbay if it's installed. Wiring is saved with the station once a station file is open.
+The **Audio Patch** group shows each radio with a playback and a capture drop-down, and a three-column picture: microphones, the radio, speakers. **Drag a wire** between a device and a radio; it's the same as choosing in the drop-down. **Helvum** opens the Helvum patchbay if it's installed. Wiring is saved with the station once a station file is open.
 
 Each row also has an **RX pipe** and a **TX pipe** chooser with a **Pipes…** button ([chapter 13](#ch13)).
 
@@ -712,7 +712,7 @@ Each row also has an **RX pipe** and a **TX pipe** chooser with a **Pipes…** b
 
 ## 11.7 Automation: rotators and amplifiers
 
-Under **Automation**, **Rotators** and **Amplifiers** each have a grid with **Add**, **Edit** and **Remove**. Each row runs Hamlib's `rotctld` or `ampctld` on `127.0.0.1` (amplifiers from port 4534) and restarts it if it exits.
+The **Rotator** and **Amplifier** groups each have a grid with **Add**, **Edit** and **Remove**. Each row runs Hamlib's `rotctld` or `ampctld` on `127.0.0.1` (amplifiers from port 4534) and restarts it if it exits.
 
 - **Rotator**: name, model, device, serial speed, extra `-C`. A Yaesu G-5500 uses GS-232A (601) or GS-232B (603). Control it from Tools → Rotator ([12.7](#s12-7)).
 - **Amplifier**: name, model from `ampctld -l`, device, serial speed, extra `-C`. The row shows power state (OFF, ON, STBY, OPER), SWR and forward power. **Standby**, **Operate**, **Off** and **Reset** are sent only when you click them. **Freq MHz** with **Set** sends a frequency once; **Follow rig frequency** sends the active radio's frequency after it has settled for 0.4 s. Settable levels get a 1–10 slider.
@@ -722,17 +722,17 @@ Use model 1 (Dummy) to try either screen.
 <!-- screenshot: cfg-07 — Configuring an amplifier. -->
 <!-- screenshot: cfg-08 — Configuring a rotator. -->
 
-## 11.8 RF patch bay
+## 11.8 RF patch
 
-The patch bay at the bottom of Config is a drawing of how coax runs in your station. It's **visual only** and switches nothing.
+The RF patch group at the bottom of Config is a drawing of how coax runs in your station. It's **visual only** and switches nothing.
 
 - Every radio appears automatically; receive-only ones are marked RX ONLY. Add amplifiers, antenna switches, tuners, meters, dummy loads and antennas from the Add row. Drag a box by its title bar; click it to edit.
 - Inputs are on the left of a box and outputs on the right, in the transmit sense. Round jacks are coax; small square ones are PTT/ALC.
 - Drag from jack to jack to add a cable. Impossible connections are refused with the reason shown below. Right-click a cable, or select it and press Delete, to remove it.
-- Below the bay, each path is listed (for example `TX path: IC-9700 → KPA1500 → ATU → Yagi`) with warnings for open outputs, loops and similar mistakes.
+- Below the drawing, each path is listed (for example `TX path: IC-9700 → KPA1500 → ATU → Yagi`) with warnings for open outputs, loops and similar mistakes.
 - An amplifier box can be bound to a configured amplifier. It then shows that amplifier's state, gets **Standby** and **Operate** keys (sent only when clicked), and warns when the amplifier's state doesn't suit the patched TX path.
 
-<!-- screenshot: cfg-09 — The RF patch bay. -->
+<!-- screenshot: cfg-09 — The RF patch. -->
 
 ---
 
@@ -1157,7 +1157,7 @@ Everything a station produces sits in the same folder as its station file, named
 
 | File | Contents |
 | --- | --- |
-| `Name.HSCommander` | The station: plan, channels, talkgroups, radios, audio wiring, levels, layout, patch bay. JSON. |
+| `Name.HSCommander` | The station: plan, channels, talkgroups, radios, audio wiring, levels, layout, RF patch. JSON. |
 | `Name.HSKeys` | Encryption keys (mode 0600) |
 | `Name.HSVNA` | NanoVNA calibration and last scan per zone. A damaged file is kept as `Name.HSVNA.corrupt-<date>`. |
 | `Name.HSLog` | Logbook |
