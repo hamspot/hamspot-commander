@@ -451,7 +451,6 @@ From top to bottom: source tabs (**HackRF TG**, **HackRF Channels**, plus any ot
 | **● Live / Now** / **○ Live / Now** | Follow the present (the red NOW line). ● is on, ○ is off. |
 | **Play next** | Play the following recording |
 | **Data** | Open the Data dialog ([9.6](#s9-6)) |
-| **Details** | Reopen the Record / Playback dialog |
 | **Undo delete** | Shown for 60 s after a delete |
 
 <!-- screenshot: rec-03 — The REC tab, armed and waiting. -->
@@ -495,7 +494,7 @@ A faint watermark along the frame's bottom bar reads: "Recording radio traffic m
 
 ## 9.5 The Record / Playback dialog
 
-Clicking a block opens this dialog. It follows the selection; close it with ✕ and reopen it with **Details**. Clicks and the wheel over it don't reach the timeline.
+Clicking a block opens this dialog. It follows the selection; close it with ✕ and reopen it by clicking the block again. Clicks and the wheel over it don't reach the timeline.
 
 From the top:
 
