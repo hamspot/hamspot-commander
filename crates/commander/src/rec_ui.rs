@@ -984,23 +984,24 @@ impl App {
             if ui.button("Fit").on_hover_text("Fit to the most recent recordings").clicked() {
                 view = timeline::fit(&recs, now);
             }
-            if ui.selectable_label(view.live, "● Live / Now").clicked() {
+            if toolbar_toggle(ui, view.live, "Live / Now", false)
+                .on_hover_text("Follow the present (the red NOW line)")
+                .clicked()
+            {
                 view = View::live(now, view.span);
             }
             let shown = timeline::layout(&recs, &lanes, &view, width, now).len();
             ui.label(format!("{} recordings ({shown} in view), {} lanes", recs.len(), lanes.len()));
             ui.checkbox(&mut self.rec.play_next, "Play next");
-            let data = egui::RichText::new("Data").small().weak();
-            if ui
-                .add(egui::Button::new(data).selected(self.rec.data_open))
+            if toolbar_toggle(ui, self.rec.data_open, "Data", true)
                 .on_hover_text("Storage cap, archive, rescan, cache, and thumb-drive copy/move")
                 .clicked()
             {
                 self.rec.data_open = !self.rec.data_open;
             }
-            let details = egui::RichText::new("Details").small().weak();
             if ui
-                .add_enabled(self.rec.selected.is_some(), egui::Button::new(details).selected(self.rec.detail_open))
+                .add_enabled_ui(self.rec.selected.is_some(), |ui| toolbar_toggle(ui, self.rec.detail_open, "Details", true))
+                .inner
                 .on_hover_text("Record / Playback dialog for the selected recording")
                 .clicked()
             {
@@ -1551,6 +1552,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn toggle_text_marks_state_without_colour() {
+        assert_eq!(toggle_text(true, "Live / Now"), "● Live / Now");
+        assert_eq!(toggle_text(false, "Live / Now"), "○ Live / Now");
+    }
+
+    #[test]
     fn icon_three_states() {
         assert_eq!(icon_state(false, false), IconState::Off);
         assert_eq!(icon_state(true, false), IconState::Armed);
@@ -1661,6 +1668,31 @@ mod tests {
 /// right (see `timeline::shelf_alpha`).
 /// Search box width in the timeline toolbar: narrow enough that the
 /// toolbar fits a ~1000 px panel on one line.
+/// Text for a toolbar toggle: the state is shown by a marker, never by colour alone.
+pub fn toggle_text(on: bool, label: &str) -> String {
+    format!("{} {label}", if on { "●" } else { "○" })
+}
+
+/// A toolbar toggle that always looks like a button: a visible frame in both
+/// states, a pressed (selection) fill when on, the normal button fill when off.
+fn toolbar_toggle(ui: &mut egui::Ui, on: bool, label: &str, muted: bool) -> egui::Response {
+    let v = ui.visuals();
+    let mut text = egui::RichText::new(toggle_text(on, label));
+    if muted {
+        text = text.small();
+        if !on {
+            text = text.weak();
+        }
+    }
+    let fill = if on { v.selection.bg_fill } else { v.widgets.inactive.weak_bg_fill };
+    let stroke = if on {
+        v.selection.stroke
+    } else {
+        egui::Stroke::new(1.0, v.widgets.noninteractive.bg_stroke.color)
+    };
+    ui.add(egui::Button::new(text).fill(fill).stroke(stroke))
+}
+
 pub fn search_width(avail: f32) -> f32 {
     (avail * 0.12).clamp(80.0, 140.0)
 }
