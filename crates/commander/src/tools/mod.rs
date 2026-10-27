@@ -439,7 +439,8 @@ pub fn frame(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) -> egui::Rect {
         egui::pos2(outer.right() - frame.cap_len, outer.top()),
         egui::vec2(frame.cap_len, frame.thin),
     );
-    ui.ctx().data_mut(|d| d.insert_temp(top_cap_id(ui.ctx()), cap));
+    let id = top_cap_id(ui.ctx());
+    ui.ctx().data_mut(|d| d.insert_temp(id, cap));
     frame.show(ui, &theme, add).1
 }
 
@@ -519,7 +520,8 @@ pub fn overflow_tab_row(
     if hidden.is_empty() {
         return picked;
     }
-    let Some(cap) = ui.ctx().data(|d| d.get_temp::<egui::Rect>(top_cap_id(ui.ctx()))) else {
+    let cap_id = top_cap_id(ui.ctx());
+    let Some(cap) = ui.ctx().data(|d| d.get_temp::<egui::Rect>(cap_id)) else {
         return picked;
     };
     let id = ui.scope_id().with(("more-tabs", id_salt));
@@ -706,5 +708,19 @@ mod tests {
             labels,
             vec!["NanoVNA", "RF Calc", "Calc", "Smith", "Hex", "Logbook", "Rotator"]
         );
+    }
+}
+
+#[cfg(test)]
+mod top_cap_deadlock_tests {
+    /// Regression: computing the cap id inside `data_mut` re-locked the egui
+    /// context and hung the app on its first frame (b928260).
+    #[test]
+    fn frame_records_cap_without_deadlock() {
+        let ctx = egui::Context::default();
+        let id = super::top_cap_id(&ctx);
+        ctx.data_mut(|d| d.insert_temp(id, egui::Rect::ZERO));
+        let got = ctx.data(|d| d.get_temp::<egui::Rect>(id));
+        assert_eq!(got, Some(egui::Rect::ZERO));
     }
 }
