@@ -1757,7 +1757,13 @@ fn spawn_decoder(
             return Err(format!("hackrf decoder: {err}"));
         }
     };
-    let argv = crate::rx_pipe::command_argv(script, port);
+    let argv = match crate::rx_pipe::command_argv(script, port) {
+        Ok(argv) => argv,
+        Err(err) => {
+            crate::rx_pipe::release_voice_port(port);
+            return Err(format!("hackrf decoder: {err}"));
+        }
+    };
     let lines = Arc::new(Mutex::new(Vec::new()));
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..])

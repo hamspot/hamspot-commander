@@ -26,6 +26,8 @@ mod amp;
 mod rot;
 mod rec_live;
 mod rec_ui;
+mod pipe_editor;
+mod pipes;
 mod rx_pipe;
 mod scan;
 mod tools;
@@ -229,6 +231,7 @@ struct App {
     amp_freq_text: String,
     amp_level_vals: std::collections::HashMap<String, u8>,
     /// Apply was sent. The station file is written once the hub has that command.
+    pipe_editor: pipe_editor::PipeEditor,
     rx_pipe_pending: Option<(u64, String)>,
     tx_pipe_pending: Option<(u64, String)>,
     favorite: Option<Favorite>,
@@ -1331,7 +1334,7 @@ fn patch_radio_tx(spec: &cat::RadioSpec) -> bool {
     matches!(spec.driver, cat::RadioDriver::Hamlib)
 }
 
-fn caution() -> egui::Color32 {
+pub(crate) fn caution() -> egui::Color32 {
     rustcars::LcarsTheme::default().alert
 }
 
@@ -1937,6 +1940,7 @@ impl App {
             amp_follow: Default::default(),
             amp_freq_text: String::new(),
             amp_level_vals: Default::default(),
+            pipe_editor: Default::default(),
             rx_pipe_pending: None,
             tx_pipe_pending: None,
             favorite: None,
@@ -2920,6 +2924,9 @@ impl eframe::App for App {
             });
         }
 
+        if let Some((id, tx, reference)) = self.pipe_editor.show(&ctx) {
+            self.apply_pipe(id, tx, reference);
+        }
         let cat_driver = self.cat_edit.as_ref().map(|edit| edit.driver.clone());
         match cat_driver {
             Some(cat::RadioDriver::Hamlib) => self.hamlib_window(&ctx),
@@ -4731,6 +4738,7 @@ impl App {
         let mut endpoint = None;
         let mut pipe_apply = None;
         let mut tx_apply = None;
+        let mut pipe_editor_open: Option<(u64, bool, String)> = None;
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label("Audio");
@@ -4846,6 +4854,12 @@ impl App {
                                 }
                             }
                         });
+                    if ui.small_button("Pipes…").clicked() {
+                        pipe_editor_open = Some((row.id, false, row.spec.rx_pipe.clone()));
+                    }
+                    if !current.is_empty() && crate::rx_pipe::resolve_pipe(current).is_err() {
+                        ui.label(egui::RichText::new("not runnable").small().color(caution()));
+                    }
                 });
                 if !row.rx_pipe_status.is_empty() {
                     ui.label(
@@ -4881,6 +4895,12 @@ impl App {
                                 }
                             }
                         });
+                    if ui.small_button("Pipes…").clicked() {
+                        pipe_editor_open = Some((row.id, true, row.spec.tx_pipe.clone()));
+                    }
+                    if !current.is_empty() && crate::rx_pipe::resolve_pipe(current).is_err() {
+                        ui.label(egui::RichText::new("not runnable").small().color(caution()));
+                    }
                 });
                 if !row.tx_pipe_status.is_empty() {
                     ui.label(
@@ -4916,6 +4936,9 @@ impl App {
         if let Some((id, input, output)) = endpoint {
             self.hub.set_endpoint(id, input, output);
         }
+        if let Some((id, tx, value)) = pipe_editor_open {
+            self.pipe_editor.open_for(id, tx, &value);
+        }
         if let Some((id, command)) = pipe_apply {
             self.hub.set_rx_pipe(id, command.clone());
             if !self.config_path.is_empty() {
@@ -4926,6 +4949,22 @@ impl App {
             self.hub.set_tx_pipe(id, command.clone());
             if !self.config_path.is_empty() {
                 self.tx_pipe_pending = Some((id, command));
+            }
+        }
+    }
+
+    /// Point a radio's RX or TX pipe at a `modems/<name>` reference and save
+    /// the station once the hub has it.
+    fn apply_pipe(&mut self, id: u64, tx: bool, reference: String) {
+        if tx {
+            self.hub.set_tx_pipe(id, reference.clone());
+            if !self.config_path.is_empty() {
+                self.tx_pipe_pending = Some((id, reference));
+            }
+        } else {
+            self.hub.set_rx_pipe(id, reference.clone());
+            if !self.config_path.is_empty() {
+                self.rx_pipe_pending = Some((id, reference));
             }
         }
     }
@@ -6353,8 +6392,11 @@ impl App {
     }
 
     fn load_config(&mut self, snap: &Snapshot) {
-        match config::load_file(Path::new(&self.config_path)) {
-            Ok(mut file) => {
+        match config::load_file_in(Path::new(&self.config_path), &crate::rx_pipe::modem_dirs()) {
+            Ok((mut file, pipe_warnings)) => {
+                if !pipe_warnings.is_empty() {
+                    self.config_note = pipe_warnings.join("\n");
+                }
                 file.scan_zones.sort_unstable();
                 let station_path = Path::new(&self.config_path);
                 match crate::tools::nanovna::load_beside(station_path, &mut file.nanovna) {

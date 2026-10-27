@@ -3297,15 +3297,12 @@ fn service_rx_pipe(
         set_rx_pipe_status(slot, &format!("{what} waiting for the speaker link"));
         return;
     }
-    let Some(program) = crate::rx_pipe::program_name(&command).map(str::to_string) else {
-        slot.rx_pipe_failed = Some(command);
-        set_rx_pipe_status(slot, &format!("{what} command is empty"));
-        return;
-    };
-    if !crate::rx_pipe::on_path(&program) {
+    if let Err(err) = crate::rx_pipe::resolve_pipe(&command) {
+        // Not a pipe file: the pipe stays off until the field changes.
+        eprintln!("commander: radio {} {what} disabled: {err} ({command})", slot.id);
         slot.rx_pipe_failed = Some(command);
         slot.rx_pipe_retry_at = None;
-        set_rx_pipe_status(slot, &format!("{what}: {program} is not on PATH"));
+        set_rx_pipe_status(slot, &format!("{what} disabled: {err}"));
         return;
     }
     let on_line = if capture || identity {
@@ -3568,15 +3565,11 @@ fn service_tx_pipe(slot: &mut Slot, graph: &crate::audio::AudioGraph, now: Insta
         set_tx_pipe_status(slot, "tx pipe waiting for the microphone link");
         return;
     }
-    let Some(program) = crate::rx_pipe::program_name(&command).map(str::to_string) else {
-        slot.tx_pipe_failed = Some(command);
-        set_tx_pipe_status(slot, "tx pipe command is empty");
-        return;
-    };
-    if !crate::rx_pipe::on_path(&program) {
+    if let Err(err) = crate::rx_pipe::resolve_pipe(&command) {
+        eprintln!("commander: radio {} tx pipe disabled: {err} ({command})", slot.id);
         slot.tx_pipe_failed = Some(command);
         slot.tx_pipe_retry_at = None;
-        set_tx_pipe_status(slot, &format!("tx pipe: {program} is not on PATH"));
+        set_tx_pipe_status(slot, &format!("tx pipe disabled: {err}"));
         return;
     }
     let outputs = crate::audio::pw_ports(true).unwrap_or_default();

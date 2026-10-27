@@ -448,8 +448,46 @@ pub fn save_file(path: &Path, file: &ConfigFile) -> Result<(), String> {
 }
 
 pub fn load_file(path: &Path) -> Result<ConfigFile, String> {
+    load_file_in(path, &crate::rx_pipe::modem_dirs()).map(|(file, _)| file)
+}
+
+/// Load a station file and normalise its pipe fields in memory against
+/// `dirs` (see [`normalise_pipes`]). The file on disk is never rewritten
+/// here; the normalised form is written only when the station is saved.
+pub fn load_file_in(path: &Path, dirs: &[std::path::PathBuf]) -> Result<(ConfigFile, Vec<String>), String> {
     let text = fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?;
-    parse(&text)
+    let mut file = parse(&text)?;
+    let warnings = normalise_pipes(&mut file, dirs);
+    for w in &warnings {
+        eprintln!("commander: {w}");
+    }
+    Ok((file, warnings))
+}
+
+/// Station pipe fields hold only `modems/<name>` references. An absolute
+/// path to a known pipe file becomes `modems/<file name>`. A shell command
+/// or an unknown path is kept as text (so it can be wrapped) but is never
+/// run; one warning per such field is returned.
+pub fn normalise_pipes(file: &mut ConfigFile, dirs: &[std::path::PathBuf]) -> Vec<String> {
+    let kind = &hsrec::safepath::MODEMS;
+    let mut warnings = Vec::new();
+    for radio in &mut file.radios {
+        for (field, value) in [("RX pipe", &mut radio.rx_pipe), ("TX pipe", &mut radio.tx_pipe)] {
+            if value.trim().is_empty() {
+                continue;
+            }
+            match kind.normalise(value, dirs) {
+                Some(v) => *value = v,
+                None => warnings.push(format!(
+                    "{} {field} disabled: {} ({})",
+                    radio.name,
+                    hsrec::safepath::CUSTOM_REFUSED,
+                    value.trim()
+                )),
+            }
+        }
+    }
+    warnings
 }
 
 pub fn validate(file: &ConfigFile) -> Result<(), String> {
@@ -929,6 +967,46 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Pipe fields copied from SAFE-T.HSCommander (read-only copy in /tmp),
+    /// plus one custom command.
+    #[test]
+    fn station_pipe_fields_normalise_on_load_without_rewriting() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("hs-cfg-pipes-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let modems = base.join("modems");
+        fs::create_dir_all(&modems).unwrap();
+        fs::set_permissions(&modems, fs::Permissions::from_mode(0o755)).unwrap();
+        for n in ["commander-demod-p25.rxpipe", "commander-mod-p25.txpipe"] {
+            fs::write(modems.join(n), "#!/bin/sh\n").unwrap();
+            fs::set_permissions(modems.join(n), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut file = sample();
+        let mut radio = crate::cat::RadioSpec::dummy();
+        radio.name = "HackRF".into();
+        radio.rx_pipe = "/home/user/.local/share/hamspot-commander/modems/commander-demod-p25.rxpipe".into();
+        radio.tx_pipe = "/home/user/.local/share/hamspot-commander/modems/commander-mod-p25.txpipe".into();
+        let mut custom = radio.clone();
+        custom.name = "Custom".into();
+        custom.rx_pipe = "dsdccx -i - -o -".into();
+        custom.tx_pipe = "/opt/elsewhere/unknown.txpipe".into();
+        file.radios = vec![radio, custom];
+        let path = base.join("Fixture.HSCommander");
+        let text = to_string(&file).unwrap();
+        fs::write(&path, &text).unwrap();
+        let (loaded, warnings) = load_file_in(&path, &[modems.clone()]).unwrap();
+        assert_eq!(loaded.radios[0].rx_pipe, "modems/commander-demod-p25.rxpipe");
+        assert_eq!(loaded.radios[0].tx_pipe, "modems/commander-mod-p25.txpipe");
+        assert_eq!(loaded.radios[1].rx_pipe, "dsdccx -i - -o -");
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings.iter().all(|w| w.contains("custom command not allowed")));
+        assert!(hsrec::safepath::MODEMS.resolve(&loaded.radios[1].rx_pipe, &[modems.clone()]).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), text, "load never rewrites");
+        let saved = to_string(&loaded).unwrap();
+        assert!(saved.contains("\"modems/commander-demod-p25.rxpipe\"") && !saved.contains("/home/user/.local"));
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]

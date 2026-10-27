@@ -32,7 +32,8 @@ The printed pages number the chapters. In this Markdown master the same headings
 10. Audio
 11. A persistent Ubuntu live USB
 12. An installed copy
-13. Appendix: files and dark controls
+13. Pipe files
+14. Appendix: files and dark controls
 
 ---
 
@@ -54,7 +55,7 @@ Digital voice is an RX pipe that runs `dsd-fme`. It is not a mode in the Mode me
 
 The Channels page is a file on this computer. It is not the memory bank inside the radio. The buttons `A > Mem` and `Mem > A` use one frequency held in the window, not that file and not the radio's memories. Favorite and that one-slot frequency are written in the station file.
 
-Some buttons on the Tune page stay dark on every radio. Section 13.4 lists them. A button that the connected radio cannot perform also stays dark, even when a different radio would light it.
+Some buttons on the Tune page stay dark on every radio. Section 14.4 lists them. A button that the connected radio cannot perform also stays dark, even when a different radio would light it.
 
 ## 1.3 This guide
 
@@ -411,11 +412,11 @@ Under them: one status line (REC state, TG, Channels, disk meter), the timeline 
 
 **Timeline.** One lane per talkgroup or channel, one block per recording, like a security camera viewer. The timeline runs the full width; the lane names sit on a shelf over its left side that fades out like a shadow. The wheel over the lane names scrolls the lanes (a scrollbar appears when they overflow); click a name to highlight its lane. The wheel over the timeline zooms about the pointer, keeping the time under it fixed: each mouse notch changes the span by about 18 %, a touchpad zooms proportionally finer, and one frame never changes it by more than 1.5×. The − / + buttons step 1.5×. The span runs from 0.5 s to 30 days. The faded part of the shelf passes clicks and the wheel through to the timeline. Drag to pan, **Fit** frames the most recent recordings, ◀ Day / Today / Day ▶ to jump, **● Live / Now** to follow the present (the red NOW line; the button shows ● when following, ○ when not). A recording in progress is a red block that grows. EMERG and PRI calls are tagged and outlined; archived blocks say `zst`, offline ones are grey and say `offline`. Waveform thumbnails are drawn once they are generated in the background.
 
-**When a replay is silent.** A digital replay that decodes no voice says so on the status line ("No voice decoded: …", with the decoder's last message), and the block is tagged `no voice`. A real failure, such as a missing audio output or decoder, reads "Playback failed: …". Blocks tagged `OUT OF BAND` were recorded while the channel was more than 3 MHz from the HackRF's centre, outside its usable 6 MHz. The call isn't in those samples, so no decoder can recover it. New recordings wait for the follower's retune instead. To check a file offline: `commander-rec render-wav FILE.cs16 out.wav --decoder ~/.local/share/hamspot-commander/modems/commander-demod-p25.rxpipe`.
+**When a replay is silent.** A digital replay that decodes no voice says so on the status line ("No voice decoded: …", with the decoder's last message), and the block is tagged `no voice`. A real failure, such as a missing audio output or decoder, reads "Playback failed: …". Blocks tagged `OUT OF BAND` were recorded while the channel was more than 3 MHz from the HackRF's centre, outside its usable 6 MHz. The call isn't in those samples, so no decoder can recover it. New recordings wait for the follower's retune instead. To check a file offline: `commander-rec render-wav FILE.cs16 out.wav --decoder ~/.local/share/hamspot-commander/modems/commander-demod-p25.rxpipe`. Chapter 13 covers writing your own pipe files.
 
 **Record / Playback dialog.** Clicking a block selects it, plays from that point, and opens the *Record / Playback* window (one at a time; it follows the selection and keeps its place for the session; close it with ✕, reopen with **Details**). It has, from the top: a header (lane, time range, duration); Playback (Play/Stop, Star, Protect, Play next, the OUT OF BAND / no voice / EMERGENCY tags and a single status line); Notes and the Export WAV…, Export raw…, Archive/Unarchive and Delete buttons with a one-line disclaimer; then the Metadata label/value grid (only fields the recording has) with a **Copy** button, and a collapsible Decoder parameters list (closed by default). Metadata scrolls on its own, so the controls at the top stay in view in a short window. Clicks and the mouse wheel over the dialog (or the Data dialog) stay in the dialog and never reach the timeline below.
 
-**Decoder parameters.** Each recording saves what the live decoder got from its environment in `decoder_params`, in the JSON sidecar, the database, and any export's `index.json`, so the parameters go with the file to a thumb drive. For P25 that includes `HAMSPOT_P25_X`, the WACN, system ID and NAC word that Phase 2 voice needs. It also saves the WACN, SYS, NAC, RFSS and site from the control channel, the modulation, and the HackRF LNA and VGA gains. Replay passes every saved parameter to the decoder script as an environment variable. Only keys matching `HAMSPOT_[A-Z0-9_]+` are passed, so a recording can't set `PATH`, `LD_PRELOAD` or similar. A new decoder, such as a GNU Radio flowgraph, can save any `HAMSPOT_*` key it reads. The Record / Playback dialog lists them one per row under Decoder parameters. Recordings made before this have none. For those, a P25 replay uses the site word this session has already learned for the same radio, if there is one. The station file holds no system word, so there's nothing else to fall back on. Override or add parameters offline with `commander-rec render-wav FILE.cs16 out.wav --decoder SCRIPT --param HAMSPOT_P25_X=BEE006BD6B5` (repeatable). **Decoder script.** A recording names its decoder only as a portable name such as `modems/commander-demod-p25.rxpipe`, never an absolute path. At replay Commander looks the name up in its own modems folders (`~/.local/share/hamspot-commander/modems`, then the install and source folders) and refuses anything absolute, containing `..`, not a plain `.rxpipe` file, or a symlink that leads outside the folder; the status line then says `decoder script not found: modems/…` and the call plays without voice decoding. Older recordings that stored a full path are shown and used by their `modems/<file>` name. A custom shell command in the radio's RX pipe is not saved as something to run. Saved parameters that name a local file (`HAMSPOT_P25_K`, `HAMSPOT_DRM_STDOUT`) or whose value is a path are not taken from a recording; `--param` on the command line still can. Imports from a thumb drive skip any `index.json` entry whose path is absolute, contains `..`, or goes through a symlink. The decoder's UDP voice port is reserved for the whole replay and released when it ends or stops, so a live decoder never takes it.
+**Decoder parameters.** Each recording saves what the live decoder got from its environment in `decoder_params`, in the JSON sidecar, the database, and any export's `index.json`, so the parameters go with the file to a thumb drive. For P25 that includes `HAMSPOT_P25_X`, the WACN, system ID and NAC word that Phase 2 voice needs. It also saves the WACN, SYS, NAC, RFSS and site from the control channel, the modulation, and the HackRF LNA and VGA gains. Replay passes every saved parameter to the decoder script as an environment variable. Only keys matching `HAMSPOT_[A-Z0-9_]+` are passed, so a recording can't set `PATH`, `LD_PRELOAD` or similar. A new decoder, such as a GNU Radio flowgraph, can save any `HAMSPOT_*` key it reads. The Record / Playback dialog lists them one per row under Decoder parameters. Recordings made before this have none. For those, a P25 replay uses the site word this session has already learned for the same radio, if there is one. The station file holds no system word, so there's nothing else to fall back on. Override or add parameters offline with `commander-rec render-wav FILE.cs16 out.wav --decoder SCRIPT --param HAMSPOT_P25_X=BEE006BD6B5` (repeatable). **Decoder script.** A recording names its decoder only as a portable name such as `modems/commander-demod-p25.rxpipe`, never an absolute path. At replay Commander looks the name up in its own modems folders (the folders in section 13.2) and refuses anything absolute, containing `..`, not a plain `.rxpipe` file, or a symlink that leads outside the folder; the status line then says `decoder script not found: modems/…` and the call plays without voice decoding. Older recordings that stored a full path are shown and used by their `modems/<file>` name. A station pipe field can only name a pipe file (chapter 13), so a recording never stores a command to run. Saved parameters that name a local file (`HAMSPOT_P25_K`, `HAMSPOT_DRM_STDOUT`) or whose value is a path are not taken from a recording; `--param` on the command line still can. Imports from a thumb drive skip any `index.json` entry whose path is absolute, contains `..`, or goes through a symlink. The decoder's UDP voice port is reserved for the whole replay and released when it ends or stops, so a live decoder never takes it.
 
 **Playback.** Click a block to play it from the point you clicked; ▶ Play / ■ Stop in the detail row; **Play next** continues with the next recording. Every playback re-runs the raw IQ through the current discriminator (and, for digital modes, through the station's voice script) and plays to the system default audio output. Playback never touches the radios' receive sinks.
 
@@ -898,9 +899,233 @@ Station files you saved, and anything under `HamSpotCommander`, are not part of 
 
 ---
 
-# 13. Appendix
+# 13. Pipe files
 
-## 13.1 Portable folder
+## 13.1 What a pipe file is
+
+An RX pipe sits between a radio's audio and the speaker. A TX pipe sits between the microphone and the radio's transmit input. Each one is a small executable file, usually a shell script, in one of Commander's own pipe folders. RX pipe files end in `.rxpipe` and TX pipe files end in `.txpipe`.
+
+A station file names a pipe only as `modems/<name>`, for example `modems/commander-demod-p25.rxpipe`. It never holds an absolute path, a shell command, arguments or anything else Commander would have to pass to a shell. Commander looks the name up in its own folders and runs the file it finds there, with nothing added except the arguments and environment described below. A station file or recording that someone hands you therefore can't make Commander run an arbitrary program. If you need a custom command, put it in a pipe file yourself. Creating that file is the explicit step that allows it to run.
+
+The same rule covers REC decoders (section 6.5) and the HackRF trunk decoder. Fixed tools that Commander runs itself, such as `pw-cat`, `rigctld`, `hackrf_transfer` and `gqrx`, aren't pipes.
+
+## 13.2 Where pipe files live
+
+Commander searches these folders in order, and the first file with that name wins:
+
+| Folder | Owner | Pipe editor |
+|---|---|---|
+| `~/.local/share/hamspot-commander/modems` | installed with Commander | read-only |
+| `modems/` next to the `commander` executable (portable folder) | installed with Commander | read-only |
+| `~/.local/share/hamspot-commander/modems.d` | you | edit, rename, delete |
+
+Debug builds also search the source tree's `modems/`, plus one folder named by `HAMSPOT_DEV_MODEMS` if that variable is set, so a checkout works before it's installed. Release builds don't search the current directory or the source tree.
+
+A user file can't reuse the name of an installed file. Use **Duplicate to user pipe…** and give the copy a new name.
+
+Before Commander runs a pipe file, it checks:
+
+- the name uses only `a-z 0-9 . _ -`, ends in `.rxpipe` or `.txpipe` and has no folder part;
+- the file is a regular file, not a symlink;
+- the file is executable by its owner;
+- neither the file nor its folder is writable by group or others (fix with `chmod go-w`).
+
+Files written by the Pipe editor are mode `0750`, and so is the `modems.d` folder.
+
+If a check fails, the pipe doesn't start and the radio's Audio row shows the reason, for example `rx pipe disabled: … refused: file or folder is group/world-writable`.
+
+**Older station files.** On load, a pipe field that holds an absolute path is shown as `modems/<file name>` when that file exists in the pipe folders. The station file on disk is updated only the next time you save the station. A field that holds a shell command, or a path to a file outside the pipe folders, is never run. Its radio shows `rx pipe disabled: custom command not allowed; create a pipe file in modems/ — see docs (Pipe files)` (or `tx pipe …`), the same text is written to the log, and the Audio row marks the field "not runnable". Open **Pipes…** on that row to wrap the command (section 13.5).
+
+## 13.3 The RX pipe contract
+
+Commander starts an RX pipe as `<pipe file> <port>`, in its own process group, and connects it like this:
+
+- **stdin:** raw 48 kHz, mono, signed 16-bit little-endian PCM (s16le) with no header.
+  - Hamlib and GQRX radios: the radio's receive audio, recorded with `pw-cat`.
+  - Audio taps: the chosen sound card input.
+  - HackRF rows: Commander's FM discriminator. It runs at 16 kHz, and each sample is repeated three times to make 48 kHz. 4 kHz of deviation is 12000 in sample units.
+- **stdout:** raw 48 kHz mono s16le, played to the radio's speaker by `pw-cat`. The pipe must keep writing that format and rate. Resample inside the pipe (for example with `sox`) if your decoder works at 8 kHz.
+- **`$1`:** a localhost UDP port Commander has reserved for this pipe. Each live pipe gets a different port, starting at 23469. Decoders that send voice over UDP, such as dsd-fme, should use it. A manual run with no argument should default to 23469, as the shipped scripts do.
+- **stderr:** discarded, unless `HAMSPOT_CC_EVENTS=1` or `HAMSPOT_IDENTITY=1` is set. Then Commander reads it line by line, as trunk events or as scanner identity text.
+- **Environment:** set only when it applies.
+
+| Variable | Meaning |
+|---|---|
+| `HAMSPOT_CC_EVENTS=1` | The pipe is the trunk control decoder. Keep the decoder's stderr. |
+| `HAMSPOT_IDENTITY=1` | A channel vocoder. Keep stderr for the scanner glass. |
+| `HAMSPOT_INVERT=1` | The channel is set to inverted polarity. |
+| `HAMSPOT_P25_K=<file>` | dsd-fme `-K` key CSV, from the station's key setting. |
+| `HAMSPOT_P25_X=<hex>` | P25 Phase 2 WACN, system and NAC word (HackRF voice decoder, and REC replay). |
+| other `HAMSPOT_*` | Decoder settings saved with a REC recording (below). |
+
+- **Exit:** when a pipe exits for any reason, Commander stops its whole process group. It shows `rx pipe restarting (…)` and starts the pipe again after 2 seconds. Exit when your input ends or a tool you depend on fails, and don't loop forever inside the pipe.
+
+**REC and decoder settings.** A recording stores the settings the live decoder got (P25 site word and IDs, modulation, HackRF gains) as `decoder_params`. Replay runs the same pipe file on the recorded IQ and feeds it the same 48 kHz discriminator stream as live. It passes each saved `HAMSPOT_*` key back as an environment variable. Keys outside `HAMSPOT_[A-Z0-9_]+`, and values that look like a path, aren't passed. A pipe must therefore be deterministic and work offline. It must not tune the radio, depend on the time of day or the live control channel, or expect a sound card. Replay may also run it faster than real time.
+
+## 13.4 The TX pipe contract
+
+Commander starts a TX pipe as `<pipe file> <port>`:
+
+- **stdin:** the microphone, as raw 48 kHz mono s16le.
+- **stdout:** the radio's transmit audio input, also raw 48 kHz mono s16le.
+- **stderr:** discarded.
+- **`$1`:** a reserved UDP port. Most TX pipes ignore it.
+
+A TX pipe never keys the radio. PTT is handled by Commander and the radio as before, and the pipe runs whenever the microphone link is up. As with RX, an exit is restarted after 2 seconds.
+
+## 13.5 The Pipe editor
+
+Open it with **Pipes…** next to the RX pipe or TX pipe chooser in a radio's Audio row.
+
+- **RX pipes / TX pipes** switch the list. Every file is marked `installed` or `user`. Selecting one shows its text in a monospace editor. Installed files are read-only.
+- **New pipe…** starts a user file from a template that documents the contract above. Change the name (for example `my-fm.rxpipe`) and the text, then click **Save…**.
+- **Duplicate to user pipe…** (installed files) copies the file under a new name, ready to edit and save.
+- **Save…** (user files) saves your edits. If you change the name, it renames the file instead. **Delete…** removes the file. Radios that still name the file stop their pipe and show "not found".
+- Every save, rename and delete opens a confirmation that shows the exact file contents or names. Nothing is written until you click **Confirm**. An existing file is replaced only when the confirmation says **Replace**.
+- **Use for this radio** sets the radio's field to `modems/<name>` and saves the station. You can also pick the file from the RX pipe or TX pipe chooser, which lists user files too. The station field is always chosen from the list, never typed.
+
+**Wrapping a custom command.** When you open **Pipes…** on a field that holds a refused command, the editor drafts `custom-<program>.rxpipe` (or `.txpipe`). The draft has a `#!/bin/sh` line, a "generated by Hamspot Commander on <date>" note and the old command, unchanged. The confirmation shows the whole file. After **Confirm**, the file is saved in `modems.d` with mode 0750, the radio's field is set to `modems/custom-<program>.rxpipe`, and the station is saved. Commander never creates a wrapper without that confirmation.
+
+## 13.6 Examples
+
+Every example below passes `sh -n` and `shellcheck`. Save each one with the Pipe editor, or by hand in `~/.local/share/hamspot-commander/modems.d` followed by `chmod 0750`. You can test any RX example without a radio against a copy of a recording:
+
+```
+cp ~/.config/hamspot-commander/<Station>.recordings/<radio>/<day>/<call>.cs16  /tmp/t.cs16
+cp ~/.config/hamspot-commander/<Station>.recordings/<radio>/<day>/<call>.json  /tmp/t.json
+commander-rec render-wav /tmp/t.cs16 /tmp/t.wav --decoder ~/.local/share/hamspot-commander/modems.d/my-nbfm.rxpipe
+```
+
+`render-wav` prints `disc_samples=… audio_samples=… voice=… decoder_status=…`. A status of `Some(0)` with non-zero audio means the pipe ran cleanly. `--decoder` on the command line is the one place a path is accepted, because you are typing it yourself.
+
+**1. Wrapping an existing command.** This is what the Pipe editor makes from an old station field that held `dsdccx -i - -o -`:
+
+```sh
+#!/bin/sh
+# custom-dsdccx.rxpipe: generated by Hamspot Commander on 2026-10-27 01:40
+# from a station-file pipe command that is no longer allowed to run directly.
+# $1 is the UDP port Commander reserved for this pipe (unused by the
+# original command). stdin/stdout are 48 kHz mono s16le raw PCM.
+# Original command, verbatim:
+dsdccx -i - -o -
+```
+
+**2. Analog narrow FM voice.** This one works on a HackRF row or a discriminator tap:
+
+```sh
+#!/bin/sh
+# my-nbfm.rxpipe: analog narrow FM voice from the 48 kHz discriminator.
+set -eu
+exec sox -q -t raw -r 48000 -e signed -b 16 -c 1 - \
+         -t raw -r 48000 -e signed -b 16 -c 1 - \
+         highpass 300 lowpass 3000 treble -12 2700 gain -l 6
+```
+
+`exec` makes `sox` the pipe process itself, so when Commander stops the pipe, `sox` stops with it.
+
+**3. P25, read from `commander-demod-p25.rxpipe`.** These are the parts of the shipped script that matter. Open it in the Pipe editor to see all of it.
+
+```bash
+#!/bin/bash
+set -euo pipefail                 # any failed tool ends the script -> Commander restarts it
+port="${1:-23469}"                # the reserved UDP port; 23469 for a manual run
+for program in dsd-fme socat sox; do   # fail fast, with a clear stderr line, if a tool is missing
+    command -v "$program" >/dev/null 2>&1 || { echo "…: ${program} is not on PATH" >&2; exit 1; }
+done
+# dsd-fme reads the 48 kHz s16le stdin (-i -), decodes P25 (-ft: Phase 1
+# control plus Phase 2 voice), and sends 8 kHz stereo voice to UDP $port.
+# HAMSPOT_P25_X -> dsd-fme -X (Phase 2 WACN/SYS/NAC word, not a key).
+# HAMSPOT_P25_K -> dsd-fme -K <key csv>; empty passes nothing.
+# HAMSPOT_CC_EVENTS=1 keeps dsd-fme stderr for the trunk follower.
+# socat listens on UDP $port; sox mixes the two slots to mono and
+# resamples 8 kHz -> 48 kHz s16le on stdout for the speaker.
+# A trap kills every child on exit, so a dead decoder or player ends the
+# whole script and Commander restarts the pipe group.
+```
+
+**4. Reading settings from the environment.** A REC replay passes the same `HAMSPOT_*` values back. Test with `--param HAMSPOT_MY_GAIN_DB=3`.
+
+```sh
+#!/bin/sh
+# my-params.rxpipe: shows how a pipe reads HAMSPOT_* settings.
+set -eu
+gain="${HAMSPOT_MY_GAIN_DB:-0}"
+case "$gain" in
+    ''|*[!0-9-]*) echo "my-params: HAMSPOT_MY_GAIN_DB must be a number" >&2; exit 1 ;;
+esac
+if [ "${HAMSPOT_INVERT:-0}" = 1 ]; then flip="vol -1"; else flip=""; fi
+# shellcheck disable=SC2086 # $flip is intentionally split into sox words
+exec sox -q -t raw -r 48000 -e signed -b 16 -c 1 - \
+         -t raw -r 48000 -e signed -b 16 -c 1 - $flip gain "$gain"
+```
+
+Check every value you read. A recording from someone else can carry any `HAMSPOT_*` text.
+
+**5. A TX pipe: microphone processing.**
+
+```sh
+#!/bin/sh
+# my-voice-clip.txpipe: microphone processing before the transmitter.
+set -eu
+exec sox -q -t raw -r 48000 -e signed -b 16 -c 1 - \
+         -t raw -r 48000 -e signed -b 16 -c 1 - \
+         highpass 300 lowpass 2700 compand 0.02,0.2 -60,-60,-30,-15,0,-6 -6 gain -l 3
+```
+
+Test it without a radio with `head -c 96000 /dev/urandom | ./my-voice-clip.txpipe | wc -c`. It should print 96000.
+
+**6. A GNU Radio flowgraph.** This is the planned direction for demodulator development (issue #145). The pipe file starts a Python flowgraph that sits beside it, so nothing outside the pipe folder is named:
+
+```sh
+#!/bin/sh
+# my-gr-fm.rxpipe: run a GNU Radio Python flowgraph as an RX pipe.
+set -eu
+here=$(dirname "$0")
+command -v python3 >/dev/null 2>&1 || { echo "my-gr-fm: python3 missing" >&2; exit 1; }
+exec python3 "$here/my-gr-fm.py" --port "${1:-23469}"
+```
+
+```python
+#!/usr/bin/env python3
+import argparse
+from gnuradio import gr, blocks, filter as grfilter
+from gnuradio.filter import firdes
+
+class Pipe(gr.top_block):
+    def __init__(self):
+        gr.top_block.__init__(self, "commander-pipe")
+        src = blocks.file_descriptor_source(gr.sizeof_short, 0, False)   # stdin s16le
+        to_f = blocks.short_to_float(1, 32768.0)
+        lpf = grfilter.fir_filter_fff(1, firdes.low_pass(1.0, 48000, 3000, 500))
+        to_s = blocks.float_to_short(1, 32768.0)
+        sink = blocks.file_descriptor_sink(gr.sizeof_short, 1)           # stdout s16le
+        self.connect(src, to_f, lpf, to_s, sink)
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(); ap.add_argument("--port", type=int, default=23469); ap.parse_args()
+    tb = Pipe(); tb.start(); tb.wait()
+```
+
+Save the `.py` file in `modems.d` next to the pipe file. The Pipe editor lists only `.rxpipe` and `.txpipe` files, so create the `.py` file in a text editor. The pipe-file checks apply to the pipe file. Keep the `.py` file `chmod go-w` as well. Python on this system follows the usual byte order (little-endian), so `sizeof_short` matches s16le.
+
+## 13.7 Troubleshooting
+
+| What you see | Likely cause | Fix |
+|---|---|---|
+| `rx pipe disabled: custom command not allowed …` | The station field holds a command or a path outside the pipe folders. | Open **Pipes…** and wrap it (section 13.5). |
+| `pipe file not found: modems/…` | The file was renamed or deleted, or is installed on another machine. | Pick another file, or copy the file into `modems.d`. |
+| `… refused: file or folder is group/world-writable` | A permissive umask or a copy from a thumb drive. | Run `chmod go-w <file>` and `chmod go-w <folder>`. |
+| `… refused: not executable` | The file was copied without its mode. | Run `chmod 0750 <file>`. |
+| `… not a regular file (symlinks are refused)` | The file is a link. | Copy the real file in instead. |
+| `rx pipe restarting (…)` every 2 s | The pipe exits straight away: a missing tool, a syntax error or a bad variable. | Run it by hand, `./x.rxpipe < /dev/zero > /dev/null`, and read stderr. |
+| sox `Broken pipe` | The next stage died, for example a player or decoder that was given the wrong format. | Check that every stage uses raw s16le, 48 kHz, mono. |
+| Silence, but the pipe runs | The output isn't 48 kHz, the decoder found no voice, or the gain is too low. | Run `commander-rec render-wav … --decoder` and check `audio_samples` and `audio_peak`. |
+| Chipmunk or slow audio | The sample rate is wrong (8 or 16 kHz written as if it were 48 kHz). | Resample to 48000 before stdout. |
+| Replay plays, live doesn't (or the other way round) | The pipe depends on something only one side has. | Use only stdin, `$1` and `HAMSPOT_*`. |
+
+# 14. Appendix
+
+## 14.1 Portable folder
 
 | Path inside `HamSpotCommander` | Role |
 | --- | --- |
@@ -917,7 +1142,7 @@ Station files you saved, and anything under `HamSpotCommander`, are not part of 
 
 The installed copy in chapter 12 does not use this layout. Its binary is `~/.local/bin/commander`, and its window state defaults to `~/.local/share/hamspotcommander`.
 
-## 13.2 Station file, short form
+## 14.2 Station file, short form
 
 Version must be 1. A file with a field this release does not know is rejected.
 
@@ -927,7 +1152,7 @@ The plan is stored in the file, and `bsp_name` says which file name under `bsp/`
 
 Talkgroups are inside the station file. Key text is not. The matching `HSKeys` file sits beside the station. `tabs`, when present, is the page-tab order. Each entry is a page name such as `Tune` or `Talkgroups:3`. `nanovna`, when present, is the NanoVNA V2 port and sweep. Omit it unless you set one of those. Calibration and zone scans are not in the station file. They are in the matching `HSVNA` file beside it. `docs/AGENT-HSCommander.md` is the field map for building a new station from a listing.
 
-## 13.3 Frequency entry
+## 14.3 Frequency entry
 
 | You type | Meaning |
 | --- | --- |
@@ -937,7 +1162,7 @@ Talkgroups are inside the station file. Key text is not. The matching `HSKeys` f
 
 Press Enter in the text under the digits. The wheel and the digit clicks do not use this parser.
 
-## 13.4 Dark controls
+## 14.4 Dark controls
 
 Dark on every radio, on the Tune control row: `Dimmer`, `NR sub`, `CW Spot`, `Keyer`, `Nar`, `Ant Rx`, `Chan +`, `Chan -`, `QMR`, `BC`, `PWR`, `QMS`, `Contour`, `Scan`, `Scan Dn`.
 
@@ -947,13 +1172,13 @@ Drawn on Meters and not wired to the radio: `Busy`, `Mic Eq`, and `PLL unlock`. 
 
 Any other control is dark when this radio's Hamlib dump does not list it. That is expected. The dummy lists more operations than a typical GQRX row, and GQRX lists no PTT.
 
-## 13.5 Process boundaries
+## 14.5 Process boundaries
 
 Commander starts `rigctld`, `gqrx`, and `pw-loopback`. It stops those process groups on Remove and on exit. It does not stop a GQRX you started from the application menu, and it will not drive a `rigctld` you started in a terminal.
 
 The first free TCP port at or above 4532 on 127.0.0.1 is the listen port. Nothing in this release listens on another address.
 
-## 13.6 Further reading in the source tree
+## 14.6 Further reading in the source tree
 
 `README.md` is the short project readme. `docs/AudioGraph.md` names the PipeWire nodes for a Hamlib dummy wired to a USB sound device. `docs/AGENT-HSCommander.md` tells another session how to turn a listing into a station file and, when the operator supplies key ids, the key file beside it. This user guide is the operator manual. Where the readme still speaks of an older screen layout, trust the window and this guide.
 

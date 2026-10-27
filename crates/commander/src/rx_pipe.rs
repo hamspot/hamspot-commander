@@ -218,8 +218,12 @@ fn is_exec(path: &Path) -> bool {
 pub struct ModemScript {
     /// File name, including `.rxpipe`.
     pub name: String,
-    /// Command passed to the pipe. This is the script path.
+    /// Station-file value for this script: `modems/<name>`.
     pub command: String,
+    /// Real file.
+    pub path: PathBuf,
+    /// In the user folder (editable), not an installed app file.
+    pub user: bool,
 }
 
 /// File name without `.rxpipe`, for the patch-bay block.
@@ -244,10 +248,25 @@ pub fn pipeline_label(name: &str) -> &str {
     }
 }
 
-/// Folders that hold RX pipe scripts, first match wins for a repeated name.
-/// The install copy is `~/.local/share/hamspot-commander/modems`. The source
-/// tree is included so a checkout works before install.
+/// Folders that hold pipe files, first match wins for a repeated name.
+/// Release builds look only in Commander's own folders:
+/// 1. `~/.local/share/hamspot-commander/modems` (installed, app-owned),
+/// 2. `modems/` next to the executable (installed, app-owned),
+/// 3. `~/.local/share/hamspot-commander/modems.d` (user pipe files, see
+///    [`user_modem_dir`]).
+/// Debug builds also look in the source tree's `modems/` so a checkout works
+/// before install. `HAMSPOT_DEV_MODEMS=<dir>` adds one developer folder
+/// (debug builds only).
 pub fn modem_dirs() -> Vec<PathBuf> {
+    let mut dirs = installed_modem_dirs();
+    if let Some(user) = user_modem_dir() {
+        dirs.push(user);
+    }
+    dirs
+}
+
+/// App-owned pipe folders. The Pipe editor never writes here.
+pub fn installed_modem_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Some(data) = data_home() {
         dirs.push(data.join("hamspot-commander/modems"));
@@ -256,12 +275,29 @@ pub fn modem_dirs() -> Vec<PathBuf> {
         if let Some(dir) = exe.parent() {
             dirs.push(dir.join("modems"));
             // The test executable lives in `target/<profile>/deps`.
+            #[cfg(debug_assertions)]
             dirs.push(dir.join("../modems"));
         }
     }
-    dirs.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../modems"));
-    dirs.push(PathBuf::from("modems"));
+    #[cfg(debug_assertions)]
+    {
+        if let Some(dev) = std::env::var_os("HAMSPOT_DEV_MODEMS").filter(|v| !v.is_empty()) {
+            dirs.push(PathBuf::from(dev));
+        }
+        dirs.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../modems"));
+    }
     dirs
+}
+
+/// User-writable pipe files: `~/.local/share/hamspot-commander/modems.d`.
+pub fn user_modem_dir() -> Option<PathBuf> {
+    data_home().map(|d| d.join("hamspot-commander").join(hsrec::safepath::MODEMS.user_dir))
+}
+
+/// Real file for a station `modems/<name>` reference, or the reason it is
+/// refused. This is the only way a pipe command is turned into a program.
+pub fn resolve_pipe(stored: &str) -> Result<PathBuf, String> {
+    hsrec::safepath::MODEMS.resolve(stored, &modem_dirs())
 }
 
 fn data_home() -> Option<PathBuf> {
@@ -304,9 +340,14 @@ pub fn scripts_suffixed(dirs: &[PathBuf], suffix: &str) -> Vec<ModemScript> {
             if !name.ends_with(suffix) || !seen.insert(name.to_string()) {
                 continue;
             }
+            if !hsrec::safepath::MODEMS.valid_name(name) {
+                continue;
+            }
             found.push(ModemScript {
                 name: name.to_string(),
-                command: path.to_string_lossy().into_owned(),
+                command: hsrec::safepath::MODEMS.reference(name),
+                user: user_modem_dir().is_some_and(|u| u == *dir),
+                path: path.clone(),
             });
         }
         found.sort_by(|left, right| left.name.cmp(&right.name));
@@ -356,22 +397,12 @@ const VOICE_TRIES: u16 = 64;
 /// can bind, and the set keeps the next pipe from taking it during that gap.
 static VOICE_PORTS: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
 
-/// A script path gets `port` as its first argument. A shell command is started
-/// unchanged, because it has no port argument to fill in.
-pub fn command_argv(command: &str, port: u16) -> Vec<String> {
-    let trimmed = command.trim();
-    if script_takes_port(trimmed) {
-        vec![trimmed.to_string(), port.to_string()]
-    } else {
-        vec!["sh".into(), "-c".into(), trimmed.to_string()]
-    }
-}
-
-fn script_takes_port(command: &str) -> bool {
-    let Some(program) = program_name(command) else {
-        return false;
-    };
-    command == program && Path::new(program).is_absolute()
+/// Program and arguments for a station pipe value. Only a `modems/<name>`
+/// pipe file found by [`resolve_pipe`] runs; it gets `port` as its first
+/// argument. A shell command or any other path is refused, never run.
+pub fn command_argv(command: &str, port: u16) -> Result<Vec<String>, String> {
+    let path = resolve_pipe(command)?;
+    Ok(vec![path.to_string_lossy().into_owned(), port.to_string()])
 }
 
 /// Next localhost UDP port at or above [`VOICE_START`] that this process can
@@ -593,7 +624,7 @@ pub fn spawn(
     source: Option<(&str, &str)>,
     key_csv: Option<&str>,
 ) -> Result<Running, String> {
-    let port = if script_takes_port(command.trim()) {
+    let port = if resolve_pipe(command).is_ok() {
         Some(claim_voice_port()?)
     } else {
         None
@@ -668,7 +699,7 @@ fn spawn_group(
         "rx pipe process id does not fit".to_string()
     })?;
 
-    let argv = command_argv(command, port.unwrap_or(VOICE_START));
+    let argv = command_argv(command, port.unwrap_or(VOICE_START))?;
     let keep_stderr = events || identity;
     let mut filter = Command::new(&argv[0]);
     filter
@@ -859,7 +890,7 @@ pub fn spawn_tx(
     if play_ports.is_empty() {
         return Err("tx pipe has no transmit input".into());
     }
-    let port = if script_takes_port(command.trim()) {
+    let port = if resolve_pipe(command).is_ok() {
         Some(claim_voice_port()?)
     } else {
         None
@@ -916,7 +947,7 @@ fn spawn_tx_group(
         stop_group(&mut record);
         "tx pipe process id does not fit".to_string()
     })?;
-    let argv = command_argv(command, port.unwrap_or(VOICE_START));
+    let argv = command_argv(command, port.unwrap_or(VOICE_START))?;
     let mut filter = Command::new(&argv[0]);
     filter
         .args(&argv[1..])
@@ -1208,9 +1239,10 @@ mod tests {
         std::fs::write(second.join("commander-demod-dmr.rxpipe"), b"dmr\n").unwrap();
         let scripts = scripts_in(&[first.clone(), second]);
         assert_eq!(scripts[0].name, "commander-demod-p25.rxpipe");
-        assert!(scripts[0].command.contains("install"));
+        assert!(scripts[0].path.starts_with(&first));
+        assert_eq!(scripts[0].command, "modems/commander-demod-p25.rxpipe");
         assert_eq!(scripts[1].name, "commander-demod-dmr.rxpipe");
-        assert!(scripts[1].command.contains("source"));
+        assert!(scripts[1].path.to_string_lossy().contains("source"));
         assert!(script_matches("commander-demod-p25.rxpipe", &scripts[0]));
         assert_eq!(choice_text("commander-demod-p25.rxpipe", &scripts), "p25");
         assert_eq!(pipeline_label("commander-demod-dmr.rxpipe"), "dmr");
@@ -1334,21 +1366,13 @@ mod tests {
 
     #[test]
     fn a_script_path_receives_its_own_udp_port() {
-        assert_eq!(
-            command_argv("/opt/modems/commander-demod-p25.rxpipe", 23470),
-            vec![
-                "/opt/modems/commander-demod-p25.rxpipe".to_string(),
-                "23470".to_string()
-            ]
-        );
-        assert_eq!(
-            command_argv("dsd-fme -f1 -i -", 23470),
-            vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                "dsd-fme -f1 -i -".to_string()
-            ]
-        );
+        // Only a resolved pipe file runs, with the port as its argument.
+        let argv = command_argv("modems/commander-demod-p25.rxpipe", 23470).expect("installed p25 pipe");
+        assert!(argv[0].ends_with("/commander-demod-p25.rxpipe") && Path::new(&argv[0]).is_absolute());
+        assert_eq!(argv[1], "23470");
+        for refused in ["/opt/modems/commander-demod-p25.rxpipe", "dsd-fme -f1 -i -", "sh -c 'x'", "modems/../x.rxpipe"] {
+            assert!(command_argv(refused, 23470).is_err(), "{refused}");
+        }
         let first = claim_voice_port().expect("first voice port");
         let second = claim_voice_port().expect("second voice port");
         assert_ne!(first, second);
