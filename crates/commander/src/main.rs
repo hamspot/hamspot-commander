@@ -2674,8 +2674,13 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = gap;
                 let show_tear = self.page == Page::Tools && !tools_open;
+                // On REC the right end of the bar carries the view controls.
+                let show_rec_bar = rec_ui::bar_shown(self.page == Page::Rec);
+                let rec_compact = rec_ui::bar_compact(ui.available_width());
                 let tabs_w = if show_tear {
                     (ui.available_width() - tab_side - gap).max(0.0)
+                } else if show_rec_bar {
+                    (ui.available_width() - rec_ui::bar_width(rec_compact) - gap).max(0.0)
                 } else {
                     ui.available_width()
                 };
@@ -2875,6 +2880,9 @@ impl eframe::App for App {
                             }
                         });
                     });
+                if show_rec_bar {
+                    self.rec_bar(ui, rec_compact);
+                }
                 if show_tear && tools::tear_off_button(ui).clicked() {
                     self.tools.lock().expect("tools").detached = true;
                     self.page = self.page_return;

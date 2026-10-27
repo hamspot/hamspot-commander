@@ -182,6 +182,10 @@ pub struct RecUi {
     data_open: bool,
     /// Record / Playback dialog shown for the selected recording.
     detail_open: bool,
+    /// Clicks on the header-bar controls, applied by the timeline this frame.
+    bar_actions: Vec<BarAction>,
+    /// Whether the shown view follows now, for the header bar's LIVE marker.
+    bar_live: bool,
 }
 
 fn rows_meta(rows: &[cat::RadioRow], id: u64) -> Option<&cat::RadioRow> {
@@ -966,6 +970,42 @@ impl App {
         }
     }
 
+    /// The REC view controls, drawn as a run of LCARS segments at the right
+    /// end of the page-tab bar. Clicks are queued and applied by the timeline.
+    pub(crate) fn rec_bar(&mut self, ui: &mut egui::Ui, compact: bool) {
+        let theme = rustcars::LcarsTheme::default();
+        let segs = bar_segments(compact);
+        let last = segs.len() - 1;
+        for (i, seg) in segs.iter().enumerate() {
+            let cap = if i == 0 { rustcars::Cap::Left } else if i == last { rustcars::Cap::Right } else { rustcars::Cap::None };
+            let on = match seg.action {
+                BarAction::Live => Some(self.rec.bar_live),
+                BarAction::Data => Some(self.rec.data_open),
+                BarAction::PlayNext => Some(self.rec.play_next),
+                _ => None,
+            };
+            let base = bar_colour(seg.action);
+            let label = bar_label(seg, on);
+            let fill = if on == Some(false) { rustcars::tint(base, -0.55) } else { base };
+            let size = egui::vec2(seg.width, theme.bar_thin);
+            let resp = rustcars::lcars_button(ui, &theme, &label, fill, size, cap, true);
+            // Toggles keep a visible outline in both states; off is a dim
+            // fill inside it and an open marker, on is full fill and a dot.
+            if on.is_some() {
+                ui.painter().rect_stroke(
+                    resp.rect.shrink(1.0),
+                    rustcars::cap_radius(cap, resp.rect.height()),
+                    egui::Stroke::new(2.0, rustcars::tint(base, 0.35)),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            let resp = resp.on_hover_text(bar_hint(seg.action, on));
+            if resp.clicked() {
+                self.rec.bar_actions.push(seg.action);
+            }
+        }
+    }
+
     fn rec_timeline(&mut self, ui: &mut egui::Ui) {
         let now = chrono::Utc::now().timestamp_millis();
         let source = self.rec_source();
@@ -980,6 +1020,27 @@ impl App {
         };
         view.follow(now);
         let width_all = ui.available_width();
+        for action in std::mem::take(&mut self.rec.bar_actions) {
+            let w = plot_width(width_all);
+            match action {
+                BarAction::DayBack => view.day(view.start + view.span / 2, -1),
+                BarAction::Today => view.day(now, 0),
+                BarAction::DayForward => view.day(view.start + view.span / 2, 1),
+                BarAction::ZoomOut => {
+                    view.zoom(BUTTON_ZOOM, w / 2.0, w);
+                    view.live = false;
+                }
+                BarAction::ZoomIn => {
+                    view.zoom(1.0 / BUTTON_ZOOM, w / 2.0, w);
+                    view.live = false;
+                }
+                BarAction::Fit => view = timeline::fit(&recs, now),
+                BarAction::Live => view = View::live(now, view.span),
+                BarAction::Data => self.rec.data_open = !self.rec.data_open,
+                BarAction::PlayNext => self.rec.play_next = !self.rec.play_next,
+            }
+        }
+        self.rec.bar_live = view.live;
         // The timeline spans the full width; the lane shelf is drawn over its left side.
         // The plot stops short of a gutter on the right for the lane scrollbar.
         let plot_w = plot_width(width_all);
@@ -988,44 +1049,6 @@ impl App {
         ui.horizontal(|ui| {
             ui.label("Search");
             ui.add(egui::TextEdit::singleline(&mut self.rec.query).desired_width(search_width(width_all)).hint_text("TG, channel, radio…"));
-            if ui.button("◀ Day").clicked() {
-                view.day(view.start + view.span / 2, -1);
-            }
-            if ui.button("Today").clicked() {
-                view.day(now, 0);
-            }
-            if ui.button("Day ▶").clicked() {
-                view.day(view.start + view.span / 2, 1);
-            }
-            if ui.button("−").on_hover_text("Zoom out").clicked() {
-                view.zoom(BUTTON_ZOOM, width / 2.0, width);
-                view.live = false;
-            }
-            if ui.button("+").on_hover_text("Zoom in").clicked() {
-                view.zoom(1.0 / BUTTON_ZOOM, width / 2.0, width);
-                view.live = false;
-            }
-            if ui.button("Fit").on_hover_text("Fit to the most recent recordings").clicked() {
-                view = timeline::fit(&recs, now);
-            }
-            if toolbar_toggle(ui, view.live, LIVE_LABEL, false)
-                .on_hover_text("Follow the present (the red NOW line)")
-                .clicked()
-            {
-                view = View::live(now, view.span);
-            }
-            if toolbar_toggle(ui, self.rec.data_open, DATA_LABEL, true)
-                .on_hover_text("Storage cap, archive, rescan, cache, and thumb-drive copy/move")
-                .clicked()
-            {
-                self.rec.data_open = !self.rec.data_open;
-            }
-            if toolbar_toggle(ui, self.rec.play_next, PLAY_NEXT_LABEL, false)
-                .on_hover_text(play_next_hint(self.rec.play_next))
-                .clicked()
-            {
-                self.rec.play_next = !self.rec.play_next;
-            }
             let shown = timeline::layout(&recs, &lanes, &view, width, now).len();
             ui.label(format!("{} recordings ({shown} in view), {} lanes", recs.len(), lanes.len()));
             if let Some((rec, _, _)) = &self.rec.undo {
@@ -1607,6 +1630,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bar_order_and_caps() {
+        use BarAction::*;
+        for compact in [false, true] {
+            let a: Vec<BarAction> = bar_segments(compact).iter().map(|s| s.action).collect();
+            assert_eq!(a, [DayBack, Today, DayForward, ZoomOut, ZoomIn, Fit, Live, Data, PlayNext]);
+        }
+        assert_eq!(bar_segments(false)[6].label, "LIVE");
+        assert_eq!(bar_segments(false)[8].label, PLAY_NEXT_LABEL);
+    }
+
+    #[test]
+    fn bar_widths_and_compact_switch() {
+        assert!(bar_width(true) < bar_width(false));
+        let full: f32 = bar_segments(false).iter().map(|s| s.width).sum::<f32>() + 8.0 * BAR_GAP;
+        assert_eq!(bar_width(false), full);
+        assert!(bar_segments(true).iter().all(|s| s.width >= 36.0));
+        assert!(!bar_compact(2000.0));
+        assert!(bar_compact(800.0));
+        let edge = bar_width(false) + BAR_GAP + BAR_TABS_MIN;
+        assert!(!bar_compact(edge));
+        assert!(bar_compact(edge - 1.0));
+    }
+
+    #[test]
+    fn bar_toggles_show_state_in_text() {
+        let live = bar_segments(true)[6];
+        assert_eq!(bar_label(&live, Some(true)), "● L");
+        assert_eq!(bar_label(&live, Some(false)), "○ L");
+        assert_eq!(bar_label(&bar_segments(false)[1], None), "TODAY");
+        assert!(bar_hint(BarAction::Data, Some(false)).ends_with("(OFF)"));
+        assert!(bar_shown(true) && !bar_shown(false));
+    }
+
+    #[test]
     fn toggle_text_marks_state_without_colour() {
         assert_eq!(toggle_text(true, LIVE_LABEL), "● Live");
         assert_eq!(toggle_text(false, LIVE_LABEL), "○ Live");
@@ -1792,15 +1849,119 @@ mod tests {
 /// toolbar fits a ~1000 px panel on one line.
 /// Text for a toolbar toggle: the state is shown by a marker, never by colour alone.
 /// REC toolbar labels, left to right: Live, Data, then play-next.
+#[cfg_attr(not(test), allow(dead_code))]
 pub const LIVE_LABEL: &str = "Live";
+#[cfg_attr(not(test), allow(dead_code))]
 pub const DATA_LABEL: &str = "Data";
 /// Play next. "▶" is already used elsewhere on this page, so it renders in
 /// egui's default fonts; "⏭" (U+23ED) is not reliably covered.
 pub const PLAY_NEXT_LABEL: &str = "▶▶";
+#[cfg_attr(not(test), allow(dead_code))]
 pub const TOOLBAR_ORDER: [&str; 3] = [LIVE_LABEL, DATA_LABEL, PLAY_NEXT_LABEL];
 
 pub fn play_next_hint(on: bool) -> String {
     format!("Play next: {}. When a recording finishes playing, play the following one.", if on { "ON" } else { "OFF" })
+}
+
+/// One control in the REC run of the header bar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BarAction {
+    DayBack,
+    Today,
+    DayForward,
+    ZoomOut,
+    ZoomIn,
+    Fit,
+    Live,
+    Data,
+    PlayNext,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BarSeg {
+    pub action: BarAction,
+    pub label: &'static str,
+    pub width: f32,
+}
+
+/// Gap between header-bar segments (rustcars `frame_gap`).
+pub const BAR_GAP: f32 = 4.0;
+/// Below this much room for the tabs, the REC controls go compact.
+pub const BAR_TABS_MIN: f32 = 420.0;
+
+/// Left to right: day back, today, day forward, zoom out, zoom in, fit,
+/// then Live, Data and play-next. Compact drops the words.
+pub fn bar_segments(compact: bool) -> Vec<BarSeg> {
+    use BarAction::*;
+    let full: [(BarAction, &str, &str, f32, f32); 9] = [
+        (DayBack, "◀ DAY", "◀", 76.0, 40.0),
+        (Today, "TODAY", "T", 72.0, 36.0),
+        (DayForward, "DAY ▶", "▶", 76.0, 40.0),
+        (ZoomOut, "−", "−", 40.0, 36.0),
+        (ZoomIn, "+", "+", 40.0, 36.0),
+        (Fit, "FIT", "FIT", 56.0, 44.0),
+        (Live, "LIVE", "L", 84.0, 48.0),
+        (Data, "DATA", "D", 84.0, 48.0),
+        (PlayNext, PLAY_NEXT_LABEL, PLAY_NEXT_LABEL, 68.0, 60.0),
+    ];
+    full.iter()
+        .map(|(a, l, c, w, cw)| if compact { BarSeg { action: *a, label: c, width: *cw } } else { BarSeg { action: *a, label: l, width: *w } })
+        .collect()
+}
+
+/// Total width of the REC run, gaps included.
+pub fn bar_width(compact: bool) -> f32 {
+    let segs = bar_segments(compact);
+    segs.iter().map(|s| s.width).sum::<f32>() + BAR_GAP * (segs.len() as f32 - 1.0)
+}
+
+/// Compact when the full run would leave the tabs less than `BAR_TABS_MIN`.
+pub fn bar_compact(row_w: f32) -> bool {
+    row_w - bar_width(false) - BAR_GAP < BAR_TABS_MIN
+}
+
+/// Only the REC page carries the run.
+pub fn bar_shown(rec_page: bool) -> bool {
+    rec_page
+}
+
+pub fn bar_label(seg: &BarSeg, on: Option<bool>) -> String {
+    match on {
+        Some(on) => toggle_text(on, seg.label),
+        None => seg.label.to_string(),
+    }
+}
+
+fn bar_colour(action: BarAction) -> egui::Color32 {
+    use BarAction::*;
+    match action {
+        DayBack | Today | DayForward => rustcars::palette::SLATE,
+        ZoomOut | ZoomIn | Fit => rustcars::palette::TEAL,
+        Live => rustcars::palette::BRICK,
+        Data => rustcars::palette::OLIVE,
+        PlayNext => rustcars::palette::PLUM,
+    }
+}
+
+pub fn bar_hint(action: BarAction, on: Option<bool>) -> String {
+    use BarAction::*;
+    let state = match on {
+        Some(true) => " (ON)",
+        Some(false) => " (OFF)",
+        None => "",
+    };
+    let text = match action {
+        DayBack => "Previous day".to_string(),
+        Today => "Today".to_string(),
+        DayForward => "Next day".to_string(),
+        ZoomOut => "Zoom out".to_string(),
+        ZoomIn => "Zoom in".to_string(),
+        Fit => "Fit to the most recent recordings".to_string(),
+        Live => "Live: follow the present (the red NOW line)".to_string(),
+        Data => "Data: storage cap, archive, rescan, cache, and thumb-drive copy/move".to_string(),
+        PlayNext => return play_next_hint(on == Some(true)),
+    };
+    format!("{text}{state}")
 }
 
 pub fn toggle_text(on: bool, label: &str) -> String {

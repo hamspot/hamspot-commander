@@ -441,17 +441,24 @@ The REC state is saved and comes back on the next start. A talkgroup recording s
 
 ## 9.3 The REC tab
 
-From top to bottom: source tabs (**HackRF TG**, **HackRF Channels**, plus any other source found; if they don't all fit, click the outlined end of the tan bar above for a list of the rest, as on the Plan page), a status line (REC state, TG, Channels, disk use), the toolbar, and the timeline.
+While REC is open, the right end of the page-tab bar at the top of the window holds the timeline controls. Below the bar, from top to bottom: source tabs (**HackRF TG**, **HackRF Channels**, plus any other source found; if they don't all fit, click the outlined end of the tan bar above them for a list of the rest, as on the Plan page), a status line (REC state, TG, Channels, disk use), the search row, and the timeline.
 
-| Toolbar control | What it does |
+| Control in the top bar | What it does |
+| --- | --- |
+| **◀ DAY**, **TODAY**, **DAY ▶** | Jump by day. Every click counts, so quick clicks step several days. |
+| **−**, **+** | Zoom out or in by 1.5× |
+| **FIT** | Frame the most recent recordings |
+| **● LIVE** / **○ LIVE** | Follow the present (the red NOW line). ● is on, ○ is off. |
+| **● DATA** / **○ DATA** | Open or close the Data dialog ([9.6](#s9-6)) |
+| **● ▶▶** / **○ ▶▶** | Play next: when a recording finishes playing, the following one plays. ● is on, ○ is off; hover to see ON or OFF. |
+
+**LIVE**, **DATA** and **▶▶** are toggles. Each keeps its outline when off; off is a dimmer fill with ○, on is a full fill with ●.
+
+When the window is too narrow for the tabs and the full controls, the controls shorten to symbols: **◀ T ▶ − + FIT ● L ● D ● ▶▶**. Hover any control to see its name.
+
+| Control in the search row | What it does |
 | --- | --- |
 | **Search** | Filter lanes by talkgroup, channel, radio ID or notes |
-| **◀ Day**, **Today**, **Day ▶** | Jump by day |
-| **−**, **+** | Zoom out or in by 1.5× |
-| **Fit** | Frame the most recent recordings |
-| **● Live** / **○ Live** | Follow the present (the red NOW line). ● is on, ○ is off. |
-| **Data** | Open the Data dialog ([9.6](#s9-6)), right of **Live** |
-| **● ▶▶** / **○ ▶▶** | Play next, right of **Data**: when a recording finishes playing, the following one plays. ● is on, ○ is off; hover to see ON or OFF. |
 | **Undo delete** | Shown for 60 s after a delete |
 
 <!-- screenshot: rec-03 — The REC tab, armed and waiting. -->
@@ -520,7 +527,7 @@ Recordings made before decoder parameters were saved have none. For those, a P25
 
 ## 9.6 The Data dialog
 
-**Data** on the toolbar opens one dialog with three groups.
+**DATA** in the top bar opens one dialog with three groups.
 
 | Group | Controls |
 | --- | --- |
