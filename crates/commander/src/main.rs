@@ -31,6 +31,36 @@ mod pipes;
 mod rx_pipe;
 mod scan;
 mod tools;
+mod group_box;
+
+/// Config page groups, in page order, with their elbow colours.
+pub(crate) const CONFIG_GROUPS: [(&str, egui::Color32); 9] = {
+    use rustcars::palette::*;
+    [
+        ("Station", TAN),
+        ("Display", TEXT_MUTED),
+        ("Trunking", PLUM),
+        ("Radio", SLATE),
+        ("Audio", TEAL),
+        ("Automation", PLUM),
+        ("Rotator", OLIVE),
+        ("Amplifier", BRICK),
+        ("Patch bay", TAN),
+    ]
+};
+
+fn cfg_colour(name: &str) -> egui::Color32 {
+    CONFIG_GROUPS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, c)| *c)
+        .unwrap_or(rustcars::palette::TAN)
+}
+
+/// Thin titled elbow around one Config group.
+fn cfg_group<R>(ui: &mut egui::Ui, name: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    group_box::group_box(ui, name, cfg_colour(name), add)
+}
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -4189,77 +4219,78 @@ impl App {
     }
 
     fn page_config(&mut self, ui: &mut egui::Ui, snap: &mut Snapshot) {
-        ui.horizontal(|ui| {
-            if ui.button("Load").clicked() {
-                self.browse_config(false, snap);
-            }
-            if ui.button("Save").clicked() {
-                self.browse_config(true, snap);
-            }
-            let label = if self.config_path.is_empty() {
-                "No file".to_string()
-            } else {
-                file_label(&self.config_path)
-            };
-            ui.label(label).on_hover_text(&self.config_path);
-        });
-        if !self.config_note.is_empty() {
-            ui.label(
-                egui::RichText::new(&self.config_note).color(caution()),
-            );
-        }
-        ui.add_space(8.0);
-        ui.label(format!("Band plan: {}", file_label(&self.plan_path)));
-        ui.label(format!("Channels: {} zones", self.channels.zones.len()));
-        ui.label(format!("Talkgroups: {} zones", self.talkgroups.zones.len()));
-        ui.add_space(8.0);
-        let mut pulse_on = self.pulse_on;
-        if ui.checkbox(&mut pulse_on, "Pulse busy tabs").changed() {
-            self.pulse_on = pulse_on;
-            self.store_pulse(snap);
-        }
-        ui.horizontal(|ui| {
-            ui.label("Pulse speed");
-            for (label, secs) in [("Slow", 3.0), ("Normal", 2.0), ("Fast", 1.0)] {
-                let on = (self.pulse_secs - secs).abs() < 0.05;
-                if ui.selectable_label(on, label).clicked() && !on {
-                    self.pulse_secs = secs;
-                    self.store_pulse(snap);
+        cfg_group(ui, "Station", |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("Load").clicked() {
+                    self.browse_config(false, snap);
                 }
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.label("Trunk voice hang")
-                .on_hover_text("How long a followed call is held after the talker stops, so butt-keys and dead carriers do not drop the audio.");
-            const HANGS: [u32; 3] = [500, 1500, 3000];
-            for ms in HANGS {
-                let on = self.voice_hang_ms == ms;
-                if ui.selectable_label(on, format!("{ms} ms")).clicked() && !on {
-                    self.voice_hang_ms = ms;
-                    self.store_pulse(snap);
+                if ui.button("Save").clicked() {
+                    self.browse_config(true, snap);
                 }
+                let label = if self.config_path.is_empty() {
+                    "No file".to_string()
+                } else {
+                    file_label(&self.config_path)
+                };
+                ui.label(label).on_hover_text(&self.config_path);
+            });
+            if !self.config_note.is_empty() {
+                ui.label(
+                    egui::RichText::new(&self.config_note).color(caution()),
+                );
             }
-            if !HANGS.contains(&self.voice_hang_ms) {
-                // A station file may hold another value. Show it and keep it.
-                let _ = ui.selectable_label(true, format!("{} ms", self.voice_hang_ms));
-            }
-            let mut allow = self.override_hold;
-            if ui
-                .checkbox(&mut allow, "Emergency/priority override")
-                .on_hover_text("An emergency grant or a talkgroup marked Priority may take the receiver off the call it is holding.")
-                .changed()
-            {
-                self.override_hold = allow;
+            ui.add_space(8.0);
+            ui.label(format!("Band plan: {}", file_label(&self.plan_path)));
+            ui.label(format!("Channels: {} zones", self.channels.zones.len()));
+            ui.label(format!("Talkgroups: {} zones", self.talkgroups.zones.len()));
+        });
+        cfg_group(ui, "Display", |ui| {
+            let mut pulse_on = self.pulse_on;
+            if ui.checkbox(&mut pulse_on, "Pulse busy tabs").changed() {
+                self.pulse_on = pulse_on;
                 self.store_pulse(snap);
             }
+            ui.horizontal(|ui| {
+                ui.label("Pulse speed");
+                for (label, secs) in [("Slow", 3.0), ("Normal", 2.0), ("Fast", 1.0)] {
+                    let on = (self.pulse_secs - secs).abs() < 0.05;
+                    if ui.selectable_label(on, label).clicked() && !on {
+                        self.pulse_secs = secs;
+                        self.store_pulse(snap);
+                    }
+                }
+            });
         });
-        ui.add_space(8.0);
+        cfg_group(ui, "Trunking", |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Trunk voice hang")
+                    .on_hover_text("How long a followed call is held after the talker stops, so butt-keys and dead carriers do not drop the audio.");
+                const HANGS: [u32; 3] = [500, 1500, 3000];
+                for ms in HANGS {
+                    let on = self.voice_hang_ms == ms;
+                    if ui.selectable_label(on, format!("{ms} ms")).clicked() && !on {
+                        self.voice_hang_ms = ms;
+                        self.store_pulse(snap);
+                    }
+                }
+                if !HANGS.contains(&self.voice_hang_ms) {
+                    // A station file may hold another value. Show it and keep it.
+                    let _ = ui.selectable_label(true, format!("{} ms", self.voice_hang_ms));
+                }
+                let mut allow = self.override_hold;
+                if ui
+                    .checkbox(&mut allow, "Emergency/priority override")
+                    .on_hover_text("An emergency grant or a talkgroup marked Priority may take the receiver off the call it is holding.")
+                    .changed()
+                {
+                    self.override_hold = allow;
+                    self.store_pulse(snap);
+                }
+            });
+        });
         self.cat_frame(ui);
-        ui.add_space(8.0);
         self.audio_frame(ui);
-        ui.add_space(8.0);
         self.automation_frame(ui, snap);
-        ui.add_space(8.0);
         let radios: Vec<(String, bool)> = self
             .hub
             .view()
@@ -4272,7 +4303,9 @@ impl App {
         }
         let amps = self.amplifiers.view();
         let link = patchbay::AmpLink { rows: &amps.rows, models: &self.amp_models };
-        patchbay::show(ui, &mut self.patchbay, &mut self.patchbay_ui, &radios, &link);
+        cfg_group(ui, "Patch bay", |ui| {
+            patchbay::show(ui, &mut self.patchbay, &mut self.patchbay_ui, &radios, &link);
+        });
         for action in self.patchbay_ui.take_actions() {
             match action {
                 patchbay::Action::AddAmplifier(spec) => {
@@ -4537,7 +4570,7 @@ impl App {
         let rots = self.rotators.view();
         let mut select = None;
         let mut follow = None;
-        egui::Frame::group(ui.style()).show(ui, |ui| {
+        cfg_group(ui, "Automation", |ui| {
             ui.horizontal(|ui| {
                 ui.label("Automation");
                 if ui
@@ -4570,9 +4603,8 @@ impl App {
                     ui.label("No radio is selected.");
                 }
             }
-            ui.add_space(8.0);
-            ui.label("Rotators");
-            ui.add_space(4.0);
+        });
+        cfg_group(ui, "Rotator", |ui| {
             egui::Grid::new("rotators")
                 .striped(true)
                 .min_col_width(64.0)
@@ -4658,7 +4690,8 @@ impl App {
                 }
             });
             ui.label("A Yaesu G-5500 uses GS-232A (601) or GS-232B (603).");
-            ui.add_space(8.0);
+        });
+        cfg_group(ui, "Amplifier", |ui| {
             self.amplifier_rows(ui);
         });
         if let Some(id) = select {
@@ -4672,9 +4705,7 @@ impl App {
     fn cat_frame(&mut self, ui: &mut egui::Ui) {
         let view = self.hub.view();
         let mut select = None;
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.label("CAT Control");
-            ui.add_space(4.0);
+        cfg_group(ui, "Radio", |ui| {
             egui::Grid::new("cat-radios")
                 .striped(true)
                 .min_col_width(72.0)
@@ -4790,7 +4821,7 @@ impl App {
         let mut pipe_apply = None;
         let mut tx_apply = None;
         let mut pipe_editor_open: Option<(u64, bool, String)> = None;
-        egui::Frame::group(ui.style()).show(ui, |ui| {
+        cfg_group(ui, "Audio", |ui| {
             ui.horizontal(|ui| {
                 ui.label("Audio");
                 if ui
