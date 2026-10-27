@@ -184,8 +184,19 @@ pub fn safe_env(env: &[(String, String)]) -> Vec<(String, String)> {
 
 /// Decoder env for `meta`: its saved `decoder_params`, then `overrides`
 /// (later wins). Unsafe keys are dropped.
+/// Params that name a file on this machine (or redirect output). A recording
+/// or an import must never choose them; only Commander or the CLI user can.
+pub const LOCAL_ONLY_PARAMS: &[&str] = &["HAMSPOT_P25_K", "HAMSPOT_DRM_STDOUT"];
+
+/// A stored param is accepted from a recording: a safe key, not local-only,
+/// and its value is not a filesystem path.
+pub fn stored_param_ok(key: &str, value: &str) -> bool {
+    param_key_ok(key) && !LOCAL_ONLY_PARAMS.contains(&key) && !value.starts_with('/') && !value.starts_with("~/") && !value.contains("../")
+}
+
 pub fn decoder_env(meta: &Meta, overrides: &[(String, String)]) -> Vec<(String, String)> {
-    let mut map = meta.decoder_params.clone();
+    let mut map: std::collections::BTreeMap<String, String> =
+        meta.decoder_params.iter().filter(|(k, v)| stored_param_ok(k, v)).map(|(k, v)| (k.clone(), v.clone())).collect();
     for (k, v) in overrides {
         map.insert(k.clone(), v.clone());
     }
@@ -532,6 +543,20 @@ mod tests {
         }
         let env = safe_env(&[("LD_PRELOAD".into(), "/x.so".into()), ("HAMSPOT_A".into(), "1".into()), ("HAMSPOT_B".into(), "a\0b".into())]);
         assert_eq!(env, vec![("HAMSPOT_A".to_string(), "1".to_string())]);
+    }
+
+    #[test]
+    fn stored_params_cannot_name_local_files() {
+        let mut m = Meta::default();
+        m.decoder_params.insert("HAMSPOT_P25_K".into(), "/etc/shadow".into());
+        m.decoder_params.insert("HAMSPOT_FOO".into(), "/home/user/x".into());
+        m.decoder_params.insert("HAMSPOT_BAR".into(), "a/../../b".into());
+        m.decoder_params.insert("HAMSPOT_P25_X".into(), "BEE00".into());
+        let env = decoder_env(&m, &[]);
+        assert_eq!(env, vec![("HAMSPOT_P25_X".to_string(), "BEE00".to_string())]);
+        // The CLI user's own explicit override may still name a key file.
+        let env = decoder_env(&m, &[("HAMSPOT_P25_K".into(), "/home/user/k.csv".into())]);
+        assert!(env.iter().any(|(k, _)| k == "HAMSPOT_P25_K"));
     }
 
     #[test]

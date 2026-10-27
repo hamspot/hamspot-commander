@@ -53,7 +53,9 @@ pub fn archive_one(db: &Db, dir: &Path, rec: &Recording, level: i32, cancel: &At
     if rec.meta.end_utc.is_empty() {
         return Outcome::Skipped("still recording");
     }
-    let src = dir.join(&rec.raw_path);
+    let Some(src) = crate::safepath::join_inside(dir, &rec.raw_path) else {
+        return Outcome::Skipped("unsafe path");
+    };
     let dst = PathBuf::from(format!("{}.zst", src.display()));
     let tmp = PathBuf::from(format!("{}.zst.tmp", src.display()));
     let run = || -> std::io::Result<Option<(String, i64)>> {
@@ -115,9 +117,10 @@ pub fn unarchive_one(db: &Db, dir: &Path, rec: &Recording) -> Result<(), String>
     if !rec.archived {
         return Ok(());
     }
-    let src = dir.join(&rec.raw_path);
     let rel = rec.raw_path.trim_end_matches(".zst").to_string();
-    let dst = dir.join(&rel);
+    let (Some(src), Some(dst)) = (crate::safepath::join_inside(dir, &rec.raw_path), crate::safepath::join_inside(dir, &rel)) else {
+        return Err(format!("{}: unsafe path", rec.raw_path));
+    };
     let tmp = PathBuf::from(format!("{}.tmp", dst.display()));
     let run = || -> std::io::Result<String> {
         let mut r = crate::replay::open_raw(&src)?;
@@ -150,7 +153,7 @@ pub fn verify_one(db: &Db, dir: &Path, rec: &Recording) -> Result<(), String> {
     if rec.offline() {
         return Ok(());
     }
-    let path = dir.join(&rec.raw_path);
+    let path = crate::safepath::join_inside(dir, &rec.raw_path).ok_or_else(|| format!("{}: unsafe path", rec.raw_path))?;
     let sha = content_sha(&path).map_err(|e| format!("{}: {e}", rec.raw_path))?;
     if rec.sha256.is_empty() {
         db.set_sha(rec.id, &sha).map_err(|e| e.to_string())?;

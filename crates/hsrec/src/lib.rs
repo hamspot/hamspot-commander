@@ -10,6 +10,7 @@ pub mod export;
 pub mod lock;
 pub mod meta;
 pub mod replay;
+pub mod safepath;
 pub mod segment;
 pub mod storage;
 pub mod timeline;

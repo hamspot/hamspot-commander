@@ -106,8 +106,10 @@ pub fn export(
             break;
         }
         progress(n, rows.len());
-        let src = dir.join(&rec.raw_path);
-        let dst = root.join(&rec.raw_path);
+        let (Some(src), Some(dst)) = (crate::safepath::join_inside(dir, &rec.raw_path), crate::safepath::join_inside(&root, &rec.raw_path)) else {
+            report.failed.push(format!("{}: unsafe path, skipped", rec.raw_path));
+            continue;
+        };
         let side = crate::storage::sidecar_for(&src);
         let run = || -> std::io::Result<String> {
             copy_file(&src, &dst)?;
@@ -127,7 +129,9 @@ pub fn export(
                     let _ = db.set_sha(rec.id, &sha);
                 }
                 index.retain(|e| e.raw_path != rec.raw_path);
-                index.push(IndexEntry { raw_path: rec.raw_path.clone(), sha256: sha, archived: rec.archived, meta: rec.meta.clone() });
+                let mut meta = rec.meta.clone();
+                crate::safepath::portable_meta(&mut meta);
+                index.push(IndexEntry { raw_path: rec.raw_path.clone(), sha256: sha, archived: rec.archived, meta });
                 if move_files {
                     if db.set_location(rec.id, &format!("offline:{label}")).is_ok() {
                         crate::storage::remove_files(dir, &rec.raw_path);
@@ -154,7 +158,7 @@ pub fn export(
 pub fn locate(rec: &Recording, drives: &[Drive]) -> Option<PathBuf> {
     let label = rec.location.strip_prefix("offline:")?;
     let drive = drives.iter().find(|d| d.label == label)?;
-    let p = drive.mount.join(EXPORT_DIR).join(&rec.raw_path);
+    let p = crate::safepath::join_inside(&drive.mount.join(EXPORT_DIR), &rec.raw_path)?;
     p.exists().then_some(p)
 }
 
@@ -163,8 +167,10 @@ pub fn reattach(db: &Db, dir: &Path, drive: &Drive) -> Report {
     let mut report = Report::default();
     let label = format!("offline:{}", drive.label);
     for rec in db.all().unwrap_or_default().into_iter().filter(|r| r.location == label) {
-        let src = drive.mount.join(EXPORT_DIR).join(&rec.raw_path);
-        let dst = dir.join(&rec.raw_path);
+        let (Some(src), Some(dst)) = (crate::safepath::join_inside(&drive.mount.join(EXPORT_DIR), &rec.raw_path), crate::safepath::join_inside(dir, &rec.raw_path)) else {
+            report.failed.push(format!("{}: unsafe path, skipped", rec.raw_path));
+            continue;
+        };
         let run = || -> std::io::Result<()> {
             if !rec.sha256.is_empty() && content_sha(&src)? != rec.sha256 {
                 return Err(std::io::Error::other("checksum mismatch on drive"));
@@ -195,12 +201,21 @@ pub fn import(db: &Db, dir: &Path, export_root: &Path) -> Report {
         return report;
     };
     let entries: Vec<IndexEntry> = serde_json::from_str(&text).unwrap_or_default();
-    for e in entries {
+    for mut e in entries {
+        // A foreign index is untrusted: its paths must stay inside the drive
+        // folder and our recordings folder, and its decoder must be portable.
+        let (Some(src), Some(dst)) = (crate::safepath::join_inside(export_root, &e.raw_path), crate::safepath::join_inside(dir, &e.raw_path)) else {
+            report.failed.push(format!("{}: unsafe path in index.json, skipped", e.raw_path));
+            continue;
+        };
+        if std::fs::symlink_metadata(&src).map(|m| !m.file_type().is_file()).unwrap_or(true) {
+            report.failed.push(format!("{}: not a regular file, skipped", e.raw_path));
+            continue;
+        }
+        crate::safepath::portable_meta(&mut e.meta);
         if db.by_path(&e.raw_path).ok().flatten().is_some() {
             continue;
         }
-        let src = export_root.join(&e.raw_path);
-        let dst = dir.join(&e.raw_path);
         match copy_file(&src, &dst).and_then(|_| content_sha(&dst)) {
             Ok(sha) if e.sha256.is_empty() || sha == e.sha256 => {
                 let _ = std::fs::write(crate::storage::sidecar_for(&dst), serde_json::to_vec_pretty(&e.meta).unwrap_or_default());
@@ -284,6 +299,28 @@ mod tests {
         let r = export(&db, &dir, &db.all().unwrap(), &usb, "USB", true, &AtomicBool::new(true), |_, _| {});
         assert!(r.cancelled);
         assert!(dir.join("t.cs16").exists());
+    }
+
+    #[test]
+    fn import_rejects_traversal_and_absolute_and_migrates_decoder() {
+        let (_dir, usb, _db, _id) = setup("exp-evil");
+        let root = usb.join(EXPORT_DIR);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("ok.cs16"), [0u8; 64]).unwrap();
+        let mut m = crate::db::tests::meta("hackrf_tg", Some(1), "2026-10-27T00:00:00Z", "2026-10-27T00:00:01Z");
+        m.decoder = serde_json::json!({"script": "/home/user/.local/share/hamspot-commander/modems/commander-demod-p25.rxpipe"});
+        let e = |p: &str| IndexEntry { raw_path: p.into(), sha256: String::new(), archived: false, meta: m.clone() };
+        std::fs::write(root.join(INDEX), serde_json::to_vec(&vec![e("../../escape.cs16"), e("/tmp/abs.cs16"), e("ok.cs16")]).unwrap()).unwrap();
+        let other = usb.parent().unwrap().join("Other.recordings");
+        std::fs::create_dir_all(&other).unwrap();
+        let db2 = Db::open_in_memory().unwrap();
+        let r = import(&db2, &other, &root);
+        assert_eq!(r.copied, 1);
+        assert_eq!(r.failed.len(), 2);
+        let rows = db2.all().unwrap();
+        assert_eq!(rows[0].meta.decoder["script"], "modems/commander-demod-p25.rxpipe");
+        let side = std::fs::read_to_string(other.join("ok.json")).unwrap();
+        assert!(!side.contains("/home/"));
     }
 
     #[test]

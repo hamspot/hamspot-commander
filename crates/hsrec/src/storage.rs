@@ -150,7 +150,7 @@ pub fn cap_decision(rows: &[Recording], cap_gb: f64, need: i64, overwrite_oldest
 
 /// Remove a recording's files (raw, sidecar). Derived cache is separate.
 pub fn remove_files(rec_dir: &Path, raw_path: &str) {
-    let raw = rec_dir.join(raw_path);
+    let Some(raw) = crate::safepath::join_inside(rec_dir, raw_path) else { return };
     let _ = std::fs::remove_file(sidecar_for(&raw));
     let _ = std::fs::remove_file(&raw);
 }

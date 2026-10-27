@@ -95,6 +95,8 @@ const COLS: &str = "id, raw_path, protected, star, notes, archived, codec, level
 fn row_rec(r: &rusqlite::Row<'_>) -> rusqlite::Result<Recording> {
     let json: String = r.get(12)?;
     let mut meta: Meta = serde_json::from_str(&json).unwrap_or_default();
+    // Old rows may carry an absolute decoder path; show and use only the portable name.
+    crate::safepath::portable_meta(&mut meta);
     meta.end_utc = r.get(13)?;
     meta.duration_ms = r.get(14)?;
     meta.bytes = r.get(15)?;
@@ -154,6 +156,9 @@ impl Db {
     }
 
     pub fn insert(&self, raw_path: &str, meta: &Meta) -> rusqlite::Result<i64> {
+        let mut owned = meta.clone();
+        crate::safepath::portable_meta(&mut owned);
+        let meta = &owned;
         self.conn.execute(
             "INSERT INTO recordings (source, source_kind, radio_id, system, site, talkgroup, channel_name,
               radio_unit_id, raw_path, raw_format, sample_rate, centre_hz, channel_hz, offset_hz,
@@ -336,7 +341,8 @@ impl Db {
         walk(dir, &mut sidecars);
         for side in sidecars {
             let Ok(text) = std::fs::read_to_string(&side) else { continue };
-            let Ok(meta) = serde_json::from_str::<Meta>(&text) else { continue };
+            let Ok(mut meta) = serde_json::from_str::<Meta>(&text) else { continue };
+            crate::safepath::portable_meta(&mut meta);
             let Some(raw) = crate::storage::raw_for_sidecar(&side) else { continue };
             let rel = crate::storage::relative(dir, &raw);
             if self.by_path(&rel)?.is_none() {
@@ -353,7 +359,7 @@ impl Db {
             if rec.offline() {
                 continue;
             }
-            let gone = !dir.join(&rec.raw_path).exists();
+            let gone = !crate::safepath::join_inside(dir, &rec.raw_path).is_some_and(|p| p.exists());
             if gone != rec.missing {
                 self.set_flag(rec.id, "missing", gone)?;
             }

@@ -429,7 +429,8 @@ impl App {
                     m.channel_hz = hz;
                     m.offset_hz = hz - row.center_hz;
                     m.modulation = "p25".into();
-                    m.decoder = serde_json::json!({ "script": row.spec.rx_pipe, "vocoder": "p25" });
+                    m.decoder = serde_json::json!({ "script": hsrec::safepath::portable_decoder(&row.spec.rx_pipe), "vocoder": "p25" });
+                    hsrec::safepath::portable_meta(&mut m);
                     m.decoder_params = self.rec_live_params(row, &m);
                     if let Some(b) = self.cc_site.get(&row.id) {
                         m.system = format!("WACN {} SYS {}", b.wacn, b.sys);
@@ -451,7 +452,7 @@ impl App {
                         m.offset_hz = ch.hz - row.center_hz;
                         m.modulation = if ch.vocoder.is_empty() { "fm".into() } else { ch.vocoder.clone() };
                         m.decoder = serde_json::json!({
-                            "script": row.spec.rx_pipe, "vocoder": ch.vocoder, "invert": ch.invert, "mode": ch.mode
+                            "script": hsrec::safepath::portable_decoder(&row.spec.rx_pipe), "vocoder": ch.vocoder, "invert": ch.invert, "mode": ch.mode
                         });
                         m.decoder_params = self.rec_live_params(row, &m);
                         return (Some(key), Some(m));
@@ -929,12 +930,28 @@ impl App {
             self.rec.dir.join(&rec.raw_path)
         };
         let fallback = self.rec_param_fallback(&rec.meta);
-        let decoder = rec.meta.decoder.get("script").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty()).and_then(|script| {
+        // The recording names its decoder only as `modems/<file>`; Commander
+        // resolves it in its own modems folders and never runs a stored path.
+        let mut meta = rec.meta.clone();
+        hsrec::safepath::portable_meta(&mut meta);
+        let stored = meta.decoder.get("script").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let script = if stored.is_empty() {
+            None
+        } else {
+            match hsrec::safepath::resolve_decoder(&stored, &crate::rx_pipe::modem_dirs()) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    self.rec.note = e;
+                    None
+                }
+            }
+        };
+        let decoder = script.and_then(|script| {
             // The script's socat listens on this port for the whole replay, so
             // the reservation rides with the player and is released when its
             // thread ends (finish, stop, or a new selection).
             let port = crate::rx_pipe::VoicePort::claim().ok()?;
-            let argv = crate::rx_pipe::command_argv(script, port.port());
+            let argv = vec![script.display().to_string(), port.port().to_string()];
             let env = hsrec::replay::decoder_env(&rec.meta, &fallback);
             Some(hsrec::replay::DecoderCmd { argv, env, hold: Some(std::sync::Arc::new(hsrec::replay::Hold(Box::new(port)))) })
         });
@@ -1058,8 +1075,13 @@ impl App {
         // take it away from the scroll area there.
         let body_view = egui::Rect::from_min_size(egui::pos2(axis.left(), axis.bottom()), egui::vec2(width_all, viewport_h));
         let wheel_pos = ui.input(|i| i.pointer.hover_pos());
+        // A REC window (Record / Playback, Data) above the timeline owns the
+        // pointer there: no zoom, and its own scroll area keeps the wheel.
+        let own_layer = ui.layer_id();
+        let layer_ctx = ui.ctx().clone();
+        let ours = move |p: egui::Pos2| pointer_is_ours(layer_ctx.layer_id_at(p), own_layer);
         let zoom_here = wheel_pos.is_some_and(|p| {
-            (axis.contains(p) || body_view.contains(p)) && !timeline::on_shelf(p.x - axis.left(), shelf_w)
+            ours(p) && (axis.contains(p) || body_view.contains(p)) && !timeline::on_shelf(p.x - axis.left(), shelf_w)
         });
         let zoom_scroll = if zoom_here {
             ui.input_mut(|i| {
@@ -1126,8 +1148,8 @@ impl App {
                 // Grid interaction: drag pans, scroll zooms, click plays a block.
                 let gresp = ui.interact(grid, ui.scope_id().with("rec-grid"), egui::Sense::click_and_drag());
                 if gresp.dragged() { drag_dx += gresp.drag_delta().x; }
-                let pointer = gresp.interact_pointer_pos();
-                let hover = gresp.hover_pos();
+                let pointer = gresp.interact_pointer_pos().filter(|p| ours(*p));
+                let hover = gresp.hover_pos().filter(|p| ours(*p));
                 let mut block_tip: Option<String> = None;
                 for b in &blocks {
                     let Some(r) = by_id.get(&b.id) else { continue };
@@ -1321,7 +1343,8 @@ impl App {
             .resizable(true)
             .default_width(480.0)
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical().max_height(ctx.content_rect().height() * 0.8).show(ui, |ui| self.rec_detail(ui, rec));
+                ui.set_max_height(ctx.content_rect().height() * 0.8);
+                self.rec_detail(ui, rec);
             });
         if !open {
             self.rec.detail_open = false;
@@ -1380,39 +1403,6 @@ impl App {
             ui.label(egui::RichText::new(&self.rec.note).color(caution()));
         }
         ui.separator();
-        // Metadata
-        let rows = self.rec_meta_rows(&rec);
-        ui.horizontal(|ui| {
-            ui.strong("Metadata");
-            if ui.small_button("📋 Copy").on_hover_text("Copy all metadata and decoder parameters").clicked() {
-                let mut text: Vec<String> = vec![rec.meta.lane()];
-                text.extend(rows.iter().map(|(k, v)| format!("{k}: {v}")));
-                text.extend(rec.meta.decoder_params.iter().map(|(k, v)| format!("{k}={v}")));
-                ui.ctx().copy_text(text.join("\n"));
-            }
-        });
-        egui::Grid::new(("rec-meta", id)).num_columns(2).striped(true).spacing([12.0, 2.0]).show(ui, |ui| {
-            for (k, v) in &rows {
-                ui.label(egui::RichText::new(*k).weak());
-                ui.add(egui::Label::new(v).wrap());
-                ui.end_row();
-            }
-        });
-        if !rec.meta.decoder_params.is_empty() {
-            egui::CollapsingHeader::new(format!("Decoder parameters ({})", rec.meta.decoder_params.len()))
-                .id_salt("rec-decoder-params")
-                .show(ui, |ui| {
-                    ui.label(egui::RichText::new("Replay passes these to the decoder script as environment variables.").small().weak());
-                    egui::Grid::new(("rec-params", id)).num_columns(2).striped(true).show(ui, |ui| {
-                        for (k, v) in &rec.meta.decoder_params {
-                            ui.monospace(k);
-                            ui.monospace(v);
-                            ui.end_row();
-                        }
-                    });
-                });
-        }
-        ui.separator();
         ui.horizontal(|ui| {
             ui.label("Notes");
             let r = ui.add(egui::TextEdit::singleline(&mut self.rec.notes_edit).desired_width(f32::INFINITY));
@@ -1448,8 +1438,43 @@ impl App {
                 delete = true;
             }
         });
-        ui.add_space(4.0);
         ui.label(egui::RichText::new(PRIVACY).weak().small());
+        ui.separator();
+        // Metadata scrolls on its own so the block above never leaves view.
+        egui::ScrollArea::vertical().id_salt(("rec-meta-scroll", id)).auto_shrink([false, true]).show(ui, |ui| {
+        let rows = self.rec_meta_rows(&rec);
+        ui.horizontal(|ui| {
+            ui.strong("Metadata");
+            if ui.small_button("📋 Copy").on_hover_text("Copy all metadata and decoder parameters").clicked() {
+                let mut text: Vec<String> = vec![rec.meta.lane()];
+                text.extend(rows.iter().map(|(k, v)| format!("{k}: {v}")));
+                text.extend(rec.meta.decoder_params.iter().map(|(k, v)| format!("{k}={v}")));
+                ui.ctx().copy_text(text.join("\n"));
+            }
+        });
+        egui::Grid::new(("rec-meta", id)).num_columns(2).striped(true).spacing([12.0, 2.0]).show(ui, |ui| {
+            for (k, v) in &rows {
+                ui.label(egui::RichText::new(*k).weak());
+                ui.add(egui::Label::new(v).wrap());
+                ui.end_row();
+            }
+        });
+        if !rec.meta.decoder_params.is_empty() {
+            egui::CollapsingHeader::new(format!("Decoder parameters ({})", rec.meta.decoder_params.len()))
+                .id_salt("rec-decoder-params")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.label(egui::RichText::new("Replay passes these to the decoder script as environment variables.").small().weak());
+                    egui::Grid::new(("rec-params", id)).num_columns(2).striped(true).show(ui, |ui| {
+                        for (k, v) in &rec.meta.decoder_params {
+                            ui.monospace(k);
+                            ui.monospace(v);
+                            ui.end_row();
+                        }
+                    });
+                });
+        }
+        });
         let mut changed = false;
         if let Some(db) = &self.rec.db {
             if star != rec.star {
@@ -1616,6 +1641,15 @@ mod tests {
     }
 
     #[test]
+    fn pointer_owner_is_top_layer_only() {
+        let bg = egui::LayerId::background();
+        let win = egui::LayerId::new(egui::Order::Middle, egui::Id::NULL);
+        assert!(pointer_is_ours(Some(bg), bg));
+        assert!(!pointer_is_ours(Some(win), bg));
+        assert!(!pointer_is_ours(None, bg));
+    }
+
+    #[test]
     fn search_width_fits_narrow_panels() {
         assert_eq!(search_width(1000.0), 120.0);
         assert_eq!(search_width(400.0), 80.0);
@@ -1691,6 +1725,12 @@ fn toolbar_toggle(ui: &mut egui::Ui, on: bool, label: &str, muted: bool) -> egui
         egui::Stroke::new(1.0, v.widgets.noninteractive.bg_stroke.color)
     };
     ui.add(egui::Button::new(text).fill(fill).stroke(stroke))
+}
+
+/// The timeline handles pointer input only when its own layer is the top
+/// layer under the pointer (not a floating REC window above it).
+pub fn pointer_is_ours(top: Option<egui::LayerId>, own: egui::LayerId) -> bool {
+    top == Some(own)
 }
 
 pub fn search_width(avail: f32) -> f32 {
