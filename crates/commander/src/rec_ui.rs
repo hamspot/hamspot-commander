@@ -1075,7 +1075,7 @@ impl App {
                 BarAction::ZoomOut => view.zoom_at(BUTTON_ZOOM, w / 2.0, w, now),
                 BarAction::ZoomIn => view.zoom_at(1.0 / BUTTON_ZOOM, w / 2.0, w, now),
                 BarAction::Fit => view = timeline::fit(&recs, now),
-                BarAction::Live => view = View::live(now, view.span),
+                BarAction::Live => view.toggle_live(now),
                 BarAction::Data => self.rec.data_open = !self.rec.data_open,
                 BarAction::PlayNext => self.rec.play_next = !self.rec.play_next,
             }

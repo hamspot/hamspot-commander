@@ -44,9 +44,22 @@ impl View {
         self.start = at - (span as f64 * frac) as i64;
         self.span = span;
     }
+    /// Pan by a drag of `dx` px. Dragging into the past (dx > 0) while live
+    /// turns live off: the user chose to look back. Dragging toward the future
+    /// while live does nothing, since the view already ends on NOW.
     pub fn pan_px(&mut self, dx: f32, width: f32) {
+        if self.live && dx <= 0.0 {
+            return;
+        }
         self.start -= (dx as f64 / width.max(1.0) as f64 * self.span as f64) as i64;
         self.live = false;
+    }
+    /// The user's LIVE toggle: flips live every call. Turning it on puts the
+    /// right edge on `now`; turning it off leaves the view where it is.
+    pub fn toggle_live(&mut self, now: i64) {
+        self.live = !self.live;
+        self.follow(now);
+        self.clamp(now);
     }
     /// Jump to the local day containing `t` (+/- days).
     pub fn day(&mut self, t: i64, days: i64) {
@@ -67,19 +80,19 @@ impl View {
     /// Zoom that keeps NOW pinned at the right edge when the view is live,
     /// otherwise anchors at `anchor_x`; never shows the future afterwards.
     pub fn zoom_at(&mut self, factor: f64, anchor_x: f32, width: f32, now: i64) {
-        // Zooming out at NOW keeps NOW pinned; zooming in uses the anchor.
-        let pinned = (self.live || self.end() >= now) && factor > 1.0;
-        self.zoom(factor, if pinned { width } else { anchor_x }, width);
+        // Live: zoom about the right edge (NOW), in or out. Not live: zoom
+        // about the cursor. Zoom never changes `live`.
+        self.zoom(factor, if self.live { width } else { anchor_x }, width);
+        self.follow(now);
         self.clamp(now);
     }
-    /// Apply [`clamp_view`]. Live means "right edge on NOW": a view whose
-    /// right edge lands on NOW follows it; one in the past stays put.
-    /// Call after [`View::follow`].
+    /// Apply [`clamp_view`] (never show the future). `live` is only ever set
+    /// by the user's toggle (and turned off by panning back, Fit or the day
+    /// buttons); reaching NOW does not turn it on. A live view stays on NOW.
     pub fn clamp(&mut self, now: i64) {
         let (start, span) = clamp_view(self.start, self.span, now);
-        self.start = start;
+        self.start = if self.live { now - span } else { start };
         self.span = span;
-        self.live = self.end() >= now;
     }
 }
 
@@ -400,7 +413,8 @@ mod tests {
         let mut v = View { start: now - 70_000, span: 60_000, live: false };
         v.zoom_at(3.0, 0.0, 600.0, now);
         assert_eq!(v.end(), now);
-        assert!(v.live);
+        // Reaching NOW never turns live on by itself.
+        assert!(!v.live);
         // Day forward from yesterday stops at now.
         let mut v = View { start: now - 3 * 86_400_000, span: 86_400_000, live: false };
         v.day(now - 86_400_000, 1);
@@ -410,6 +424,69 @@ mod tests {
         v.day(now, 0);
         v.clamp(now);
         assert!(v.end() == now && v.span == 86_400_000);
+    }
+
+    #[test]
+    fn live_wheel_zoom_keeps_now_and_live() {
+        let now = 2_000_000_000;
+        let mut v = View::live(now, 600_000);
+        for f in [1.0 / 1.18, 1.0 / 1.18, 1.18, 3.0, 1.0 / 5.0] {
+            // Cursor anywhere: live zoom is about the right edge.
+            v.zoom_at(f, 123.0, 1000.0, now);
+            v.clamp(now);
+            assert!(v.live);
+            assert_eq!(v.end(), now);
+        }
+        // Time advances: still pinned.
+        v.follow(now + 5_000);
+        v.clamp(now + 5_000);
+        assert_eq!((v.end(), v.live), (now + 5_000, true));
+    }
+
+    #[test]
+    fn not_live_zoom_to_now_stays_off() {
+        let now = 2_000_000_000;
+        let mut v = View { start: now - 61_000, span: 60_000, live: false };
+        for _ in 0..10 {
+            v.zoom_at(1.5, 999.0, 1000.0, now);
+            v.clamp(now);
+            assert!(!v.live);
+            assert!(v.end() <= now, "never show the future");
+        }
+        assert_eq!(v.end(), now);
+        // Zoom in at the cursor from NOW: still off, and the view may leave NOW.
+        v.zoom_at(1.0 / 1.18, 500.0, 1000.0, now);
+        v.clamp(now);
+        assert!(!v.live && v.end() < now);
+    }
+
+    #[test]
+    fn live_toggle_flips_every_time() {
+        let now = 2_000_000_000;
+        let mut v = View { start: now - 60_000, span: 60_000, live: false };
+        for i in 0..6 {
+            v.toggle_live(now);
+            v.clamp(now);
+            assert_eq!(v.live, i % 2 == 0);
+            assert!(v.end() <= now);
+        }
+        // Toggled off at NOW, the next frame does not turn it back on.
+        let mut v = View::live(now, 60_000);
+        v.toggle_live(now);
+        v.follow(now + 1_000);
+        v.clamp(now + 1_000);
+        assert!(!v.live);
+    }
+
+    #[test]
+    fn pan_with_live() {
+        let now = 2_000_000_000;
+        let mut v = View::live(now, 60_000);
+        v.pan_px(-50.0, 600.0); // toward the future: no change
+        assert_eq!((v.end(), v.live), (now, true));
+        v.pan_px(50.0, 600.0); // into the past: live off
+        v.clamp(now);
+        assert!(!v.live && v.end() < now);
     }
 
     #[test]
