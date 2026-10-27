@@ -32,6 +32,7 @@ mod rx_pipe;
 mod scan;
 mod tools;
 mod group_box;
+mod toggle;
 
 /// Config page groups, in page order, with their elbow colours.
 pub(crate) const CONFIG_GROUPS: [(&str, egui::Color32); 9] = {
@@ -3110,7 +3111,7 @@ impl App {
                 if alt.clicked() && snap.caps.vfo_ops.contains("XCHG") {
                     self.send(Command::VfoOp("XCHG".into()));
                 }
-                let bsp = ui.selectable_label(self.show_spread, "BSP");
+                let bsp = crate::toggle::add_toggle(ui, true, self.show_spread, "BSP");
                 if bsp.clicked() {
                     self.show_spread = !self.show_spread;
                 }
@@ -4594,9 +4595,9 @@ impl App {
             let selected = radios.rows.iter().find(|row| row.selected);
             match selected {
                 Some(row) => {
-                    let mut on = row.spec.follow;
-                    if ui.checkbox(&mut on, "Follow").changed() {
-                        follow = Some((row.id, on));
+                    let on = row.spec.follow;
+                    if crate::toggle::add_toggle(ui, true, on, "Follow").clicked() {
+                        follow = Some((row.id, !on));
                     }
                 }
                 None => {
@@ -6052,11 +6053,10 @@ impl App {
                     self.send_amp(&row.spec.id, amp::Control::SetFreq(hz));
                 }
             }
-            let mut follow = row.spec.follow_rig;
-            if ui
-                .checkbox(&mut follow, "Follow rig frequency")
+            let follow = !row.spec.follow_rig;
+            if crate::toggle::add_toggle(ui, true, row.spec.follow_rig, "Follow rig frequency")
                 .on_hover_text("Sends the active rig's frequency to this amplifier (set_freq only) after it settles. Saved per amplifier.")
-                .changed()
+                .clicked()
             {
                 self.amplifiers.update(row.id, amp::AmplifierSpec { follow_rig: follow, ..row.spec.clone() });
             }
@@ -11511,10 +11511,7 @@ impl App {
     fn func_btn(&self, ui: &mut egui::Ui, snap: &Snapshot, label: &str, name: &str) {
         let on = snap.funcs.get(name).copied().unwrap_or(false);
         let enabled = snap.online() && snap.caps.has_func(name);
-        if ui
-            .add_enabled(enabled, egui::Button::new(label).selected(on))
-            .clicked()
-        {
+        if crate::toggle::add_toggle(ui, enabled, on, label).clicked() {
             self.send(Command::SetFunc {
                 name: name.into(),
                 on: !on,
@@ -11542,10 +11539,7 @@ impl App {
             .levels
             .get("PREAMP")
             .is_some_and(|v| (*v - db).abs() < 0.5);
-        if ui
-            .add_enabled(enabled, egui::Button::new(label).selected(on))
-            .clicked()
-        {
+        if crate::toggle::add_toggle(ui, enabled, on, label).clicked() {
             self.send(Command::SetLevel {
                 name: "PREAMP".into(),
                 value: db,
@@ -11555,10 +11549,7 @@ impl App {
 
     fn ptt(&mut self, ui: &mut egui::Ui, snap: &Snapshot, label: &str) {
         let enabled = snap.online() && snap.caps.can_set_ptt;
-        if ui
-            .add_enabled(enabled, egui::Button::new(label).selected(snap.ptt))
-            .clicked()
-        {
+        if crate::toggle::add_toggle(ui, enabled, snap.ptt, label).clicked() {
             let next = !snap.ptt;
             if next {
                 if let Some(why) = self.plan.transmit_block_on(
@@ -11641,20 +11632,14 @@ impl App {
     }
 
     fn receiver_box(&self, ui: &mut egui::Ui, snap: &Snapshot) {
-        let label = if snap.power_on { "RX" } else { "Off" };
         let enabled = snap.online() && snap.caps.can_set_power;
-        ui.add_enabled_ui(enabled, |ui| {
-            egui::ComboBox::from_id_salt("receiver")
-                .selected_text(format!("Receiver: {label}"))
-                .show_ui(ui, |ui| {
-                    if ui.selectable_label(snap.power_on, "RX").clicked() {
-                        self.send(Command::SetPower(true));
-                    }
-                    if ui.selectable_label(!snap.power_on, "Off").clicked() {
-                        self.send(Command::SetPower(false));
-                    }
-                });
-        });
+        let state = if snap.power_on { "Receiver ON" } else { "Receiver OFF" };
+        if crate::toggle::add_toggle(ui, enabled, snap.power_on, "Receiver")
+            .on_hover_text(state)
+            .clicked()
+        {
+            self.send(Command::SetPower(!snap.power_on));
+        }
     }
 
     fn sliders(&mut self, ui: &mut egui::Ui, snap: &Snapshot) {
