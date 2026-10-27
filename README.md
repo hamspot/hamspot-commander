@@ -1,32 +1,40 @@
 # Hamspot Commander
 
-A station console for amateur radio. Phase 1 is the rig-control face: frequency, S-meter, VFO and RIT keys, the ham-band scales, and the level sliders.
+A station console for amateur radio and scanner listening on Linux. One window drives Hamlib radios, GQRX and HackRF receivers; scans channel lists; follows trunked systems (P25 and others) with talkgroup and radio-ID lists; decodes digital voice through pipe files; records HackRF traffic as raw IQ and re-decodes it on playback; controls rotators and amplifiers; and includes a NanoVNA V2 screen, Smith chart, RF calculators, a logbook and station timers.
 
-The layout kinda follows the rig screen in the Ham Radio Deluxe 5.21 preliminary user guide (11 May 2012). That guide is the behavior reference for this screen. Ham Radio Deluxe is a trademark of its owner. This project does not copy its icons, bitmaps, or manual text, and it does not include that program's logbook.
+- **User guide:** [docs/UserGuide.md](docs/UserGuide.md)
+- **For developers and agents:** [AGENTS.md](AGENTS.md)
 
-The window is a Rust [`egui`](https://github.com/emilk/egui) app in the same spirit as the RT-950 CPS: dark groups, a large frequency, and a click-to-tune bandspread. Radio I/O goes through Hamlib's `rigctld` extended response protocol (`+\` commands, `RPRT` replies). GQRX uses the short rigctl commands on the same client. The program does not link `libhamlib`. Digital voice is an RX pipe around `dsd-fme`, not a mode in the menu.
+## Install
 
-The operator manual is `docs/UserGuide.md`. `docs/AGENT-HSCommander.md` is the field map for turning a listing into a `.HSCommander` station and the `.HSKeys` file beside it. The Tools page mounts the rustcars example screens. The station log is `Name.HSLog` beside the station file.
-
-The face uses [rustcars](https://github.com/webaugur/rustcars) (MIT, `licenses/rustcars-MIT.txt`). The Antonio typeface is bundled by that crate under the SIL Open Font License 1.1. `licenses/Antonio-OFL.txt` and `licenses/Antonio-FONTS.md` travel with the program.
-
-## Run
+On Ubuntu 26.04, from a checkout:
 
 ```bash
-cargo run -p commander
+scripts/install.sh
 ```
 
-The window starts Hamlib's dummy itself: `rigctld -m 1` on `127.0.0.1`, port 4532 when that port is free. VFO A is 14.153608 MHz USB, VFO B is 146.520 MHz FM, and VFO C is 446.000 MHz FM. **Demo** switches to a small in-process stand-in and does not spawn `rigctld`. The Config tab saves the station to one JSON file and adds radios. A hamlib row starts `rigctld`. A GQRX row starts GQRX. The program does not attach to a `rigctld` or GQRX it did not start.
+See the user guide for the portable folder and a persistent live USB.
 
-`scripts/dummy-rig.sh` still starts that dummy by hand for a manual run. Levels the backend lists with an empty range stay disabled.
+## Build from source
+
+```bash
+cargo build --release -p commander
+```
+
+Radio I/O goes through Hamlib's `rigctld` protocol; Commander starts its own `rigctld`, `gqrx`, `rotctld` and `ampctld` and doesn't link `libhamlib`.
 
 ## Layout
 
 ```
-crates/rigctl/      rigctld client and the demo rig
-crates/commander/   the egui face
+crates/rigctl/      rigctld client
+crates/commander/   the egui window
+crates/hsrec/       REC library and the commander-rec tool
+modems/             shipped RX/TX pipe files
+bsp/                band plans
+scripts/            install, portable build and helper scripts
+docs/               user guide, agent notes, design docs
 ```
 
 ## License
 
-GPL-3.0-or-later. See `LICENSE`. The rustcars widgets and the copied example screens are MIT (`licenses/rustcars-MIT.txt`). Antonio is OFL 1.1 (`licenses/Antonio-OFL.txt`).
+GPL-3.0-or-later. See `LICENSE`. The face uses [rustcars](https://github.com/webaugur/rustcars) (MIT, `licenses/rustcars-MIT.txt`); the bundled Antonio typeface is OFL 1.1 (`licenses/Antonio-OFL.txt`). The Tune layout loosely follows the Ham Radio Deluxe rig screen; Ham Radio Deluxe is a trademark of its owner and none of its icons, bitmaps or text are copied.

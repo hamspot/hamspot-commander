@@ -1,450 +1,568 @@
-# Hamspot Commander
+# Hamspot Commander User Guide
 
-**User Guide**
+Hamspot Commander is a station console for amateur radio and scanner listening on Linux. This guide covers the program as it is today: how to install it, how to find your way round the window, and how to do the everyday jobs: tune, scan, follow a trunked system, record and replay traffic, sweep an antenna with a NanoVNA, and write your own pipe files.
 
-Version 0.8.5
+The program is licensed under the GNU General Public License, version 3 or later. See `LICENSE` in the source tree.
 
-24 October 2026
+## Contents
 
-Hamspot
+1. [Introduction](#ch1)
+2. [Quick start](#ch2)
+3. [Installing](#ch3)
+4. [The window](#ch4)
+5. [Tune](#ch5)
+6. [Plan: band plans](#ch6)
+7. [Channels and scanning](#ch7)
+8. [Trunked systems: Talkgroups, Radio IDs and Keys](#ch8)
+9. [REC: recording and playback](#ch9)
+10. [Meters, Levels and Timers](#ch10)
+11. [Config: radios, audio and automation](#ch11)
+12. [Tools](#ch12)
+13. [Pipe files](#ch13)
+14. [How-to recipes](#ch14)
+15. [Files and folders](#ch15)
+16. [Troubleshooting](#ch16)
+17. [Glossary](#ch17)
+18. [Recording, the law and your privacy](#ch18)
+19. [Roadmap](#ch19)
 
-This guide tells you how to run Hamspot Commander, tune a radio from the window, save a station file, and keep a portable copy on an Ubuntu live USB. It describes the program that ships in release 0.8.5. It does not describe a later build.
-
-Ham Radio Deluxe is a trademark of its owner. This project does not copy that program's icons, pictures, or manual text. The chapter order of this guide follows the same kind of operator manual: what the program is, how to start it, how the face works, then how to configure it.
-
-The program is licensed under the GNU General Public License, version 3 or any later version. See the `LICENSE` file in the source tree.
-
----
-
-## Table of contents
-
-The printed pages number the chapters. In this Markdown master the same headings are the contents.
-
-1. Introduction
-2. Getting started
-3. The window
-4. Tuning
-5. Band plans
-6. Channels
-7. Meters and levels
-8. The station file
-9. CAT control and GQRX
-10. Audio
-11. A persistent Ubuntu live USB
-12. An installed copy
-13. Pipe files
-14. Appendix: files and dark controls
+Screenshots are being collected. Where one belongs, the Markdown source has a `<!-- screenshot: … -->` marker.
 
 ---
+
+<a id="ch1"></a>
 
 # 1. Introduction
 
-## 1.1 What Hamspot Commander is
+## 1.1 What Commander does
 
-Hamspot Commander is a station face for a radio you can reach with Hamlib, and for a GQRX receiver the program starts itself. You use it to read the frequency, change the VFO, set the mode, key the transmitter when the radio allows it, and keep a band plan and a local channel file.
+Commander puts the controls of one or more radios in one dark, LCARS-style window:
 
-The window is a dark set of grouped frames: a top bar, a row of page tabs, and the page. The frames reach the bottom of the window. The standing pages are Tune, Plan, Channels, Meters, Timers, Levels, Keys, Tools, and Config. Timers sits immediately right of Meters. Keys sits immediately left of Tools. A radio that can follow a trunked system adds a TG tab after Channels, and an ID tab when that system has named radios. The label is the radio name plus TG or ID, for example `HackRF TG`. The Channels tab and each TG tab always show a speaker on the left of the name. It stays dim until voice is coming in, then it is solid, and it fades over about two seconds of silence. While that voice is up the tab also brightens and darkens. A control channel does not do this. The Config page can turn the pulse off or set it to Slow, Normal, or Fast. Turning animation off in the desktop settings leaves the speaker and holds the tab still.
+- **Rig control** for any radio Hamlib can drive, through `rigctld`, which Commander starts for you.
+- **SDR receive** with GQRX (started by Commander) or a HackRF read directly.
+- **Scanning** a local channel file, and **following a trunked system** (P25 and others) from its control channel, with talkgroup lists and the radio IDs heard on the air.
+- **Digital voice** through RX pipes, small scripts that run decoders such as `dsd-fme`.
+- **REC**, which records HackRF traffic as raw radio data and re-decodes it every time you play it back.
+- **Automation**: Hamlib rotators and amplifiers, and an RF patch bay drawing of your station.
+- **Tools**: a NanoVNA V2 vector network analyzer screen, a Smith chart, RF and general calculators, a hex viewer, a logbook and a rotator display. The **Timers** page has station clocks, an ID timer, a countdown and a stopwatch.
 
-Radio traffic uses Hamlib's `rigctld` text protocol. Commander does not link the Hamlib library. A GQRX row uses the short rigctl commands on the same kind of client. Commander starts those programs. It does not attach to a `rigctld` or a GQRX that some other program already started, and it stops only the processes it started.
+Everything about a station (radios, band plan, channels, talkgroups, levels, layout) is kept in one **station file**, `Name.HSCommander`. Key material, VNA calibration, the logbook and recordings are kept in separate files beside it ([chapter 15](#ch15)).
 
-## 1.2 What this release does not do
+## 1.2 What it does not do
 
-ADIF import, a contest logger, and a DX cluster are not in this release. The Tools page has a Logbook, which is a time-stamped diary beside the station file. It is not an ADIF log. Commander is not itself a satellite tracker. A radio row can still follow Gpredict when that row's Gpredict box is on. That box is not talkgroup Follow.
+- It is not a contest logger, ADIF log or DX cluster client. The Logbook is a time-stamped station diary.
+- It is not a satellite tracker. A radio row can follow Gpredict instead.
+- The Channels page is a file on your computer, not the memory bank inside the radio.
+- It does not attach to a `rigctld` or GQRX that something else started. It starts its own and stops only what it started.
 
-Digital voice is an RX pipe that runs `dsd-fme`. It is not a mode in the Mode menu. Rotators have their own rows on the Config page. A HackRF row captures one dongle. An audio tap takes a discriminator or line input and plays a demodulator. It does not tune.
+## 1.3 What you need
 
-The Channels page is a file on this computer. It is not the memory bank inside the radio. The buttons `A > Mem` and `Mem > A` use one frequency held in the window, not that file and not the radio's memories. Favorite and that one-slot frequency are written in the station file.
+| Item | Notes |
+| --- | --- |
+| Computer | 64-bit Linux with a graphical desktop and PipeWire. The installer supports Ubuntu 26.04 only. |
+| Groups | Your user in `dialout` (serial radios) and `plugdev` (some USB devices). Log out and in after a change. |
+| `rigctld`, `rotctld`, `ampctld` | Ubuntu package `libhamlib-utils`. |
+| `gqrx` | Package `gqrx-sdr`, for GQRX rows. |
+| `pw-loopback`, `pw-cat`, `pw-dump` | Package `pipewire-bin`. |
+| `helvum` | Optional PipeWire patchbay, opened from the Audio frame. |
+| `dsd-fme`, `sox`, `socat` | Digital voice pipes. The installer builds `dsd-fme`. |
+| `hackrf_transfer` | Package `hackrf`, for HackRF rows. |
 
-Some buttons on the Tune page stay dark on every radio. Section 14.4 lists them. A button that the connected radio cannot perform also stays dark, even when a different radio would light it.
+Supported test equipment is the **NanoVNA V2** (V2.2, USB id `04b4:0008`). Supported SDR hardware for raw capture and REC is the **HackRF**.
 
-## 1.3 This guide
+## 1.4 Conventions in this guide
 
-Each chapter starts with what you are looking at, then the steps. A note is something you can skip and still operate. An important note is something that will lose a setting or key the radio if you miss it.
+- Button and field names are printed as they appear, for example **Add hamlib** or `Band +`.
+- **Click modes.** Some keys do different things on a single, double or triple click. They show three small dots on their right edge: green for click, orange for double-click and purple for triple-click. On those keys **Shift+click** is the same as a double-click and **Ctrl+click** the same as a triple-click. The tooltip lists all three.
+- Warnings are always spelled out in words. Colour is only a second cue.
 
-Button names are printed as they appear on the window, for example `Add hamlib` and `Band +`.
+---
 
-## 1.4 Computer
+<a id="ch2"></a>
 
-Release 0.8.5 of the portable build is a 64-bit Linux program. The install script in the source tree accepts only Ubuntu 26.04. The portable folder can be copied onto another Ubuntu machine of the same kind. It still needs the packages in the next section. Those packages are not inside the zip.
+# 2. Quick start
 
-You need a graphical session. The window uses the desktop's display. Audio uses the session's PipeWire socket. Do not point the launcher at a different runtime directory. The start script leaves that socket alone on purpose.
+1. **Install.** On Ubuntu 26.04, from a source checkout, run `scripts/install.sh` ([3.1](#s3-1)). For a USB stick, use the portable folder ([3.3](#s3-3)).
+2. **Start it** from the desktop menu (**Hamspot Commander**) or with `~/.local/bin/commander`. The window opens on **Tune**. With no station loaded, Commander runs Hamlib's dummy radio (model 1), so the controls work straight away.
+3. **Save a station.** Open **Config** and press **Save**. Choose a folder and a name such as `Home.HSCommander`. Pages such as Keys, Logbook and REC need a saved station, because their files go beside it.
+4. **Add your radio.** On **Config**, press **Add hamlib** for a CAT radio, **Add GQRX** for an SDR through GQRX, or **Add HackRF** for a HackRF. Fill in the window and press **Save** ([chapter 11](#ch11)). Click the row to make it the radio that Tune drives. Wait for its **Status** to stop saying `starting`.
+5. **Listen.** On **Tune**, click a band chip, or type a frequency under the digits and press Enter ([chapter 5](#ch5)). Wire the radio's RX card to your speakers in the **Audio** frame on Config ([11.6](#s11-6)).
+6. **Scan.** On **Channels**, press **LOAD** to open a channel file or **Add** to store the current frequency, then press **SCAN** ([chapter 7](#ch7)).
+7. **Save again** on Config when you have changed things you want to keep. When you close the window with unsaved changes, Commander asks **Save**, **Don't save** or **Cancel**.
 
-A serial radio needs the user in the `dialout` group. A USB device node that Ubuntu assigns to `plugdev` needs that group as well. Membership is on the machine, not inside the portable folder. After a group change, log out and back in before you open the port.
+<!-- screenshot: main-01 — Commander's main window: top bar, page row and the Tune page. -->
+<!-- screenshot: station-03 — A new station with no radios yet. -->
 
-## 1.5 Programs the radio face expects
+---
 
-| Program | Package on Ubuntu | What it is for |
+<a id="ch3"></a>
+
+# 3. Installing
+
+<a id="s3-1"></a>
+
+## 3.1 Installed copy (Ubuntu 26.04)
+
+From a source checkout:
+
+```bash
+scripts/install.sh
+```
+
+The script checks `/etc/os-release` and stops on anything other than Ubuntu 26.04. It uses `sudo` for apt, so run it from a terminal that can authenticate. It then:
+
+- installs the packages in [1.3](#ch1) plus the build tools;
+- builds the release program and the upstream `mbelib` and `dsd-fme`;
+- installs the shipped pipe files ([chapter 13](#ch13)).
+
+| Installed path | What it is |
+| --- | --- |
+| `~/.local/bin/commander` | The program |
+| `~/.local/bin/dsd-fme` | Digital voice decoder |
+| `~/.local/share/hamspot-commander/modems/` | Shipped pipe files (also linked into `~/.local/bin`) |
+| `~/.local/share/applications/hamspotcommander.desktop` | Desktop menu entry |
+| `~/.local/share/icons/hicolor/128x128/apps/hamspot-commander.png` | Icon |
+| `~/.local/share/hamspot-commander/installed.manifest` | What this install added |
+
+You are added to `dialout` or `plugdev` only if you were not already a member. Log out and back in if a group was added. The script does not start Commander.
+
+The command-line tool `commander-rec` ([9.10](#s9-10)) is built with the program as `target/release/commander-rec`. Copy it onto your `PATH` if you want to use it from cron.
+
+## 3.2 Removing an installed copy
+
+```bash
+scripts/uninstall.sh
+```
+
+This removes what the manifest lists under your home directory, and takes you out of a group only if the install added you. Apt packages, your station files and your recordings stay.
+
+<a id="s3-3"></a>
+
+## 3.3 Portable folder and a persistent live USB
+
+The portable build is a folder, `HamSpotCommander`, that keeps its settings inside itself, so it can live on a USB stick. `scripts/portable-install.sh` builds it from a source checkout. Start it with `HamSpotCommander/hamspot-commander.sh`. The script finds its own folder and points the config, data, cache and state directories into it.
+
+To run it from a persistent Ubuntu live USB:
+
+1. Make the stick with **mkusb**, choosing its persistent-live operation. The desktop Startup Disk Creator does not add persistence. Use a stick of 32 GB or more.
+   > **Important.** mkusb erases the drive you pick. Match the device name to `lsblk` before you accept.
+2. Boot the **persistent** menu entry. Check with `findmnt -T /` (an overlay on `/`) and `lsblk -o NAME,LABEL,SIZE,FSTYPE,MOUNTPOINT` (a partition labelled `writable` or `casper-rw`).
+3. Copy the folder into your home directory, for example `~/Applications/HamSpotCommander`. Don't run it from a FAT or NTFS partition, which drops the executable bit. Check with `test -x ~/Applications/HamSpotCommander/bin/commander && echo OK`.
+4. Install the packages: `sudo apt-get install gqrx-sdr libhamlib-utils pipewire-bin helvum`.
+5. Add yourself to the groups with `sudo usermod -aG dialout,plugdev "$USER"`, then log out and back in.
+6. Start it with `~/Applications/HamSpotCommander/hamspot-commander.sh`. Don't set a private `XDG_RUNTIME_DIR` first, or audio will not reach PipeWire.
+
+Reboot into the persistent entry again and check that your station is still there. A plain "Try Ubuntu" boot starts clean and shows neither the folder nor the packages.
+
+| Inside `HamSpotCommander` | Role |
+| --- | --- |
+| `hamspot-commander.sh` | Launcher |
+| `bin/commander` | The program |
+| `bsp/*.json` | Band plans |
+| `config/` | A convenient place for station files |
+| `data/`, `cache/`, `state/` | Window state, GQRX settings and other program data |
+| `hamspotcommander.desktop` | Desktop entry that follows the folder |
+
+---
+
+<a id="ch4"></a>
+
+# 4. The window
+
+<a id="s4-1"></a>
+
+## 4.1 Page row
+
+The top of the window is one row of page tabs. The default order is **Tune**, **Plan**, **Channels**, then any **TG** and **ID** tabs, then **REC**, **Meters**, **Timers**, **Levels**, **Keys**, **Tools** and **Config**.
+
+- A radio that follows a trunked system adds a **TG** tab (its talkgroups) and, once radios have been heard, an **ID** tab. The label is the radio's name plus TG or ID, for example `HackRF TG`.
+- **Rearrange** tabs by dragging one off the row and dropping it on another tab. A small sideways nudge still counts as a click. The order is saved in the station file.
+- **Voice activity.** The Channels tab and each TG tab show a speaker. It is dim when quiet, solid while voice is coming in, and fades over about two seconds of silence. The tab also pulses while voice is up. Set the pulse on the Config page (**Pulse busy tabs**, **Pulse speed**). Turning animation off in the desktop settings stops the pulse.
+- **REC tab icon.** Black means no REC key is lit, dark red means armed, and bright red means a recording is being written. Hover it for the same words.
+
+<!-- screenshot: main-02 — The top bar shows the active radio and its status. -->
+
+## 4.2 Separate windows
+
+- **Tools** can be torn off: on the Tools page, the square at the right end of the tab row opens the tools in their own window. Close that window to put them back.
+- **Meters** has a **Detach** button that opens it in its own window, and **Dock** puts it back.
+
+<!-- screenshot: main-03 — Any page can be torn off into its own window. -->
+
+## 4.3 When the radio does not answer
+
+Look at the **Status** column on the Config page.
+
+| Status | Meaning | What to do |
 | --- | --- | --- |
-| `rigctld` | `libhamlib-utils` | Hamlib radios, including the built-in dummy |
-| `gqrx` | `gqrx-sdr` | A GQRX row on the Config page |
-| `pw-loopback`, `pw-dump` | `pipewire-bin` | The receive and transmit audio cards |
-| `helvum` | `helvum` | The Helvum button on the Audio frame |
-| `dsd-fme` | built from lwvmobile/dsd-fme | Digital voice, including P25, on an RX pipe |
-| `sox`, `socat` | `sox`, `socat` | Resample dsd-fme's 8 kHz voice to the RX pipe's 48 kHz stream |
+| `starting` | Commander has launched the radio program; its port isn't open yet. | Wait a moment. |
+| `device missing` | The serial device named in the row isn't on the machine. | Plug the cable in. No restart is needed. |
+| `choose I/O device` | GQRX is running and waiting for you to pick its input. | Pick the device in GQRX's window. |
+| `retrying` | The radio program exited. Commander starts it again about 2 s later. | Check the cable, model and serial speed. |
 
-PipeWire itself is part of the Ubuntu desktop session. Commander does not start it.
+A frequency the radio refuses doesn't move the readout.
 
-The source-tree installer also installs `rustc`, `cargo`, `pkg-config`, and `libgtk-3-dev` so it can compile the window. It installs `build-essential`, `cmake`, `git`, `libcodec2-dev`, `libncurses-dev`, `libpulse-dev`, `librtlsdr-dev`, `libsndfile1-dev`, and `libusb-1.0-0-dev`, then builds `mbelib` and `dsd-fme` into `~/.local/bin`. It does not install GNU Radio or the Ubuntu `dsdcc` package. The portable zip is already compiled and does not include `dsd-fme`. A live USB does not need the compiler.
-
-## 1.6 Radios
-
-A Hamlib row stores a model number, a device path, a serial speed, a CI-V address, a PTT type, a PTT device, and any extra Hamlib `-C` options. The model list is the list `rigctld -l` prints on that machine. The closed model button shows the model number and the radio name, for example `3073  Icom IC-7300`. The saved value is the number.
-
-An empty device is valid. Model `1` is Hamlib's dummy radio. The first time that dummy answers, the window sets VFO A to 14.153608 MHz USB, VFO B to 146.520 MHz FM, and VFO C to 446.000 MHz FM, then selects VFO A again. A later reconnect of the same dummy does not write those frequencies again.
-
-The dummy receives from 150 kHz through 1.5 GHz. The window will not tune it outside that span.
-
-GQRX is a receiver on this face. Its caps are one VFO, no transmit, no RIT, and no split. The face treats its receive range as 0 Hz through 6 GHz. A new GQRX row has no input device, so GQRX opens its I/O device chooser and Commander leaves that window up.
-
-## 1.7 Where the release file is
-
-The portable zip for this guide is attached to the GitHub release:
-
-https://github.com/hamspot/hamspot-commander/releases/tag/v0.8.5
-
-The file name is `hamspot-commander-0.8.5-portable-linux-x86_64.zip`. Unzipping it produces one folder, `HamSpotCommander`. Chapter 11 is the procedure for a USB stick.
+<!-- screenshot: main-04 — What Commander shows when the radio is not responding. -->
 
 ---
 
-# 2. Getting started
+<a id="ch5"></a>
 
-## 2.1 Two ways to run it
+# 5. Tune
 
-Use the portable folder when the computer is an Ubuntu live USB, or when you want the station files to travel with the program. Chapter 11 is that path.
+<!-- screenshot: tune-01 — The Tune page. -->
 
-Use `scripts/install.sh` from a source checkout when Ubuntu 26.04 is installed on the machine and you want a binary under your home directory. Chapter 12 is that path.
+The Tune page has the frequency frame (digits, VFO keys, the paired VFO), a band row (`ALT`, `BSP`, `LOAD`, band chips, `Mode`, `Sub`, `Receiver`), the optional bandspread, and a control row of radio functions.
 
-Both end at the same window. They put the station files in different places.
+## 5.1 The frequency readout
 
-## 2.2 What you see first
+The readout shows four MHz digits, then kHz and Hz groups: 14.153608 MHz is `0014.153.608`. The left readout is the current VFO, with the S-meter. The right readout, when the radio has one, is the paired VFO (A with B, Main with Sub). Tuning the right digits sets the split frequency.
 
-The window opens on the Tune page. If the station file has no radio list, Commander starts one Hamlib row named Dummy, model 1, with no serial device.
-
-Press `Demo` on the top bar to leave the live radio and use a small radio inside the process. Demo does not start `rigctld`. Press `Demo` again to return to the selected radio.
-
-The in-process demo receives the ten HF segments from 160 m through 10 m, including 60 m from 5.250 MHz to 5.450 MHz. It will not tune 6 m, 2 m, or 70 cm. It starts with VFO A at 14.153608 MHz USB and VFO B at 7.074 MHz LSB, and it transmits on VFO A until you select `TX sub`.
-
-## 2.3 Full screen and a second window
-
-`Full screen` on the top bar switches the window. Press it again to leave full screen.
-
-The desktop file has an action named New Window. That starts another process. Two processes do not share one radio port. They can share the same saved window folder, so the last one to exit writes the band-plan folder remembered for the file dialog.
-
-## 2.4 Favorite
-
-1. Press `Favorite` on the top bar.
-2. Press `Save current` while a radio is online. The window stores the frequency, mode, and passband.
-3. Press `Recall` to send them again, if the radio can set the frequency.
-
-Close the Favorite window with its title-bar control. Nothing is written to disk. The next launch starts with "Nothing saved."
-
-## 2.5 If the radio does not answer
-
-Read the Status column on the Config page before you change frequency.
-
-`starting` means the program has been launched and the port is not open yet.
-
-`device missing` means a Hamlib row names a serial device that is not on the machine. Commander waits. Plug the cable in. It does not need a restart if the device appears.
-
-`choose I/O device` means a GQRX row is up and its remote-control port is not accepting yet. Use the GQRX window to pick a device. Commander does not kill that window on a timer.
-
-`retrying` means a Hamlib process exited. Commander starts it again about two seconds later.
-
-A frequency the radio refuses does not move the readout. The typed number is ignored and the digits stay where the radio is.
-
----
-
-# 3. The window
-
-## 3.1 Top bar
-
-The top bar holds `Demo`, `Favorite`, and `Full screen`.
-
-## 3.2 Pages
-
-The tab row starts as `Tune`, `Plan`, `Channels`, then any TG or ID tabs, then `Meters`, `Timers`, `Levels`, `Keys`, `Tools`, and `Config`. Timers is the station clocks. A TG tab reads like `HackRF TG`. An ID tab reads like `HackRF ID`. Click a tab to open that page. Pull a tab off the row, then drop it on another tab, to move it. A sideways nudge stays a click. The station file stores that order in `tabs` when it is not the built-in order. The wheel over the frequency display is handled by Tune. The band scales sit outside the scroll area so the wheel is not stolen by the list.
-
-## 3.3 Page frame
-
-Every page frame reaches the bottom of the window. There is no status line under the elbows.
-
-## 3.4 Tune, from top to bottom
-
-The Tune page is four bands of controls.
-
-The frequency frame holds the current VFO, a column of VFO buttons, and the paired VFO when the radio has one. Under the digits is a fine scale. The next row is `ALT`, `BSP`, `LOAD`, the band chips for the zone that contains the frequency, then `Mode`, `Sub`, and `Receiver` at the right.
-
-Under that frame is the control row: `ATU`, `Band -`, `Band +`, and the rest of the keys in section 4.8.
-
-`BSP` shows or hides the bandspread. When it is on, one line is drawn for each zone in the loaded plan. A zone the radio cannot receive is left out.
-
----
-
-# 4. Tuning
-
-## 4.1 The digits
-
-The readout always shows four megahertz digits, then a kilohertz group, then a hertz group. 14.153608 MHz is `0014.153.608`. 146.520 MHz is `0146.520.000`. A frequency at or above 10000 MHz prints in full.
-
-The left readout is the current VFO. Its label is the Hamlib token, written with a space: `VFO A`, `Sub`, `Main A`. The S-meter sits on this readout. Hamlib reports one strength, so the other readout has no second S-meter.
-
-The right readout is the paired VFO: VFO A with VFO B, Main with Sub, and the A and B forms of those names. A VFO with no pair in the radio's list has no right readout. The right digits tune the split frequency.
-
-Click a digit to select that place and add one to it. One notch of the mouse wheel on a digit adds or subtracts one of that digit and does not change which digit is selected. A notch anywhere else on that VFO cluster, including the typed frequency, the mode text, the meter, and the gaps, steps the selected digit. One physical notch is one step. The line under the digits reads `step` and the size, such as `100 Hz` or `1 kHz`.
-
-## 4.2 Typed frequency
-
-Click the text under the digits, type a frequency, and press Enter.
-
-Three groups work: `0014.153.608` or `14.153.608`. Two groups are megahertz, so `14.153608` is the same frequency. A whole number is hertz.
-
-The radio must be able to receive that frequency. A number outside the receive ranges is ignored.
-
-## 4.3 The fine scale
-
-The scale marked Fine sits under the two readouts. A drag on it tunes the current VFO inside the window it opened on. It does not jump to another band.
-
-## 4.4 VFO buttons
-
-These sit between the two readouts. A button lights only when the radio reports that it can do the operation.
-
-| Button | Action |
+| Action | Result |
 | --- | --- |
-| `A <> B` | Exchange the VFOs (Hamlib `XCHG`) |
-| `A > B` | Copy A to B (Hamlib `CPY`) |
-| `A > Mem` | Store the current frequency in the window |
-| `Mem > A` | Tune back to that one stored frequency |
-| `TX main` | Split off. Transmit on the current VFO |
-| `TX sub` | Split on. Transmit on VFO B |
-| `VFO A`, `VFO B` | Select that VFO |
-| `R-6kHz`, `R-3kHz`, `R-15kHz` | Set the RIT offset |
-| `R-Auto` | Clear RIT |
+| Click a digit | Select that place and add one to it |
+| Wheel on a digit | Step that digit up or down, one step per notch |
+| Wheel elsewhere on the VFO block | Step the selected digit |
+| Drag the **Fine** scale under the digits | Fine-tune within the current window |
 
-`ALT` on the band row sends the same exchange as `A <> B` when the radio lists `XCHG`.
+The line under the digits shows the step size, such as `step 1 kHz`.
 
-RIT is an offset. It is not a second VFO frequency. The current readout shows `RIT` and the offset in hertz when it is not zero.
+<!-- screenshot: tune-02 — Scroll or click a digit to tune by that step. -->
 
-VFO select on this face is A and B. A dummy radio can hold 70 cm on VFO C from the first park, and this row does not offer a VFO C button.
+## 5.2 Typing a frequency
 
-## 4.5 Mode, sub mode, and the receiver
+Click the text under the digits, type, and press Enter.
 
-`Mode` lists the modes the radio reported. Choosing one sends that mode and keeps the current passband.
-
-`Sub` does the same for the paired VFO, when the radio can set split and it listed modes.
-
-`Receiver` is `RX` or `Off`. It is enabled when the radio can be powered from CAT. Off is not a substitute for disconnecting the cable.
-
-## 4.6 Band chips and Band + / Band -
-
-The chips are the bands in the current zone that intersect the radio's receive ranges. A radio that stops at 30 MHz does not show a chip for a 500 MHz allocation. Click a chip to tune the remembered frequency for that band, or its home frequency if you have not visited it in this session.
-
-`Band +` and `Band -` step to the next band the radio can receive, in frequency order, across every zone. There is no Hamlib band-up command. The window sends a frequency set. A band outside the receive ranges is skipped.
-
-On the dummy, receive starts at 150 kHz, so 2200 m is not a step and 630 m is.
-
-The chips follow the radio frequency. The Plan page does not follow, so its zone tab stays where you left it.
-
-## 4.7 The bandspread
-
-Turn `BSP` on. Each zone in the plan is one horizontal line, highest zone first. Low frequency is on the left. Sub-bands share the line with a small pad between them. A press in the pad or on the zone name does nothing.
-
-Colors on a ham plan are the segment use: CW is amber, digital is blue, voice is green, and mixed is gray. On the shortwave example the line is painted by service name.
-
-Left-click or left-drag a segment to tune the main VFO and set the main mode from that segment. CW segments ask for CW. Digital segments ask for RTTY, or another mode in that family if the radio has no RTTY. Voice and mixed segments ask for USB, unless the band's stored mode is already legal on that segment. A CW band mode does not stick when you click a voice segment.
-
-Right-click or right-drag sets the split frequency and the split mode. It does not move the main VFO. Right-click is ignored when the radio cannot set split, or when the frequency is outside the receive ranges.
-
-`LOAD` on this row opens a JSON file dialog titled "Load band plan". It does not save. Saving a plan is on the Plan page.
-
-## 4.8 The control row
-
-A control is dark when the radio is offline, when Hamlib did not list that function, or when the button has no command in this release.
-
-| Button | Sent when the radio lists it |
+| You type | Meaning |
 | --- | --- |
-| `ATU` | Tuner |
-| `Band -`, `Band +` | A frequency on the next receive band |
-| `NR` | Noise reduction on or off |
-| `Pre 1`, `Pre 2` | Preamp at 10 dB or 20 dB |
-| `Ant 1`, `Ant 2` | Antenna 1 or 2 |
+| `0014.153.608` or `14.153.608` | 14.153608 MHz (three groups) |
+| `14.153608` | 14.153608 MHz (two groups are MHz) |
+| `14153608` | 14153608 Hz (a whole number is Hz) |
+
+A frequency outside the radio's receive ranges is ignored.
+
+<!-- screenshot: tune-03 — Type a frequency directly. -->
+
+## 5.3 VFO keys, mode and receiver
+
+A key lights only when the radio reports it can do that operation.
+
+| Key | Action |
+| --- | --- |
+| `A <> B` (and `ALT`) | Exchange the VFOs |
+| `A > B` | Copy A to B |
+| `A > Mem`, `Mem > A` | Store and recall one frequency held by the window |
+| `TX main`, `TX sub` | Split off or on |
+| `VFO A`, `VFO B` | Select a VFO |
+| `R-6kHz`, `R-3kHz`, `R-15kHz`, `R-Auto` | Set or clear the RIT offset |
+
+`Mode` lists the modes the radio reports and keeps the passband. `Sub` sets the paired VFO's mode when split is possible. `Receiver` (`RX` or `Off`) powers the radio over CAT when it supports that.
+
+<!-- screenshot: tune-04 — VFO, mode and receiver controls. -->
+
+## 5.4 Band chips and the bandspread
+
+- **Band chips** show the bands of the current plan zone that your radio can receive. Click one to go back to where you last were in that band, or to its home frequency.
+- `Band +` and `Band -` step to the next receivable band, skipping bands outside the radio's range.
+- `BSP` shows the **bandspread**: one coloured line per plan zone. On a ham plan, amber is CW, blue is digital, green is voice and grey is mixed.
+  - **Left-click or drag** a segment to tune the main VFO and set a matching mode (CW for CW segments, RTTY or similar for digital, USB for voice unless the band's mode already suits).
+  - **Right-click or drag** to set the split frequency and mode without moving the main VFO.
+- `LOAD` on this row loads a band plan ([chapter 6](#ch6)).
+
+<!-- screenshot: tune-05 — Band chips and the bandspread for the current band. -->
+
+## 5.5 Control row
+
+| Key | Function |
+| --- | --- |
+| `ATU` | Antenna tuner |
+| `NR` | Noise reduction |
+| `Pre 1`, `Pre 2` | Preamp |
+| `Ant 1`, `Ant 2` | Antenna select |
 | `Bk-in` | Semi break-in |
 | `Fast` | Fast AGC |
 | `Proc` | Speech processor |
 | `Lock` | Dial lock |
 | `Notch` | Automatic notch |
-| `MOX` | Push-to-talk |
+| `MOX` | Transmit |
 | `Moni` | Monitor |
 
-These stay dark on every radio in this release: `Dimmer`, `NR sub`, `CW Spot`, `Keyer`, `Nar`, `Ant Rx`, `Chan +`, `Chan -`, `QMR`, `BC`, `PWR`, `QMS`, `Contour`, `Scan`, and `Scan Dn`.
+A key is dark when the radio is offline or doesn't support that function. `Dimmer`, `NR sub`, `CW Spot`, `Keyer`, `Nar`, `Ant Rx`, `Chan +`, `Chan -`, `QMR`, `BC`, `PWR`, `QMS`, `Contour`, `Scan` and `Scan Dn` are always dark in this version.
 
-## 4.9 Transmit and the band plan
+## 5.6 Transmit and the band plan
 
-> Important. `MOX` can key the transmitter. The band-plan check below runs first, and a refusal does not key. A mode the plan allows is sent to the radio.
+> **Important.** `MOX` keys the transmitter.
 
-`MOX` checks the loaded plan before it keys. CW is allowed on every segment use. Voice is refused on a CW segment and on a digital segment. Digital is refused on a CW segment and on a voice segment. Mixed refuses nothing. A mode the plan does not classify is not blocked.
+Before keying, `MOX` checks the loaded band plan: voice is refused on CW and digital segments, digital is refused on CW and voice segments, CW is allowed everywhere, and mixed segments allow anything. A refusal is shown as a note on the page and the transmitter isn't keyed. The plan never stops you from listening.
 
-The check uses the frequency and mode on the current VFO. Receive tuning is still the radio's receive ranges. The plan does not stop you from listening.
+Tuning stays inside the receive ranges the radio reports. A step that would leave the current range stops at its edge.
 
-The refusal is a note on the page. The transmitter is not keyed.
-
-## 4.10 Where tuning stops
-
-The window rejects a negative frequency, and it rejects a frequency that is not a finite number. Tuning stays inside the receive ranges Hamlib printed under `RX ranges #1`. Transmit ranges are not used as the tune limit. An empty receive list closes tuning.
-
-A step that would leave the current receive segment stops at the edge. It does not jump the gap.
+<!-- screenshot: tune-06 — The band plan stops transmit outside your privileges. -->
 
 ---
 
-# 5. Band plans
+<a id="ch6"></a>
 
-## 5.1 The file you start with
+# 6. Plan: band plans
 
-Startup loads `bsp/default.json` from beside the program. In the portable tree that directory is `HamSpotCommander/bsp`. The file is a version-1 JSON plan: zones, and bands inside the zones. Each band has edges, a home frequency, a home mode, and segments tagged `cw`, `digital`, `voice`, or `mixed`.
+A band plan is a JSON file of **zones**, each holding **bands**, each with edges, a home frequency and mode, and segments marked `cw`, `digital`, `voice` or `mixed`.
 
-`bsp/arrl.json` is an example of the ARRL voluntary plan, one zone per named allocation. It is not the file the window loads at startup. `bsp/shortwave.json` is an example listening map (broadcast, aero, marine, time, and the rest). It is not the startup plan, and it does not apply the amateur mode limits from the ham plan.
+| Shipped plan (`bsp/`) | Contents |
+| --- | --- |
+| `default.json` | Amateur bands, loaded at startup |
+| `arrl.json` | ARRL voluntary plan |
+| `shortwave.json` | Listening map: broadcast, aero, marine, time signals |
+| `publicsafety.json` | Public-safety allocations |
+| `indiana-railroads.json`, `indy-business.json` | Local example listening maps |
 
-License class and calling-frequency spots are not segments.
+The station file keeps a copy of its plan, so a station always opens with the plan it was saved with.
 
-## 5.2 Plan page
+## 6.1 The Plan page
 
-The zone row starts with `LOAD`, `Save`, and `ADD`, then the zone names.
+- **LOAD** and **SAVE** open and save plan files. **ADD** adds a zone with one band around the current frequency.
+- **Right-click a zone name** to rename or delete it.
+- **Click a band row** to select it and tune its home frequency.
+- The editor on the right edits the band's Name, Home, Low, High and Mode. Click the dial inside a band to set its home.
 
-`LOAD` opens "Load band plan". `Save` opens "Save band plan". Both dialogs filter for JSON. The dialog starts in the `bsp` folder beside the program unless you have already picked a folder. That folder is remembered with the window.
+Nothing is written to disk until you save. A file that doesn't parse, or has overlapping bands, is refused and the plan already loaded stays; the page shows the error. Bands may touch at an edge.
 
-An empty plan has no standalone Save. `ADD` appends a zone named New, or New 2, and so on, with one band around the current VFO. If the VFO cannot seed a band, the new band is 14.200 MHz USB. The chip text is `new`.
-
-Right-click a zone name to rename it or to delete that zone and its bands. A blank name is ignored. Delete selects the previous zone. Nothing is written to disk until you Save.
-
-The list under the dial is one row per band: slot, home in megahertz, and name. Click a row to select that band and tune its home, inside the receive ranges.
-
-The editor on the right has Name, Home, Low, High, and Mode. It does not edit the individual segments inside the band. A click on the dial inside a band sets that band's home. A click in a gap does not widen the band.
-
-The Plan page lists every band in the file. The Tune page hides bands the radio cannot receive.
-
-## 5.3 A bad file
-
-A plan that does not parse is refused. The plan already in memory stays, and the page shows the error. Saving writes pretty JSON and refuses an invalid plan.
-
-Overlapping bands are an error. Bands that only touch at an edge are valid. The edge belongs to the band that starts there.
+<!-- screenshot: plan-01 — The Plan page. -->
+<!-- screenshot: plan-02 — What a malformed band-plan file looks like. -->
 
 ---
 
-# 6. Channels
+<a id="ch7"></a>
 
-## 6.1 A memory file, not the radio
+# 7. Channels and scanning
 
-The Channels page stores named frequencies on disk. A file is version 1: zones of channels. Each channel has a name, a frequency in hertz, and a mode, and may be marked control or encrypted. A vocoder name selects a digital demodulator for that memory. The page starts with one empty zone named Memories.
+<!-- screenshot: chan-01 — The Channels page and its memory file. -->
 
-This does not read or write the memories in the radio.
+## 7.1 Channel files
 
-## 6.2 Load, save, add, recall
+The Channels page holds named frequencies grouped in zones. It's stored in the station file and can be loaded from or saved to a separate `channels.json` with **LOAD** and **SAVE**.
 
-The buttons are `Load` and `Save`. The dialogs are titled "Load channels" and "Save channels". A new save suggests `channels.json` when no file is open yet.
+- **Click a row** to tune it (mode too, if the radio can set it).
+- The editor has **Name**, **Frequency**, **Mode**, **Vocoder** (the digital decoder for this channel), **Control** (a trunking control channel), **Encrypted**, and **Invert** for DMR, NXDN and dPMR. **Add** stores the current frequency and mode, **Delete** removes the selected channel.
+- The strip above the list draws the band plan across the zone's frequency span, so you can see where each channel sits.
 
-The list shows slot, megahertz, and name. Click a row to recall it. Recall tunes only inside the receive ranges, and it sends the mode when the radio can set mode.
+## 7.2 Scanning
 
-The editor has Name, Frequency, Mode, Vocoder, Control, Encrypted, `Add`, and `Delete`. Invert is shown for DMR, NXDN, and dPMR. `Add` uses the current VFO frequency and mode. `Delete` removes the selected channel.
+- **SCAN** steps through the channels and stops on activity. **DWELL** holds on the current channel.
+- **Double-click a zone** to mark it for scanning. With zones marked, SCAN covers only those (**Selected zones.**); with none marked it covers the zone you have open. Marks are saved; whether SCAN or DWELL is on is not.
+- Encrypted channels are skipped unless a matching key is filled on the Keys page ([8.4](#s8-4)).
 
-A file with unknown fields, a missing channel list, a band-plan document, or a frequency that is not a finite number above zero is refused. The previous memories stay.
-
-## 6.3 The strip above the list
-
-The strip is the loaded band plan, drawn across the span of the channels in the selected zone, padded on each side. It is decoration and a place to look. Loading a channel file does not change the band plan. If the plan has no segment in that window, the built-in ham plan is used for the colors. A window outside both stays unmarked.
-
-Channel zones and band-plan zones are different lists. They are not matched by name.
-
-## 6.4 Control, encryption, and scan
-
-`Control` marks a trunked control channel. The follower uses the control channels in the zone you have open, and it skips one that is also marked encrypted.
-
-`Encrypted` marks a memory the listing calls encrypted. With no filled key on the Keys page, scan skips it and a click does not tune it. The editor still opens. A filled key lets an encrypted grant play. The click still does not tune that memory.
-
-`SCAN` and `DWELL` themselves are not stored. A double-click marks a zone for the limited scan, and those marks are stored. An empty mark list scans the zone you have open.
-
-### Holding a followed call
-
-Once a receiver is on a voice channel, it holds that call. Grants for other talkgroups, housekeeping and other control traffic do not move the radio or change the readout. The readout keeps the talkgroup, source radio ID and alias of the call being decoded. Control-channel lines are still written to the decoder log and the radio ID list. A receiver set to the Control role keeps watching the control channel the whole time.
-
-A terminator, a sync loss or a dead carrier starts the **voice hang**. The readout shows `· HANG` and the audio stays routed. Voice on that channel inside the hang picks the same call back up, which covers butt-keys and push-to-talk gaps. When the hang runs out, the radio goes back to the control channel it left. A channel that syncs but decodes no voice for 6 seconds is let go as well. Encrypted voice with no filled key still leaves at once.
-
-On the Config page, `Trunk voice hang` sets the hang to 500 ms (the default), 1500 ms or 3000 ms. The value is stored as `voice_hang_ms` and is written only when it is not 500. A station file with another value up to 15000 still loads, and its value is shown as an extra choice.
-
-`Emergency/priority override` is on by default (`override_hold_emergency_priority`). While it is on, only an emergency grant (the emergency bit in the grant's service options) or a talkgroup ticked `Priority` on its talkgroup page can take a receiver off a held call. The switch is made in one step, and the decoder log gets a `hamspot: emergency override` or `hamspot: priority override` line. Turn the box off to hold every call until its hang ends.
-
-An emergency overrides even on a talkgroup you are not monitoring, as long as the override box is on. A priority talkgroup is one you have ticked, so it is already one you chose.
-
-The HackRF wideband follow uses the same hold, hang, silence limit and override rules. A voice channel inside the capture window is decoded while every control decoder in the window keeps running, so control traffic is still logged during the call. A voice channel outside the window takes the whole capture for the call, as before, and the hold keeps that capture until the hang or the silence limit ends it.
+<!-- screenshot: chan-02 — The strip shows which channel has voice right now. -->
+<!-- screenshot: chan-03 — Scanning a channel list. -->
 
 ---
 
-## 6.5 Recording (REC)
+<a id="ch8"></a>
 
-REC records HackRF traffic for later playback. It saves the **raw radio data**, never the demodulator's audio, so a better decoder later gives better playback of old recordings.
+# 8. Trunked systems: Talkgroups, Radio IDs and Keys
 
-**What is saved.** For a HackRF talkgroup call or a held channel, Commander saves the channel itself: complex IQ after DC removal, shifted to the call's frequency and averaged down to **32 ksps, 16-bit (cs16)**. That is half of the 500-sample block the live voice path uses, so replay rebuilds the exact 16 kHz stream the live discriminator sees. It costs about 128 KB/s (about 460 MB an hour of traffic). The full 8 Msps capture (about 58 GB an hour) is not saved. Each recording gets a JSON sidecar with the frequency, capture centre, offset, rate, chain, talkgroup, radio, decoder settings and Commander version.
+## 8.1 Following a control channel
 
-**Encrypted traffic is never recorded.** An encrypted talkgroup or channel cannot be marked, and a call whose voice decoder reports a non-clear algorithm is discarded, even with a filled key.
+1. On **Channels**, mark the system's control channels with **Control** (all in one zone).
+2. On the radio's row, choose a trunking pipe (for P25, `modems/commander-demod-p25.rxpipe`) in its Audio row ([11.6](#s11-6)).
+3. On **Config**, tick **Follow** for that radio. The follower then reads the control channel and tunes to voice grants for talkgroups you monitor.
 
-On the REC page, a faint watermark along the frame's bottom bar reads: "Recording radio traffic may be regulated where you are; that is your responsibility. Encrypted traffic is never recorded. Nothing is uploaded." Hover over it to read it at full contrast.
+A HackRF can follow wideband: voice channels inside its capture window are decoded while the control decoders keep running.
 
-The red NOW line carries a translucent red tint on its left, just wide enough for the **NOW** label: strongest at the line and fading quickly to clear toward the past (nothing right of NOW is tinted, and there is no tint when NOW is off screen), so the lanes, recordings, NOW line and label all show through it. It is only paint; clicks, drags and the wheel work there as on the rest of the timeline.
+<!-- screenshot: chan-04 — Following a P25 control channel and holding a call. -->
 
-### Marking
+## 8.2 Holding a call
 
-Right-click a talkgroup row (Talkgroups tab) or a channel row (Channels tab) to mark or unmark it. A marked row shows a red **● REC** at its right end. Marks are saved with the talkgroups and channels in the station file (`"record": true`), so they travel with Load and Save. Left click and double click are unchanged.
+Once a receiver is on a voice channel it **holds** that call: other grants don't move it, and the readout keeps the talkgroup, radio ID and alias of the call.
 
-### The REC key
+When the call ends, the **voice hang** starts: the readout shows `· HANG` and the audio stays up, so a quick re-key picks the call back up. After the hang, the radio returns to the control channel. A channel that syncs but gives no voice for 6 seconds is released. Encrypted voice with no key is released at once.
 
-Each Talkgroups tab and the Channels tab has a REC key above LOAD and SAVE. It follows the rustcars convention:
+| Config setting | Choices | Meaning |
+| --- | --- | --- |
+| **Trunk voice hang** | 500 ms (default), 1500 ms, 3000 ms | How long to wait for a re-key |
+| **Emergency/priority override** | on (default) / off | When on, only an emergency call or a **Priority** talkgroup can take a receiver off a held call |
+
+## 8.3 Talkgroups (TG tab) and Radio IDs (ID tab)
+
+The **TG** tab is the talkgroup directory for one radio, in zones. Each row has a number and a name, and can be marked **Encrypted** or **Priority**. **FOLLOW** turns following on for that radio. **LOAD** and **SAVE** read and write talkgroup files, **Add** and **Delete** edit the list.
+
+The **ID** tab lists the radio IDs heard on that control channel, with what was learned about each (talkgroups, site, emergency or encrypted use). Commander fills it in and stores it in the station file. Select an ID to add a **Description**.
+
+<!-- screenshot: chan-05 — The talkgroup directory learned from the control channel. -->
+<!-- screenshot: chan-06 — Radio IDs seen on the control channel. -->
+
+<a id="s8-4"></a>
+
+## 8.4 Keys
+
+The **Keys** page holds the encryption keys you are entitled to use. They're kept in `Name.HSKeys` beside the station (mode 0600), never in the station file. The page needs a saved station.
+
+- Columns are Key ID, Algorithm, Status and Name. A missing key is flagged under Status.
+- **Add** adds the next free ID as a blank DES key. **Remove** deletes one. **Import** and **Export** read and write a dsd-fme hex CSV. **Generate** fills random key text for a radio you program yourself. **Save** writes the key file.
+- Key IDs the decoder reports are added automatically with blank text.
+- DES, RC4 and AES-256 can be filled. With no filled key, encrypted talkgroups and channels aren't scanned or played.
+
+<!-- screenshot: keys-01 — Station keys are stored outside the station file. -->
+<!-- screenshot: chan-07 — Encrypted calls are marked and not decoded. -->
+
+---
+
+<a id="ch9"></a>
+
+# 9. REC: recording and playback
+
+REC records HackRF talkgroup calls and channel traffic so you can play them back later. It saves the **raw radio signal** of the channel, not the audio, and decodes it again every time you play. A better decoder later gives better playback of old recordings.
+
+- About 128 KB per second of traffic, roughly 460 MB per hour.
+- **Encrypted traffic is never recorded.** Encrypted talkgroups and channels can't be marked, and a call found to be encrypted is discarded.
+- Nothing is uploaded. See [chapter 18](#ch18).
+
+REC needs a saved station. Recordings sit beside it ([chapter 15](#ch15)).
+
+<!-- screenshot: rec-01 — Creating the recordings database on first use. -->
+
+## 9.1 Marking what to record
+
+**Right-click** a talkgroup row (TG tab) or a channel row (Channels) to mark or unmark it. A marked row shows a red **● REC**. Marks are saved with the station.
+
+## 9.2 The REC key
+
+The TG tabs and Channels have a **REC** key above LOAD and SAVE.
 
 | Press | Lamp | Records |
 | --- | --- | --- |
-| Click | red | marked talkgroups / channels only |
-| Shift+click, or double-click | amber | all talkgroup / channel traffic |
-| Click while lit (Shift+click while amber) | dark | off |
-| Ctrl+click | — | reserved, does nothing |
+| Click | red | Marked talkgroups or channels only |
+| Double-click or Shift+click | amber | All traffic |
+| Click again when lit | dark | Off |
 
-The REC key state is saved in the station file and restored on launch; the REC tab icon comes up dark red and a log line says recording resumed. Talkgroup recordings follow the trunk follower: a segment starts on the call, keeps going through re-keys inside the voice hang, and ends after it, with about 250 ms of padding at each end. Channel recordings run while the scanner holds an open (non-control) channel on the selected HackRF radio. Long calls are split every 5 minutes.
+The REC state is saved and comes back on the next start. A talkgroup recording starts with the call, continues through re-keys in the voice hang, and has about 250 ms of padding at each end. A channel recording runs while the scanner holds a voice channel. Long calls are split every 5 minutes.
 
-### The REC tab
+<!-- screenshot: rec-02 — Arming a channel for recording. -->
 
-The tab has a record icon on the left of its name: **black** when no REC key is lit, **dark red** when armed, **bright red** while raw IQ is being written. Hover the icon for the same words. Across the top are source tabs, **HackRF TG** and **HackRF Channels** (always shown, even when empty), plus any other source found in the database.
+## 9.3 The REC tab
 
-Under them: one status line (REC state, TG, Channels, disk meter), the timeline toolbar, then the timeline, which takes all the remaining height down to a one-line hint and disclaimer. With few lanes the rows grow (up to twice their normal height) so the area is filled; with many, a taller window shows more lanes and extra lanes scroll with the wheel over the lane names. Messages (playback status, "No voice decoded", errors) are not shown in the tab; they appear once in the Record / Playback dialog (or the Data dialog for storage jobs). The timeline toolbar starts with **Search** (TG, channel, radio id, notes), followed by the day, zoom, Fit, Live, Play next, a small **Data** button and a small **Details** button that reopens the Record / Playback dialog. After a delete, an Undo button sits in the toolbar for 60 s. **Data** opens one *Data* dialog, shared by both source tabs, with three groups: **Storage** (disk use, Cap GB, overwrite oldest), **Archive** (Archive older than N d, Rescan, Clear cache) and **Drive** (thumb-drive copy, move, re-attach, import). Close it with its ✕ or the Data button; it starts closed each session. Job progress and Cancel show both in the tab and in the dialog.
+From top to bottom: source tabs (**HackRF TG**, **HackRF Channels**, plus any other source found), a status line (REC state, TG, Channels, disk use), the toolbar, and the timeline.
 
-**Timeline.** One lane per talkgroup or channel, one block per recording, like a security camera viewer. The timeline runs the full width; the lane names sit on a shelf over its left side that fades out like a shadow. Long lane names run on past the shelf into their lane, behind the recordings, and fade out by halfway across; clicks and the wheel on that text go to the timeline. The wheel over the lane names scrolls the lanes (a thin scrollbar appears in a strip right of the timeline when they overflow); click a name to highlight its lane. The wheel over the timeline zooms about the pointer, keeping the time under it fixed: each mouse notch changes the span by about 18 %, a touchpad zooms proportionally finer, and one frame never changes it by more than 1.5×. The − / + buttons step 1.5×. The span runs from 0.5 s to 30 days. The faded part of the shelf passes clicks and the wheel through to the timeline. Drag to pan, **Fit** frames the most recent recordings, ◀ Day / Today / Day ▶ to jump, **● Live / Now** to follow the present (the red NOW line; the button shows ● when following, ○ when not). A recording in progress is a red block that grows. EMERG and PRI calls are tagged and outlined; archived blocks say `zst`, offline ones are grey and say `offline`. Waveform thumbnails are drawn once they are generated in the background.
+| Toolbar control | What it does |
+| --- | --- |
+| **Search** | Filter lanes by talkgroup, channel, radio ID or notes |
+| **◀ Day**, **Today**, **Day ▶** | Jump by day |
+| **−**, **+** | Zoom out or in by 1.5× |
+| **Fit** | Frame the most recent recordings |
+| **● Live / Now** / **○ Live / Now** | Follow the present (the red NOW line). ● is on, ○ is off. |
+| **Play next** | Play the following recording |
+| **Data** | Open the Data dialog ([9.6](#s9-6)) |
+| **Details** | Reopen the Record / Playback dialog |
+| **Undo delete** | Shown for 60 s after a delete |
 
-**When a replay is silent.** A digital replay that decodes no voice says so on the status line ("No voice decoded: …", with the decoder's last message), and the block is tagged `no voice`. A real failure, such as a missing audio output or decoder, reads "Playback failed: …". Blocks tagged `OUT OF BAND` were recorded while the channel was more than 3 MHz from the HackRF's centre, outside its usable 6 MHz. The call isn't in those samples, so no decoder can recover it. New recordings wait for the follower's retune instead. To check a file offline: `commander-rec render-wav FILE.cs16 out.wav --decoder ~/.local/share/hamspot-commander/modems/commander-demod-p25.rxpipe`. Chapter 13 covers writing your own pipe files.
+<!-- screenshot: rec-03 — The REC tab, armed and waiting. -->
+<!-- screenshot: rec-07 — Live / Now follows the present moment when on. -->
+<!-- screenshot: rec-08 — Search narrows the lanes. -->
 
-**Record / Playback dialog.** Clicking a block selects it, plays from that point, and opens the *Record / Playback* window (one at a time; it follows the selection and keeps its place for the session; close it with ✕, reopen with **Details**). It has, from the top: a header (lane, time range, duration); Playback (Play/Stop, Star, Protect, Play next, the OUT OF BAND / no voice / EMERGENCY tags and a single status line); Notes and the Export WAV…, Export raw…, Archive/Unarchive and Delete buttons with a one-line disclaimer; then the Metadata label/value grid (only fields the recording has) with a **Copy** button, and a collapsible Decoder parameters list (closed by default). Metadata scrolls on its own, so the controls at the top stay in view in a short window. Clicks and the mouse wheel over the dialog (or the Data dialog) stay in the dialog and never reach the timeline below.
+## 9.4 The timeline
 
-**Decoder parameters.** Each recording saves what the live decoder got from its environment in `decoder_params`, in the JSON sidecar, the database, and any export's `index.json`, so the parameters go with the file to a thumb drive. For P25 that includes `HAMSPOT_P25_X`, the WACN, system ID and NAC word that Phase 2 voice needs. It also saves the WACN, SYS, NAC, RFSS and site from the control channel, the modulation, and the HackRF LNA and VGA gains. Replay passes every saved parameter to the decoder script as an environment variable. Only keys matching `HAMSPOT_[A-Z0-9_]+` are passed, so a recording can't set `PATH`, `LD_PRELOAD` or similar. A new decoder, such as a GNU Radio flowgraph, can save any `HAMSPOT_*` key it reads. The Record / Playback dialog lists them one per row under Decoder parameters. Recordings made before this have none. For those, a P25 replay uses the site word this session has already learned for the same radio, if there is one. The station file holds no system word, so there's nothing else to fall back on. Override or add parameters offline with `commander-rec render-wav FILE.cs16 out.wav --decoder SCRIPT --param HAMSPOT_P25_X=BEE006BD6B5` (repeatable). **Decoder script.** A recording names its decoder only as a portable name such as `modems/commander-demod-p25.rxpipe`, never an absolute path. At replay Commander looks the name up in its own modems folders (the folders in section 13.2) and refuses anything absolute, containing `..`, not a plain `.rxpipe` file, or a symlink that leads outside the folder; the status line then says `decoder script not found: modems/…` and the call plays without voice decoding. Older recordings that stored a full path are shown and used by their `modems/<file>` name. A station pipe field can only name a pipe file (chapter 13), so a recording never stores a command to run. Saved parameters that name a local file (`HAMSPOT_P25_K`, `HAMSPOT_DRM_STDOUT`) or whose value is a path are not taken from a recording; `--param` on the command line still can. Imports from a thumb drive skip any `index.json` entry whose path is absolute, contains `..`, or goes through a symlink. The decoder's UDP voice port is reserved for the whole replay and released when it ends or stops, so a live decoder never takes it.
+One **lane** per talkgroup or channel and one **block** per recording, like a security-camera viewer.
 
-**Playback.** Click a block to play it from the point you clicked; ▶ Play / ■ Stop in the detail row; **Play next** continues with the next recording. Every playback re-runs the raw IQ through the current discriminator (and, for digital modes, through the station's voice script) and plays to the system default audio output. Playback never touches the radios' receive sinks.
+| Mouse | Action |
+| --- | --- |
+| Wheel over the timeline | Zoom about the pointer (about 18% per notch) |
+| Wheel over the lane names | Scroll the lanes |
+| Drag | Pan |
+| Click a lane name | Highlight that lane |
+| Click a block | Play from that point and open the Record / Playback dialog |
 
-**Detail row.** Star, Protect (never removed by overwrite-oldest), Notes, Export WAV (demodulated now; REC does not keep it), Export raw (IQ plus sidecar), Archive / Unarchive, and Delete (raw file, row and cache; **Undo** for 60 seconds).
+The span runs from 0.5 seconds to 30 days. A recording in progress is a red block that grows.
 
-### Storage, cap and retention
+The lane names sit on a shelf over the timeline's left edge that fades out like a shadow. A long name runs on past the shelf into its lane, behind the recordings, and fades out by halfway across. Clicks, drags and the wheel on that faded text go to the timeline. When there are more lanes than fit, a thin scrollbar appears in a narrow strip right of the timeline.
 
-Files live beside the station: `Name.HSREC.sqlite` (the index) and `Name.recordings/<source>/<YYYY-MM-DD>/<HHMMSS>_<lane>_<MHz>.cs16` with a `.json` sidecar. The sidecars are the source of truth: **Rescan** rebuilds missing rows from them and flags rows whose file is gone.
+The red NOW line has a translucent red tint on its left, just wide enough for the **NOW** label. It is strongest at the line and fades to clear toward the past. Nothing right of NOW is tinted, and there is no tint when NOW is off screen. The lanes, recordings, NOW line and label all show through it. It is only paint: clicks, drags and the wheel work there as on the rest of the timeline.
 
-The cap is adjustable (default **20 GB**). Retention is indefinite. The meter warns in words at 80% and 95%. At the cap, recording **stops with a red warning and nothing is deleted**, unless you tick *Overwrite oldest unprotected at cap*. Archived files count at their compressed size; recordings moved to a drive do not count.
+A faint watermark along the frame's bottom bar reads: "Recording radio traffic may be regulated where you are; that is your responsibility. Encrypted traffic is never recorded. Nothing is uploaded." Hover over it to read it at full contrast.
 
-The writer runs at idle CPU and I/O priority, writes 128 KiB sequential chunks without per-chunk fsync, and drops (and counts) samples rather than stall live decoding if the disk falls behind. A recording that was cut off by a crash is repaired from its file on the next start.
+| Block tag | Meaning |
+| --- | --- |
+| `EMERG`, `PRI` | Emergency or priority call |
+| `zst` | Archived (compressed); still plays |
+| `offline` | Moved to a drive that isn't attached |
+| `no voice` | Playback decoded no voice |
+| `OUT OF BAND` | The channel was outside the HackRF's capture when recorded, so the call isn't in the file |
+| `MISSING` | The file is gone; **Rescan** flags these |
 
-Waveforms are a disposable cache in `Name.recordings/.cache/`, keyed by recording and decoder version. **Clear cache** loses nothing.
+<!-- screenshot: rec-04 — A call being recorded live. -->
+<!-- screenshot: rec-05 — The recordings timeline, one lane per channel. -->
+<!-- screenshot: rec-06 — Zoomed in with the mouse wheel. -->
+<!-- screenshot: rec-12 — The channel was outside the HackRF's capture, so the call wasn't recorded. -->
+<!-- screenshot: rec-13 — A recording in which no voice was decoded. -->
 
-### Archive
+## 9.5 The Record / Playback dialog
 
-There is no live compression. **Archive older than N d** (or Archive on one recording) compresses with zstd level 9 in the background: compress to a temp file, decompress and compare sha256, rename, then remove the original. Any failure keeps the original. Archived recordings play directly. Unarchive reverses it.
+Clicking a block opens this dialog. It follows the selection; close it with ✕ and reopen it with **Details**. Clicks and the wheel over it don't reach the timeline.
 
-### Thumb drives
+From the top:
 
-With a drive mounted under `/media` or `/run/media`, open **Data**, pick it under **Drive**, and Copy or Move the selected recording or those older than N days. Files and sidecars go to `HamSpot-REC/` on the drive with an `index.json`. A **move deletes the local copy only after the copy on the drive verifies by sha256**. Moved recordings stay listed as offline and play from the drive when it is attached; **Re-attach** copies them back (verified), and **Import** reads another Commander's `HamSpot-REC/index.json`. The export ends with a sync; then you may remove the drive.
+1. **Header**: lane, time range and length.
+2. **Playback**: **▶ Play** / **■ Stop**, **★ Star**, **🔒 Protect** (never removed by overwrite-oldest), **Play next**, tags, and one status line.
+3. **Notes**, then **Export WAV…** (decoded now), **Export raw…** (raw IQ plus its sidecar), **Archive** / **Unarchive** and **Delete** (undo for 60 s).
+4. **Metadata**: a label/value grid with a **📋 Copy** button.
+5. **Decoder parameters**: the decoder settings saved with the recording, collapsed by default.
 
-### commander-rec (cron)
+Playback re-runs the raw signal through the current demodulator and, for digital modes, through the decoder pipe the recording names. It plays to your default audio output and never touches the radios' own audio. If the decoder can't be found, the status line says `decoder script not found: modems/…` and the call plays without voice decoding.
 
-`commander-rec` is a small command-line tool built with Commander (`target/release/commander-rec`). It shares the REC library and needs no GUI.
+Recordings made before decoder parameters were saved have none. For those, a P25 replay uses the site settings this session has already learned for the same radio, if any.
+
+<!-- screenshot: rec-09 — The Record / Playback dialog. -->
+<!-- screenshot: rec-10 — Decoder settings saved with the recording. -->
+<!-- screenshot: rec-11 — Playing a recording back. -->
+<!-- screenshot: rec-14 — Shown when the decoder script can't be found. -->
+<!-- screenshot: rec-15 — Undo a delete within 60 seconds. -->
+<!-- screenshot: rec-21 — Exporting a recording. -->
+
+<a id="s9-6"></a>
+
+## 9.6 The Data dialog
+
+**Data** on the toolbar opens one dialog with three groups.
+
+| Group | Controls |
+| --- | --- |
+| **Storage** | Disk use, **Cap GB**, **Overwrite oldest unprotected at cap** |
+| **Archive** | **Archive older than** N days, **Rescan**, **Clear cache** |
+| **Drive** | Pick a mounted drive, **Copy selected**, **Copy older than**, **Move selected**, **Move older than**, **Re-attach**, **Import** |
+
+A running job shows a progress bar and **Cancel** in the tab and in the dialog.
+
+<!-- screenshot: rec-16 — Storage cap and overwrite policy. -->
+<!-- screenshot: rec-17 — Archiving older recordings. -->
+<!-- screenshot: rec-18 — Copying recordings to a thumb drive. -->
+<!-- screenshot: rec-19 — Importing another Commander's export. -->
+
+## 9.7 Storage cap
+
+The default cap is 20 GB. The disk meter warns in words at 80% and 95%. At the cap, recording **stops with a red warning and nothing is deleted**, unless you tick **Overwrite oldest unprotected at cap**. Archived files count at their compressed size; recordings moved to a drive don't count.
+
+If the disk falls behind, REC drops samples rather than disturb live listening, and says so. A recording cut short by a crash is repaired on the next start.
+
+<!-- screenshot: rec-20 — Recording stops at the cap and nothing is deleted. -->
+
+## 9.8 Archiving
+
+**Archive older than** N days (or **Archive** on one recording) compresses recordings in the background. The original is removed only after the compressed copy has been checked. Archived recordings play directly. **Unarchive** reverses it. **Clear cache** removes the waveform thumbnails, which are rebuilt as needed; no recording is lost.
+
+## 9.9 Thumb drives
+
+With a drive mounted under `/media` or `/run/media`, open **Data** and pick it under **Drive**.
+
+- **Copy** puts recordings and their sidecars in `HamSpot-REC/` on the drive with an `index.json`.
+- **Move** does the same and deletes the local copy only after the drive copy is verified.
+- Moved recordings stay listed as `offline` and play from the drive when it's attached. **Re-attach** copies them back.
+- **Import** reads another Commander's `HamSpot-REC/index.json`. Entries with unsafe paths are skipped.
+
+Wait for the job to finish before removing the drive; it ends with a sync.
+
+<a id="s9-10"></a>
+
+## 9.10 commander-rec
+
+`commander-rec` does the same storage jobs from a terminal or cron, without the window.
 
 ```
 commander-rec archive   --station PATH [--older-than 7d] [--level 1-19] [--nice] [--dry-run]
@@ -453,455 +571,250 @@ commander-rec list      --station PATH [--source hackrf_tg]
 commander-rec verify    --station PATH [--archived-only]
 commander-rec stats     --station PATH [--cap-gb 20]
 commander-rec export    --station PATH --to DIR [--label NAME] [--move] [--older-than AGE] [--dry-run]
+commander-rec render-wav RAW OUT.wav [--decoder SCRIPT] [--param HAMSPOT_K=V]...
 ```
 
-Ages are `7d`, `2w`, `12h`, `30m`. Exit codes: 0 ok, 1 error, 2 partial or verify failure, 3 another run holds the lock (`Name.HSREC.sqlite.lock`; the REC tab's archive and export take the same lock). Example crontab line:
+Ages are written `7d`, `2w`, `12h` or `30m`. Exit codes: 0 OK, 1 error, 2 partial or verify failure, 3 another job holds the lock. `render-wav` decodes one recording to a WAV file, which is handy for testing pipe files ([13.6](#s13-6)).
+
+Example crontab line:
 
 ```
-15 3 * * * nice -n 19 ionice -c3 commander-rec archive --older-than 7d --station ~/stations/SAFE-T.HSCommander
+15 3 * * * nice -n 19 ionice -c3 commander-rec archive --older-than 7d --station ~/stations/Home.HSCommander
 ```
 
-### Other radios
+## 9.11 Other radios
 
-Hamlib and GQRX radios only give demodulated audio. The database and player already handle such recordings (`source_kind = demod_audio`, labelled "DEMOD AUDIO (not raw)" and played as-is), but recording them is not wired to the REC keys yet.
-
-### REC test plan
-
-Automated: channeliser (tone at offset lands at DC), live tap vs replay (synthetic FM through the live voice mixer, replayed through the shared discriminator), segment split/merge and REC key states, writer pre/post roll, re-key merge, encrypted discard, cap stop and overwrite-oldest skipping protected, crash recovery, DB migrations, range/lane queries, rescan, cache keying/pruning, archive round trip/cancel/corruption, export copy/move/re-attach/import, timeline layout, and `commander-rec` subcommands, dry run and lock contention.
-
-On the air (by hand): a P25 follow with REC red and a marked talkgroup; amber with all traffic; a scanner hold on a marked channel; an encrypted call (nothing kept); HackRF retune mid-call; restart with REC armed; playback after a decoder upgrade; a full cap; a thumb-drive move and re-attach.
-
-
-# 7. Meters and levels
-
-## 7.1 Meters
-
-The Meters page shows the S-meter for the current VFO, then ALC, SWR, and PWR.
-
-S-meter numbers use Hamlib's strength in dB relative to S9. S9 is about 0 dB. Above that the label is `S9` plus the dB. Below that the label steps by about 6 dB per S-unit down to S0.
-
-SWR is the number Hamlib reports. The bar treats 1.0 as empty and 5.0 as full. The alarm `High SWR` lights when that number is 3.0 or higher.
-
-PWR uses `RFPOWER_METER` when the radio has it, otherwise `RFPOWER`. The numeric label is the value times 100, rounded.
-
-ALC, SWR, and PWR read zero or 1.0 when the radio has not reported that level.
-
-`Roofing` is a label when the radio reports a roofing value.
-
-`Busy`, `Mic Eq`, and `PLL unlock` are drawn and stay off. They do not follow the radio in this release.
-
-Meters are not stored in the station file.
-
-## 7.2 Levels
-
-The Levels page is also the set of sliders you are configuring. A slider is live only when the radio lists that level and gives it a range. Otherwise the label ends in a dash and the slider does not move.
-
-| Control | Hamlib level | Notes |
-| --- | --- | --- |
-| AF gain (main) | `AF` | |
-| RF gain (main) | `RF` | |
-| AGC (main) | `AGC` | A drop-down of the names the radio listed |
-| RF power | `RFPOWER` | |
-| AF gain (sub) | none | Fixed. It never sends a command |
-| RF gain (sub) | none | Fixed. It never sends a command |
-| AGC (sub): Auto Fast | none | Dark |
-| Noise reduction | `NR` | The level, not the NR button |
-| IF shift | `IF` | Shown in hertz |
-| Filter width | passband | 50 Hz through 16000 Hz, sent with the mode |
-| Contour: 20 Hz | none | Dark |
-| Mic gain | `MICGAIN` | |
-| VOX delay | `VOXDELAY` | Milliseconds when the range allows it |
-| VOX gain | `VOXGAIN` | |
-
-Levels that the radio lists are written into the station file. PTT is not.
+Hamlib and GQRX radios give only demodulated audio, and REC does not record them yet. Recordings of that kind from elsewhere are labelled "demod audio (rig's own audio, not raw)" and play as they are.
 
 ---
 
-# 8. The station file
+<a id="ch10"></a>
 
-## 8.1 One JSON document
+# 10. Meters, Levels and Timers
 
-The Config page `Load` and `Save` buttons store one version-1 JSON file. The dialog remembers the folder. The label next to the buttons is `No file` until you save or load.
+## 10.1 Meters
 
-The file holds the band plan, the plan's file name, the channel file, the talkgroup directory, the Tune face (frequency, mode, split, RIT, Favorite, the one-slot memory, and the VFO selection the face can store), the settable levels, the radio list, the audio graph, and the rotator list. Unknown fields fail the load and leave the running face unchanged. Key text is not in this file. Section 8.4 is the key file beside it.
+The Meters page shows the S-meter for the current VFO, then ALC, SWR and power.
 
-`Save` does not write the `bsp` directory by itself except as described in the next section, and it does not send CAT until you open a file onto a radio that is already online.
+- The S-meter reads S0 to S9 in about 6 dB steps, then `S9+` dB.
+- SWR reads 1.0 (empty) to 5.0 (full). **High SWR** lights at 3.0 or more.
+- `Busy`, `Mic Eq` and `PLL unlock` are drawn but not yet connected to the radio.
+- **Detach** opens the meters in their own window, and the lock button stops them being rearranged.
 
-## 8.2 Opening a file
+<!-- screenshot: meter-01 — The Meters page. -->
 
-Opening a config replaces the plan, the channels, and the Tune fields in memory. It does not reconnect. If the radio is already online, the window then sends frequency, mode, passband, split, RIT, and the listed levels. A frequency the radio refuses does not block the rest. PTT is not keyed.
+## 10.2 Levels
 
-The plan name in the file must be a single `.json` file name, with no slash and no parent directory. If `bsp/<that name>` is missing beside the program, the embedded plan is written there. An existing file is left alone, even when its bytes differ. If the folder is missing, the face still loads and a note says the plan was not written.
+Sliders for AF gain, RF gain, AGC, RF power, noise reduction, IF shift, filter width (50–16000 Hz), mic gain, VOX delay and VOX gain. A slider works only when the radio lists that level with a range; otherwise its label ends in a dash. Levels are saved in the station file. The sub-receiver AF and RF gain, `AGC (sub)` and `Contour` are not connected yet.
 
-The channel path is cleared on open, so a later Channels `Save` does not overwrite the channel file you had open before.
+<!-- screenshot: meter-02 — Audio levels. -->
 
-## 8.3 What you must save yourself
+## 10.3 Timers
 
-Live meter needles and PTT are not in the file. `SCAN` and `DWELL` being on or off is not stored. The marked scan zones are.
+Station clocks at fixed offsets (no daylight saving time), a 10-minute **ID timer** that warns you to identify, a **countdown** (click +1 min, double-click +5 min, triple-click +10 min), and a **stopwatch** with laps. **Copy time** copies a timestamp.
 
-PipeWire changes are written only when a station file is already open. The Audio frame says "Open a station file to keep PipeWire changes." when none is open. Commander does not restore a wire that another program moved. The live graph is the source of truth, and the open file is updated to match it.
-
-## 8.4 Keys
-
-The Keys tab is immediately left of Tools. Until the station has been saved, the page says so and does not write a key file. The line under the buttons names the key file. A station `City.HSCommander` keeps its keys in `City.HSKeys`, in the same folder. The mode of that file is 0600.
-
-The list columns are Key ID, Algorithm, Status, and Name. A missing key uses the alert color under Status. The key text is only in the editor on the right.
-
-`Add` appends the next free id, from 0001 upward, as DES with blank text. `Remove` deletes the selected row. `Import` reads a dsd-fme hex CSV. The first line is the header and is skipped. `Export` writes that same CSV, mode 0600. Names are not in the CSV. `Generate` replaces the selected key text with random hex for the algorithm in the editor and saves the key file. An empty list starts as one DES key. Generate is for a radio you program yourself. It is not a fill from a system key loader. `Save` writes the editor into the key file. It does not save the station.
-
-A key id the decoder prints, when that id is not already listed, is added with blank text. The row stays until you remove it.
-
-With no filled key, an encrypted talkgroup or channel is not scanned or played. DES, RC4, and AES-256 are the algorithms this page can fill. A filled row of one of those lets an encrypted grant play. The air still picks the algorithm. Hytera, TYT, and DMR privacy flags are not sent.
-
-## 8.5 What stays out of the station JSON
-
-Do not paste key hex into the station file. Do not add a field the program does not already know. A later save from the window rewrites the station and will not invent those fields back. The key file is the only place for key text.
-
-## 8.6 Tools
-
-The Tools tab sits between Keys and Config. On that tab, the right end of the tab row is a square the same height as the other tabs. The mark is a box with an arrow pointing out of it. That square opens the tools in their own window titled Tools. Hovering it says Tear off. Closing that window puts the tools back on the tab. While the window is open, clicking the Tools tab brings that window forward, and the main window stays on the page it was already showing. The screens are NanoVNA, RF Calc, Calc, Smith, Hex, and Logbook. One screen is open at a time. Timers is the page after Meters, not one of these screens.
-
-Logbook is the shack diary. Until the station has been saved, the page says so and does not write a file. A station `City.HSCommander` keeps the log in `City.HSLog`, in the same folder. `Log` stamps the selected radio's frequency, mode, and name onto the next entry and focuses the text. Enter still saves. A row click selects it, a double-click edits it, and a triple-click quotes it into a new entry. Delete asks first. `Undo delete` puts the last deleted entry back.
-
-Calc, RF Calc, Hex, and Smith are the rustcars example screens. Hex opens on a sample font until you press `Open`. That button is on the Hex Viewer row, to the right of the title. RF Calc is bench math for wavelength, antennas, coax, SWR, power, Ohm's law, LC, matching, path loss, and a US band list. It does not key the radio. The Timers page is the station clocks, with fixed offsets and no daylight saving time.
-
-Smith stays a manual calculator. It calculates gamma, SWR, return loss, mismatch loss, normalized impedance, admittance, and Zin from the load you type.
-
-NanoVNA talks to a NanoVNA V2 (the S-A-A-2, USB id `04b4:0008`) over its binary protocol. Other NanoVNA families are not on this screen. The chart fills the NanoVNA screen inside the same elbow frames as the other tools. Sweep controls and the selected marker's gamma, SWR, return loss, mismatch loss, normalized impedance, and admittance are in the left frame. The chart is in the right frame. When that screen is open and the station already names a port, Commander connects to that port once. Close in Setup holds that off until you leave the NanoVNA screen and open it again. The port list is USB serial only. A NanoVNA V2 is marked. Built-in serial ports are not listed. A missing device leaves the chart empty.
-
-Cal is the first tab and stays at the left. The tabs after it are the zones in the station band plan, such as HF, VHF, and UHF. Bands and subbands inside a zone are not listed. Click a zone tab to show the last scan stored for that zone. If that zone has no scan yet, the click measures it. Double-click a zone tab to measure it again. Press Scan to measure the selected zone. While that measurement is running, the zone tab is dark red. Run keeps sweeping that range until Stop. A sweep without open, short, and load for this device and those limits is not a valid scan, and the chart does not keep it. Scan and Run then open the calibration dialog instead of measuring the device under test. The point buttons are 11, 51, 101, 201, 301, 501, and 1023. Scan, Run or Stop, Setup, and M1 through M4 are a column on the left edge of the chart. The view buttons are at the top of the chart frame. The chart views are Smith (the same resistance and reactance circles as the Smith screen; Y adds the admittance grid), Polar, SWR, return loss, R and X, S21 in dB (the Bode magnitude), phase, unwrapped phase, group delay, and TDR. Click the chart to drop the selected marker. M1 through M4 each keep a point. Hover the Smith chart to read the impedance under the pointer. The connection status is the first line of the left frame. The selected marker's gamma, SWR, return loss, mismatch loss, and impedance are in the left frame. Setup also lists delta M1 minus M2, resonance, and the S21 peak (3 dB, 6 dB, and Q). On the TDR view, Setup shows the peak distance, the range limit, and the mean cable loss. Setup is the port, the sweep limits, and the trace options. Open, short, and load are measured from the Cal tab, not again in Setup. Velocity factor and port extension are in Setup. Smooth averages that many points on the trace. Host avg keeps that many sweeps and averages them. Both start at 1, which is off.
-
-Cal lists every zone and the open, short, 50 ohm, cable, and both-loads sweeps stored for it: point count, frequency span, and the first sample. A square reload button on the left of a line repeats that one step for that zone. Rescan all repeats every step for every zone, even when a set is already stored. The dialog closes when the last piece is stored or skipped. The chart button row does not insert a status line. The V2 does not store your calibration. Commander keeps one set per zone tab, from that zone's lowest frequency to its highest. If this device already has an open, a short, and a 50 ohm load for that span, Commander sweeps the stored grid and scans. If it does not, a dialog opens over the chart. The diagram marks the jacks S11 and S21, the same labels as on the device. It draws what is fitted on those jacks: nothing for the open, the short, the 50 ohm load, or a cable from S11 to S21. The open, the short, and the 50 ohm load do not have to be finished on one zone before the next. Each piece is fitted once, and every zone that still needs a calibration is swept before the next piece. Step 1 leaves S11 empty and S21 empty, then Measure open. Step 2 screws the short onto S11 once, then Measure short. Step 3 screws the 50 ohm load onto S11 once, then Measure load. A cable from S11 to S21 is optional: fit it once, Measure cable, or Skip cable. A load on each jack is optional: fit them once, Measure both, or Skip loads. A zone that already has all three pieces is left as it is. Scan beside the chart does not run during these steps. When the three pieces are stored, take them off, connect the antenna or the device, and press Scan on the zone. The set is stored for that zone in the VNA file, not in the station file. A station `City.HSCommander` keeps it at `City.HSVNA`, in the same folder. That file holds the same calibration records and the most recent scan of each zone. The station file keeps the port and the sweep settings. An older station that still has calibration inside it is copied into the VNA file the next time it is opened. The device is not given the coefficients. One piece is kept even before the other two are stored. Cancel drops the step you have not measured yet. Backup writes the sets to a JSON file. Restore loads that file into the VNA file. Clear cal drops the sets for the connected device. Every stored piece is written to the VNA file at once, and again when Commander closes. The file is written to a temporary name and then renamed, so a crash never leaves half a file. When the station is opened again, its calibration comes back from that file without a manual save. The NanoVNA V2 firmware reports the chip's fixed serial number, the same value as SN on the device's About screen. Commander shows it with the leading zeros of each of the three words dropped, so `00000001-0000abcd-12345678` reads `SN 1-abcd-12345678`, and a zero word reads `0`. The device details list it as DEVICE SN in that form and as SN (FULL) with all 24 digits, the same as the About screen. The read is checked when the device connects: Commander clears the serial input and reads the id twice. When the two reads match, that id is used. When they differ, a third read is made, and the id is used if it matches either of the first two. A read that times out counts as one that matches nothing. An id of all zeros or all FF is used only if all three reads give it. Otherwise the id is set to all zeros and the status line says ID unreliable. The status line text then turns red, the ID lamp turns red, and the line adds ID UNRELIABLE: POWER CYCLE VNA, and the Cal pane shows a red note: Device ID unreliable. The NanoVNA may be power cycling: check battery charge and USB hub power, then power cycle the device and reconnect. A NanoVNA on a low battery behind a USB hub that cannot power it tends to restart during the read. Three reads that all time out give the same note. Sets stored under older, unchecked ids are kept and not rewritten. Commander uses a set stored under this connection's id first, and otherwise the newest set for the same zone and frequency range from any id. The calibration badge then says RESTORED, with the date it was saved. It also says OTHER ID when the set was stored under a different, non-zero id, and the note line names both ids. A set whose zone or frequency range does not match the sweep is not applied, and the sweep shows as uncalibrated (or CAL INT when a covering set can be interpolated). If the VNA file cannot be read, it is renamed to `Name.HSVNA.corrupt-<date>` and kept, the note line says so, and the station opens with no calibration instead of overwriting the damaged file.
-
-CSV, s1p, and s2p write the trace you see, including calibration and port extension. The s2p file says S12 and S22 were not measured. PNG is a picture of the current chart. Screen asks the device for its display. Pixel order follows the published Python example and has not been checked on this hardware.
-
-TX power and on-device averaging appear only when the firmware is 1.0.2 or newer and the sweep starts at or above 140 MHz. Below that, the screen says so. Commander does not flash the unit. A white screen after you hold the left button while switching on is the bootloader. Use `bootload_firmware.py` or NanoVNA-QT. Do not use a standard USB DFU tool. If ModemManager takes the port, install `docs/nanovna-v2.rules` by hand and add your user to the `dialout` group. Commander does not install that rule.
-
-### NanoVNA page layout and keys
-
-Layout·1, Layout·2, and Layout·4 split the chart into one, two, or four panes. Up to four traces can be shown. Each trace has its own format, such as S11 return loss, S21 dB, Smith, or S21 group delay, and its own pane. +Trace adds a trace. Pane → moves the active trace to the next pane. Several traces in one Cartesian pane are drawn over each other in the trace colors. Double-click a pane header to fill the chart with it, and double-click again to restore the grid. Max (X on the keyboard) does the same for the active trace's pane: click maximizes or restores it, double-click (Shift+X) maximizes the next pane, and triple-click (Ctrl+X) restores the grid. While a pane is maximized the key reads Restore. Each pane keeps its own scale. The layout is saved in the station file.
-
-A header line sits above each pane: the trace number, the parameter, the format, the scale per division, the reference, AUTO or MAN, memory and math flags, AVG and the count when host averaging is above 1, LIMIT PASS (light green) or LIMIT FAIL (light red) when limit lines are on for that trace, and the calibration badge. Clicking the header opens that trace's menu. When a pane is narrow, the header drops sections from the right instead of overlapping them. Couple on shows the markers on every pane at the same frequency. Couple off shows them only on the active pane.
-
-Marker search: Max, Min, and Next pk move the active marker. TARGET takes a value in the trace unit, and ◀ Tgt or Tgt ▶ move the marker to the next point where the trace crosses it. Track follows the maximum or the minimum on every sweep. Peaks→M puts M1 to M8 on the highest peaks. Filter, on an S21 pane, shows the center frequency, the insertion loss, the 3 dB and 6 dB edges and widths, and Q, and draws the center and the 3 dB and 6 dB edges as labelled vertical lines on the chart. Double-click Filter (Shift+click) for notch analysis instead: the notch frequency, its depth below the pass-band (the higher sweep end), the 3 dB and half-depth widths, and Q, with the notch and its 3 dB edges drawn as lines. Triple-click (Ctrl+click) turns both off. SWR BW, on an S11 pane, shows the lowest SWR and the band where SWR stays under 2:1.
-
-The Graph button beside each stored calibration standard opens that standard in its own window. Click opens the Smith chart (polar for the cable and loads-on-both-jacks steps). Double-click opens return loss (S21 dB). Triple-click opens phase. A light grey ideal trace is drawn behind the measured one, and R marks the point furthest from ideal, with the value in the summary line. Compare draws another stored set over it. Err terms plots directivity, source match, and reflection tracking. A wild source match or tracking curve usually means a standard was fitted wrongly. PNG and CSV save what is shown. Clicking inside the graph places markers as on the live sweep, on the nearest point: click moves M1, double-click or Shift+click adds the next marker (up to M8), and triple-click or Ctrl+click clears them. On Smith and polar views the nearest point to the click is used. A line above the graph reads each marker's frequency and value in the shown format. Markers are not placed on the Err terms view.
-
-Keys with three small dots on the right edge have click modes. Green is click, orange is double-click, and purple is triple-click. The same actions are on the keyboard while no text box has focus. A letter alone is the click, Shift and the letter is the double-click, and Ctrl and the letter is the triple-click. The letters are R Run, L Layout, T Trace, S Store, A Auto, K Limits, M Marker, X Max, and I for the status line. With the mouse, Shift+click on a key with dots is its double-click and Ctrl+click is its triple-click, the same as rustcars mode buttons. This also applies to the calibration badge and the chart. The left and right arrows move the active marker one point. The tooltip on each key lists all three actions and their keys.
-
-### Conventions: keep in step with rustcars
-
-Click modes and their modifiers come from rustcars, the interface library every screen uses: click is the primary action (green), double-click or Shift is the first alternate (orange), and triple-click or Ctrl is the second alternate (purple). The NanoVNA keyboard letters follow the same rule. Before adding a new shortcut or modifier anywhere in Commander, check it against rustcars (its mode buttons and any keys it handles) so the two never give the same key two meanings.
-
-Each calibration set records when it was measured as an ISO 8601 date-time in UTC, such as `2026-10-25T22:40:17Z`. The calibration badge, the Cal list, and the Graph window show it to the minute. A set saved before this was added shows no date.
+<!-- screenshot: timers-01 — Station clocks and timers. -->
 
 ---
 
-# 9. CAT control and GQRX
+<a id="ch11"></a>
 
-## 9.1 The CAT Control frame
+# 11. Config: radios, audio and automation
 
-Config shows a table: Name, Driver, Device, Listen, and Status. Click a row to make it the Tune radio. Other rows stay running. Each of them keeps a light frequency poll about every two seconds. The selected row is the one the Tune page drives.
+<!-- screenshot: cfg-01 — The Config page. -->
 
-Listen is `127.0.0.1` and a port. Ports are chosen from 4532 upward, the first free port.
+## 11.1 Station file
 
-`Add hamlib` opens the Hamlib radio window. `Add GQRX` opens the GQRX window. `Edit` opens the selected row. `Remove` stops that row and the process group Commander started for it. Closing the Commander window stops every process group it started.
+**Load** and **Save** at the top of Config open and save the station file. The label beside them shows the file name, or `No file`.
 
-Under the buttons, USB ports lists `/dev/serial/by-id` when those links exist, otherwise `/dev/ttyUSB*` and `/dev/ttyACM*`. The label `none` means no port was found. The list updates when a device appears or disappears.
+- Opening a station replaces the plan, channels, talkgroups and Tune settings. If the radio is already online, Commander then sends the frequency, mode, split, RIT and levels. It never keys the transmitter or puts an amplifier in Operate.
+- A file with a field Commander doesn't know is refused, and the window carries on unchanged.
+- Key text, VNA calibration, the logbook and recordings are never in the station file; they're beside it.
 
-## 9.2 Add a Hamlib radio
+<!-- screenshot: station-01 — Opening a station file (.HSCommander). -->
+<!-- screenshot: station-02 — Commander asks before discarding unsaved station changes. -->
 
-1. Press `Add hamlib`.
-2. Type a Name.
-3. Pick a model in the list, or type the model number in Model. The list is `rigctld -l` in fixed columns.
-4. Pick a Device from the USB ports, choose `none`, or type a path.
-5. Set Serial speed, CI-V, PTT type, and PTT device to what that radio's Hamlib model expects. Leave a field blank when the model does not use it.
-6. Extra `-C` is passed through as Hamlib configuration. The program does not add `-o`.
-7. Press `Save`.
+## 11.2 CAT Control
 
-The port is assigned when the row starts. The window shows `Listen  127.0.0.1:` and the port, or `assigning` before that.
+A table of radios: **Name**, **Driver**, **Device**, **Listen** and **Status**. **Click a row** to make it the radio Tune drives; the others keep running. **Add hamlib**, **Add GQRX**, **Add HackRF**, **Add audio tap**, **Edit** and **Remove** manage the list. Closing Commander stops everything it started.
 
-A missing device node waits in `device missing`. It is not a failed save.
+Each radio listens on `127.0.0.1`, on the first free port from 4532. The USB ports line lists `/dev/serial/by-id` links, or `/dev/ttyUSB*` and `/dev/ttyACM*`.
 
-## 9.3 Add a GQRX receiver
+Settings on this page include **Follow** (trunk following, [8.1](#ch8)), **Gpredict** (let Gpredict move this radio), **Trunk voice hang**, **Emergency/priority override**, **Pulse busy tabs** and **Pulse speed**.
 
-1. Press `Add GQRX`.
-2. Type a Name. The note under the name says Commander starts this GQRX and stops it on exit.
-3. A new row has no input device. The window says so. GQRX will open its I/O chooser.
-4. Press `Save`.
+<!-- screenshot: cfg-02 — Radios under CAT control. -->
 
-Commander writes a GQRX config for that name and starts `gqrx` on it. Remote control is turned on, bound to 127.0.0.1, and the port is the one in the Listen column. Status stays `choose I/O device` until that port accepts a connection.
+## 11.3 Adding a Hamlib radio
 
-Pick the device in the GQRX chooser and let GQRX finish starting. When the port has been up, a later exit folds the device you chose back into the station row. `crashed` is stored false so the next start does not open GQRX's crash guard.
+1. Press **Add hamlib** and type a **Name**.
+2. Pick a **Model** from the list (Hamlib's `rigctld -l`) or type its number. Model 1 is the dummy radio.
+3. Pick a **Device**, choose `none`, or type a path.
+4. Set **Serial speed**, **CI-V**, **PTT type** and **PTT device** if your model uses them. **Extra -C** passes Hamlib options through.
+5. Press **Save**.
 
-If you remove the row, or close Commander, before the port has ever accepted a connection, the chooser is not copied back. A device GQRX may have written only because the window was closing is not stored.
+<!-- screenshot: cfg-03 — Adding a Hamlib radio. -->
 
-An older station row with no GQRX settings adopts a config file that is already on disk for that name. It does not copy your personal `~/.config/gqrx/default.conf`.
+## 11.4 Adding a GQRX receiver
 
-GQRX rows do not ask for a model, a serial port, CI-V, or PTT.
+1. Press **Add GQRX**, type a **Name** and press **Save**.
+2. Commander writes a GQRX configuration and starts GQRX with remote control on the Listen port. A new row has no input device, so GQRX opens its I/O chooser. Pick your device there.
+3. Status reads `choose I/O device` until GQRX answers. After that, the device you chose is kept with the station.
 
-Do not point a new row at a config whose `crashed` flag is true and whose input device is a radio that is not on the network. That is the GQRX crash guard, and the chooser will not appear until `crashed` is false and the dead device line is gone. A new row from `Add GQRX` already meets that condition.
+GQRX is receive-only here: one VFO, no transmit, RIT or split.
 
-## 9.4 Which radio Tune uses
+<!-- screenshot: cfg-04 — Adding a GQRX receiver. -->
 
-Select the row. The Tune page follows that row after the port is up. Opening a station file does not by itself reconnect. The face settings in the file are sent when that row's session is published.
+## 11.5 Adding a HackRF or an audio tap
 
-Demo leaves the selected radio running and shows the in-process radio instead. Press Demo again to return.
+- **Add HackRF** adds a HackRF, read directly by Commander. Leave the device as **only HackRF** if you have one; otherwise pick its serial. **Refresh** rescans. HackRF rows are receive-only and feed the trunk follower and REC.
+- **Add audio tap** takes a sound-card input (for example a scanner's discriminator output) and runs a decoder pipe on it. It doesn't tune anything.
 
-## 9.5 Amplifiers
+<!-- screenshot: cfg-05 — Adding a HackRF. -->
 
-Config → Automation has an Amplifiers grid under Rotators. Add opens the Amplifier window: name, a model from `ampctld -l` (or Hamlib 4.6.5's list when that fails), device, serial speed and extra `-C` settings. Commander starts one `ampctld` for each row on 127.0.0.1, on the first free port from 4534, and restarts it two seconds after it exits. A row whose serial device is unplugged shows "device missing".
+<a id="s11-6"></a>
 
-Each second the row shows frequency, power state (OFF, ON, STBY, OPER), SWR and forward power when the backend reports them. The line under the keys lists every level the backend reports. Standby, Operate, Off and Reset act on the selected amplifier. Commander sends them only when you click. Opening a station file or restarting a daemon never puts an amplifier in Operate.
+## 11.6 Audio
 
-Under the keys, a live amplifier has a **Freq MHz** field with **Set** (sends `set_freq` once) and a **Follow rig frequency** checkbox. Follow is off by default and saved per amplifier (`follow_rig` in the station file). When it is on, Commander sends the active rig's frequency with `set_freq` after it has stayed put for 0.4 s; it never sends power or level commands. Levels that the backend lists as settable (`set_level ?`) get a **1–10** slider and a **Set** key. Step n sends n ÷ 10 to Hamlib (10 is 1.0); the slider starts at the amplifier's reading × 10, rounded and held to 1–10 (a reading of 0 shows 1). The raw Hamlib value is in the slider's tooltip; an amplifier that lists none says so. The Dummy's levels are all read-only meters. A refused command shows its `RPRT` code in the row's status.
+Each radio gets two PipeWire devices while Commander runs: an RX sink `hamspot_<id>_rx` that the radio plays into and a TX source `hamspot_<id>_tx` that it transmits from. GQRX is started on them. Hamlib radios still get them so you can wire a speaker and a microphone.
 
-Use the Dummy (model 1) to try the screen. Amplifier rows are saved in the station file as `amplifiers`. Each row has a fixed `id` (32 random hex digits) made when the row is created. It never changes, even when you rename the amplifier, and it is not taken from the name. A file without ids gets them on load. If two rows share an id (for example a copied file), the later row gets a new one. Amplifiers are not written to the Gpredict hardware files; Gpredict has no amplifier devices.
+The **Audio** frame shows each radio with a playback and a capture drop-down, and a three-column picture: microphones, the radio, speakers. **Drag a wire** between a device and a radio; it's the same as choosing in the drop-down. **Helvum** opens the Helvum patchbay if it's installed. Wiring is saved with the station once a station file is open.
 
----
+Each row also has an **RX pipe** and a **TX pipe** chooser with a **Pipes…** button ([chapter 13](#ch13)).
 
-# 10. Audio
+<!-- screenshot: cfg-06 — One sound card per radio. -->
 
-## 10.1 One card per radio
+## 11.7 Automation: rotators and amplifiers
 
-Each CAT row gets two PipeWire loopbacks while Commander is running:
+Under **Automation**, **Rotators** and **Amplifiers** each have a grid with **Add**, **Edit** and **Remove**. Each row runs Hamlib's `rotctld` or `ampctld` on `127.0.0.1` (amplifiers from port 4534) and restarts it if it exits.
 
-- Receive is a sink named `hamspot_<id>_rx`. The radio plays into it. The description is the make, the model, the connection id, and `RX`.
-- Transmit is a source named `hamspot_<id>_tx`. The radio captures it. The description ends in `TX`.
+- **Rotator**: name, model, device, serial speed, extra `-C`. A Yaesu G-5500 uses GS-232A (601) or GS-232B (603). Control it from Tools → Rotator ([12.7](#s12-7)).
+- **Amplifier**: name, model from `ampctld -l`, device, serial speed, extra `-C`. The row shows power state (OFF, ON, STBY, OPER), SWR and forward power. **Standby**, **Operate**, **Off** and **Reset** are sent only when you click them. **Freq MHz** with **Set** sends a frequency once; **Follow rig frequency** sends the active radio's frequency after it has settled for 0.4 s. Settable levels get a 1–10 slider.
 
-`<id>` is the connection id in the Audio frame, not the text you typed in Name.
+Use model 1 (Dummy) to try either screen.
 
-GQRX is started with that sink and that source as its Pulse sink and source. Hamlib does not play audio by itself. The loopbacks are still created so you can wire a speaker and a microphone.
+<!-- screenshot: cfg-07 — Configuring an amplifier. -->
+<!-- screenshot: cfg-08 — Configuring a rotator. -->
 
-The defaults are the computer's default playback device and default capture device.
+## 11.8 RF patch bay
 
-## 10.2 The Audio frame
+The patch bay at the bottom of Config is a drawing of how coax runs in your station. It's **visual only** and switches nothing.
 
-The frame is on the Config page under CAT Control. Each row shows the connection id, the make, and the model, then a playback drop-down on the RX line and a capture drop-down on the TX line.
+- Every radio appears automatically; receive-only ones are marked RX ONLY. Add amplifiers, antenna switches, tuners, meters, dummy loads and antennas from the Add row. Drag a box by its title bar; click it to edit.
+- Inputs are on the left of a box and outputs on the right, in the transmit sense. Round jacks are coax; small square ones are PTT/ALC.
+- Drag from jack to jack to add a cable. Impossible connections are refused with the reason shown below. Right-click a cable, or select it and press Delete, to remove it.
+- Below the bay, each path is listed (for example `TX path: IC-9700 → KPA1500 → ATU → Yagi`) with warnings for open outputs, loops and similar mistakes.
+- An amplifier box can be bound to a configured amplifier. It then shows that amplifier's state, gets **Standby** and **Operate** keys (sent only when clicked), and warns when the amplifier's state doesn't suit the patched TX path.
 
-If Helvum is on `PATH`, the Helvum button starts it. The button stays visible and is dark when `helvum` is not an executable on `PATH`. Commander does not quit when you close Helvum.
-
-The line under the drop-downs says: "Drag a wire from a microphone to the radio, or from the radio to a speaker."
-
-The picture is three columns. Microphones and other capture devices are on one side, the radio in the center, and speakers and other playback devices on the other. Drag only between a device and a radio. System devices use the desktop's icons. The radio, the speaker, and the microphone use the drawings shipped with Commander.
-
-A wire you drop is the same change as picking that device in the drop-down.
-
-`Other hamspot devices` lists `hamspot_` nodes that are not the RX or TX card of a current row.
-
-## 10.3 What is kept
-
-With a station file open, devices and wires whose names start with `hamspot_` are written into the file after the graph settles. Commander does not fight a wire you move in Helvum. It records the move.
-
-Deleting a radio card that Commander has already seen turns that row's RX or TX flag off. Commander does not immediately create the card again.
-
-The loopbacks exist only while Commander is running. Helvum does not show `Hamlib Dummy 1 RX` after you quit.
-
-## 10.4 Nodes this program does not create
-
-Do not add null sinks named Radio-Playback, Radio-Mic, Radio-EQ-In, or Radio-EQ-Out. Those are not Commander cards. A real sound card and the `hamspot_<id>_rx` and `hamspot_<id>_tx` nodes are the graph this window uses.
+<!-- screenshot: cfg-09 — The RF patch bay. -->
 
 ---
 
-# 11. A persistent Ubuntu live USB
+<a id="ch12"></a>
 
-## 11.1 What you are installing
+# 12. Tools
 
-The zip is a folder, not an Ubuntu package and not a new squashfs. Unzip it and run `hamspot-commander.sh`. The script finds its own directory, so the folder can move. Config, window state, and the GQRX files Commander writes stay inside that folder.
+The Tools page has seven screens: **NanoVNA**, **RF Calc**, **Calc**, **Smith**, **Hex**, **Logbook** and **Rotator**. One is shown at a time. Tear them off into their own window with the square at the right of the tab row.
 
-The read-only live image does not contain Commander, `gqrx`, or `rigctld`. A normal live boot forgets every file you unzip into the home directory and every package you install. Persistence is the part that keeps them.
+## 12.1 NanoVNA
 
-You do two different writes:
+For a **NanoVNA V2** (V2.2) over USB. When the screen opens and the station names a port, Commander connects once. The port list shows USB serial ports and marks a NanoVNA V2.
 
-1. Put `HamSpotCommander` on a Linux filesystem that the persistent session keeps.
-2. Install `gqrx-sdr`, `libhamlib-utils`, `pipewire-bin`, and `helvum` with apt while that same persistent session is running, and add your user to `dialout` and `plugdev`.
+<!-- screenshot: vna-01 — NanoVNA sweep with markers. -->
+<!-- screenshot: vna-03 — Choosing a NanoVNA. -->
 
-The next boot has to be the persistent boot entry. A plain "Try Ubuntu" entry starts a clean image and will not show the folder or the packages.
+**Zone tabs.** **Cal** is first; the rest are your band-plan zones (HF, VHF, UHF…). Click a zone to show its last scan, or measure it if there is none. Double-click to measure again. **Scan** measures the selected zone, **Run** keeps sweeping until **Stop**. A zone being measured is dark red.
 
-## 11.2 Make the stick
+**Chart.** Views are Smith (Y adds admittance), Polar, SWR, return loss, R and X, S21 dB, phase, unwrapped phase, group delay and TDR. **Layout·1/2/4** splits the chart into panes, **+Trace** adds up to four traces, each with its own format and pane. Double-click a pane header to fill the chart with it. Click the chart to drop the selected marker (M1–M4); hover a Smith chart to read impedance.
 
-Use a USB drive you can erase. Ubuntu 26.04 desktop is several gigabytes, and the persistence area has to hold package installs on top of that. A 32 GB stick is a practical minimum. Larger is more comfortable once GQRX and Hamlib are installed.
+**Markers and search.** Max, Min and Next pk move the active marker; TARGET with ◀ Tgt / Tgt ▶ finds crossings; Track follows the max or min each sweep; Peaks→M places M1–M8 on the highest peaks. **Filter** on an S21 pane shows centre, loss, 3 dB and 6 dB widths and Q (double-click for notch analysis, triple-click turns both off). **SWR BW** on an S11 pane shows the 2:1 bandwidth.
 
-On a working Ubuntu machine, create the stick with mkusb and choose its persistent-live operation. That is the Ubuntu community tool that adds a writable overlay. The desktop Startup Disk Creator writes a live USB and does not add this overlay.
+**Setup.** Port, sweep limits, points (11 to 1023), velocity factor, port extension, **Smooth** and **Host avg** (1 = off). TX power and on-device averaging appear only on firmware 1.0.2 or newer with the sweep at or above 140 MHz.
 
-mkusb will ask you to confirm the target drive. Confirm the device name with `lsblk` before you accept.
+<!-- screenshot: vna-04 — Sweep setup. -->
+<!-- screenshot: vna-06 — Limit lines flag a failing sweep. -->
 
-> Important. mkusb erases the drive you select. A wrong disk is gone. Read the device name in the prompt and match it to `lsblk` before you accept.
+**Keyboard** (when no text box has focus): a letter is the click, Shift+letter the double-click, Ctrl+letter the triple-click. R Run, L Layout, T Trace, S Store, A Auto, K Limits, M Marker, X Max, I status line. Left and right arrows move the active marker one point.
 
-Current mkusb labels the overlay partition `writable`. Older mkusb layouts label it `casper-rw`. Either label is the overlay. mkusb also creates a separate data partition, often named `usbdata`, that you can open from another computer. Use `usbdata` to carry the zip. Do not run the program from that partition when it is NTFS or FAT. The binary needs a Linux filesystem so it stays executable.
+**Export.** CSV, s1p and s2p save the trace as shown (with calibration). PNG saves the chart. **Screen** reads the device's own display.
 
-After mkusb finishes, boot the persistent menu entry, not the plain live entry.
+### Calibration
 
-## 11.3 Confirm the boot is persistent
+Commander keeps one calibration set per zone, in `Name.HSVNA` beside the station. The NanoVNA itself doesn't store it.
 
-Open a terminal on the live session and run:
+1. Press **Scan** on an uncalibrated zone, or open the **Cal** tab. A dialog shows which jacks to fit.
+2. **Open**: nothing on S11 or S21, then **Measure open**.
+3. **Short** on S11, then **Measure short**.
+4. **50 Ω load** on S11, then **Measure load**.
+5. Optionally a cable from S11 to S21 (**Measure cable** or **Skip cable**) and a load on each jack (**Measure both** or **Skip loads**).
 
-```bash
-findmnt -T /
-lsblk -o NAME,LABEL,SIZE,FSTYPE,MOUNTPOINT
-```
+Each piece is fitted once and every zone that needs it is swept before you move on. Then fit your antenna or device and press **Scan**. The **Cal** tab lists what's stored per zone, with a reload button per step and **Rescan all**. **Backup** and **Restore** save and load the sets as JSON; **Clear cal** removes them for the connected device. **Graph** beside a stored standard plots it against the ideal (click Smith, double-click return loss, triple-click phase), and **Err terms** plots the error terms, which helps spot a badly fitted standard.
 
-`findmnt` should show an overlay on `/`. `lsblk` should show a partition labeled `writable` or `casper-rw`. If `/` is only the read-only image, stop. Packages and an unzip into the home directory will disappear at shutdown. Boot the persistent entry, or recreate the stick with mkusb's persistent-live operation.
+The calibration badge reads, for example, RESTORED with its date, OTHER ID if the set came from a different serial, or CAL INT when it's interpolated.
 
-The live user is the one the Ubuntu image logs in as. Commands below use that user's home directory.
+<!-- screenshot: vna-05 — Calibrating the VNA. -->
 
-## 11.4 Copy the zip onto the stick
+### Status line and lamps
 
-From any computer, copy `hamspot-commander-0.8.5-portable-linux-x86_64.zip` onto the `usbdata` partition, or download the release onto the live session after you have confirmed persistence.
+The bar under the chart shows the sweep (start, stop, points, averaging, run mode, calibration) and the device and port. Click it, or a lamp, for full device details; double-click reconnects; triple-click copies the status line.
 
-The release page is chapter 1.7.
+| Lamp | Green | Amber | Red | Grey |
+| --- | --- | --- | --- | --- |
+| LINK | connected | | lost (check USB) | not connected |
+| ID | serial read and checked | | ID unreliable: power cycle the VNA | no ID |
+| CAL | calibration applied | interpolated or correction off | | uncalibrated |
+| SWEEP | sweeping | sweep errors | | held |
 
-## 11.5 Unzip into the home directory
+**ID UNRELIABLE: POWER CYCLE VNA** means the serial number reads didn't agree, usually because the NanoVNA restarted during the read (low battery, or a USB hub that can't power it). Charge it or use a powered port, power cycle it and reconnect.
 
-On the persistent live session:
+<!-- screenshot: vna-02 — VNA status lamps. -->
 
-```bash
-ZIP=/media/$USER/usbdata/hamspot-commander-0.8.5-portable-linux-x86_64.zip
-mkdir -p "$HOME/Applications"
-unzip "$ZIP" -d "$HOME/Applications"
-```
+Commander doesn't flash firmware. If ModemManager grabs the port, install `docs/nanovna-v2.rules` by hand and make sure you're in `dialout`.
 
-Change `ZIP` if you downloaded the archive somewhere else. The archive already contains the folder `HamSpotCommander`, so the tree is:
+## 12.2 Smith
 
-```text
-$HOME/Applications/HamSpotCommander/hamspot-commander.sh
-$HOME/Applications/HamSpotCommander/bin/commander
-$HOME/Applications/HamSpotCommander/bsp/
-$HOME/Applications/HamSpotCommander/config/
-$HOME/Applications/HamSpotCommander/data/
-```
+A manual Smith chart calculator: type a load and read gamma, SWR, return loss, mismatch loss, normalized impedance, admittance and Zin.
 
-`config`, `data`, `cache`, and `state` are created by the launcher if a copy omitted them. Band plans are in `bsp` next to `bin`.
+<!-- screenshot: smith-01 — Smith chart. -->
 
-Check that the binary is executable:
+## 12.3 RF Calc
 
-```bash
-test -x "$HOME/Applications/HamSpotCommander/bin/commander" && echo OK
-```
+Bench maths: wavelength, antennas, coax loss, SWR, power, Ohm's law, LC, matching, path loss and a US band list.
 
-If that does not print OK, the unzip landed on a filesystem that dropped the executable bit. Unzip it again onto `$HOME/Applications`, which is on the overlay.
+<!-- screenshot: rfcalc-01 — RF calculators. -->
 
-## 11.6 Install the packages the folder does not contain
+## 12.4 Calc
 
-Still on the persistent session:
+A general calculator.
 
-```bash
-sudo apt-get update
-sudo apt-get install gqrx-sdr libhamlib-utils pipewire-bin helvum
-```
+<!-- screenshot: calc-01 — The calculator. -->
 
-Confirm the four programs:
+## 12.5 Hex
 
-```bash
-command -v rigctld
-command -v gqrx
-command -v pw-loopback
-command -v helvum
-```
+A hex viewer. Press **Open** on the Hex Viewer row to load a file.
 
-Each line should print a path.
+<!-- screenshot: hex-01 — Hex viewer. -->
 
-These packages land on the overlay. They are still there after a reboot only when you boot the persistent entry again. They are not copied into the read-only squashfs by this procedure, and they are not inside the zip.
+## 12.6 Logbook
 
-## 11.7 Device permissions
+A station diary in `Name.HSLog` beside the station (it needs a saved station). **Log** stamps the selected radio's frequency, mode and name on a new entry; Enter saves it. Click a row to select, double-click to edit, triple-click to quote it into a new entry. Delete asks first, and **Undo delete** brings back the last one.
 
-A live user is not always in `dialout` and `plugdev`. Without `dialout`, a serial radio port will not open. Without `plugdev`, some USB device nodes will not open.
+<!-- screenshot: log-01 — The station logbook. -->
 
-```bash
-sudo usermod -aG dialout,plugdev "$USER"
-```
+<a id="s12-7"></a>
 
-Log out and back in, or reboot and choose the persistent entry again. Group membership is read at login. Check it:
+## 12.7 Rotator
 
-```bash
-id
-```
+Shows each configured rotator ([11.7](#ch11)) with an azimuth indicator and horizon, presets (**PRESET AZ / EL**), manual moves (LEFT/RIGHT, UP/DOWN), speed, **STOP ALL** and rate tracking. Limits come from Hamlib or the model preset, and overlap past 360° is shown.
 
-The line should include `dialout` and `plugdev`.
-
-Ubuntu's default rules already cover `/dev/ttyUSB*`, `/dev/ttyACM*`, and `/dev/serial/by-id` for members of `dialout`. You do not add a separate udev file for this program.
-
-## 11.8 Start Commander
-
-```bash
-"$HOME/Applications/HamSpotCommander/hamspot-commander.sh"
-```
-
-The script sets the config, data, cache, and state directories to folders inside `HamSpotCommander`, then runs `bin/commander`. Station files you save from the Config page default to that config directory if you navigate there. GQRX files Commander writes for a portable launch go under `HamSpotCommander/config`, because that directory is the config home.
-
-The desktop file in the folder is named Hamspot Commander. Its launch line uses the desktop file's own location, so it still works after you move the folder. If the file manager will not start a desktop file, use the shell command above. That command is the one this guide relies on.
-
-PipeWire stays on the session socket. Do not export a private runtime directory before you start the script.
-
-## 11.9 Reboot and see that it stuck
-
-1. Shut down.
-2. Boot the same stick and choose the persistent entry again.
-3. Run `findmnt -T /` and confirm the overlay.
-4. Run the start command in section 11.8.
-5. Open Config and confirm the radio rows you saved are the rows in the station file.
-
-A station file you saved inside `HamSpotCommander/config` is part of the folder. Copy the whole `HamSpotCommander` folder if you want that station on another machine. The zip from the release page is a fresh tree and does not contain your station.
-
-If you boot the non-persistent entry, the home directory is empty again and apt will not list the packages you installed. The zip you left on `usbdata` is still there, because that partition is not the overlay. You would have to install the packages again.
-
-## 11.10 What this chapter does not do
-
-It does not rebuild the Ubuntu squashfs. The live image stays the image you downloaded. Persistence holds your changes beside it. That is the layout the portable folder was built for: no home directory is baked into the launcher.
-
-Rebuilding the ISO so that Commander and the four packages are inside the read-only image is a separate remaster. This release does not ship that ISO. If you later remaster, keep the `HamSpotCommander` folder as a normal directory and leave its config path relative. Do not replace `hamspot-commander.sh` with a script that points at `/home/user`.
+<!-- screenshot: rot-01 — Rotator control. -->
 
 ---
 
-# 12. An installed copy
-
-## 12.1 When to use the installer
-
-Use this chapter when Ubuntu 26.04 is installed on the computer, you have a source checkout, and you want `commander` on your account. The installer refuses any other distribution. It reads `/etc/os-release` and stops if the id is not `ubuntu` or the version is not `26.04`.
-
-The portable zip in chapter 11 does not use this script.
-
-## 12.2 Install
-
-From the source tree:
-
-```bash
-scripts/install.sh
-```
-
-The script asks for sudo without a password prompt. On a machine where sudo requires a password in the terminal, run it from a terminal that can authenticate, or arrange passwordless sudo for the duration of the install. If sudo cannot run, the script stops before it changes packages.
-
-It installs the packages in section 1.5, including the compiler, then builds the release binary and `dsd-fme`. It copies:
-
-| Installed path | What it is |
-| --- | --- |
-| `~/.local/bin/commander` | The window |
-| `~/.local/bin/dsd-fme` | The digital voice decoder |
-| `~/.local/share/applications/hamspotcommander.desktop` | The desktop entry |
-| `~/.local/share/icons/hicolor/128x128/apps/hamspot-commander.png` | The icon |
-| `~/.local/share/hamspot-commander/installed.manifest` | What this install added |
-
-The desktop name is Hamspot Commander. The executable line points at `~/.local/bin/commander`.
-
-You are added to `dialout` or `plugdev` only if you are not already a member. The manifest records `added_dialout=yes` or `added_plugdev=yes` only in that case. Log out and back in if a group was added.
-
-The script does not start Commander or GQRX.
-
-## 12.3 Remove
-
-```bash
-scripts/uninstall.sh
-```
-
-Removal deletes the binary, the desktop file, and the icon recorded in the manifest, when those paths are under your home directory. It also deletes the `dsd-fme` and `mbelib` files listed in the manifest. It removes you from `dialout` or `plugdev` only if the manifest says this install added you. It does not remove apt packages. GQRX, Hamlib, PipeWire, and the compiler stay installed. The decoder source cache under `~/.cache/hamspot-commander` stays as well.
-
-A second install leaves `added_dialout` and `added_plugdev` as they were, so a later uninstall does not drop a group you already belonged to.
-
-Station files you saved, and anything under `HamSpotCommander`, are not part of the manifest. Uninstall does not delete them.
-
----
+<a id="ch13"></a>
 
 # 13. Pipe files
+
+<a id="s13-1"></a>
 
 ## 13.1 What a pipe file is
 
@@ -909,7 +822,9 @@ An RX pipe sits between a radio's audio and the speaker. A TX pipe sits between 
 
 A station file names a pipe only as `modems/<name>`, for example `modems/commander-demod-p25.rxpipe`. It never holds an absolute path, a shell command, arguments or anything else Commander would have to pass to a shell. Commander looks the name up in its own folders and runs the file it finds there, with nothing added except the arguments and environment described below. A station file or recording that someone hands you therefore can't make Commander run an arbitrary program. If you need a custom command, put it in a pipe file yourself. Creating that file is the explicit step that allows it to run.
 
-The same rule covers REC decoders (section 6.5) and the HackRF trunk decoder. Fixed tools that Commander runs itself, such as `pw-cat`, `rigctld`, `hackrf_transfer` and `gqrx`, aren't pipes.
+The same rule covers REC decoders ([chapter 9](#ch9)) and the HackRF trunk decoder. Fixed tools that Commander runs itself, such as `pw-cat`, `rigctld`, `hackrf_transfer` and `gqrx`, aren't pipes.
+
+<a id="s13-2"></a>
 
 ## 13.2 Where pipe files live
 
@@ -936,7 +851,11 @@ Files written by the Pipe editor are mode `0750`, and so is the `modems.d` folde
 
 If a check fails, the pipe doesn't start and the radio's Audio row shows the reason, for example `rx pipe disabled: … refused: file or folder is group/world-writable`.
 
-**Older station files.** On load, a pipe field that holds an absolute path is shown as `modems/<file name>` when that file exists in the pipe folders. The station file on disk is updated only the next time you save the station. A field that holds a shell command, or a path to a file outside the pipe folders, is never run. Its radio shows `rx pipe disabled: custom command not allowed; create a pipe file in modems/ — see docs (Pipe files)` (or `tx pipe …`), the same text is written to the log, and the Audio row marks the field "not runnable". Open **Pipes…** on that row to wrap the command (section 13.5).
+**Older station files.** On load, a pipe field that holds an absolute path is shown as `modems/<file name>` when that file exists in the pipe folders. The station file on disk is updated only the next time you save the station. A field that holds a shell command, or a path to a file outside the pipe folders, is never run. Its radio shows `rx pipe disabled: custom command not allowed; create a pipe file in modems/ — see docs (Pipe files)` (or `tx pipe …`), the same text is written to the log, and the Audio row marks the field "not runnable". Open **Pipes…** on that row to wrap the command ([13.5](#s13-5)).
+
+<!-- screenshot: pipe-05 — Custom commands no longer run directly. -->
+
+<a id="s13-3"></a>
 
 ## 13.3 The RX pipe contract
 
@@ -964,6 +883,8 @@ Commander starts an RX pipe as `<pipe file> <port>`, in its own process group, a
 
 **REC and decoder settings.** A recording stores the settings the live decoder got (P25 site word and IDs, modulation, HackRF gains) as `decoder_params`. Replay runs the same pipe file on the recorded IQ and feeds it the same 48 kHz discriminator stream as live. It passes each saved `HAMSPOT_*` key back as an environment variable. Keys outside `HAMSPOT_[A-Z0-9_]+`, and values that look like a path, aren't passed. A pipe must therefore be deterministic and work offline. It must not tune the radio, depend on the time of day or the live control channel, or expect a sound card. Replay may also run it faster than real time.
 
+<a id="s13-4"></a>
+
 ## 13.4 The TX pipe contract
 
 Commander starts a TX pipe as `<pipe file> <port>`:
@@ -975,7 +896,14 @@ Commander starts a TX pipe as `<pipe file> <port>`:
 
 A TX pipe never keys the radio. PTT is handled by Commander and the radio as before, and the pipe runs whenever the microphone link is up. As with RX, an exit is restarted after 2 seconds.
 
+<a id="s13-5"></a>
+
 ## 13.5 The Pipe editor
+
+<!-- screenshot: pipe-01 — Choosing an RX/TX pipe. -->
+<!-- screenshot: pipe-02 — Editing a pipe. -->
+<!-- screenshot: pipe-03 — Creating a new pipe. -->
+<!-- screenshot: pipe-04 — Duplicate a built-in pipe to customise it. -->
 
 Open it with **Pipes…** next to the RX pipe or TX pipe chooser in a radio's Audio row.
 
@@ -988,13 +916,17 @@ Open it with **Pipes…** next to the RX pipe or TX pipe chooser in a radio's Au
 
 **Wrapping a custom command.** When you open **Pipes…** on a field that holds a refused command, the editor drafts `custom-<program>.rxpipe` (or `.txpipe`). The draft has a `#!/bin/sh` line, a "generated by Hamspot Commander on <date>" note and the old command, unchanged. The confirmation shows the whole file. After **Confirm**, the file is saved in `modems.d` with mode 0750, the radio's field is set to `modems/custom-<program>.rxpipe`, and the station is saved. Commander never creates a wrapper without that confirmation.
 
+<!-- screenshot: pipe-06 — Wrap an old command into a pipe file. -->
+
+<a id="s13-6"></a>
+
 ## 13.6 Examples
 
 Every example below passes `sh -n` and `shellcheck`. Save each one with the Pipe editor, or by hand in `~/.local/share/hamspot-commander/modems.d` followed by `chmod 0750`. You can test any RX example without a radio against a copy of a recording:
 
 ```
-cp ~/.config/hamspot-commander/<Station>.recordings/<radio>/<day>/<call>.cs16  /tmp/t.cs16
-cp ~/.config/hamspot-commander/<Station>.recordings/<radio>/<day>/<call>.json  /tmp/t.json
+cp <station folder>/<Station>.recordings/<radio>/<day>/<call>.cs16  /tmp/t.cs16
+cp <station folder>/<Station>.recordings/<radio>/<day>/<call>.json  /tmp/t.json
 commander-rec render-wav /tmp/t.cs16 /tmp/t.wav --decoder ~/.local/share/hamspot-commander/modems.d/my-nbfm.rxpipe
 ```
 
@@ -1076,7 +1008,7 @@ exec sox -q -t raw -r 48000 -e signed -b 16 -c 1 - \
 
 Test it without a radio with `head -c 96000 /dev/urandom | ./my-voice-clip.txpipe | wc -c`. It should print 96000.
 
-**6. A GNU Radio flowgraph.** This is the planned direction for demodulator development (issue #145). The pipe file starts a Python flowgraph that sits beside it, so nothing outside the pipe folder is named:
+**6. A GNU Radio flowgraph.** The pipe file starts a Python flowgraph that sits beside it, so nothing outside the pipe folder is named:
 
 ```sh
 #!/bin/sh
@@ -1110,11 +1042,13 @@ if __name__ == "__main__":
 
 Save the `.py` file in `modems.d` next to the pipe file. The Pipe editor lists only `.rxpipe` and `.txpipe` files, so create the `.py` file in a text editor. The pipe-file checks apply to the pipe file. Keep the `.py` file `chmod go-w` as well. Python on this system follows the usual byte order (little-endian), so `sizeof_short` matches s16le.
 
+<a id="s13-7"></a>
+
 ## 13.7 Troubleshooting
 
 | What you see | Likely cause | Fix |
 |---|---|---|
-| `rx pipe disabled: custom command not allowed …` | The station field holds a command or a path outside the pipe folders. | Open **Pipes…** and wrap it (section 13.5). |
+| `rx pipe disabled: custom command not allowed …` | The station field holds a command or a path outside the pipe folders. | Open **Pipes…** and wrap it ([13.5](#s13-5)). |
 | `pipe file not found: modems/…` | The file was renamed or deleted, or is installed on another machine. | Pick another file, or copy the file into `modems.d`. |
 | `… refused: file or folder is group/world-writable` | A permissive umask or a copy from a thumb drive. | Run `chmod go-w <file>` and `chmod go-w <folder>`. |
 | `… refused: not executable` | The file was copied without its mode. | Run `chmod 0750 <file>`. |
@@ -1125,89 +1059,172 @@ Save the `.py` file in `modems.d` next to the pipe file. The Pipe editor lists o
 | Chipmunk or slow audio | The sample rate is wrong (8 or 16 kHz written as if it were 48 kHz). | Resample to 48000 before stdout. |
 | Replay plays, live doesn't (or the other way round) | The pipe depends on something only one side has. | Use only stdin, `$1` and `HAMSPOT_*`. |
 
-# 14. Appendix
+---
 
-## 14.1 Portable folder
+<a id="ch14"></a>
 
-| Path inside `HamSpotCommander` | Role |
+# 14. How-to recipes
+
+## 14.1 Tune to a frequency and listen
+
+1. Make sure the right radio row is selected on Config and its Status is up.
+2. On Tune, type the frequency under the digits and press Enter, or click a band chip.
+3. Pick a mode from **Mode**.
+4. On Config → Audio, wire the radio's RX card to your speakers.
+
+## 14.2 Scan a list of channels
+
+1. On Channels, **LOAD** a channel file, or tune each frequency and press **Add**.
+2. Double-click the zones you want to scan (or open one zone).
+3. Press **SCAN**. Press **DWELL** to stay on a busy channel.
+
+## 14.3 Follow a talkgroup
+
+1. Store the system's control channels in one Channels zone and tick **Control** on each.
+2. Set the radio's RX pipe to the right trunking pipe, for example `modems/commander-demod-p25.rxpipe`.
+3. Tick **Follow** on Config, or press **FOLLOW** on the radio's TG tab.
+4. On the TG tab, add or edit talkgroups, and tick **Priority** on any that should interrupt a held call.
+
+## 14.4 Record and replay a call
+
+1. Right-click the talkgroup (TG tab) or channel (Channels) to mark it: **● REC**.
+2. Click the **REC** key (red). Double-click for all traffic (amber).
+3. Open the **REC** tab. Calls appear as blocks; a red block is still recording.
+4. Click a block to play it and open Record / Playback. Add notes, **★ Star** or **🔒 Protect** it, or **Export WAV…**.
+
+## 14.5 Calibrate and sweep an antenna with a NanoVNA
+
+1. Plug in the NanoVNA V2, open Tools → NanoVNA and pick its port in Setup.
+2. Click the zone you want (for example HF). Follow the calibration dialog: open, short, load ([12.1](#ch12)).
+3. Connect the antenna to S11 and press **Scan**.
+4. Choose the SWR or Smith view, and press **SWR BW** for the 2:1 bandwidth, or **Max**/**Min** to place markers.
+5. Save the sweep with **CSV** or **s1p**, or **PNG** for a picture.
+
+## 14.6 Back up or move recordings to a thumb drive
+
+1. Plug the drive in and let the desktop mount it.
+2. On REC, open **Data** and pick the drive under **Drive**.
+3. **Copy older than** N days for a backup, or **Move older than** N days to free space.
+4. Wait for the job to finish, then eject the drive.
+
+Moved recordings stay on the timeline as `offline`. Attach the drive to play them, or **Re-attach** to copy them back. From cron, use `commander-rec export --to DIR` ([9.10](#s9-10)).
+
+## 14.7 Write your own pipe file
+
+1. On Config → Audio, press **Pipes…** on the radio's RX pipe.
+2. Press **New pipe…**, rename it (for example `my-nbfm.rxpipe`) and edit the text.
+3. Press **Save…** and **Confirm**, then **Use for this radio**.
+4. Test it offline with `commander-rec render-wav` on a recording.
+
+[Chapter 13](#ch13) has the full rules and worked examples.
+
+---
+
+<a id="ch15"></a>
+
+# 15. Files and folders
+
+## 15.1 Station files
+
+Everything a station produces sits in the same folder as its station file, named after it:
+
+| File | Contents |
 | --- | --- |
-| `hamspot-commander.sh` | Sets the four data directories, then execs the binary |
-| `hamspotcommander.desktop` | Desktop entry that follows the folder |
-| `hamspot-commander.png` | Icon used by the relocatable desktop file |
-| `bin/commander` | The window |
-| `bsp/*.json` | Band plans. Startup uses `default.json` |
-| `config/` | Station files and GQRX INI for a portable launch |
-| `data/` | Window state |
-| `cache/`, `state/` | The other two relocated directories |
-| `share/applications/` | A second desktop file, for the app id search path |
-| `share/icons/hicolor/128x128/apps/` | The same icon on that search path |
+| `Name.HSCommander` | The station: plan, channels, talkgroups, radios, audio wiring, levels, layout, patch bay. JSON. |
+| `Name.HSKeys` | Encryption keys (mode 0600) |
+| `Name.HSVNA` | NanoVNA calibration and last scan per zone. A damaged file is kept as `Name.HSVNA.corrupt-<date>`. |
+| `Name.HSLog` | Logbook |
+| `Name.HSREC.sqlite` | Recording index |
+| `Name.recordings/<source>/<YYYY-MM-DD>/` | Recordings (`.cs16` or archived `.zst`) with a `.json` sidecar each |
+| `Name.recordings/.cache/` | Waveform thumbnails; safe to delete |
 
-The installed copy in chapter 12 does not use this layout. Its binary is `~/.local/bin/commander`, and its window state defaults to `~/.local/share/hamspotcommander`.
+The sidecars are the source of truth for recordings: **Rescan** rebuilds the index from them.
 
-## 14.2 Station file, short form
+## 15.2 Program files
 
-Version must be 1. A file with a field this release does not know is rejected.
-
-Radios and the GQRX object may be absent. An older file still loads. An empty radio list starts the Dummy row.
-
-The plan is stored in the file, and `bsp_name` says which file name under `bsp/` to write only when that file is not already there.
-
-Talkgroups are inside the station file. Key text is not. The matching `HSKeys` file sits beside the station. `tabs`, when present, is the page-tab order. Each entry is a page name such as `Tune` or `Talkgroups:3`. `nanovna`, when present, is the NanoVNA V2 port and sweep. Omit it unless you set one of those. Calibration and zone scans are not in the station file. They are in the matching `HSVNA` file beside it. `docs/AGENT-HSCommander.md` is the field map for building a new station from a listing.
-
-## 14.3 Frequency entry
-
-| You type | Meaning |
+| Path (installed copy) | Contents |
 | --- | --- |
-| `0014.153.608` | 14153608 Hz |
-| `14.153608` | 14.153608 MHz |
-| `14153608` | 14153608 Hz |
+| `~/.local/bin/commander` | The program |
+| `~/.local/share/hamspot-commander/modems/` | Shipped pipe files (read-only) |
+| `~/.local/share/hamspot-commander/modems.d/` | Your own pipe files |
+| `bsp/` beside the program | Band plans |
+| `~/.local/share/hamspot-commander/gqrx/<name>.conf` | GQRX settings Commander writes for each GQRX row |
 
-Press Enter in the text under the digits. The wheel and the digit clicks do not use this parser.
+The portable folder keeps all of these inside `HamSpotCommander` ([3.3](#s3-3)).
 
-## 14.4 Dark controls
+## 15.3 Thumb drive
 
-Dark on every radio, on the Tune control row: `Dimmer`, `NR sub`, `CW Spot`, `Keyer`, `Nar`, `Ant Rx`, `Chan +`, `Chan -`, `QMR`, `BC`, `PWR`, `QMS`, `Contour`, `Scan`, `Scan Dn`.
+| Path on the drive | Contents |
+| --- | --- |
+| `HamSpot-REC/` | Exported recordings and sidecars |
+| `HamSpot-REC/index.json` | What was exported, read by **Import** and **Re-attach** |
 
-Dark on the Levels page: `AF gain (sub)`, `RF gain (sub)`, `AGC (sub): Auto Fast`, and `Contour: 20 Hz`.
+---
 
-Drawn on Meters and not wired to the radio: `Busy`, `Mic Eq`, and `PLL unlock`. `High SWR` does follow the SWR number.
+<a id="ch16"></a>
 
-Any other control is dark when this radio's Hamlib dump does not list it. That is expected. The dummy lists more operations than a typical GQRX row, and GQRX lists no PTT.
+# 16. Troubleshooting
 
-## 14.5 Process boundaries
+| What you see | Likely cause | What to do |
+| --- | --- | --- |
+| Status `device missing` | Cable unplugged or wrong device path | Plug it in or fix **Device**; no restart needed |
+| Status `retrying` over and over | Wrong model, speed or CI-V address | Edit the row; check with `rigctld -m <model> -r <device>` |
+| Serial port won't open | Not in `dialout` | `sudo usermod -aG dialout "$USER"`, log out and in |
+| GQRX stuck on `choose I/O device` | GQRX is waiting for its input | Pick the device in GQRX's window |
+| A button is dark | The radio doesn't report that function, or it isn't wired in this version | Expected; see [5.5](#ch5) |
+| `MOX` doesn't key | The band plan refused the mode on that segment | Read the note on Tune; change mode or frequency |
+| No audio | RX card not wired to a speaker | Wire it in Config → Audio |
+| `rx pipe disabled: custom command not allowed …` | The station names a command, not a pipe file | **Pipes…** → wrap it ([13.5](#s13-5)) |
+| `rx pipe restarting (…)` every 2 s | The pipe exits at once | See [13.7](#s13-7) |
+| Encrypted calls are skipped | No filled key | Expected. Fill a key you're entitled to on Keys |
+| Keys, Logbook or REC says to save first | No station file yet | Save the station on Config |
+| REC playback says `no voice` | Decoder found no voice; or the call was `OUT OF BAND` | Check the tag; test with `commander-rec render-wav` |
+| `decoder script not found: modems/…` | That pipe file isn't on this machine | Install or copy it into `modems.d` |
+| `⚠ DISK CAP REACHED` | Recordings hit the cap | Raise **Cap GB**, archive, move to a drive, or tick overwrite |
+| `ID UNRELIABLE: POWER CYCLE VNA` | NanoVNA restarted while being read | Charge it or use a powered port, power cycle, reconnect |
+| NanoVNA port missing or busy | ModemManager took it, or not in `dialout` | Install `docs/nanovna-v2.rules`, check groups |
+| Station file won't load | It has a field Commander doesn't know, or bad JSON | Fix the file; the running station is unchanged |
 
-Commander starts `rigctld`, `gqrx`, and `pw-loopback`. It stops those process groups on Remove and on exit. It does not stop a GQRX you started from the application menu, and it will not drive a `rigctld` you started in a terminal.
+---
 
-The first free TCP port at or above 4532 on 127.0.0.1 is the listen port. Nothing in this release listens on another address.
+<a id="ch17"></a>
 
-## 14.6 Further reading in the source tree
+# 17. Glossary
 
-`README.md` is the short project readme. `docs/AudioGraph.md` names the PipeWire nodes for a Hamlib dummy wired to a USB sound device. `docs/AGENT-HSCommander.md` tells another session how to turn a listing into a station file and, when the operator supplies key ids, the key file beside it. This user guide is the operator manual. Where the readme still speaks of an older screen layout, trust the window and this guide.
+| Term | Meaning |
+| --- | --- |
+| **Bandspread (BSP)** | The coloured strip of plan zones on Tune that you click to tune |
+| **CAT** | Computer control of a radio, here through Hamlib |
+| **Control channel** | The trunked-system channel that announces which voice channel each call uses |
+| **cs16** | The raw recording format: complex samples, 16-bit |
+| **Decoder parameters** | `HAMSPOT_*` settings saved with a recording and passed to its decoder on replay |
+| **Dwell** | Hold on the current channel while scanning |
+| **Grant** | A control-channel message assigning a call to a voice channel |
+| **Hamlib** | The radio-control library; Commander runs its `rigctld`, `rotctld` and `ampctld` |
+| **Lane / block** | A row per talkgroup or channel on the REC timeline, and one recording on it |
+| **Pipe file** | A small executable (`.rxpipe`, `.txpipe`) that processes audio between radio and speaker or microphone |
+| **Priority talkgroup** | One that can interrupt a held call |
+| **Sidecar** | The `.json` file next to each recording with its details |
+| **Station file** | `Name.HSCommander`, holding one station's setup |
+| **Talkgroup (TG)** | A group of radios on a trunked system that talk together |
+| **Voice hang** | How long a receiver waits on a voice channel for a re-key |
+| **Zone** | A named group of bands, channels or talkgroups |
 
-## RF patch bay (Config tab)
+---
 
-The RF patch bay at the bottom of the Config tab is a drawing of how coax runs in your station. It is **visual only**: nothing on it switches, keys or tunes hardware yet.
+<a id="ch18"></a>
 
-- **Devices.** Every radio row in the station appears automatically (HackRF, GQRX and line taps are marked RX ONLY). Add amplifiers (the Hamlib `ampctl` models, or "Other amplifier"), antenna switches, tuners, SWR/power meters, dummy loads and antennas from the Add row. Click a box to rename it, note its bands, set a switch's ways and position, or remove it. Drag a box by its coloured title bar.
-- **Jacks.** Inputs are on the left of a box and outputs on the right, in the transmit sense; received signal flows the other way. Round jacks are coax, small square jacks are PTT/ALC control.
-- **Cables.** Drag from a jack to another jack. The end snaps to the nearest jack that accepts it. Output to output, input to input, coax to control, a box to itself and a jack that already has a cable are refused, and the reason shows below the panel. Drag a plugged end to move it; drop it on empty panel to unplug it. Right-click a cable, or click it and press Delete, to remove it.
-- **Flow.** Chevrons move along each cable in the direction of the signal, with a TX (amber) or RX (teal) tag. Below the panel the bay lists each path, for example `TX path: IC-9700 → KPA1500 → ATU → Yagi`, and warns about open outputs, loops, an amplifier fed from nothing, or an amplifier in line with a receive-only radio.
-- The layout is saved in the station file under `patchbay` (devices with positions, and cables from an output jack to an input jack). Older station files load with an empty bay.
+# 18. Recording, the law and your privacy
 
-- **Configured amplifiers (#96).** The amplifier model list is the same one the Automation window uses (`ampctld -l`, with Hamlib 4.6.5's list as fallback). Click an amplifier box and pick a **Configured amplifier** from the Automation list (name plus the start of its id), or leave it "unbound (visual only)". The box is bound to the amplifier's fixed id, never to its name or position, so renaming keeps the binding and two amplifiers with the same name cannot be mixed up. **Add to Automation list** creates a matching amplifier row with a new id (Dummy model when the box has no Hamlib model) and binds the box to it; it sends nothing to the amplifier. A bound box shows a power LED with its word (OFF, ON, STBY, OPER), the frequency, whether the daemon is up or the device is missing, SWR, forward power and any fault. If the bound amplifier is removed, the box shows **amplifier missing** and sends nothing; it never falls back to another amplifier. Every command (Standby, Operate, Set freq, follow rig, levels) looks the amplifier up by id when it is sent. When a station file is loaded, boxes bound to a duplicated id are unbound with a note, and boxes saved by an early test build that bound by name are moved to the id only when exactly one amplifier has that name; otherwise they are unbound with a note.
-- **Power keys.** A bound, live box has Standby and Operate (amber) keys. They send only on that click, like the Automation keys. The patch bay never sends Operate on its own.
-- **Amplifier warnings (#97).** With a bound amplifier on a TX path, the bay warns when the amplifier is OFF, ON or STBY while the TX path is patched through it, and when it is in OPERATE but the path does not end in an antenna or dummy load. These are reminders only.
+- Recording or listening to radio traffic may be regulated where you are. That is your responsibility.
+- **Encrypted traffic is never recorded.** Encrypted talkgroups and channels can't be marked, and calls found to be encrypted are discarded, even if you hold a key.
+- Recordings stay on your computer and the drives you choose. **Nothing is uploaded.**
+- Keys are stored only in `Name.HSKeys`, readable by you alone. Use only keys you are entitled to.
 
-Still to do (#97): nothing in the bay switches or keys hardware. Antenna switch control, PTT/ALC and automatic operate are not built and are not planned without a separate decision.
+---
 
-### VNA status line and device lamps
+<a id="ch19"></a>
 
-The bar under the VNA chart shows the sweep (START, STOP, PTS, AVG, run mode, calibration) on the left and only the device type and port on the right, for example `NANOVNA V2 · ttyACM0`. The left text never runs into the right: when the window is narrow, AVG is dropped first, then calibration and the run mode, then the sweep summary. Warnings (marked ⚠) are never dropped; if the warnings alone do not fit they are cut with `…`. Firmware, sweep time, sweep count, calibration and warnings are always listed in the device details, which open with a click on the bar or on a lamp (I). Double-click (Shift+I) reconnects and triple-click (Ctrl+I) copies the full status line.
+# 19. Roadmap
 
-Four small lamps sit left of the device name. Hover over a lamp to read what it means; every warning lamp also has text on the bar or in the details, never colour alone.
-
-- LINK: green connected, red disconnected (lost, check USB), grey not connected.
-- ID: green serial number read and checked, red ID unreliable (power cycle the VNA), grey no id.
-- CAL: green calibration applied (exact or restored), amber interpolated (CAL INT) or correction off, grey uncalibrated.
-- SWEEP: green sweeping, amber sweep errors, grey held or not connected.
-
+Planned work, including a TV tab, a cleaner layout for station data, and more decoders, is tracked on the project's [GitHub issues](https://github.com/hamspot/hamspot-commander/issues). This guide describes only what the program does today.
