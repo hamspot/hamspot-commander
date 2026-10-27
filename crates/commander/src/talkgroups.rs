@@ -21,6 +21,9 @@ pub struct Talkgroup {
     /// station allows emergency/priority overrides. Absent means not priority.
     #[serde(default, skip_serializing_if = "is_false")]
     pub priority: bool,
+    /// Marked for recording (right-click). Absent means not marked.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub record: bool,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -130,6 +133,7 @@ pub fn note_seen(file: &mut TalkgroupFile, tg: u32, encrypted: bool) -> bool {
         return false;
     };
     zone.talkgroups.push(Talkgroup {
+        record: false,
         name: tg.to_string(),
         tg,
         encrypted,
@@ -178,7 +182,7 @@ mod tests {
             version: 1,
             zones: vec![TalkgroupZone {
                 name: "Police".into(),
-                talkgroups: vec![Talkgroup {
+                talkgroups: vec![Talkgroup { record: false,
                     name: "Dispatch".into(),
                     tg: 100,
                     encrypted: false,
@@ -205,7 +209,7 @@ mod tests {
         assert!(!note_seen(&mut file, 4400, true));
         assert_eq!(file.zones[1].talkgroups.len(), 1);
         assert!(!file.zones[1].talkgroups[0].encrypted);
-        file.zones[0].talkgroups.push(Talkgroup {
+        file.zones[0].talkgroups.push(Talkgroup { record: false,
             name: "Dispatch".into(),
             tg: 100,
             encrypted: false,

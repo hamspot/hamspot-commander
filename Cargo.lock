@@ -708,6 +708,7 @@ dependencies = [
  "chrono",
  "eframe",
  "egui",
+ "hsrec",
  "image",
  "libc",
  "rfd",

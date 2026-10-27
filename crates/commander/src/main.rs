@@ -24,6 +24,8 @@ mod talkgroups;
 mod units;
 mod amp;
 mod rot;
+mod rec_live;
+mod rec_ui;
 mod rx_pipe;
 mod scan;
 mod tools;
@@ -478,6 +480,8 @@ struct App {
     tool_place: Option<egui::Pos2>,
     tool_size: Option<egui::Vec2>,
     tool_placed: bool,
+    /// REC recorder state (#119).
+    rec: rec_ui::RecUi,
 }
 
 /// Meter grid state. The main window and the detached window share one copy.
@@ -841,7 +845,7 @@ mod talkgroup_tab_tests {
         let mut file = crate::talkgroups::empty();
         assert!(!directory_has_talkgroups(&file));
         assert!(talkgroup_radio_ids(&rows, false).is_empty());
-        file.zones[0].talkgroups.push(crate::talkgroups::Talkgroup {
+        file.zones[0].talkgroups.push(crate::talkgroups::Talkgroup { record: false,
             name: "ISP".into(),
             tg: 10006,
             encrypted: false,
@@ -924,7 +928,7 @@ mod talkgroup_tab_tests {
             row(3, crate::cat::RadioDriver::Gqrx, "HackRF", "", false),
         ];
         let mut file = crate::talkgroups::empty();
-        file.zones[0].talkgroups.push(crate::talkgroups::Talkgroup {
+        file.zones[0].talkgroups.push(crate::talkgroups::Talkgroup { record: false,
             name: "ISP".into(),
             tg: 10006,
             encrypted: false,
@@ -1139,12 +1143,15 @@ enum Page {
     Meters,
     Levels,
     Config,
+    /// Recordings (#119): source tabs and the timeline.
+    Rec,
 }
 
 const PAGES: &[(Page, &str)] = &[
     (Page::Tune, "Tune"),
     (Page::Plan, "Plan"),
     (Page::Channels, "Channels"),
+    (Page::Rec, "REC"),
     (Page::Meters, "Meters"),
     (Page::Timers, "Timers"),
     (Page::Levels, "Levels"),
@@ -1559,6 +1566,8 @@ fn lcd_title_row(ui: &mut egui::Ui, title: &str, mode: &str) {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum KeyLamp {
     Dark,
+    /// REC armed for marked talkgroups / channels.
+    Red,
     Green,
     Amber,
     Purple,
@@ -1578,6 +1587,7 @@ fn radio_key(ui: &mut egui::Ui, label: &str, lamp: KeyLamp, enabled: bool) -> eg
         KeyLamp::Green => egui::Color32::from_rgb(18, 58, 28),
         KeyLamp::Amber => egui::Color32::from_rgb(72, 48, 10),
         KeyLamp::Purple => egui::Color32::from_rgb(42, 16, 64),
+        KeyLamp::Red => egui::Color32::from_rgb(70, 12, 10),
         KeyLamp::Dark if hover => egui::Color32::from_rgb(48, 48, 52),
         KeyLamp::Dark => egui::Color32::from_rgb(28, 28, 32),
     };
@@ -1585,6 +1595,7 @@ fn radio_key(ui: &mut egui::Ui, label: &str, lamp: KeyLamp, enabled: bool) -> eg
         KeyLamp::Green => egui::Color32::from_rgb(46, 176, 78),
         KeyLamp::Amber => egui::Color32::from_rgb(214, 148, 32),
         KeyLamp::Purple => egui::Color32::from_rgb(168, 96, 214),
+        KeyLamp::Red => egui::Color32::from_rgb(214, 44, 32),
         KeyLamp::Dark if hover => egui::Color32::from_rgb(120, 120, 126),
         KeyLamp::Dark => egui::Color32::from_rgb(78, 78, 84),
     };
@@ -1602,6 +1613,7 @@ fn radio_key(ui: &mut egui::Ui, label: &str, lamp: KeyLamp, enabled: bool) -> eg
             KeyLamp::Green => egui::Color32::from_rgb(150, 230, 140),
             KeyLamp::Amber => egui::Color32::from_rgb(255, 196, 96),
             KeyLamp::Purple => egui::Color32::from_rgb(220, 170, 255),
+            KeyLamp::Red => egui::Color32::from_rgb(255, 150, 140),
             KeyLamp::Dark => egui::Color32::from_rgb(232, 228, 216),
         }
     };
@@ -1894,6 +1906,7 @@ impl App {
             override_hold: true,
             trunk_emergency: Vec::new(),
             patchbay: Default::default(),
+            rec: Default::default(),
             patchbay_ui: Default::default(),
             reduced_motion: pulse::system_reduced_motion(),
             scan_zones: BTreeSet::new(),
@@ -2642,15 +2655,18 @@ impl eframe::App for App {
                                     };
                                     pulse::brighten(base, lift)
                                 });
+                                let rec_tab = page == Page::Rec;
+                                let shown = if rec_tab { format!("    {label}") } else { label.clone() };
                                 let resp = folder_tab_colored(
                                     ui,
                                     self.page == page,
                                     index,
-                                    &label,
+                                    &shown,
                                     index == 0,
                                     fill,
                                     speaker,
                                 );
+                                let resp = if rec_tab { self.paint_rec_icon(ui, resp) } else { resp };
                                 hits.push((name, resp.rect));
                                 if resp.clicked() {
                                     clicked_page = Some(page);
@@ -2804,6 +2820,8 @@ impl eframe::App for App {
                         self.page_talkgroups(ui, id, &snap);
                     } else if let Page::RadioIds(id) = self.page {
                         self.page_radio_ids(ui, id, &snap);
+                    } else if self.page == Page::Rec {
+                        self.page_rec(ui, &snap);
                     } else {
                         egui::ScrollArea::vertical()
                             .id_salt("body")
@@ -2851,6 +2869,7 @@ impl App {
             Page::RadioIds(id) => self.page_radio_ids(ui, id, snap),
             Page::Meters => self.page_meters(ui, snap),
             Page::Levels => self.page_levels(ui, snap),
+            Page::Rec => self.page_rec(ui, snap),
             Page::Config => self.page_config(ui, snap),
         }
     }
@@ -3401,6 +3420,7 @@ impl App {
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 6.0;
                 ui.set_width(72.0);
+                self.rec_key(ui, false);
                 if radio_key(ui, "LOAD", KeyLamp::Dark, true).clicked() {
                     self.browse_channels(false);
                 }
@@ -3633,7 +3653,11 @@ impl App {
                             .map(|zone| zone.channels.len())
                             .unwrap_or(0);
                         for idx in 0..count {
-                            if self.channel_row(ui, idx) {
+                            let (clicked, marked) = self.channel_row(ui, idx);
+                            if marked {
+                                self.rec_toggle_channel(idx);
+                            }
+                            if clicked {
                                 self.stop_scan();
                                 self.recall_channel(snap, idx);
                             }
@@ -6624,6 +6648,7 @@ impl App {
             voice_hang_ms: self.voice_hang_ms,
             override_hold_emergency_priority: self.override_hold,
             patchbay: self.patchbay.clone(),
+            rec: self.rec.face.clone(),
         })
     }
 
@@ -6693,8 +6718,11 @@ impl App {
             voice_hang_ms,
             override_hold_emergency_priority,
             mut patchbay,
+            rec,
             ..
         } = file;
+        self.rec.face = rec;
+        self.rec.configured = None;
         // Every amplifier gets a unique fixed id; bindings to a duplicated
         // id or an ambiguous old name are dropped with a note (#96).
         let dup = amp::repair_ids(&mut amplifiers);
@@ -6989,14 +7017,14 @@ impl App {
         (clicked, doubled, response)
     }
 
-    fn channel_row(&self, ui: &mut egui::Ui, idx: usize) -> bool {
+    fn channel_row(&self, ui: &mut egui::Ui, idx: usize) -> (bool, bool) {
         let Some(channel) = self
             .channels
             .zones
             .get(self.channel_zone)
             .and_then(|zone| zone.channels.get(idx))
         else {
-            return false;
+            return (false, false);
         };
         let freq = format!("{:10.3}", channel.hz / 1_000_000.0);
         let slot = format!("{:>3}", idx + 1);
@@ -7023,10 +7051,15 @@ impl App {
             egui::FontId::monospace(14.0),
             ui.visuals().text_color(),
         );
+        if channel.record {
+            rec_ui::paint_row_mark(ui, rect);
+        }
         if self.channel_list_follow && idx == self.channel_sel {
             response.scroll_to_me(Some(egui::Align::Center));
         }
-        response.clicked()
+        let marked = response.secondary_clicked();
+        let response = response.on_hover_text(rec_ui::ROW_HOVER);
+        (response.clicked(), marked)
     }
 
     fn channel_editor(&mut self, ui: &mut egui::Ui, snap: &Snapshot, width: f32) {
@@ -7220,6 +7253,7 @@ impl App {
             return;
         };
         zone.channels.push(channels::Channel {
+            record: false,
             name: String::new(),
             hz,
             mode,
@@ -8713,6 +8747,7 @@ impl App {
             }
         }
         self.service_hackrf(snap);
+        self.rec_frame(snap);
         self.steer_voice_radios();
     }
 
@@ -8915,6 +8950,12 @@ impl App {
             let encrypted_end = tick.voice_events.iter().any(|event| {
                 matches!(event, follow::CcEvent::Alg(alg) if *alg != follow::CLEAR_ALG && !keyed)
             });
+            // REC never keeps encrypted traffic, even with a filled key.
+            if tick.voice_events.iter().any(|event| {
+                matches!(event, follow::CcEvent::Alg(alg) if *alg != follow::CLEAR_ALG)
+            }) {
+                self.rec.enc.insert(tick.id);
+            }
             let mut candidates: Vec<(f64, u32, bool)> =
                 fresh.iter().map(|(hz, tg)| (*hz, *tg, false)).collect();
             for (from, hz, tg) in &self.trunk_emergency {
@@ -10006,11 +10047,13 @@ impl App {
             let face_h = 204.0_f32;
             let key_h = 46.0;
             let key_gap = 6.0;
-            let stack = key_h * 3.0 + key_gap * 2.0;
+            let stack = key_h * 4.0 + key_gap * 3.0;
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 ui.set_width(72.0);
                 ui.add_space(((face_h - stack) * 0.5).max(0.0));
+                self.rec_key(ui, true);
+                ui.add_space(key_gap);
                 if radio_key(ui, "LOAD", KeyLamp::Dark, true).clicked() {
                     self.browse_talkgroups(false);
                 }
@@ -10179,7 +10222,10 @@ impl App {
                                     .map(|zone| zone.talkgroups.len())
                                     .unwrap_or(0);
                                 for idx in 0..count {
-                                    let (clicked, doubled) = self.talkgroup_row(ui, idx, active);
+                                    let (clicked, doubled, marked) = self.talkgroup_row(ui, idx, active);
+                                    if marked {
+                                        self.rec_toggle_talkgroup(idx);
+                                    }
                                     if doubled {
                                         if let Some(tg) = self
                                             .talkgroups
@@ -10225,14 +10271,14 @@ impl App {
         }
     }
 
-    fn talkgroup_row(&self, ui: &mut egui::Ui, idx: usize, active: Option<u32>) -> (bool, bool) {
+    fn talkgroup_row(&self, ui: &mut egui::Ui, idx: usize, active: Option<u32>) -> (bool, bool, bool) {
         let Some(row) = self
             .talkgroups
             .zones
             .get(self.talkgroup_zone)
             .and_then(|zone| zone.talkgroups.get(idx))
         else {
-            return (false, false);
+            return (false, false, false);
         };
         let slot = format!("{:>4}", idx + 1);
         let mut label = format!("{slot}   {:>8}   {}", row.tg, row.name);
@@ -10299,7 +10345,12 @@ impl App {
             egui::FontId::monospace(14.0),
             color,
         );
-        (response.clicked(), response.double_clicked())
+        if row.record {
+            rec_ui::paint_row_mark(ui, rect);
+        }
+        let marked = response.secondary_clicked();
+        let response = response.on_hover_text(rec_ui::ROW_HOVER);
+        (response.clicked(), response.double_clicked(), marked)
     }
 
     fn talkgroup_editor(&mut self, ui: &mut egui::Ui, width: f32) {
@@ -10392,6 +10443,7 @@ impl App {
         };
         let next = zone.talkgroups.iter().map(|row| row.tg).max().unwrap_or(0).saturating_add(1);
         zone.talkgroups.push(talkgroups::Talkgroup {
+            record: false,
             name: String::new(),
             tg: next,
             encrypted: false,
