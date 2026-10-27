@@ -365,7 +365,7 @@ fn open_port(path: &str) -> Result<Box<dyn serialport::SerialPort>, String> {
 /// Status text for an id: the About-screen SN, or a clear unreliable flag.
 pub fn id_text(id: &[u8; 12], reliable: bool) -> String {
     if reliable {
-        format!("SN {}", proto::device_id_sn(id))
+        format!("SN {}", proto::device_id_sn_compact(id))
     } else {
         "ID unreliable".into()
     }
@@ -695,7 +695,7 @@ mod tests {
     #[test]
     fn id_text_uses_the_about_screen_format() {
         let id = [0x78, 0x56, 0x34, 0x12, 1, 0, 0, 0, 0xef, 0xbe, 0xad, 0xde];
-        assert_eq!(id_text(&id, true), "SN 12345678-00000001-deadbeef");
+        assert_eq!(id_text(&id, true), "SN 12345678-1-deadbeef");
         assert_eq!(id_text(&id, false), "ID unreliable");
     }
 
