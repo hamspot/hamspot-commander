@@ -448,14 +448,14 @@ From top to bottom: source tabs (**HackRF TG**, **HackRF Channels**, plus any ot
 | **◀ Day**, **Today**, **Day ▶** | Jump by day |
 | **−**, **+** | Zoom out or in by 1.5× |
 | **Fit** | Frame the most recent recordings |
-| **● Live / Now** / **○ Live / Now** | Follow the present (the red NOW line). ● is on, ○ is off. |
-| **Play next** | Play the following recording |
-| **Data** | Open the Data dialog ([9.6](#s9-6)) |
+| **● Live** / **○ Live** | Follow the present (the red NOW line). ● is on, ○ is off. |
+| **Data** | Open the Data dialog ([9.6](#s9-6)), right of **Live** |
+| **● ▶▶** / **○ ▶▶** | Play next, right of **Data**: when a recording finishes playing, the following one plays. ● is on, ○ is off; hover to see ON or OFF. |
 | **Details** | Reopen the Record / Playback dialog |
 | **Undo delete** | Shown for 60 s after a delete |
 
 <!-- screenshot: rec-03 — The REC tab, armed and waiting. -->
-<!-- screenshot: rec-07 — Live / Now follows the present moment when on. -->
+<!-- screenshot: rec-07 — Live follows the present moment when on. -->
 <!-- screenshot: rec-08 — Search narrows the lanes. -->
 
 ## 9.4 The timeline
