@@ -2666,6 +2666,7 @@ impl eframe::App for App {
             self.page = self.page_return;
         }
         let tab_side = rustcars::LcarsTheme::default().bar_thin;
+        let mut rec_place: Option<rec_ui::BarPlace> = None;
         egui::Panel::top("pages")
             .show_separator_line(false)
             .frame(tools::tab_row(rustcars::LcarsTheme::default().bg))
@@ -2676,7 +2677,13 @@ impl eframe::App for App {
                 let show_tear = self.page == Page::Tools && !tools_open;
                 // On REC the right end of the bar carries the view controls.
                 let show_rec_bar = rec_ui::bar_shown(self.page == Page::Rec);
-                let rec_compact = rec_ui::bar_compact(ui.available_width());
+                let row_w = ui.available_width();
+                let place = rec_ui::bar_place(row_w - rec_ui::FRAME_MARGIN_X, row_w);
+                rec_place = show_rec_bar.then_some(place);
+                let (show_rec_bar, rec_compact) = match place {
+                    rec_ui::BarPlace::TabRow { compact } => (show_rec_bar, compact),
+                    rec_ui::BarPlace::InFrame { .. } => (false, false),
+                };
                 let tabs_w = if show_tear {
                     (ui.available_width() - tab_side - gap).max(0.0)
                 } else if show_rec_bar {
@@ -2915,7 +2922,12 @@ impl eframe::App for App {
                 .show(ui, |ui| {
                 // Tune owns the wheel. Plan and Channels own a bandspread click.
                 // A scroll area would take those pointers and move the page.
-                let frame_rect = tools::frame(ui, |ui| {
+                let in_frame = match rec_place {
+                    Some(rec_ui::BarPlace::InFrame { compact }) if self.page == Page::Rec => Some(compact),
+                    _ => None,
+                };
+                let slot_w = in_frame.map(rec_ui::bar_slot_width);
+                let (frame_rect, slot) = tools::frame_with_slot(ui, slot_w, |ui| {
                     if self.page == Page::Tune {
                         self.page_tune(ui, &mut snap);
                     } else if self.page == Page::Plan {
@@ -2935,6 +2947,15 @@ impl eframe::App for App {
                             .show(ui, |ui| self.page_body(ui, &mut snap));
                     }
                 });
+                // REC's view controls sit in the gap opened in the top bar.
+                if let (Some(compact), Some(r)) = (in_frame, slot) {
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(r).id_salt("rec-bar-in-frame"), |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = rec_ui::BAR_GAP;
+                            self.rec_bar(ui, compact);
+                        });
+                    });
+                }
                 // REC's legal note rides the bottom elbow's bar, REC page only.
                 if self.page == Page::Rec {
                     tools::bottom_bar_watermark(ui, frame_rect, rec_ui::PRIVACY);

@@ -975,9 +975,9 @@ impl App {
     pub(crate) fn rec_bar(&mut self, ui: &mut egui::Ui, compact: bool) {
         let theme = rustcars::LcarsTheme::default();
         let segs = bar_segments(compact);
-        let last = segs.len() - 1;
-        for (i, seg) in segs.iter().enumerate() {
-            let cap = if i == 0 { rustcars::Cap::Left } else if i == last { rustcars::Cap::Right } else { rustcars::Cap::None };
+        for seg in segs.iter() {
+            // Every control is a plain rectangle, first and last included.
+            let cap = rustcars::Cap::None;
             let on = match seg.action {
                 BarAction::Live => Some(self.rec.bar_live),
                 BarAction::Data => Some(self.rec.data_open),
@@ -1002,6 +1002,8 @@ impl App {
             let resp = resp.on_hover_text(bar_hint(seg.action, on));
             if resp.clicked() {
                 self.rec.bar_actions.push(seg.action);
+                // The timeline applies the action; it may already be drawn.
+                ui.ctx().request_repaint();
             }
         }
     }
@@ -1659,6 +1661,18 @@ mod tests {
         assert_eq!(bar_label(&live, Some(true)), "● L");
         assert_eq!(bar_label(&live, Some(false)), "○ L");
         assert_eq!(bar_label(&bar_segments(false)[1], None), "TODAY");
+    }
+
+    #[test]
+    fn bar_goes_in_the_elbow_then_compact_then_tab_row() {
+        let need = |c| ELBOW_CURVE_W + END_CAP_W + bar_slot_width(c) + BAR_TAN_MIN;
+        assert_eq!(bar_place(1264.0, 1280.0), BarPlace::InFrame { compact: false });
+        assert_eq!(bar_place(need(false), 0.0), BarPlace::InFrame { compact: false });
+        assert_eq!(bar_place(need(false) - 1.0, 0.0), BarPlace::InFrame { compact: true });
+        assert_eq!(bar_place(need(true), 0.0), BarPlace::InFrame { compact: true });
+        assert!(matches!(bar_place(need(true) - 1.0, 2000.0), BarPlace::TabRow { compact: false }));
+        assert!(matches!(bar_place(300.0, 300.0), BarPlace::TabRow { compact: true }));
+        assert_eq!(bar_slot_width(false), bar_width(false) + 8.0);
         assert!(bar_hint(BarAction::Data, Some(false)).ends_with("(OFF)"));
         assert!(bar_shown(true) && !bar_shown(false));
     }
@@ -1918,6 +1932,44 @@ pub fn bar_width(compact: bool) -> f32 {
 /// Compact when the full run would leave the tabs less than `BAR_TABS_MIN`.
 pub fn bar_compact(row_w: f32) -> bool {
     row_w - bar_width(false) - BAR_GAP < BAR_TABS_MIN
+}
+
+/// Minimum tan left showing in the top elbow bar beside the controls.
+pub const BAR_TAN_MIN: f32 = 80.0;
+/// Horizontal room the top elbow's curve takes before its straight run
+/// (rustcars: max(thick + r_in, 2 * r_out) at scale 1).
+pub const ELBOW_CURVE_W: f32 = 180.0;
+/// rustcars LcarsFrame end cap length.
+pub const END_CAP_W: f32 = 48.0;
+/// The central panel's left + right margin around the frame.
+pub const FRAME_MARGIN_X: f32 = 16.0;
+
+/// Where the REC controls go this frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BarPlace {
+    /// Inside the top elbow bar, in a gap opened before its end cap.
+    InFrame { compact: bool },
+    /// Fallback: the right end of the page-tab row.
+    TabRow { compact: bool },
+}
+
+/// Slot width the controls need in the elbow bar: the run plus a
+/// `BAR_GAP` of black on each side.
+pub fn bar_slot_width(compact: bool) -> f32 {
+    bar_width(compact) + 2.0 * BAR_GAP
+}
+
+/// Full run in the elbow bar if it leaves `BAR_TAN_MIN` of tan, else the
+/// compact run, else back to the tab row. `frame_w` is the frame's width,
+/// `row_w` the page-tab row's.
+pub fn bar_place(frame_w: f32, row_w: f32) -> BarPlace {
+    let run = frame_w - ELBOW_CURVE_W - END_CAP_W;
+    for compact in [false, true] {
+        if run - bar_slot_width(compact) >= BAR_TAN_MIN {
+            return BarPlace::InFrame { compact };
+        }
+    }
+    BarPlace::TabRow { compact: bar_compact(row_w) }
 }
 
 /// Only the REC page carries the run.

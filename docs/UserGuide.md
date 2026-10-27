@@ -441,9 +441,9 @@ The REC state is saved and comes back on the next start. A talkgroup recording s
 
 ## 9.3 The REC tab
 
-While REC is open, the right end of the page-tab bar at the top of the window holds the timeline controls. Below the bar, from top to bottom: source tabs (**HackRF TG**, **HackRF Channels**, plus any other source found; if they don't all fit, click the outlined end of the tan bar above them for a list of the rest, as on the Plan page), a status line (REC state, TG, Channels, disk use), the search row, and the timeline.
+While REC is open, the timeline controls sit inside the tan bar at the top of the page, at its right end just before the rounded end cap. They are plain rectangular buttons, the same height as the bar. Below the bar, from top to bottom: source tabs (**HackRF TG**, **HackRF Channels**, plus any other source found; if they don't all fit, click the outlined end of the tan bar above them for a list of the rest, as on the Plan page), a status line (REC state, TG, Channels, disk use), the search row, and the timeline.
 
-| Control in the top bar | What it does |
+| Control in the tan bar | What it does |
 | --- | --- |
 | **◀ DAY**, **TODAY**, **DAY ▶** | Jump by day. Every click counts, so quick clicks step several days. |
 | **−**, **+** | Zoom out or in by 1.5× |
@@ -454,7 +454,7 @@ While REC is open, the right end of the page-tab bar at the top of the window ho
 
 **LIVE**, **DATA** and **▶▶** are toggles. Each keeps its outline when off; off is a dimmer fill with ○, on is a full fill with ●.
 
-When the window is too narrow for the tabs and the full controls, the controls shorten to symbols: **◀ T ▶ − + FIT ● L ● D ● ▶▶**. Hover any control to see its name.
+When the window is too narrow for the full controls, they shorten to symbols: **◀ T ▶ − + FIT ● L ● D ● ▶▶**. If even that would leave too little of the tan bar, the controls move up to the right end of the page-tab row. Hover any control to see its name.
 
 | Control in the search row | What it does |
 | --- | --- |
