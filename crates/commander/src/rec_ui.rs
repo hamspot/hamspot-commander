@@ -975,8 +975,10 @@ impl App {
         view.follow(now);
         let width_all = ui.available_width();
         // The timeline spans the full width; the lane shelf is drawn over its left side.
-        let width = width_all.max(1.0);
-        let shelf_w = timeline::shelf_width(width_all);
+        // The plot stops short of a gutter on the right for the lane scrollbar.
+        let plot_w = plot_width(width_all);
+        let width = plot_w;
+        let shelf_w = timeline::shelf_width(plot_w);
         ui.horizontal(|ui| {
             ui.label("Search");
             ui.add(egui::TextEdit::singleline(&mut self.rec.query).desired_width(search_width(width_all)).hint_text("TG, channel, radio…"));
@@ -1054,7 +1056,7 @@ impl App {
             v
         };
         // Axis row: label column header, then tick labels over the grid only.
-        let (axis, axis_resp) = ui.allocate_exact_size(egui::vec2(width_all, AXIS_H), egui::Sense::click_and_drag());
+        let (axis, axis_resp) = ui.allocate_exact_size(egui::vec2(plot_w, AXIS_H), egui::Sense::click_and_drag());
         {
             let painter = ui.painter_at(axis);
             painter.rect_filled(axis, egui::CornerRadius::ZERO, bg);
@@ -1068,13 +1070,16 @@ impl App {
             }
             paint_shelf(&painter, egui::Rect::from_min_size(axis.min, egui::vec2(shelf_w, AXIS_H)), bg);
             let now_w = ui.fonts_mut(|f| f.layout_no_wrap("NOW".into(), egui::FontId::monospace(10.0), weak).size().x);
-            paint_shelf_right(&painter, right_shelf_rect(axis, now_w), NOW_SHELF);
+            if let Some((x0, x1)) = now_fade_span(view.x(now, width), plot_w, right_shelf_w(now_w)) {
+                let r = egui::Rect::from_min_max(egui::pos2(axis.left() + x0, axis.top()), egui::pos2(axis.left() + x1, axis.bottom()));
+                paint_shelf_right(&painter, r, NOW_SHELF);
+            }
             painter.text(axis.left_center() + egui::vec2(6.0, 0.0), egui::Align2::LEFT_CENTER, "Lane", egui::FontId::monospace(11.0), weak);
         }
         // Wheel: over the opaque shelf it scrolls the lanes (the scroll area
         // does that); over the grid, the fade, or the axis it zooms time, so
         // take it away from the scroll area there.
-        let body_view = egui::Rect::from_min_size(egui::pos2(axis.left(), axis.bottom()), egui::vec2(width_all, viewport_h));
+        let body_view = egui::Rect::from_min_size(egui::pos2(axis.left(), axis.bottom()), egui::vec2(plot_w, viewport_h));
         let wheel_pos = ui.input(|i| i.pointer.hover_pos());
         // A REC window (Record / Playback, Data) above the timeline owns the
         // pointer there: no zoom, and its own scroll area keeps the wheel.
@@ -1125,7 +1130,8 @@ impl App {
             .auto_shrink([false, false])
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
             .show(ui, |ui| {
-                let (rect, _) = ui.allocate_exact_size(egui::vec2(width_all, body_h), egui::Sense::hover());
+                ui.style_mut().spacing.scroll = egui::style::ScrollStyle::thin();
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(plot_w, body_h), egui::Sense::hover());
                 let label_rect = egui::Rect::from_min_size(rect.min, egui::vec2(shelf_w, body_h));
                 let grid = rect;
                 ui.painter_at(rect).rect_filled(rect, egui::CornerRadius::ZERO, bg);
@@ -1136,12 +1142,30 @@ impl App {
                 }
                 for (i, name) in lanes.iter().enumerate() {
                     let y = rect.top() + lane_top[i];
-                    let full = egui::Rect::from_min_size(egui::pos2(rect.left(), y), egui::vec2(width_all, lane_h[i]));
+                    let full = egui::Rect::from_min_size(egui::pos2(rect.left(), y), egui::vec2(plot_w, lane_h[i]));
                     if sel_lane.as_deref() == Some(name.as_str()) {
                         gp.rect_filled(full, egui::CornerRadius::ZERO, egui::Color32::from_rgb(40, 40, 70));
                     } else if i % 2 == 1 {
                         gp.rect_filled(full, egui::CornerRadius::ZERO, egui::Color32::from_rgb(20, 20, 26));
                     }
+                }
+                // Lane names run on past the shelf into the lane, under the
+                // blocks, fading out by halfway across. Painted only: input
+                // passes through to the grid. The part on the solid shelf is
+                // drawn again on top of the shelf further down.
+                let label_font = egui::FontId::monospace(12.0);
+                let now_w_pre = ui.fonts_mut(|f| f.layout_no_wrap("NOW".into(), egui::FontId::monospace(10.0), egui::Color32::WHITE).size().x);
+                let label_cap = lane_label_cap(width, width);
+                let _ = now_w_pre;
+                let solid_end = shelf_w * timeline::SHELF_OPAQUE_FRAC;
+                let lane_ink = |ui: &egui::Ui, selected: bool, cell: egui::Rect| if selected || ui.rect_contains_pointer(cell) { egui::Color32::WHITE } else { ui.visuals().text_color() };
+                for (i, name) in lanes.iter().enumerate() {
+                    let y = rect.top() + lane_top[i];
+                    let cell = egui::Rect::from_min_size(egui::pos2(label_rect.left(), y), egui::vec2(solid_end, row_h));
+                    let ink = lane_ink(ui, sel_lane.as_deref() == Some(name.as_str()), cell);
+                    let job = lane_label_job(ui, name, &label_font, ink, LABEL_PAD, solid_end, label_cap, true);
+                    let g = ui.fonts_mut(|f| f.layout_job(job));
+                    gp.galley(egui::pos2(cell.left() + LABEL_PAD, cell.center().y - g.size().y / 2.0), g, ink);
                 }
                 if lanes.is_empty() {
                     gp.text(grid.center(), egui::Align2::CENTER_CENTER, "No recordings in this view.", egui::FontId::proportional(14.0), weak);
@@ -1227,10 +1251,13 @@ impl App {
                 // still goes to the grid underneath.
                 let now_font = egui::FontId::monospace(10.0);
                 let now_w = ui.fonts_mut(|f| f.layout_no_wrap("NOW".into(), now_font.clone(), egui::Color32::WHITE).size().x);
-                let rshelf = right_shelf_rect(grid.intersect(rect), now_w);
-                paint_shelf_right(&ui.painter_at(rect), rshelf, NOW_SHELF);
                 if now_x >= grid.left() && now_x <= grid.right() {
                     gp.text(egui::pos2(now_x - 2.0, grid.bottom() - 2.0), egui::Align2::RIGHT_BOTTOM, "NOW", now_font, egui::Color32::from_rgb(255, 90, 75));
+                }
+                // Tint goes over the NOW line and label so they sit under it.
+                if let Some((x0, x1)) = now_fade_span(now_x - grid.left(), plot_w, right_shelf_w(now_w)) {
+                    let r = egui::Rect::from_min_max(egui::pos2(grid.left() + x0, grid.top()), egui::pos2(grid.left() + x1, grid.bottom()));
+                    paint_shelf_right(&ui.painter_at(rect), r, NOW_SHELF);
                 }
                 if let Some(tip) = block_tip {
                     gresp.on_hover_text(tip);
@@ -1238,16 +1265,15 @@ impl App {
                 // Shelf over the grid: opaque on the left, fading out. Labels are
                 // clickable only on the opaque part; the fade passes through.
                 paint_shelf(&ui.painter_at(rect), label_rect, bg);
-                let max_chars = ((shelf_w * 0.85 - 10.0) / 7.3).max(4.0) as usize;
                 for (i, name) in lanes.iter().enumerate() {
                     let y = rect.top() + lane_top[i];
-                    let full = egui::Rect::from_min_size(egui::pos2(rect.left(), y), egui::vec2(width_all, lane_h[i]));
                     let selected = sel_lane.as_deref() == Some(name.as_str());
-                    let _ = full;
-                    let cell = egui::Rect::from_min_size(egui::pos2(label_rect.left(), y), egui::vec2(shelf_w * timeline::SHELF_OPAQUE_FRAC, row_h));
+                    let cell = egui::Rect::from_min_size(egui::pos2(label_rect.left(), y), egui::vec2(solid_end, row_h));
                     let resp = ui.interact(cell, ui.scope_id().with(("rec-lane", i)), egui::Sense::click());
-                    let ink = if selected || resp.hovered() { egui::Color32::WHITE } else { ui.visuals().text_color() };
-                    ui.painter_at(label_rect).text(cell.left_center() + egui::vec2(6.0, 0.0), egui::Align2::LEFT_CENTER, timeline::ellipsize(name, max_chars), egui::FontId::monospace(12.0), ink);
+                    let ink = lane_ink(ui, selected, cell);
+                    let job = lane_label_job(ui, name, &label_font, ink, LABEL_PAD, solid_end, label_cap, false);
+                    let g = ui.fonts_mut(|f| f.layout_job(job));
+                    ui.painter_at(label_rect).galley(egui::pos2(cell.left() + LABEL_PAD, cell.center().y - g.size().y / 2.0), g, ink);
                     if resp.clicked() {
                         lane_click = Some(name.clone());
                     }
@@ -1647,6 +1673,46 @@ mod tests {
     }
 
     #[test]
+    fn lane_labels_cap_halfway_and_fade_softly() {
+        assert_eq!(lane_label_cap(800.0, 760.0), 400.0);
+        assert_eq!(lane_label_cap(100.0, 30.0), 30.0);
+        assert_eq!(lane_label_cap(f32::NAN, 30.0), 0.0);
+        assert_eq!(lane_label_alpha(10.0, 400.0), 1.0);
+        assert_eq!(lane_label_alpha(400.0 - LABEL_FADE, 400.0), 1.0);
+        assert!((lane_label_alpha(400.0 - LABEL_FADE / 2.0, 400.0) - 0.5).abs() < 1e-6);
+        assert_eq!(lane_label_alpha(400.0, 400.0), 0.0);
+        assert_eq!(lane_label_alpha(500.0, 400.0), 0.0);
+    }
+
+    #[test]
+    fn now_tint_is_a_steep_translucent_highlight() {
+        assert_eq!(now_tint_alpha(0.0), 0.0);
+        assert!((now_tint_alpha(1.0) - NOW_TINT_PEAK).abs() < 1e-6);
+        assert!(NOW_TINT_PEAK > 0.35 && NOW_TINT_PEAK < 0.5);
+        assert!(now_tint_alpha(0.5) < NOW_TINT_PEAK * 0.2);
+        let mut prev = -1.0;
+        for k in 0..=20 {
+            let a = now_tint_alpha(k as f32 / 20.0);
+            assert!(a > prev || (k == 0 && a == 0.0));
+            prev = a;
+        }
+        assert_eq!(now_tint_alpha(f32::NAN), 0.0);
+        assert_eq!(now_tint_alpha(2.0), NOW_TINT_PEAK);
+    }
+
+    #[test]
+    fn now_fade_ends_at_the_line_and_gutter_is_excluded() {
+        assert_eq!(now_fade_span(300.0, 500.0, 40.0), Some((260.0, 300.0)));
+        assert_eq!(now_fade_span(500.0, 500.0, 40.0), Some((460.0, 500.0)));
+        assert_eq!(now_fade_span(20.0, 500.0, 40.0), Some((0.0, 20.0)));
+        assert_eq!(now_fade_span(501.0, 500.0, 40.0), None);
+        assert_eq!(now_fade_span(-1.0, 500.0, 40.0), None);
+        assert_eq!(now_fade_span(f32::NAN, 500.0, 40.0), None);
+        assert_eq!(plot_width(800.0), 800.0 - SCROLL_GUTTER);
+        assert_eq!(plot_width(5.0), 1.0);
+    }
+
+    #[test]
     fn right_shelf_is_one_and_a_half_labels_clamped() {
         assert_eq!(right_shelf_w(18.0), 40.0);
         assert_eq!(right_shelf_w(40.0), 60.0);
@@ -1795,8 +1861,73 @@ pub fn lane_row_h(rows: usize, viewport_h: f32) -> f32 {
     (viewport_h / rows as f32).clamp(LANE_H, LANE_H * LANE_GROW_MAX)
 }
 
+/// Left padding of lane names inside the shelf.
+const LABEL_PAD: f32 = 6.0;
+/// Width over which a long lane name fades out before its cap.
+const LABEL_FADE: f32 = 48.0;
+
+/// Where lane names stop, measured from the timeline's left edge: halfway
+/// across the lane, and never into the right-hand NOW shelf.
+pub fn lane_label_cap(lane_w: f32, right_shelf_left: f32) -> f32 {
+    if !lane_w.is_finite() || lane_w <= 0.0 {
+        return 0.0;
+    }
+    (lane_w * 0.5).min(right_shelf_left.max(0.0))
+}
+
+/// Alpha (0..1) of lane-name text at `x` (from the timeline's left edge):
+/// full until `LABEL_FADE` before `cap`, then a linear fade to 0 at `cap`.
+pub fn lane_label_alpha(x: f32, cap: f32) -> f32 {
+    if !(x.is_finite() && cap.is_finite()) {
+        return 0.0;
+    }
+    ((cap - x) / LABEL_FADE).clamp(0.0, 1.0)
+}
+
+/// One lane name as a per-character coloured job. `under` selects the
+/// characters past the solid shelf (drawn under the blocks); otherwise the
+/// ones on the solid shelf (drawn over it). Characters past `cap` are dropped.
+fn lane_label_job(ui: &egui::Ui, name: &str, font: &egui::FontId, ink: egui::Color32, pad: f32, solid_end: f32, cap: f32, under: bool) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    let mut buf = [0u8; 4];
+    let mut x = pad;
+    for c in name.chars() {
+        let w = ui.fonts_mut(|f| f.glyph_width(font, c));
+        let mid = x + w / 2.0;
+        if mid >= cap {
+            break;
+        }
+        let on_solid = mid < solid_end;
+        let a = if on_solid != under { lane_label_alpha(mid, cap) } else { 0.0 };
+        job.append(c.encode_utf8(&mut buf), 0.0, egui::TextFormat::simple(font.clone(), ink.gamma_multiply(a)));
+        x += w;
+    }
+    job
+}
+
 /// Dark red of the right-hand NOW shelf (kin to the armed REC icon's red).
-const NOW_SHELF: egui::Color32 = egui::Color32::from_rgb(72, 10, 8);
+const NOW_SHELF: egui::Color32 = egui::Color32::from_rgb(120, 16, 12);
+
+/// Free strip at the right of the lane area for the lane scrollbar.
+pub const SCROLL_GUTTER: f32 = 14.0;
+
+/// Plot (axis + lanes) width: the available width minus the scrollbar gutter.
+pub fn plot_width(avail: f32) -> f32 {
+    if !avail.is_finite() {
+        return 1.0;
+    }
+    (avail - SCROLL_GUTTER).max(1.0)
+}
+
+/// Span (x0, x1) of the NOW tint relative to the plot's left edge: it ends
+/// exactly at the NOW line and reaches `w` to its left. None when NOW is
+/// outside the visible plot.
+pub fn now_fade_span(now_x: f32, plot_w: f32, w: f32) -> Option<(f32, f32)> {
+    if !(now_x.is_finite() && plot_w.is_finite()) || now_x < 0.0 || now_x > plot_w {
+        return None;
+    }
+    Some(((now_x - w).max(0.0), now_x))
+}
 
 /// Right shelf width: 1.5x the NOW label, clamped to 40..90 px.
 pub fn right_shelf_w(label_w: f32) -> f32 {
@@ -1807,6 +1938,7 @@ pub fn right_shelf_w(label_w: f32) -> f32 {
 }
 
 /// Full-height strip at the right edge of `area`, `right_shelf_w` wide.
+#[cfg(test)]
 fn right_shelf_rect(area: egui::Rect, label_w: f32) -> egui::Rect {
     let w = right_shelf_w(label_w).min(area.width());
     egui::Rect::from_min_max(egui::pos2(area.right() - w, area.top()), area.max)
@@ -1814,19 +1946,37 @@ fn right_shelf_rect(area: egui::Rect, label_w: f32) -> egui::Rect {
 
 /// Mirror of `paint_shelf`: opaque at the right edge, fading out leftward.
 fn paint_shelf_right(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
-    let solid_w = rect.width() * timeline::SHELF_OPAQUE_FRAC;
-    let solid = egui::Rect::from_min_max(egui::pos2(rect.right() - solid_w, rect.top()), rect.max);
-    painter.rect_filled(solid, egui::CornerRadius::ZERO, color);
+    // Translucent red highlight: eased (cubic) from clear on the left to
+    // NOW_TINT_PEAK at the right edge, so what is underneath shows through.
+    const STEPS: usize = 16;
     let mut mesh = egui::Mesh::default();
-    let clear = egui::Color32::TRANSPARENT;
-    let (x0, x1, y0, y1) = (rect.left(), solid.left(), rect.top(), rect.bottom());
-    mesh.colored_vertex(egui::pos2(x0, y0), clear);
-    mesh.colored_vertex(egui::pos2(x1, y0), color);
-    mesh.colored_vertex(egui::pos2(x1, y1), color);
-    mesh.colored_vertex(egui::pos2(x0, y1), clear);
-    mesh.add_triangle(0, 1, 2);
-    mesh.add_triangle(0, 2, 3);
+    for k in 0..=STEPS {
+        let t = k as f32 / STEPS as f32;
+        let x = rect.left() + rect.width() * t;
+        let a = (now_tint_alpha(t) * 255.0).round() as u8;
+        let c = egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), a);
+        mesh.colored_vertex(egui::pos2(x, rect.top()), c);
+        mesh.colored_vertex(egui::pos2(x, rect.bottom()), c);
+        if k > 0 {
+            let b = (2 * k) as u32;
+            mesh.add_triangle(b - 2, b - 1, b);
+            mesh.add_triangle(b - 1, b + 1, b);
+        }
+    }
     painter.add(egui::Shape::mesh(mesh));
+}
+
+/// Peak alpha (0..1) of the NOW tint at the right edge (~45 %).
+pub const NOW_TINT_PEAK: f32 = 115.0 / 255.0;
+
+/// NOW tint alpha at `t` across the strip (0 = left end, 1 = right edge):
+/// cubic ease-in, so most of the width is nearly clear.
+pub fn now_tint_alpha(t: f32) -> f32 {
+    if !t.is_finite() {
+        return 0.0;
+    }
+    let t = t.clamp(0.0, 1.0);
+    NOW_TINT_PEAK * t * t * t
 }
 
 fn paint_shelf(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
