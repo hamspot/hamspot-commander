@@ -1029,20 +1029,20 @@ impl App {
                 _ => None,
             };
             let base = bar_colour(seg.action);
-            let label = bar_label(seg, on);
-            let fill = if on == Some(false) { rustcars::tint(base, -0.55) } else { base };
             let size = egui::vec2(seg.width, theme.bar_thin);
-            let resp = rustcars::lcars_button(ui, &theme, &label, fill, size, cap, true);
-            // Toggles keep a visible outline in both states; off is a dim
-            // fill inside it and an open marker, on is full fill and a dot.
-            if on.is_some() {
-                ui.painter().rect_stroke(
-                    resp.rect.shrink(1.0),
-                    rustcars::cap_radius(cap, resp.rect.height()),
-                    egui::Stroke::new(2.0, rustcars::tint(base, 0.35)),
-                    egui::StrokeKind::Inside,
-                );
-            }
+            let resp = match on {
+                // Toggles: the rustcars toggle button (thin border, painted
+                // ●/○). The timeline applies the action, so the local flip
+                // is discarded here.
+                Some(state) => {
+                    let mut local = state;
+                    let resp = rustcars::toggle_button(ui, &theme, seg.label, &mut local, base, size);
+                    let name = bar_label(seg, on);
+                    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, true, state, &name));
+                    resp
+                }
+                None => rustcars::lcars_button(ui, &theme, &bar_label(seg, on), base, size, cap, true),
+            };
             let resp = resp.on_hover_text(bar_hint(seg.action, on));
             if resp.clicked() {
                 self.rec.bar_actions.push(seg.action);
@@ -1535,7 +1535,6 @@ impl App {
             }
             ui.checkbox(&mut star, "★ Star");
             ui.checkbox(&mut protect, "🔒 Protect").on_hover_text("Never removed by overwrite-oldest.");
-            ui.checkbox(&mut self.rec.play_next, "Play next");
         });
         self.rec_output_row(ui);
         ui.horizontal_wrapped(|ui| {
@@ -2116,26 +2115,6 @@ pub fn bar_hint(action: BarAction, on: Option<bool>) -> String {
 
 pub fn toggle_text(on: bool, label: &str) -> String {
     format!("{} {label}", if on { "●" } else { "○" })
-}
-
-/// A toolbar toggle that always looks like a button: a visible frame in both
-/// states, a pressed (selection) fill when on, the normal button fill when off.
-fn toolbar_toggle(ui: &mut egui::Ui, on: bool, label: &str, muted: bool) -> egui::Response {
-    let v = ui.visuals();
-    let mut text = egui::RichText::new(toggle_text(on, label));
-    if muted {
-        text = text.small();
-        if !on {
-            text = text.weak();
-        }
-    }
-    let fill = if on { v.selection.bg_fill } else { v.widgets.inactive.weak_bg_fill };
-    let stroke = if on {
-        v.selection.stroke
-    } else {
-        egui::Stroke::new(1.0, v.widgets.noninteractive.bg_stroke.color)
-    };
-    ui.add(egui::Button::new(text).fill(fill).stroke(stroke))
 }
 
 /// The timeline handles pointer input only when its own layer is the top

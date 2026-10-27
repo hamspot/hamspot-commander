@@ -256,7 +256,7 @@ A key lights only when the radio reports it can do that operation.
 | `VFO A`, `VFO B` | Select a VFO |
 | `R-6kHz`, `R-3kHz`, `R-15kHz`, `R-Auto` | Set or clear the RIT offset |
 
-`Mode` lists the modes the radio reports and keeps the passband. `Sub` sets the paired VFO's mode when split is possible. `Receiver` (`RX` or `Off`) powers the radio over CAT when it supports that.
+`Mode` lists the modes the radio reports and keeps the passband. `Sub` sets the paired VFO's mode when split is possible. `Receiver` is one toggle (● on, ○ off) that powers the radio over CAT when it supports that.
 
 <!-- screenshot: tune-04 — VFO, mode and receiver controls. -->
 
@@ -452,7 +452,9 @@ While REC is open, the timeline controls sit inside the tan bar at the top of th
 | **● DATA** / **○ DATA** | Open or close the Data dialog ([9.6](#s9-6)) |
 | **● ▶▶** / **○ ▶▶** | Play next: when a recording finishes playing, the following one plays. ● is on, ○ is off; hover to see ON or OFF. |
 
-**LIVE**, **DATA** and **▶▶** are toggles. Each keeps its outline when off; off is a dimmer fill with ○, on is a full fill with ●.
+**LIVE**, **DATA** and **▶▶** are toggles. Each keeps its thin outline when off; off is a dark fill with ○, on is a full fill with ●.
+
+The same rule holds everywhere in Commander: a button that switches something on or off (for example **NR**, **ATU**, **MOX**, **BSP**, **Receiver**, **Follow**, **Follow rig frequency**, **Limit test on**) has a thin border and starts with ● when on or ○ when off. Buttons that do something once have no border. A toggle the radio does not support stays visible, bordered and greyed out. Checkboxes in forms stay checkboxes.
 
 When the window is too narrow for the full controls, they shorten to symbols: **◀ T ▶ − + FIT ● L ● D ● ▶▶**. If even that would leave too little of the tan bar, the controls move up to the right end of the page-tab row. Hover any control to see its name.
 
@@ -509,7 +511,7 @@ Clicking a block opens this dialog. It follows the selection; close it with ✕ 
 From the top:
 
 1. **Header**: lane, time range and length.
-2. **Playback**: **▶ Play** / **■ Stop**, **★ Star**, **🔒 Protect** (never removed by overwrite-oldest), **Play next**, tags, and one status line. **Output** chooses where replay plays: **System default** (as before), or any audio output on the computer, such as wired speakers, a USB headset or a Bluetooth device. **Refresh** lists the outputs again. The choice is saved with the station. If the chosen output isn't there, replay plays to the system default and the dialog says so in words.
+2. **Playback**: **▶ Play** / **■ Stop**, **★ Star**, **🔒 Protect** (never removed by overwrite-oldest), tags, and one status line. To play the following recording when one finishes, use the **▶▶** toggle in the REC bar. **Output** chooses where replay plays: **System default** (as before), or any audio output on the computer, such as wired speakers, a USB headset or a Bluetooth device. **Refresh** lists the outputs again. The choice is saved with the station. If the chosen output isn't there, replay plays to the system default and the dialog says so in words.
 3. **Notes**, then **Export WAV…** (decoded now), **Export raw…** (raw IQ plus its sidecar), **Archive** / **Unarchive** and **Delete** (undo for 60 s).
 4. **Metadata**: a label/value grid with a **📋 Copy** button.
 5. **Decoder parameters**: the decoder settings saved with the recording, collapsed by default.

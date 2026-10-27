@@ -241,7 +241,6 @@ mod tests {
                                 ui.label("setting");
                                 ui.horizontal(|ui| {
                                     let _ = ui.button("Add");
-                                    let _ = ui.checkbox(&mut true, "Follow");
                                 });
                                 group_box(ui, "nested", c, |ui| ui.label("x"));
                             });

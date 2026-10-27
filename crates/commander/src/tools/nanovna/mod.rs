@@ -4555,7 +4555,9 @@ impl NanoVna {
             .open(&mut open)
             .resizable(false)
             .show(ui.ctx(), |ui| {
-                ui.checkbox(&mut set.on, "Limit test on");
+                if crate::toggle::add_toggle(ui, true, set.on, "Limit test on").clicked() {
+                    set.on = !set.on;
+                }
                 let mut remove = None;
                 egui::Grid::new("vna-limits").striped(true).show(ui, |ui| {
                     for h in ["START MHz", "STOP MHz", &format!("START {unit}"), &format!("STOP {unit}"), "TYPE", ""] {
