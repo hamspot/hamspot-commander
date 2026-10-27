@@ -723,4 +723,45 @@ mod top_cap_deadlock_tests {
         let got = ctx.data(|d| d.get_temp::<egui::Rect>(id));
         assert_eq!(got, Some(egui::Rect::ZERO));
     }
+
+    /// Headless smoke test: runs `frame` + `overflow_tab_row` (forced into
+    /// overflow) through `Context::run_ui` for a few frames on a worker thread
+    /// and fails if it doesn't finish in 10 s. Catches egui lock re-entry
+    /// deadlocks like the one that hung the app before its first frame.
+    /// Does not cover the full app `update` or the REC page.
+    #[test]
+    fn frame_and_overflow_row_run_headless_without_deadlock() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let ctx = egui::Context::default();
+            let labels: Vec<String> = (0..40).map(|i| format!("TAB NUMBER {i}")).collect();
+            for _ in 0..3 {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(400.0, 300.0),
+                    )),
+                    ..Default::default()
+                };
+                let mut out = ctx.run_ui(input, |ui| {
+                    {
+                        super::frame(ui, |ui| {
+                            super::overflow_tab_row(
+                                ui,
+                                "smoke",
+                                &labels,
+                                Some(0),
+                                |_, _| 120.0,
+                                |ui, i, sel| ui.selectable_label(sel, &labels[i]),
+                            );
+                        });
+                    }
+                });
+                out.textures_delta.clear();
+            }
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("headless frame/overflow_tab_row did not finish in 10 s (deadlock?)");
+    }
 }
