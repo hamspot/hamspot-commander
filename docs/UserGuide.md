@@ -630,6 +630,22 @@ Station clocks at fixed offsets (no daylight saving time), a 10-minute **ID time
 
 <!-- screenshot: cfg-01 — The Config page. -->
 
+The page is split into groups. Each group sits inside a thin elbow: a bar across the top, with the group's name printed in it, that turns down the left side of the group. From the top:
+
+| Group | What's in it |
+|---|---|
+| **STATION** | **Load**, **Save**, the station file name, the band plan, and the channel and talkgroup zone counts ([11.1](#ch11)). |
+| **DISPLAY** | **Pulse busy tabs** and **Pulse speed**. |
+| **TRUNKING** | **Trunk voice hang** and **Emergency/priority override**. |
+| **RADIO** | The CAT Control table of radios and its buttons ([11.2](#ch11)). |
+| **AUDIO** | Audio wiring and pipes ([11.6](#s11-6)). |
+| **AUTOMATION** | Gpredict, the Control view, **Follow** and the decoder log. |
+| **ROTATOR** | The rotator table with **Add**, **Edit** and **Remove**. |
+| **AMPLIFIER** | The amplifier table. |
+| **PATCH BAY** | The RF patch bay ([11.8](#ch11)). |
+
+The groups only separate the page visually. Every setting works as before.
+
 ## 11.1 Station file
 
 **Load** and **Save** at the top of Config open and save the station file. The label beside them shows the file name, or `No file`.
