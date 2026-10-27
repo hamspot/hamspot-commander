@@ -160,8 +160,9 @@ fn run(a: Args) -> u8 {
     }
     let db_path = hsrec::db::db_path_beside(&station);
     let dir = storage::recordings_dir_beside(&station);
-    if !db_path.exists() {
-        eprintln!("commander-rec: no recordings database at {}", db_path.display());
+    // A missing database is created quietly, but only beside a real station.
+    if !db_path.exists() && !station.exists() {
+        eprintln!("commander-rec: no station file at {}", station.display());
         return 1;
     }
     let db = match Db::open(&db_path) {
