@@ -2,6 +2,7 @@
 pub mod db;
 pub mod dsp;
 pub mod meta;
+pub mod replay;
 pub mod segment;
 pub mod storage;
 pub mod writer;
