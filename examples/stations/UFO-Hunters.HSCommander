@@ -455,6 +455,93 @@
             ]
           }
         ]
+      },
+      {
+        "name": "OTHER HW (not HackRF)",
+        "color": [
+          120,
+          120,
+          140
+        ],
+        "bands": [
+          {
+            "name": "VLF / natural radio (needs <1 MHz hw)",
+            "chip": "vlf",
+            "lo_hz": 3000,
+            "hi_hz": 30000,
+            "home_hz": 24000,
+            "mode": "USB",
+            "segments": [
+              {
+                "lo_hz": 3000,
+                "hi_hz": 30000,
+                "use": "mixed"
+              }
+            ]
+          },
+          {
+            "name": "LF/MF NDB (needs <1 MHz hw)",
+            "chip": "ndb",
+            "lo_hz": 190000,
+            "hi_hz": 535000,
+            "home_hz": 414000,
+            "mode": "CW",
+            "segments": [
+              {
+                "lo_hz": 190000,
+                "hi_hz": 535000,
+                "use": "mixed",
+                "service": "aero"
+              }
+            ]
+          },
+          {
+            "name": "X-band radar (needs >6 GHz hw)",
+            "chip": "xrad",
+            "lo_hz": 9300000000,
+            "hi_hz": 9500000000,
+            "home_hz": 9410000000,
+            "mode": "AM",
+            "segments": [
+              {
+                "lo_hz": 9300000000,
+                "hi_hz": 9500000000,
+                "use": "mixed",
+                "service": "marine"
+              }
+            ]
+          },
+          {
+            "name": "Ku satcom downlink (needs >6 GHz hw)",
+            "chip": "ku",
+            "lo_hz": 10700000000,
+            "hi_hz": 12750000000,
+            "home_hz": 11700000000,
+            "mode": "AM",
+            "segments": [
+              {
+                "lo_hz": 10700000000,
+                "hi_hz": 12750000000,
+                "use": "mixed"
+              }
+            ]
+          },
+          {
+            "name": "Ka satcom downlink (needs >6 GHz hw)",
+            "chip": "ka",
+            "lo_hz": 17700000000,
+            "hi_hz": 21200000000,
+            "home_hz": 19000000000,
+            "mode": "AM",
+            "segments": [
+              {
+                "lo_hz": 17700000000,
+                "hi_hz": 21200000000,
+                "use": "mixed"
+              }
+            ]
+          }
+        ]
       }
     ]
   },
@@ -1029,6 +1116,493 @@
             "encrypted": false
           }
         ]
+      },
+      {
+        "name": "ENC A51 NTTR P25 sites (awareness only)",
+        "channels": [
+          {
+            "name": "ENC A51 NTTR Tonopah Radar Peak 385.9125",
+            "hz": 385912500,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Tonopah Radar Peak 386.3375",
+            "hz": 386337500,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Tonopah Radar Peak 386.6500",
+            "hz": 386650000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Tonopah Radar Peak 387.2500",
+            "hz": 387250000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Tonopah Radar Peak 387.5500",
+            "hz": 387550000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Antelope Peak TTR 385.8125",
+            "hz": 385812500,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Antelope Peak TTR 386.2500",
+            "hz": 386250000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Antelope Peak TTR 386.5500",
+            "hz": 386550000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Antelope Peak TTR 386.8500",
+            "hz": 386850000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Antelope Peak TTR 387.3500",
+            "hz": 387350000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Antelope Peak TTR 387.7250",
+            "hz": 387725000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Antelope Peak TTR 388.7000",
+            "hz": 388700000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Cedar Peak 385.7750",
+            "hz": 385775000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Cedar Peak 386.1875",
+            "hz": 386187500,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Cedar Peak 386.4875",
+            "hz": 386487500,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Cedar Peak 386.9125",
+            "hz": 386912500,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Cedar Peak 387.2750",
+            "hz": 387275000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Cedar Peak 387.6625",
+            "hz": 387662500,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Cedar Peak 388.1125",
+            "hz": 388112500,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Halligan Mesa Basecamp 385.6250",
+            "hz": 385625000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Halligan Mesa Basecamp 386.3750",
+            "hz": 386375000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Halligan Mesa Basecamp 386.7000",
+            "hz": 386700000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Halligan Mesa Basecamp 387.2125",
+            "hz": 387212500,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Halligan Mesa Basecamp 387.5125",
+            "hz": 387512500,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Bald Mtn 385.7250",
+            "hz": 385725000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Bald Mtn 386.1250",
+            "hz": 386125000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Bald Mtn 386.5250",
+            "hz": 386525000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Bald Mtn 386.9375",
+            "hz": 386937500,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Bald Mtn 387.3250",
+            "hz": 387325000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Papoose Mtn 385.6750",
+            "hz": 385675000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Papoose Mtn 385.9625",
+            "hz": 385962500,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Papoose Mtn 386.2750",
+            "hz": 386275000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Papoose Mtn 386.5750",
+            "hz": 386575000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Papoose Mtn 386.8875",
+            "hz": 386887500,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Black Mtn 385.0875",
+            "hz": 385087500,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Black Mtn 385.7000",
+            "hz": 385700000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Black Mtn 386.0125",
+            "hz": 386012500,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Black Mtn 388.0000",
+            "hz": 388000000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Black Mtn 388.5000",
+            "hz": 388500000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          }
+        ]
+      },
+      {
+        "name": "HOP A51 HAVE QUICK (cannot be followed)",
+        "channels": [
+          {
+            "name": "HOP HAVE QUICK 225.150",
+            "hz": 225150000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "HOP HAVE QUICK 235.050",
+            "hz": 235050000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "HOP HAVE QUICK 239.950",
+            "hz": 239950000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "HOP HAVE QUICK 252.925",
+            "hz": 252925000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "HOP HAVE QUICK 257.250",
+            "hz": 257250000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "HOP HAVE QUICK 262.450",
+            "hz": 262450000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "HOP HAVE QUICK 267.850",
+            "hz": 267850000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "HOP HAVE QUICK 271.950",
+            "hz": 271950000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "HOP HAVE QUICK 279.750",
+            "hz": 279750000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "HOP HAVE QUICK 284.150",
+            "hz": 284150000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "HOP HAVE QUICK 289.050",
+            "hz": 289050000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "HOP HAVE QUICK 293.550",
+            "hz": 293550000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "HOP HAVE QUICK 298.650",
+            "hz": 298650000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "HOP HAVE QUICK 303.275",
+            "hz": 303275000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "HOP HAVE QUICK 308.750",
+            "hz": 308750000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "HOP HAVE QUICK 314.450",
+            "hz": 314450000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          }
+        ]
+      },
+      {
+        "name": "OLD A51 gates",
+        "channels": [
+          {
+            "name": "OLD A51 North Gate 310.125",
+            "hz": 310125000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "OLD A51 South Gate 314.525",
+            "hz": 314525000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          }
+        ]
+      },
+      {
+        "name": "WATCH Inmarsat STD-C (data, not voice)",
+        "channels": [
+          {
+            "name": "WATCH Inmarsat 4F3 AOR-W STD-C 1537.700",
+            "hz": 1537700000,
+            "mode": "USB",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "WATCH Inmarsat 3F5 AOR-E/POR STD-C 1541.450",
+            "hz": 1541450000,
+            "mode": "USB",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "WATCH Inmarsat IOR STD-C 1537.100",
+            "hz": 1537100000,
+            "mode": "USB",
+            "control": false,
+            "encrypted": false
+          }
+        ]
+      },
+      {
+        "name": "OTHER HW only (HackRF refuses these)",
+        "channels": [
+          {
+            "name": "Hessdalen station radar 9450 (needs >6 GHz hw)",
+            "hz": 9450000000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "X-band marine radar 9410 (needs >6 GHz hw)",
+            "hz": 9410000000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "OLD Groom NDB PYD 414 kHz (needs <1 MHz hw)",
+            "hz": 414000,
+            "mode": "CW",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "OLD TTR NDB XSD 278 kHz (needs <1 MHz hw)",
+            "hz": 278000,
+            "mode": "CW",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "VLF NAA Cutler 24.0 kHz (needs <1 MHz hw)",
+            "hz": 24000,
+            "mode": "USB",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "VLF NLK Jim Creek 24.8 kHz (needs <1 MHz hw)",
+            "hz": 24800,
+            "mode": "USB",
+            "control": false,
+            "encrypted": false
+          }
+        ]
       }
     ]
   },
@@ -1036,8 +1610,124 @@
     "version": 1,
     "zones": [
       {
-        "name": "Talkgroups",
-        "talkgroups": []
+        "name": "ENC A51 NTTR P25 (WACN 33744 SYS 001, all encrypted)",
+        "talkgroups": [
+          {
+            "name": "ENC TTR Security Cactus",
+            "tg": 1201,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 Technicians",
+            "tg": 1426,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 Tower",
+            "tg": 1557,
+            "encrypted": true
+          },
+          {
+            "name": "ENC Gravel Trucks",
+            "tg": 1711,
+            "encrypted": true
+          },
+          {
+            "name": "ENC Emergency patch",
+            "tg": 1903,
+            "encrypted": true
+          },
+          {
+            "name": "ENC Phoenix Dispatch",
+            "tg": 2001,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 Fire/EMT Dispatch",
+            "tg": 2005,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 Fire Dispatch",
+            "tg": 2006,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 Security Tac-1",
+            "tg": 2201,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 Security Tac-2 Rider",
+            "tg": 2202,
+            "encrypted": true
+          },
+          {
+            "name": "ENC Cattle Man",
+            "tg": 2210,
+            "encrypted": true
+          }
+        ]
+      },
+      {
+        "name": "ENC Nellis/Creech/NNSS P25 (encrypted groups only)",
+        "talkgroups": [
+          {
+            "name": "ENC unknown",
+            "tg": 49,
+            "encrypted": true
+          },
+          {
+            "name": "ENC Security",
+            "tg": 60,
+            "encrypted": true
+          },
+          {
+            "name": "ENC Nellis Security",
+            "tg": 62,
+            "encrypted": true
+          },
+          {
+            "name": "ENC unknown",
+            "tg": 63,
+            "encrypted": true
+          },
+          {
+            "name": "ENC unknown",
+            "tg": 64,
+            "encrypted": true
+          },
+          {
+            "name": "ENC Nellis Security",
+            "tg": 70,
+            "encrypted": true
+          },
+          {
+            "name": "ENC Nellis Police/surveillance",
+            "tg": 222,
+            "encrypted": true
+          },
+          {
+            "name": "ENC LV DOE Bldg Security",
+            "tg": 31218,
+            "encrypted": true
+          },
+          {
+            "name": "ENC LV DOE Bldg Security",
+            "tg": 31219,
+            "encrypted": true
+          },
+          {
+            "name": "ENC Security TAC-5",
+            "tg": 31222,
+            "encrypted": true
+          },
+          {
+            "name": "ENC Security TAC-6",
+            "tg": 31223,
+            "encrypted": true
+          }
+        ]
       }
     ]
   },

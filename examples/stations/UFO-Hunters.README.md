@@ -4,7 +4,7 @@
 
 - Radio: HackRF only, RX on and **TX off**. Nothing in this file is meant to be transmitted.
 - No pipes are named, so every channel uses the built-in analog demodulator (AM for aircraft, FM for land mobile). A P25 control channel is marked `control` so you can follow it with `modems/commander-demod-p25.rxpipe` if you choose.
-- Counts: 7 channel zones and 77 channels. The band plan has 6 zones, 19 bands and 35 segments. The scan list covers the SKW public-safety zone and both A51 zones.
+- Counts: 12 channel zones and 143 channels, plus 22 talkgroups. The band plan has 7 zones, 24 bands and 40 segments. The scan list covers the SKW public-safety zone and both A51 zones.
 - `WATCH …` channels are waterfall bookmarks. Radar pulses, ADS-B, GNSS, Iridium, telemetry and the hydrogen line carry no voice, so listening in AM or FM only gives you hiss or buzz. Look at them on the waterfall instead.
 
 ## Listening rules
@@ -49,15 +49,52 @@ HackRF below about 10 MHz is weak without an upconverter or a good antenna.
 | S12 | https://old.hessdalen.org/reports/hpreport84.shtml and https://old.hessdalen.org/station/second.shtml | Hessdalen radar (9450 MHz) and spectrum analyzer (to 1250 MHz) |
 | S13 | Standard allocations: https://www.gps.gov/systems/gps/space/ (L1/L2); https://en.wikipedia.org/wiki/Hydrogen_line (1420.405752); https://en.wikipedia.org/wiki/Iridium_satellite_constellation; https://en.wikipedia.org/wiki/GLONASS; https://www.faa.gov/air_traffic/technology/adsb (1090/1030); https://en.wikipedia.org/wiki/ACARS (131.550); https://www.ntia.gov/page/united-states-frequency-allocation-chart (radar, ISM and band edges); FCC FRS/GMRS/MURS/CB pages https://www.fcc.gov/wireless/bureau-divisions/mobility-division/ | universal channels and band plan |
 
-## Excluded, and why
+## Encrypted (awareness only)
 
-- **NTTR P25 talkgroups:** all encrypted (S3).
-- **HAVE QUICK channels:** frequency hopping (S2).
-- **Groom gate frequencies 310.125 and 314.525:** S1 marks them OLD. The bus channel 856.525 is kept but labelled (OLD).
-- **"Sensitive" frequencies:** the Rachel list deliberately leaves some out, and I did not go looking for them.
-- **Lincoln Co NV 155.310:** RadioReference subcat 10897 turned out to be Lincoln County, **New Mexico**, so I didn't use its frequencies. 155.310 MHz is used by Lincoln Co NM SO, which matters for Roswell; those frequencies are left out until you look the county up yourself.
-- **Hotspot-specific local frequencies outside UT/NV:** not sourced this round, so they aren't in the file.
-- **Inmarsat, Globalstar and NEXRAD exact channels:** only band edges are given.
+These entries are here so you can identify what you see on the waterfall, not so you can listen to it. Commander never decrypts encrypted traffic, and does not record traffic it can't decode.
+
+- **Channel zone "ENC A51 NTTR P25 sites", 39 channels:** the NTTR P25 site frequencies (WACN 33744h, system 001h, 385–389 MHz; source S3). Each has `encrypted: true`, so the Channels list shows `enc` and scan skips it, and clicking does not tune it.
+- **Talkgroups:** 11 for the NTTR system, which is entirely encrypted, and 11 encrypted or mostly encrypted groups on the Nellis/Creech/NNSS system (S3). All have `encrypted: true`, and none is marked for recording. Talkgroup Follow does not play an encrypted talkgroup unless a key file has a filled key, and no keys are supplied.
+- Intercepting encrypted government communications is illegal. Listen only to clear traffic.
+
+## Hopping
+
+The zone "HOP A51 HAVE QUICK" lists the 16 published HAVE QUICK frequencies (S2). HAVE QUICK hops many times a second, so a fixed-frequency receiver such as the HackRF on one channel, or any scanner, can't follow it. You might hear short fragments at most. These entries are not marked encrypted, because hopping isn't encryption.
+
+## Old
+
+The zone "OLD A51 gates" has the North Gate (310.125) and South Gate (314.525) frequencies, which S1 marks as old. "51 Bus 856.525 (OLD)" stays in the A51 ground zone. The Groom NDB "PYD" (414 kHz) and TTR NDB "XSD" (278 kHz) are listed as inactive in S2.
+
+## Satcom and radar detail
+
+- **Inmarsat STD-C channels (S14):** 1537.700 (4F3 AOR-W, the satellite you see from Utah and Nevada), 1541.450 (AOR-E and POR) and 1537.100 (IOR). They are 1200 bps BPSK data, so you need a decoder, not voice. Commander has no Inmarsat pipe.
+- **Globalstar and NEXRAD:** exact channels were not sourced, so only the band edges are in the file.
+
+## Out of HackRF range
+
+The zone "OTHER HW only" and the band-plan zone "OTHER HW (not HackRF)" are tagged `(needs >6 GHz hw)` or `(needs <1 MHz hw)`:
+- Hessdalen radar at 9450 MHz (S12).
+- X-band marine radar at 9.3–9.5 GHz, with 9410 as a typical channel (S15).
+- Ku satcom downlink at 10.7–12.75 GHz and Ka at 17.7–21.2 GHz (S15).
+- VLF and natural radio at 3–30 kHz, with the US Navy stations NAA at 24.0 kHz and NLK at 24.8 kHz (S16).
+- The LF/MF NDB band at 190–535 kHz, with the old Groom and TTR beacons (S2).
+
+These entries are safe with the HackRF. The HackRF radio reports its receive range as 1 MHz–6 GHz, and Commander's tune path (`tune` calls `caps.allow_freq`), its channel click and its scan candidates all refuse a frequency outside that range. Clicking these entries therefore does nothing on the HackRF, and scan skips them. A future radio with a wider range would tune them. The station has no second radio entry, because the CAT manager would try to start it. I made no code change.
+
+Additional sources:
+- S14: https://github.com/f4exb/sdrangel/blob/master/plugins/channelrx/demodinmarsat/readme.md, https://thebaldgeek.github.io/stdc.html and https://www.rtl-sdr.com/rtl-sdr-tutorial-decoding-inmarsat-std-c-egc-messages/
+- S15: https://en.wikipedia.org/wiki/Marine_radar (X-band 9.3–9.5 GHz), https://en.wikipedia.org/wiki/Ku_band and https://en.wikipedia.org/wiki/Ka_band. These Wikipedia pages were cited without being reopened this run.
+- S16: https://en.wikipedia.org/wiki/VLF_Transmitter_Cutler (NAA 24.0 kHz), https://en.wikipedia.org/wiki/Jim_Creek_Naval_Radio_Station (NLK 24.8 kHz) and https://en.wikipedia.org/wiki/Very_low_frequency. Also cited without being reopened.
+
+All retrieved 2026-10-27.
+
+## Still excluded
+
+- **Frequencies the Rachel list chooses not to publish.**
+- **Lincoln Co NM frequencies:** they belong to the wrong state, and are a Roswell lookup.
+- **Local frequencies at the other hotspots.**
+- **Globalstar and NEXRAD exact channels:** not sourced.
+- **NTTR control-channel flags:** the source shows which channels are control channels only by colour, which didn't survive text extraction, so no NTTR channel is flagged `control`.
 
 ## Hotspots
 

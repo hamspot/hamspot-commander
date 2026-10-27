@@ -131,11 +131,54 @@ bsp={"version":1,"zones":[
    band("915 ISM","ism915",902,928,915,"FM",[seg(902,928,"mixed")]),
  ]},
 ]}
+
+# --- awareness-only additions (encrypted / hopping / old / other hardware) ---
+nttr_sites={"Tonopah Radar Peak":[385.9125,386.3375,386.6500,387.2500,387.5500],
+ "Antelope Peak TTR":[385.8125,386.2500,386.5500,386.8500,387.3500,387.7250,388.7000],
+ "Cedar Peak":[385.7750,386.1875,386.4875,386.9125,387.2750,387.6625,388.1125],
+ "Halligan Mesa Basecamp":[385.6250,386.3750,386.7000,387.2125,387.5125],
+ "Bald Mtn":[385.7250,386.1250,386.5250,386.9375,387.3250],
+ "Papoose Mtn":[385.6750,385.9625,386.2750,386.5750,386.8875],
+ "Black Mtn":[385.0875,385.7000,386.0125,388.0000,388.5000]}
+Z("ENC A51 NTTR P25 sites (awareness only)",[ch(f"ENC A51 NTTR {k} {f:.4f}",f,"FM",enc=True) for k,v in nttr_sites.items() for f in v])
+hq=[225.150,235.050,239.950,252.925,257.250,262.450,267.850,271.950,279.750,284.150,289.050,293.550,298.650,303.275,308.750,314.450]
+Z("HOP A51 HAVE QUICK (cannot be followed)",[ch(f"HOP HAVE QUICK {f:.3f}",f,"AM") for f in hq])
+Z("OLD A51 gates",[ch("OLD A51 North Gate 310.125",310.125,"AM"),ch("OLD A51 South Gate 314.525",314.525,"AM")])
+Z("WATCH Inmarsat STD-C (data, not voice)",[ch("WATCH Inmarsat 4F3 AOR-W STD-C 1537.700",1537.70,"USB"),
+ ch("WATCH Inmarsat 3F5 AOR-E/POR STD-C 1541.450",1541.45,"USB"),ch("WATCH Inmarsat IOR STD-C 1537.100",1537.10,"USB")])
+OUT=" (needs >6 GHz hw)"; LOW=" (needs <1 MHz hw)"
+Z("OTHER HW only (HackRF refuses these)",[
+ ch("Hessdalen station radar 9450"+OUT,9450.0,"AM"),
+ ch("X-band marine radar 9410"+OUT,9410.0,"AM"),
+ ch("OLD Groom NDB PYD 414 kHz"+LOW,0.414,"CW"),
+ ch("OLD TTR NDB XSD 278 kHz"+LOW,0.278,"CW"),
+ ch("VLF NAA Cutler 24.0 kHz"+LOW,0.024,"USB"),
+ ch("VLF NLK Jim Creek 24.8 kHz"+LOW,0.0248,"USB"),
+])
+bsp["zones"].append({"name":"OTHER HW (not HackRF)","color":[120,120,140],"bands":[
+ band("VLF / natural radio"+LOW,"vlf",0.003,0.030,0.024,"USB",[seg(0.003,0.030,"mixed")]),
+ band("LF/MF NDB"+LOW,"ndb",0.190,0.535,0.414,"CW",[seg(0.190,0.535,"mixed","aero")]),
+ band("X-band radar"+OUT,"xrad",9300,9500,9410,"AM",[seg(9300,9500,"mixed","marine")]),
+ band("Ku satcom downlink"+OUT,"ku",10700,12750,11700,"AM",[seg(10700,12750,"mixed")]),
+ band("Ka satcom downlink"+OUT,"ka",17700,21200,19000,"AM",[seg(17700,21200,"mixed")]),
+]})
+talkgroups={"version":1,"zones":[
+ {"name":"ENC A51 NTTR P25 (WACN 33744 SYS 001, all encrypted)","talkgroups":[{"name":f"ENC {n}","tg":t,"encrypted":True} for t,n in [
+  (1201,"TTR Security Cactus"),(1426,"A51 Technicians"),(1557,"A51 Tower"),(1711,"Gravel Trucks"),(1903,"Emergency patch"),
+  (2001,"Phoenix Dispatch"),(2005,"A51 Fire/EMT Dispatch"),(2006,"A51 Fire Dispatch"),(2201,"A51 Security Tac-1"),
+  (2202,"A51 Security Tac-2 Rider"),(2210,"Cattle Man")]]},
+ {"name":"ENC Nellis/Creech/NNSS P25 (encrypted groups only)","talkgroups":[{"name":f"ENC {n}","tg":t,"encrypted":True} for t,n in [
+  (49,"unknown"),(60,"Security"),(62,"Nellis Security"),(63,"unknown"),(64,"unknown"),(70,"Nellis Security"),
+  (222,"Nellis Police/surveillance"),(31218,"LV DOE Bldg Security"),(31219,"LV DOE Bldg Security"),
+  (31222,"Security TAC-5"),(31223,"Security TAC-6")]]},
+]}
+
 base=json.load(open('examples/Example-Satellite-EME.HSCommander'))
 base["bsp_name"]="ufo-hunters.json"; base["bsp"]=bsp
 base["channels"]={"version":1,"zones":zones}
+base["talkgroups"]=talkgroups
 base["tune"].update({"zone_sel":0,"band_sel":0,"band_mem":{},"freq_hz":121500000,"mode":"AM","passband_hz":8000})
 base["scan_zones"]=[0,2,3]
 base["page"]="Channels"
 json.dump(base,open('examples/stations/UFO-Hunters.HSCommander','w'),indent=2)
-print(sum(len(z["channels"]) for z in zones), sum(len(b["segments"]) for z in bsp["zones"] for b in z["bands"]), sum(len(z["bands"]) for z in bsp["zones"]))
+print(sum(len(z["talkgroups"]) for z in talkgroups["zones"]),sum(len(z["channels"]) for z in zones), sum(len(b["segments"]) for z in bsp["zones"] for b in z["bands"]), sum(len(z["bands"]) for z in bsp["zones"]))

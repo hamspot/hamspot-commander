@@ -1634,10 +1634,16 @@ mod tests {
             let (file, warnings) = load_file_in(&path, &modems).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             assert!(warnings.is_empty(), "{}: refused pipes {warnings:?}", path.display());
             for band in file.bsp.zones.iter().flat_map(|zone| zone.bands.iter()) {
-                assert!(band.lo_hz >= 1_000_000.0 && band.hi_hz <= 6_000_000_000.0, "{}", band.name);
+                let inside = band.lo_hz >= 1_000_000.0 && band.hi_hz <= 6_000_000_000.0;
+                assert!(inside || band.name.contains("(needs "), "{}: outside HackRF range but not flagged", band.name);
             }
             for c in file.channels.zones.iter().flat_map(|zone| zone.channels.iter()) {
-                assert!(c.hz >= 1_000_000.0 && c.hz <= 6_000_000_000.0, "{}", c.name);
+                let inside = c.hz >= 1_000_000.0 && c.hz <= 6_000_000_000.0;
+                assert!(inside || c.name.contains("(needs "), "{}: outside HackRF range but not flagged", c.name);
+                assert!(!(c.encrypted && c.record), "{}: encrypted channel marked for recording", c.name);
+            }
+            for t in file.talkgroups.zones.iter().flat_map(|zone| zone.talkgroups.iter()) {
+                assert!(!(t.encrypted && t.record), "{}: encrypted talkgroup marked for recording", t.name);
             }
             assert!(file.radios.iter().all(|r| !r.audio.tx), "{}: example stations never transmit", path.display());
         }
