@@ -376,6 +376,93 @@ The HackRF wideband follow uses the same hold, hang, silence limit and override 
 
 ---
 
+## 6.5 Recording (REC)
+
+REC records HackRF traffic for later playback. It saves the **raw radio data**, never the demodulator's audio, so a better decoder later gives better playback of old recordings.
+
+**What is saved.** For a HackRF talkgroup call or a held channel, Commander saves the channel itself: complex IQ after DC removal, shifted to the call's frequency and averaged down to **32 ksps, 16-bit (cs16)**. That is half of the 500-sample block the live voice path uses, so replay rebuilds the exact 16 kHz stream the live discriminator sees. It costs about 128 KB/s (about 460 MB an hour of traffic). The full 8 Msps capture (about 58 GB an hour) is not saved. Each recording gets a JSON sidecar with the frequency, capture centre, offset, rate, chain, talkgroup, radio, decoder settings and Commander version.
+
+**Encrypted traffic is never recorded.** An encrypted talkgroup or channel cannot be marked, and a call whose voice decoder reports a non-clear algorithm is discarded, even with a filled key.
+
+Recording radio traffic may be regulated where you are; that is your responsibility. Nothing is uploaded.
+
+### Marking
+
+Right-click a talkgroup row (Talkgroups tab) or a channel row (Channels tab) to mark or unmark it. A marked row shows a red **● REC** at its right end. Marks are saved with the talkgroups and channels in the station file (`"record": true`), so they travel with Load and Save. Left click and double click are unchanged.
+
+### The REC key
+
+Each Talkgroups tab and the Channels tab has a REC key above LOAD and SAVE. It follows the rustcars convention:
+
+| Press | Lamp | Records |
+| --- | --- | --- |
+| Click | red | marked talkgroups / channels only |
+| Shift+click, or double-click | amber | all talkgroup / channel traffic |
+| Click while lit (Shift+click while amber) | dark | off |
+| Ctrl+click | — | reserved, does nothing |
+
+The REC key state is saved in the station file and restored on launch; the REC tab icon comes up dark red and a log line says recording resumed. Talkgroup recordings follow the trunk follower: a segment starts on the call, keeps going through re-keys inside the voice hang, and ends after it, with about 250 ms of padding at each end. Channel recordings run while the scanner holds an open (non-control) channel on the selected HackRF radio. Long calls are split every 5 minutes.
+
+### The REC tab
+
+The tab has a record icon on the left of its name: **black** when no REC key is lit, **dark red** when armed, **bright red** while raw IQ is being written. Hover the icon for the same words. Across the top are source tabs, **HackRF TG** and **HackRF Channels** (always shown, even when empty), plus any other source found in the database.
+
+Under them: the REC state in words, the disk meter, search, the cap, archive, export, rescan and clear-cache controls, then the timeline.
+
+**Timeline.** One lane per talkgroup or channel, one block per recording, like a security camera viewer. Drag to pan, scroll to zoom, ◀ Day / Today / Day ▶ to jump, **● Live / Now** to follow the present (the red NOW line). A recording in progress is a red block that grows. EMERG and PRI calls are tagged and outlined; archived blocks say `zst`, offline ones are grey and say `offline`. Waveform thumbnails are drawn once they are generated in the background.
+
+**Playback.** Click a block to play it from the point you clicked; ▶ Play / ■ Stop in the detail row; **Play next** continues with the next recording. Every playback re-runs the raw IQ through the current discriminator (and, for digital modes, through the station's voice script) and plays to the system default audio output. Playback never touches the radios' receive sinks.
+
+**Detail row.** Star, Protect (never removed by overwrite-oldest), Notes, Export WAV (demodulated now; REC does not keep it), Export raw (IQ plus sidecar), Archive / Unarchive, and Delete (raw file, row and cache; **Undo** for 60 seconds).
+
+### Storage, cap and retention
+
+Files live beside the station: `Name.HSREC.sqlite` (the index) and `Name.recordings/<source>/<YYYY-MM-DD>/<HHMMSS>_<lane>_<MHz>.cs16` with a `.json` sidecar. The sidecars are the source of truth: **Rescan** rebuilds missing rows from them and flags rows whose file is gone.
+
+The cap is adjustable (default **20 GB**). Retention is indefinite. The meter warns in words at 80% and 95%. At the cap, recording **stops with a red warning and nothing is deleted**, unless you tick *Overwrite oldest unprotected at cap*. Archived files count at their compressed size; recordings moved to a drive do not count.
+
+The writer runs at idle CPU and I/O priority, writes 128 KiB sequential chunks without per-chunk fsync, and drops (and counts) samples rather than stall live decoding if the disk falls behind. A recording that was cut off by a crash is repaired from its file on the next start.
+
+Waveforms are a disposable cache in `Name.recordings/.cache/`, keyed by recording and decoder version. **Clear cache** loses nothing.
+
+### Archive
+
+There is no live compression. **Archive older than N d** (or Archive on one recording) compresses with zstd level 9 in the background: compress to a temp file, decompress and compare sha256, rename, then remove the original. Any failure keeps the original. Archived recordings play directly. Unarchive reverses it.
+
+### Thumb drives
+
+With a drive mounted under `/media` or `/run/media`, pick it in **Drive** and Copy or Move the selected recording or those older than N days. Files and sidecars go to `HamSpot-REC/` on the drive with an `index.json`. A **move deletes the local copy only after the copy on the drive verifies by sha256**. Moved recordings stay listed as offline and play from the drive when it is attached; **Re-attach** copies them back (verified), and **Import** reads another Commander's `HamSpot-REC/index.json`. The export ends with a sync; then you may remove the drive.
+
+### commander-rec (cron)
+
+`commander-rec` is a small command-line tool built with Commander (`target/release/commander-rec`). It shares the REC library and needs no GUI.
+
+```
+commander-rec archive   --station PATH [--older-than 7d] [--level 1-19] [--nice] [--dry-run]
+commander-rec unarchive --station PATH [--dry-run]
+commander-rec list      --station PATH [--source hackrf_tg]
+commander-rec verify    --station PATH [--archived-only]
+commander-rec stats     --station PATH [--cap-gb 20]
+commander-rec export    --station PATH --to DIR [--label NAME] [--move] [--older-than AGE] [--dry-run]
+```
+
+Ages are `7d`, `2w`, `12h`, `30m`. Exit codes: 0 ok, 1 error, 2 partial or verify failure, 3 another run holds the lock (`Name.HSREC.sqlite.lock`; the REC tab's archive and export take the same lock). Example crontab line:
+
+```
+15 3 * * * nice -n 19 ionice -c3 commander-rec archive --older-than 7d --station ~/stations/SAFE-T.HSCommander
+```
+
+### Other radios
+
+Hamlib and GQRX radios only give demodulated audio. The database and player already handle such recordings (`source_kind = demod_audio`, labelled "DEMOD AUDIO (not raw)" and played as-is), but recording them is not wired to the REC keys yet.
+
+### REC test plan
+
+Automated: channeliser (tone at offset lands at DC), live tap vs replay (synthetic FM through the live voice mixer, replayed through the shared discriminator), segment split/merge and REC key states, writer pre/post roll, re-key merge, encrypted discard, cap stop and overwrite-oldest skipping protected, crash recovery, DB migrations, range/lane queries, rescan, cache keying/pruning, archive round trip/cancel/corruption, export copy/move/re-attach/import, timeline layout, and `commander-rec` subcommands, dry run and lock contention.
+
+On the air (by hand): a P25 follow with REC red and a marked talkgroup; amber with all traffic; a scanner hold on a marked channel; an encrypted call (nothing kept); HackRF retune mid-call; restart with REC armed; playback after a decoder upgrade; a full cap; a thumb-drive move and re-attach.
+
+
 # 7. Meters and levels
 
 ## 7.1 Meters

@@ -123,6 +123,56 @@ pub struct ConfigFile {
     /// Absent in a station written before the patch bay existed.
     #[serde(default, skip_serializing_if = "crate::patchbay::PatchBay::is_empty")]
     pub patchbay: crate::patchbay::PatchBay,
+    /// REC (#119): REC key modes (restored on launch), disk cap, REC tab.
+    /// Absent means off, 20 GB, stop at cap.
+    #[serde(default, skip_serializing_if = "RecFace::is_default")]
+    pub rec: RecFace,
+}
+
+/// REC settings kept in the station file. Recordings themselves live in
+/// `Name.HSREC.sqlite` and `Name.recordings/` beside the station.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RecFace {
+    #[serde(default, skip_serializing_if = "hsrec::segment::RecMode::is_off")]
+    pub talkgroups: hsrec::segment::RecMode,
+    #[serde(default, skip_serializing_if = "hsrec::segment::RecMode::is_off")]
+    pub channels: hsrec::segment::RecMode,
+    #[serde(default = "default_rec_cap")]
+    pub cap_gb: f64,
+    /// At the cap, delete the oldest unprotected recordings instead of stopping.
+    #[serde(default, skip_serializing_if = "is_false_flag")]
+    pub overwrite_oldest: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_tab: String,
+}
+
+fn default_rec_cap() -> f64 {
+    hsrec::storage::DEFAULT_CAP_GB
+}
+
+fn is_false_flag(value: &bool) -> bool {
+    !*value
+}
+
+impl Default for RecFace {
+    fn default() -> Self {
+        Self {
+            talkgroups: Default::default(),
+            channels: Default::default(),
+            cap_gb: default_rec_cap(),
+            overwrite_oldest: false,
+            source_tab: String::new(),
+        }
+    }
+}
+
+impl RecFace {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+    pub fn armed(&self) -> bool {
+        self.talkgroups.armed() || self.channels.armed()
+    }
 }
 
 fn default_pulse() -> bool {
@@ -672,6 +722,7 @@ mod tests {
             voice_hang_ms: default_voice_hang_ms(),
             override_hold_emergency_priority: true,
             patchbay: Default::default(),
+            rec: Default::default(),
         }
     }
 
@@ -916,7 +967,7 @@ mod tests {
     #[test]
     fn station_file_embeds_talkgroups_channel_flags_and_pipes() {
         let mut file = sample();
-        file.channels.zones[0].channels.push(crate::channels::Channel {
+        file.channels.zones[0].channels.push(crate::channels::Channel { record: false,
             name: "852.475c".into(),
             hz: 852_475_000.0,
             mode: "FM".into(),
@@ -925,7 +976,7 @@ mod tests {
             vocoder: String::new(),
             invert: false,
         });
-        file.talkgroups.zones[0].talkgroups.push(crate::talkgroups::Talkgroup {
+        file.talkgroups.zones[0].talkgroups.push(crate::talkgroups::Talkgroup { record: false,
             name: "01-LEDISP — Law: Dispatch (County)".into(),
             tg: 10006,
             encrypted: false,

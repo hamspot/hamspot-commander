@@ -1,0 +1,1214 @@
+//! REC (#119) on the face: right-click marks, REC keys, the REC page tab
+//! icon, source tabs, the timeline, replay, archive and export.
+//!
+//! HackRF sources record raw channelised IQ (32 ksps cs16) and every
+//! playback re-runs it through the current discriminator and decoder.
+//! Encrypted traffic is never recorded.
+use super::{caution, folder_tab, radio_key, App, KeyLamp, Snapshot};
+use crate::{cat, config};
+use eframe::egui;
+use hsrec::db::{Db, Recording};
+use hsrec::meta::{self, Meta};
+use hsrec::segment::{self, Action, CallKey, Press, RecMode, Segmenter};
+use hsrec::timeline::{self, View};
+use hsrec::writer::Cmd;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+pub const ROW_HOVER: &str = "Right-click: mark or unmark for recording (● REC).";
+pub const PRIVACY: &str = "Recording radio traffic may be regulated where you are; that is your responsibility. \
+Encrypted traffic is never recorded. Nothing is uploaded.";
+const LANE_W: f32 = 170.0;
+const LANE_H: f32 = 22.0;
+const AXIS_H: f32 = 20.0;
+
+/// Record icon colour on the REC tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IconState {
+    /// No REC key armed.
+    Off,
+    /// Armed, nothing being written.
+    Armed,
+    /// Raw IQ is being written right now.
+    Writing,
+}
+
+pub fn icon_state(armed: bool, writing: bool) -> IconState {
+    match (armed, writing) {
+        (_, true) => IconState::Writing,
+        (true, false) => IconState::Armed,
+        (false, false) => IconState::Off,
+    }
+}
+
+pub fn icon_color(state: IconState) -> egui::Color32 {
+    match state {
+        IconState::Off => egui::Color32::from_rgb(0, 0, 0),
+        IconState::Armed => egui::Color32::from_rgb(110, 10, 8),
+        IconState::Writing => egui::Color32::from_rgb(255, 28, 20),
+    }
+}
+
+pub fn icon_text(state: IconState) -> &'static str {
+    match state {
+        IconState::Off => "REC off",
+        IconState::Armed => "REC armed (waiting for traffic)",
+        IconState::Writing => "REC: recording now",
+    }
+}
+
+pub fn key_lamp(mode: RecMode) -> KeyLamp {
+    match mode {
+        RecMode::Off => KeyLamp::Dark,
+        RecMode::Marked => KeyLamp::Red,
+        RecMode::All => KeyLamp::Amber,
+    }
+}
+
+/// Red "● REC" at the right end of a marked row (text, not colour alone).
+pub fn paint_row_mark(ui: &egui::Ui, rect: egui::Rect) {
+    ui.painter().text(
+        rect.right_center() - egui::vec2(10.0, 0.0),
+        egui::Align2::RIGHT_CENTER,
+        "● REC",
+        egui::FontId::monospace(13.0),
+        egui::Color32::from_rgb(232, 40, 30),
+    );
+}
+
+#[derive(Default)]
+struct JobState {
+    label: String,
+    done: usize,
+    total: usize,
+    finished: bool,
+    lines: Vec<String>,
+}
+
+struct Job {
+    state: Arc<Mutex<JobState>>,
+    cancel: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+pub struct RecUi {
+    pub face: config::RecFace,
+    /// Station path the recorder is set up for. None forces a redo.
+    pub configured: Option<String>,
+    db: Option<Db>,
+    dir: PathBuf,
+    db_path: PathBuf,
+    seg: HashMap<u64, Segmenter>,
+    /// Radios whose voice decoder reported a non-clear algorithm this tick.
+    pub enc: HashSet<u64>,
+    marks_dirty: bool,
+    face_dirty: bool,
+    rows: Vec<Recording>,
+    rows_gen: u64,
+    rows_source: String,
+    rows_at: Option<Instant>,
+    views: HashMap<String, View>,
+    query: String,
+    selected: Option<i64>,
+    player: Option<(i64, hsrec::replay::Player)>,
+    play_next: bool,
+    notes_edit: String,
+    note: String,
+    log: Vec<String>,
+    undo: Option<(Recording, PathBuf, Instant)>,
+    job: Option<Job>,
+    waveforms: HashMap<i64, Vec<u8>>,
+    wf_rx: Option<std::sync::mpsc::Receiver<(i64, Vec<u8>)>>,
+    wf_asked: HashSet<i64>,
+    archive_days: f64,
+    drives: Vec<hsrec::export::Drive>,
+    drive_pick: usize,
+    drives_at: Option<Instant>,
+    usage: Option<hsrec::storage::Usage>,
+}
+
+fn rows_meta(rows: &[cat::RadioRow], id: u64) -> Option<&cat::RadioRow> {
+    rows.iter().find(|r| r.id == id)
+}
+
+impl App {
+    fn rec_armed(&self) -> bool {
+        self.rec.face.armed()
+    }
+
+    fn rec_icon(&self) -> IconState {
+        let writing = self.rec.db.is_some()
+            && crate::rec_live::recorder().status.writing.load(Ordering::Relaxed);
+        icon_state(self.rec_armed(), writing)
+    }
+
+    /// Draw the record icon over the REC page tab, left of the name.
+    pub(super) fn paint_rec_icon(&self, ui: &egui::Ui, resp: egui::Response) -> egui::Response {
+        let state = self.rec_icon();
+        let c = egui::pos2(resp.rect.left() + 20.0, resp.rect.center().y);
+        ui.painter().circle_filled(c, 7.0, icon_color(state));
+        ui.painter().circle_stroke(c, 7.0, egui::Stroke::new(1.0, egui::Color32::from_gray(150)));
+        if state == IconState::Writing {
+            ui.ctx().request_repaint_after(Duration::from_millis(250));
+        }
+        resp.on_hover_text(icon_text(state))
+    }
+
+    /// REC key above LOAD/SAVE. `talkgroups` picks the tab it controls.
+    pub(super) fn rec_key(&mut self, ui: &mut egui::Ui, talkgroups: bool) {
+        let mode = if talkgroups { self.rec.face.talkgroups } else { self.rec.face.channels };
+        let resp = radio_key(ui, "REC", key_lamp(mode), true);
+        let (shift, ctrl) = ui.input(|i| (i.modifiers.shift, i.modifiers.command || i.modifiers.ctrl));
+        let press = if resp.double_clicked() {
+            Some(Press::DoubleClick)
+        } else if resp.clicked() {
+            Some(if ctrl { Press::CtrlClick } else if shift { Press::ShiftClick } else { Press::Click })
+        } else {
+            None
+        };
+        let what = if talkgroups { "talkgroups" } else { "channels" };
+        resp.on_hover_text(format!(
+            "REC {what}: {}.\nClick: red, record marked {what} only.\nShift+click or double-click: amber, record all {what} traffic.\nClick again: off. Right-click a row to mark it.\nEncrypted traffic is never recorded.",
+            mode.label()
+        ));
+        if let Some(p) = press {
+            let next = segment::press(mode, p);
+            if next != mode {
+                if talkgroups {
+                    self.rec.face.talkgroups = next;
+                } else {
+                    self.rec.face.channels = next;
+                }
+                self.rec.face_dirty = true;
+                self.rec_log(format!("REC {what}: {}", next.label()));
+            }
+        }
+    }
+
+    pub(super) fn rec_toggle_talkgroup(&mut self, idx: usize) {
+        let zone = self.talkgroup_zone;
+        let Some(row) = self.talkgroups.zones.get_mut(zone).and_then(|z| z.talkgroups.get_mut(idx)) else { return };
+        if row.encrypted && !row.record {
+            self.talkgroup_note = "Encrypted talkgroups are never recorded; mark refused.".into();
+            return;
+        }
+        row.record = !row.record;
+        self.rec.marks_dirty = true;
+    }
+
+    pub(super) fn rec_toggle_channel(&mut self, idx: usize) {
+        let zone = self.channel_zone;
+        let Some(ch) = self.channels.zones.get_mut(zone).and_then(|z| z.channels.get_mut(idx)) else { return };
+        if ch.encrypted && !ch.record {
+            self.rec.note = "Encrypted channels are never recorded; mark refused.".into();
+            return;
+        }
+        ch.record = !ch.record;
+        self.rec.marks_dirty = true;
+    }
+
+    fn rec_log(&mut self, line: String) {
+        self.rec.log.push(line);
+        let n = self.rec.log.len();
+        if n > 200 {
+            self.rec.log.drain(..n - 200);
+        }
+    }
+
+    /// Once per frame: configure the recorder for the open station, run the
+    /// segmenters from the follower / scanner state, and save marks.
+    pub(super) fn rec_frame(&mut self, snap: &Snapshot) {
+        let path = self.config_path.clone();
+        if self.rec.configured.as_deref() != Some(path.as_str()) {
+            self.rec_configure(&path);
+        }
+        if self.rec.marks_dirty || self.rec.face_dirty {
+            self.rec.marks_dirty = false;
+            self.rec.face_dirty = false;
+            if !self.config_path.is_empty() {
+                self.save_config(snap);
+            }
+        }
+        let armed = self.rec_armed() && self.rec.db.is_some();
+        crate::rec_live::set_tap(armed);
+        let recorder = crate::rec_live::recorder();
+        for line in recorder.status.take_log() {
+            self.rec_log(line);
+        }
+        let hang = Duration::from_millis(u64::from(self.voice_hang_ms));
+        let now = Instant::now();
+        let rows = self.hub.view().rows;
+        let hackrf: Vec<u64> = rows.iter().filter(|r| r.spec.driver == cat::RadioDriver::Hackrf).map(|r| r.id).collect();
+        let gone: Vec<u64> = self.rec.seg.keys().copied().filter(|id| !hackrf.contains(id) || !armed).collect();
+        for id in gone {
+            if let Some(mut s) = self.rec.seg.remove(&id) {
+                for a in s.stop() {
+                    if let Action::Close { keep } = a {
+                        recorder.send(Cmd::Close { key: id, keep });
+                    }
+                }
+            }
+        }
+        if !armed {
+            self.rec.enc.clear();
+            return;
+        }
+        for id in hackrf {
+            let Some(row) = rows_meta(&rows, id) else { continue };
+            let (want, meta) = self.rec_want(row);
+            let enc = self.rec.enc.remove(&id);
+            let actions = self.rec.seg.entry(id).or_default().step(want, enc, hang, now);
+            for a in actions {
+                match a {
+                    Action::Open(_) => {
+                        if let Some(m) = meta.clone() {
+                            recorder.send(Cmd::Open { key: id, meta: m });
+                        }
+                    }
+                    Action::Close { keep } => {
+                        if !keep {
+                            self.rec_log("REC: encrypted traffic on this call; segment discarded.".into());
+                        }
+                        recorder.send(Cmd::Close { key: id, keep });
+                    }
+                }
+            }
+        }
+    }
+
+    fn rec_configure(&mut self, path: &str) {
+        self.rec.configured = Some(path.to_string());
+        self.rec.db = None;
+        self.rec.rows.clear();
+        self.rec.waveforms.clear();
+        self.rec.wf_asked.clear();
+        self.rec.selected = None;
+        self.rec.player = None;
+        if path.is_empty() {
+            return;
+        }
+        let station = Path::new(path);
+        self.rec.dir = hsrec::storage::recordings_dir_beside(station);
+        self.rec.db_path = hsrec::db::db_path_beside(station);
+        // The UI only opens the database (and creates it) once REC was
+        // used: armed, or the file already exists.
+        if !self.rec.db_path.exists() && !self.rec_armed() {
+            return;
+        }
+        let recorder = crate::rec_live::recorder();
+        recorder.send(Cmd::Configure { rec_dir: self.rec.dir.clone(), db_path: self.rec.db_path.clone() });
+        recorder.send(Cmd::Cap { gb: self.rec.face.cap_gb, overwrite_oldest: self.rec.face.overwrite_oldest });
+        match Db::open(&self.rec.db_path) {
+            Ok(db) => self.rec.db = Some(db),
+            Err(e) => self.rec.note = format!("REC database: {e}"),
+        }
+        if self.rec_armed() {
+            let line = format!(
+                "REC resumed from the station file: talkgroups {}, channels {}.",
+                self.rec.face.talkgroups.label(),
+                self.rec.face.channels.label()
+            );
+            self.rec_log(line);
+        }
+    }
+
+    /// The call this HackRF radio should be recording now, and its metadata.
+    fn rec_want(&self, row: &cat::RadioRow) -> (Option<CallKey>, Option<Meta>) {
+        let face = &self.rec.face;
+        let base = |source: &str| Meta {
+            source: source.into(),
+            source_kind: meta::KIND_RAW_IQ.into(),
+            radio_id: row.id,
+            radio_name: row.spec.name.clone(),
+            raw_format: "cs16".into(),
+            sample_rate: hsrec::dsp::REC_RATE,
+            centre_hz: row.center_hz,
+            bandwidth_hz: hsrec::dsp::REC_RATE as f64,
+            chain: hsrec::dsp::CHAIN_ID.into(),
+            sw_version: format!("commander {} / {}", env!("CARGO_PKG_VERSION"), meta::sw_version()),
+            ..Default::default()
+        };
+        if let Some((hz, tg)) = self.hackrf_call.get(&row.id).copied().flatten() {
+            if face.talkgroups.armed() {
+                let found = self.talkgroups.zones.iter().flat_map(|z| z.talkgroups.iter()).find(|t| t.tg == tg);
+                let marked = found.is_some_and(|t| t.record);
+                let enc = found.is_some_and(|t| t.encrypted);
+                if segment::wanted(face.talkgroups, marked, enc) {
+                    let key = CallKey { talkgroup: Some(tg), channel: String::new(), hz: hz.round() as u64 };
+                    let mut m = base(meta::SOURCE_HACKRF_TG);
+                    m.talkgroup = Some(tg);
+                    m.talkgroup_name = found.map(|t| t.name.clone()).unwrap_or_default();
+                    m.priority = found.is_some_and(|t| t.priority);
+                    m.emergency = self.trunk_emergency.iter().any(|(_, _, t)| *t == tg);
+                    m.channel_hz = hz;
+                    m.offset_hz = hz - row.center_hz;
+                    m.modulation = "p25".into();
+                    m.decoder = serde_json::json!({ "script": row.spec.rx_pipe, "vocoder": "p25" });
+                    return (Some(key), Some(m));
+                }
+            }
+            return (None, None);
+        }
+        if row.selected && face.channels.armed() {
+            if let Some((z, i)) = self.memory_scan.hold_memory() {
+                if let Some(ch) = self.channels.zones.get(z).and_then(|zone| zone.channels.get(i)) {
+                    if !ch.control && segment::wanted(face.channels, ch.record, ch.encrypted) {
+                        let key = CallKey { talkgroup: None, channel: ch.name.clone(), hz: ch.hz.round() as u64 };
+                        let mut m = base(meta::SOURCE_HACKRF_CHANNELS);
+                        m.channel_name = ch.name.clone();
+                        m.channel_hz = ch.hz;
+                        m.offset_hz = ch.hz - row.center_hz;
+                        m.modulation = if ch.vocoder.is_empty() { "fm".into() } else { ch.vocoder.clone() };
+                        m.decoder = serde_json::json!({
+                            "script": row.spec.rx_pipe, "vocoder": ch.vocoder, "invert": ch.invert, "mode": ch.mode
+                        });
+                        return (Some(key), Some(m));
+                    }
+                }
+            }
+        }
+        (None, None)
+    }
+
+    fn rec_source(&self) -> String {
+        let s = &self.rec.face.source_tab;
+        if s.is_empty() { meta::SOURCE_HACKRF_TG.to_string() } else { s.clone() }
+    }
+
+    fn rec_reload(&mut self, force: bool) {
+        let Some(db) = self.rec.db.as_ref() else { return };
+        let gen = crate::rec_live::recorder().status.generation.load(Ordering::Relaxed);
+        let source = self.rec_source();
+        let stale = self.rec.rows_at.is_none_or(|t| t.elapsed() > Duration::from_secs(2));
+        if !force && gen == self.rec.rows_gen && source == self.rec.rows_source && !stale {
+            return;
+        }
+        let all = db.all().unwrap_or_default();
+        self.rec.usage = Some(hsrec::storage::Usage::from_rows(&all, self.rec.face.cap_gb));
+        self.rec.rows = all.into_iter().filter(|r| r.meta.source == source).collect();
+        self.rec.rows_gen = gen;
+        self.rec.rows_source = source;
+        self.rec.rows_at = Some(Instant::now());
+    }
+
+    /// REC page: source tabs, status, timeline, selected recording.
+    pub(super) fn page_rec(&mut self, ui: &mut egui::Ui, _snap: &Snapshot) {
+        if self.config_path.is_empty() {
+            ui.label("Open or save a station first. Recordings live beside the station file.");
+            ui.label(egui::RichText::new(PRIVACY).weak());
+            return;
+        }
+        if self.rec.db.is_none() {
+            ui.label("No recordings yet. Arm REC on the Talkgroups or Channels tab (red: marked, amber: all).");
+            if ui.button("Create the recordings database now").clicked() {
+                self.rec.configured = None;
+                if let Ok(db) = Db::open(&self.rec.db_path) {
+                    drop(db);
+                }
+            }
+            ui.label(egui::RichText::new(PRIVACY).weak());
+            return;
+        }
+        self.rec_poll_jobs();
+        self.rec_reload(false);
+        let sources = self.rec.db.as_ref().and_then(|db| db.sources().ok()).unwrap_or_default();
+        let tabs = meta::source_tabs(&sources);
+        let current = self.rec_source();
+        ui.horizontal(|ui| {
+            for (index, s) in tabs.iter().enumerate() {
+                if folder_tab(ui, *s == current, index, &meta::source_label(s), index == 0).clicked() && *s != current {
+                    self.rec.face.source_tab = s.clone();
+                    self.rec.face_dirty = true;
+                    self.rec.selected = None;
+                }
+            }
+        });
+        ui.add_space(4.0);
+        self.rec_status_row(ui);
+        self.rec_tools_row(ui);
+        ui.separator();
+        self.rec_timeline(ui);
+        ui.separator();
+        self.rec_detail(ui);
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new(PRIVACY).weak().small());
+        if self.rec.player.is_some() || self.rec.job.is_some() || self.rec_icon() == IconState::Writing {
+            ui.ctx().request_repaint_after(Duration::from_millis(200));
+        }
+    }
+
+    fn rec_status_row(&mut self, ui: &mut egui::Ui) {
+        let status = &crate::rec_live::recorder().status;
+        let state = self.rec_icon();
+        ui.horizontal_wrapped(|ui| {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+            ui.painter().circle_filled(rect.center(), 6.0, icon_color(state));
+            ui.painter().circle_stroke(rect.center(), 6.0, egui::Stroke::new(1.0, egui::Color32::from_gray(150)));
+            ui.label(icon_text(state));
+            ui.label(format!(
+                "   TG: {}   Channels: {}",
+                self.rec.face.talkgroups.label(),
+                self.rec.face.channels.label()
+            ));
+            if let Some(u) = &self.rec.usage {
+                let text = u.text();
+                let color = match u.level() {
+                    hsrec::storage::Level::Ok => ui.visuals().text_color(),
+                    hsrec::storage::Level::Warn80 => caution(),
+                    _ => egui::Color32::from_rgb(240, 60, 50),
+                };
+                ui.label(egui::RichText::new(format!("   Disk {text}")).color(color));
+            }
+        });
+        if status.cap_hit.load(Ordering::Relaxed) {
+            ui.label(
+                egui::RichText::new("⚠ DISK CAP REACHED: recording stopped. Nothing was deleted. Archive, export, or raise the cap.")
+                    .strong()
+                    .color(egui::Color32::from_rgb(240, 60, 50)),
+            );
+        }
+        if !self.rec.note.is_empty() {
+            ui.label(egui::RichText::new(&self.rec.note).color(caution()));
+        }
+        if let Some(line) = self.rec.log.last() {
+            ui.label(egui::RichText::new(line).weak());
+        }
+    }
+
+    fn rec_tools_row(&mut self, ui: &mut egui::Ui) {
+        let mut cap_changed = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Search");
+            ui.add(egui::TextEdit::singleline(&mut self.rec.query).desired_width(140.0).hint_text("TG, channel, radio id, notes"));
+            ui.separator();
+            ui.label("Cap GB");
+            if ui.add(egui::DragValue::new(&mut self.rec.face.cap_gb).range(0.1..=100_000.0).speed(0.5)).changed() {
+                cap_changed = true;
+            }
+            if ui
+                .checkbox(&mut self.rec.face.overwrite_oldest, "Overwrite oldest unprotected at cap")
+                .on_hover_text("Off (default): stop recording at the cap and warn. Protected recordings are never overwritten.")
+                .changed()
+            {
+                cap_changed = true;
+            }
+            ui.separator();
+            let busy = self.rec.job.is_some();
+            if self.rec.archive_days <= 0.0 {
+                self.rec.archive_days = 7.0;
+            }
+            if ui.add_enabled(!busy, egui::Button::new("Archive older than")).on_hover_text("zstd compress, verify by sha256, then replace. Archived recordings still play.").clicked() {
+                let rows = self.rec.db.as_ref().and_then(|d| d.all().ok()).unwrap_or_default();
+                let todo: Vec<Recording> = hsrec::archive::older_than(&rows, self.rec.archive_days, chrono::Utc::now()).into_iter().cloned().collect();
+                self.rec_start_archive(todo);
+            }
+            ui.add(egui::DragValue::new(&mut self.rec.archive_days).range(0.0..=3650.0).suffix(" d"));
+            if ui.add_enabled(!busy, egui::Button::new("Rescan")).on_hover_text("Re-add recordings from sidecars on disk; flag missing files.").clicked() {
+                if let Some(db) = &self.rec.db {
+                    match db.rescan(&self.rec.dir) {
+                        Ok((a, m)) => self.rec.note = format!("Rescan: {a} added, {m} missing."),
+                        Err(e) => self.rec.note = format!("Rescan failed: {e}"),
+                    }
+                    self.rec_reload(true);
+                }
+            }
+            if ui.add_enabled(!busy, egui::Button::new("Clear cache")).on_hover_text("Waveform thumbnails are rebuilt from raw IQ. Nothing is lost.").clicked() {
+                if let Some(db) = &self.rec.db {
+                    let _ = hsrec::cache::clear(db, &self.rec.dir);
+                }
+                self.rec.waveforms.clear();
+                self.rec.wf_asked.clear();
+            }
+        });
+        // Export / move to a removable drive.
+        if self.rec.drives_at.is_none_or(|t| t.elapsed() > Duration::from_secs(5)) {
+            self.rec.drives = hsrec::export::removable_drives();
+            self.rec.drives_at = Some(Instant::now());
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Drive");
+            if self.rec.drives.is_empty() {
+                ui.label(egui::RichText::new("no removable drive under /media or /run/media").weak());
+            } else {
+                if self.rec.drive_pick >= self.rec.drives.len() {
+                    self.rec.drive_pick = 0;
+                }
+                let d = &self.rec.drives[self.rec.drive_pick];
+                let text = format!("{} ({:.1} GB free)", d.label, d.free as f64 / 1e9);
+                egui::ComboBox::from_id_salt("rec-drive").selected_text(text).show_ui(ui, |ui| {
+                    for (i, d) in self.rec.drives.iter().enumerate() {
+                        ui.selectable_value(&mut self.rec.drive_pick, i, format!("{} ({:.1} GB free)", d.label, d.free as f64 / 1e9));
+                    }
+                });
+                let busy = self.rec.job.is_some();
+                let sel = self.rec.selected;
+                if ui.add_enabled(!busy && sel.is_some(), egui::Button::new("Copy selected")).clicked() {
+                    self.rec_start_export(sel, false);
+                }
+                if ui.add_enabled(!busy && sel.is_some(), egui::Button::new("Move selected")).on_hover_text("The local copy is deleted only after the copy on the drive verifies.").clicked() {
+                    self.rec_start_export(sel, true);
+                }
+                if ui.add_enabled(!busy, egui::Button::new(format!("Copy older than {:.0} d", self.rec.archive_days))).clicked() {
+                    self.rec_start_export(None, false);
+                }
+                if ui.add_enabled(!busy, egui::Button::new(format!("Move older than {:.0} d", self.rec.archive_days))).clicked() {
+                    self.rec_start_export(None, true);
+                }
+                if ui.add_enabled(!busy, egui::Button::new("Re-attach")).on_hover_text("Copy recordings that were moved to this drive back, verified by sha256.").clicked() {
+                    self.rec_start_reattach();
+                }
+                if ui.add_enabled(!busy, egui::Button::new("Import")).on_hover_text("Import another Commander's export (HamSpot-REC/index.json) from this drive.").clicked() {
+                    self.rec_start_import();
+                }
+            }
+        });
+        if let Some(job) = &self.rec.job {
+            let st = job.state.lock().expect("rec job");
+            ui.horizontal(|ui| {
+                let frac = if st.total == 0 { 0.0 } else { st.done as f32 / st.total as f32 };
+                ui.add(egui::ProgressBar::new(frac).desired_width(240.0).text(format!("{} {}/{}", st.label, st.done, st.total)));
+                if ui.button("Cancel").clicked() {
+                    job.cancel.store(true, Ordering::Relaxed);
+                }
+            });
+        }
+        if cap_changed {
+            self.rec.face_dirty = true;
+            crate::rec_live::recorder().send(Cmd::Cap { gb: self.rec.face.cap_gb, overwrite_oldest: self.rec.face.overwrite_oldest });
+            self.rec_reload(true);
+        }
+    }
+
+    fn rec_job(&mut self, label: &str, work: impl FnOnce(Db, &Mutex<JobState>, &AtomicBool) + Send + 'static) {
+        let db_path = self.rec.db_path.clone();
+        let lock = match hsrec::lock::try_lock(&db_path) {
+            Ok(Some(l)) => l,
+            Ok(None) => {
+                self.rec.note = "Another archive or export run (commander-rec) holds the lock; try later.".into();
+                return;
+            }
+            Err(e) => {
+                self.rec.note = format!("REC lock: {e}");
+                return;
+            }
+        };
+        let state = Arc::new(Mutex::new(JobState { label: label.to_string(), ..Default::default() }));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (s, c) = (state.clone(), cancel.clone());
+        std::thread::spawn(move || {
+            let _lock = lock;
+            unsafe {
+                let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
+                libc::setpriority(libc::PRIO_PROCESS, tid, 19);
+                libc::syscall(libc::SYS_ioprio_set, 1, tid as libc::c_int, 3 << 13);
+            }
+            match Db::open(&db_path) {
+                Ok(db) => work(db, &s, &c),
+                Err(e) => s.lock().expect("rec job").lines.push(format!("database: {e}")),
+            }
+            s.lock().expect("rec job").finished = true;
+        });
+        self.rec.job = Some(Job { state, cancel });
+    }
+
+    fn rec_start_archive(&mut self, todo: Vec<Recording>) {
+        if todo.is_empty() {
+            self.rec.note = "Nothing to archive.".into();
+            return;
+        }
+        let dir = self.rec.dir.clone();
+        self.rec_job("Archiving", move |db, st, cancel| {
+            st.lock().expect("job").total = todo.len();
+            let (mut ok, mut saved) = (0, 0i64);
+            for (i, r) in todo.iter().enumerate() {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                match hsrec::archive::archive_one(&db, &dir, r, hsrec::archive::DEFAULT_LEVEL, cancel) {
+                    hsrec::archive::Outcome::Archived { saved: s } => {
+                        ok += 1;
+                        saved += s;
+                    }
+                    hsrec::archive::Outcome::Failed(e) => st.lock().expect("job").lines.push(e),
+                    _ => {}
+                }
+                st.lock().expect("job").done = i + 1;
+            }
+            st.lock().expect("job").lines.push(format!("Archived {ok}, saved {:.1} MB.", saved as f64 / 1e6));
+        });
+    }
+
+    fn rec_drive(&self) -> Option<hsrec::export::Drive> {
+        self.rec.drives.get(self.rec.drive_pick).cloned()
+    }
+
+    fn rec_start_export(&mut self, one: Option<i64>, move_files: bool) {
+        let Some(drive) = self.rec_drive() else { return };
+        let all = self.rec.db.as_ref().and_then(|d| d.all().ok()).unwrap_or_default();
+        let todo: Vec<Recording> = match one {
+            Some(id) => all.into_iter().filter(|r| r.id == id).collect(),
+            None => hsrec::archive::older_than(&all, self.rec.archive_days, chrono::Utc::now()).into_iter().cloned().collect(),
+        };
+        if todo.is_empty() {
+            self.rec.note = "Nothing to export.".into();
+            return;
+        }
+        if self.rec.player.as_ref().is_some_and(|(id, _)| todo.iter().any(|r| r.id == *id)) {
+            self.rec.player = None;
+        }
+        let dir = self.rec.dir.clone();
+        self.rec_job(if move_files { "Moving" } else { "Copying" }, move |db, st, cancel| {
+            let rep = hsrec::export::export(&db, &dir, &todo, &drive.mount, &drive.label, move_files, cancel, |n, of| {
+                let mut s = st.lock().expect("job");
+                s.done = n;
+                s.total = of;
+            });
+            let mut s = st.lock().expect("job");
+            s.lines.extend(rep.failed.iter().cloned());
+            s.lines.push(format!(
+                "{} copied, {} moved, {} failed{}. Synced: you may remove the drive.",
+                rep.copied,
+                rep.moved,
+                rep.failed.len(),
+                if rep.cancelled { " (cancelled)" } else { "" }
+            ));
+        });
+    }
+
+    fn rec_start_reattach(&mut self) {
+        let Some(drive) = self.rec_drive() else { return };
+        let dir = self.rec.dir.clone();
+        self.rec_job("Re-attaching", move |db, st, _| {
+            let rep = hsrec::export::reattach(&db, &dir, &drive);
+            let mut s = st.lock().expect("job");
+            s.lines.extend(rep.failed.iter().cloned());
+            s.lines.push(format!("{} recordings back on this disk.", rep.copied));
+        });
+    }
+
+    fn rec_start_import(&mut self) {
+        let Some(drive) = self.rec_drive() else { return };
+        let dir = self.rec.dir.clone();
+        self.rec_job("Importing", move |db, st, _| {
+            let rep = hsrec::export::import(&db, &dir, &drive.mount.join(hsrec::export::EXPORT_DIR));
+            let mut s = st.lock().expect("job");
+            s.lines.extend(rep.failed.iter().cloned());
+            s.lines.push(format!("{} recordings imported.", rep.copied));
+        });
+    }
+
+    fn rec_poll_jobs(&mut self) {
+        let finished = self.rec.job.as_ref().is_some_and(|j| j.state.lock().expect("job").finished);
+        if finished {
+            if let Some(job) = self.rec.job.take() {
+                let lines = std::mem::take(&mut job.state.lock().expect("job").lines);
+                if let Some(last) = lines.last() {
+                    self.rec.note = last.clone();
+                }
+                for l in lines {
+                    self.rec_log(l);
+                }
+                self.rec_reload(true);
+            }
+        }
+        if let Some(rx) = &self.rec.wf_rx {
+            while let Ok((id, wf)) = rx.try_recv() {
+                self.rec.waveforms.insert(id, wf);
+            }
+        }
+        // Undo window for delete: 60 s, then the trash is emptied.
+        if self.rec.undo.as_ref().is_some_and(|(_, _, t)| t.elapsed() > Duration::from_secs(60)) {
+            if let Some((_, trash, _)) = self.rec.undo.take() {
+                let _ = std::fs::remove_dir_all(trash);
+            }
+        }
+        if let Some((id, p)) = &self.rec.player {
+            if p.finished() {
+                let id = *id;
+                let err = p.error.lock().expect("replay").clone();
+                self.rec.player = None;
+                if !err.is_empty() {
+                    self.rec.note = format!("Playback: {err}");
+                } else if self.rec.play_next {
+                    if let Some(next) = timeline::next_after(&self.rec.rows, id) {
+                        self.rec.selected = Some(next);
+                        self.rec_play(next, 0);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Ask a background thread for waveform thumbnails of `ids`.
+    fn rec_waveforms(&mut self, ids: Vec<i64>) {
+        let ids: Vec<i64> = ids.into_iter().filter(|id| self.rec.wf_asked.insert(*id)).take(32).collect();
+        if ids.is_empty() {
+            return;
+        }
+        let rows: Vec<Recording> = self.rec.rows.iter().filter(|r| ids.contains(&r.id) && !r.offline() && !r.missing && !r.meta.end_utc.is_empty()).cloned().collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (dir, db_path) = (self.rec.dir.clone(), self.rec.db_path.clone());
+        std::thread::spawn(move || {
+            unsafe {
+                let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
+                libc::setpriority(libc::PRIO_PROCESS, tid, 19);
+            }
+            let Ok(db) = Db::open(&db_path) else { return };
+            let version = hsrec::cache::decoder_version();
+            for r in rows {
+                if let Ok(wf) = hsrec::cache::waveform(&db, &dir, &r, &version) {
+                    if tx.send((r.id, wf)).is_err() {
+                        return;
+                    }
+                }
+            }
+            hsrec::cache::prune(&dir, hsrec::cache::DEFAULT_CACHE_BYTES, &version);
+        });
+        self.rec.wf_rx = Some(rx);
+    }
+
+    fn rec_play(&mut self, id: i64, from_ms: u64) {
+        self.rec.player = None;
+        let Some(rec) = self.rec.rows.iter().find(|r| r.id == id).cloned() else { return };
+        let path = if rec.offline() {
+            match hsrec::export::locate(&rec, &self.rec.drives) {
+                Some(p) => p,
+                None => {
+                    self.rec.note = format!("This recording is on drive {}; attach it to play.", rec.location.trim_start_matches("offline:"));
+                    return;
+                }
+            }
+        } else {
+            self.rec.dir.join(&rec.raw_path)
+        };
+        let decoder = rec.meta.decoder.get("script").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty()).and_then(|script| {
+            let port = crate::rx_pipe::claim_voice_port().ok()?;
+            let argv = crate::rx_pipe::command_argv(script, port);
+            // The port is only used by the decoder's event output; the replay
+            // reads none, so it is released at once.
+            crate::rx_pipe::release_voice_port(port);
+            Some(hsrec::replay::DecoderCmd { argv, env: Vec::new() })
+        });
+        match hsrec::replay::Player::start(&path, &rec.meta, from_ms, decoder, hsrec::replay::default_play_argv()) {
+            Ok(p) => self.rec.player = Some((id, p)),
+            Err(e) => self.rec.note = format!("Playback: {e}"),
+        }
+    }
+
+    fn rec_timeline(&mut self, ui: &mut egui::Ui) {
+        let now = chrono::Utc::now().timestamp_millis();
+        let source = self.rec_source();
+        let mut view = *self.rec.views.entry(source.clone()).or_insert_with(|| View::live(now, 3_600_000));
+        view.follow(now);
+        let width_all = ui.available_width();
+        let width = (width_all - LANE_W).max(100.0);
+        let query = self.rec.query.clone();
+        let recs: Vec<Recording> = self.rec.rows.iter().filter(|r| timeline::matches(r, &query)).cloned().collect();
+        let lanes = timeline::lanes(&recs);
+        ui.horizontal(|ui| {
+            if ui.button("◀ Day").clicked() {
+                view.day(view.start + view.span / 2, -1);
+            }
+            if ui.button("Today").clicked() {
+                view.day(now, 0);
+            }
+            if ui.button("Day ▶").clicked() {
+                view.day(view.start + view.span / 2, 1);
+            }
+            if ui.button("−").on_hover_text("Zoom out").clicked() {
+                view.zoom(2.0, width, width);
+            }
+            if ui.button("+").on_hover_text("Zoom in").clicked() {
+                view.zoom(0.5, width, width);
+            }
+            if ui.selectable_label(view.live, "● Live / Now").clicked() {
+                view = View::live(now, view.span);
+            }
+            ui.label(format!("{} recordings, {} lanes", recs.len(), lanes.len()));
+            ui.checkbox(&mut self.rec.play_next, "Play next");
+        });
+        let blocks = timeline::layout(&recs, &lanes, &view, width, now);
+        let subs: Vec<usize> = (0..lanes.len())
+            .map(|l| blocks.iter().filter(|b| b.lane == l).map(|b| b.sub + 1).max().unwrap_or(1))
+            .collect();
+        let lane_top: Vec<f32> = subs.iter().scan(0.0, |y, n| { let top = *y; *y += *n as f32 * LANE_H; Some(top) }).collect();
+        let body_h: f32 = subs.iter().map(|n| *n as f32 * LANE_H).sum::<f32>().max(LANE_H * 2.0);
+        let height = (AXIS_H + body_h).min(ui.available_height() - 140.0).max(AXIS_H + LANE_H * 2.0);
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(width_all, height), egui::Sense::click_and_drag());
+        let painter = ui.painter_at(rect);
+        let area = egui::Rect::from_min_max(egui::pos2(rect.left() + LANE_W, rect.top()), rect.max);
+        painter.rect_filled(rect, egui::CornerRadius::ZERO, egui::Color32::from_rgb(14, 14, 18));
+        // Axis.
+        let step = timeline::tick_step(view.span, width);
+        let mut t = view.start - view.start.rem_euclid(step);
+        let weak = ui.visuals().weak_text_color();
+        while t <= view.end() {
+            let x = area.left() + view.x(t, width);
+            if x >= area.left() {
+                painter.line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())], egui::Stroke::new(1.0, egui::Color32::from_gray(40)));
+                let local = chrono::DateTime::from_timestamp_millis(t).unwrap_or_default().with_timezone(&chrono::Local);
+                let fmt = if step >= 86_400_000 { "%a %m-%d" } else if step >= 60_000 { "%H:%M" } else { "%H:%M:%S" };
+                painter.text(egui::pos2(x + 2.0, rect.top() + 2.0), egui::Align2::LEFT_TOP, local.format(fmt).to_string(), egui::FontId::monospace(11.0), weak);
+            }
+            t += step;
+        }
+        // Lanes.
+        for (i, name) in lanes.iter().enumerate() {
+            let y = rect.top() + AXIS_H + lane_top[i];
+            let h = subs[i] as f32 * LANE_H;
+            if i % 2 == 1 {
+                painter.rect_filled(egui::Rect::from_min_size(egui::pos2(rect.left(), y), egui::vec2(width_all, h)), egui::CornerRadius::ZERO, egui::Color32::from_rgb(20, 20, 26));
+            }
+            painter.text(egui::pos2(rect.left() + 6.0, y + LANE_H / 2.0), egui::Align2::LEFT_CENTER, name, egui::FontId::monospace(12.0), ui.visuals().text_color());
+        }
+        if lanes.is_empty() {
+            painter.text(area.center(), egui::Align2::CENTER_CENTER, "No recordings in this view.", egui::FontId::proportional(14.0), weak);
+        }
+        // Blocks.
+        let mut want_wf = Vec::new();
+        let mut hit: Option<(i64, u64)> = None;
+        let pointer = resp.interact_pointer_pos();
+        let by_id: HashMap<i64, &Recording> = recs.iter().map(|r| (r.id, r)).collect();
+        for b in &blocks {
+            let Some(r) = by_id.get(&b.id) else { continue };
+            let y = rect.top() + AXIS_H + lane_top[b.lane] + b.sub as f32 * LANE_H;
+            let br = egui::Rect::from_min_max(egui::pos2(area.left() + b.x0.max(0.0), y + 3.0), egui::pos2(area.left() + b.x1.min(width), y + LANE_H - 3.0));
+            if br.width() <= 0.0 {
+                continue;
+            }
+            let selected = self.rec.selected == Some(b.id);
+            let fill = if r.offline() || r.missing {
+                egui::Color32::from_gray(70)
+            } else if b.live {
+                egui::Color32::from_rgb(170, 24, 18)
+            } else if r.meta.source_kind == meta::KIND_DEMOD_AUDIO {
+                egui::Color32::from_rgb(40, 90, 120)
+            } else {
+                egui::Color32::from_rgb(46, 120, 70)
+            };
+            painter.rect_filled(br, egui::CornerRadius::same(2), fill);
+            if let Some(wf) = self.rec.waveforms.get(&b.id) {
+                let n = wf.len().max(1) as f32;
+                for (k, v) in wf.iter().enumerate() {
+                    let x = br.left() + br.width() * k as f32 / n;
+                    let a = br.height() * 0.45 * (*v as f32 / 255.0);
+                    painter.line_segment([egui::pos2(x, br.center().y - a), egui::pos2(x, br.center().y + a)], egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(220, 240, 220, 120)));
+                }
+            } else if br.width() > 20.0 {
+                want_wf.push(b.id);
+            }
+            let mut tag = String::new();
+            if r.meta.emergency {
+                tag.push_str("EMERG ");
+            }
+            if r.meta.priority {
+                tag.push_str("PRI ");
+            }
+            if r.archived {
+                tag.push_str("zst ");
+            }
+            if r.protected {
+                tag.push_str("🔒");
+            }
+            if r.star {
+                tag.push('★');
+            }
+            if r.offline() {
+                tag = format!("{tag}offline");
+            }
+            if r.missing {
+                tag = format!("{tag}MISSING");
+            }
+            if !tag.is_empty() && br.width() > 30.0 {
+                painter.text(br.left_center() + egui::vec2(3.0, 0.0), egui::Align2::LEFT_CENTER, tag.trim(), egui::FontId::monospace(10.0), egui::Color32::WHITE);
+            }
+            if r.meta.emergency {
+                painter.rect_stroke(br, egui::CornerRadius::same(2), egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 60, 40)), egui::StrokeKind::Outside);
+            }
+            if selected {
+                painter.rect_stroke(br, egui::CornerRadius::same(2), egui::Stroke::new(2.0, egui::Color32::WHITE), egui::StrokeKind::Outside);
+            }
+            if let Some(p) = pointer {
+                if resp.clicked() && br.expand(2.0).contains(p) {
+                    let t0 = timeline::parse_ms(&r.meta.start_utc).unwrap_or(0);
+                    let at = (view.t(p.x - area.left(), width) - t0).max(0) as u64;
+                    hit = Some((b.id, at));
+                }
+            }
+            // Play head.
+            if let Some((pid, pl)) = &self.rec.player {
+                if *pid == b.id {
+                    let t0 = timeline::parse_ms(&r.meta.start_utc).unwrap_or(0);
+                    let x = area.left() + view.x(t0 + pl.pos_ms.load(Ordering::Relaxed) as i64, width);
+                    painter.line_segment([egui::pos2(x, br.top() - 2.0), egui::pos2(x, br.bottom() + 2.0)], egui::Stroke::new(2.0, egui::Color32::YELLOW));
+                }
+            }
+        }
+        if let Some(now_x) = Some(area.left() + view.x(now, width)).filter(|x| *x >= area.left() && *x <= area.right()) {
+            painter.line_segment([egui::pos2(now_x, rect.top()), egui::pos2(now_x, rect.bottom())], egui::Stroke::new(1.0, egui::Color32::from_rgb(240, 60, 50)));
+            painter.text(egui::pos2(now_x - 2.0, rect.bottom() - 2.0), egui::Align2::RIGHT_BOTTOM, "NOW", egui::FontId::monospace(10.0), egui::Color32::from_rgb(240, 60, 50));
+        }
+        // Pan / zoom.
+        if resp.dragged() {
+            view.pan_px(resp.drag_delta().x, width);
+        }
+        if resp.hovered() {
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll.abs() > 0.5 {
+                let anchor = ui.input(|i| i.pointer.hover_pos()).map(|p| p.x - area.left()).unwrap_or(width).clamp(0.0, width);
+                view.zoom(if scroll > 0.0 { 0.8 } else { 1.25 }, anchor, width);
+                view.live = false;
+            }
+        }
+        self.rec.views.insert(source, view);
+        if let Some((id, at)) = hit {
+            if self.rec.selected != Some(id) {
+                self.rec.notes_edit = self.rec.rows.iter().find(|r| r.id == id).map(|r| r.notes.clone()).unwrap_or_default();
+            }
+            self.rec.selected = Some(id);
+            // Click plays from the clicked point (seek).
+            self.rec_play(id, at);
+        }
+        self.rec_waveforms(want_wf);
+    }
+
+    fn rec_detail(&mut self, ui: &mut egui::Ui) {
+        let Some(id) = self.rec.selected else {
+            ui.label(egui::RichText::new("Click a block to play it from that point. Drag to pan, scroll to zoom.").weak());
+            if let Some((rec, _, _)) = &self.rec.undo {
+                let label = format!("Undo delete of {}", rec.meta.lane());
+                if ui.button(label).clicked() {
+                    self.rec_undo();
+                }
+            }
+            return;
+        };
+        let Some(rec) = self.rec.rows.iter().find(|r| r.id == id).cloned() else {
+            self.rec.selected = None;
+            return;
+        };
+        let local = |utc: &str| {
+            chrono::DateTime::parse_from_rfc3339(utc)
+                .map(|t| t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_else(|_| if utc.is_empty() { "recording…".into() } else { utc.to_string() })
+        };
+        ui.horizontal_wrapped(|ui| {
+            ui.strong(rec.meta.lane());
+            ui.label(format!(
+                "{} → {}  {:.1} s  {:.4} MHz  {}  {}",
+                local(&rec.meta.start_utc),
+                local(&rec.meta.end_utc),
+                rec.meta.duration_ms as f64 / 1000.0,
+                rec.meta.channel_hz / 1e6,
+                rec.meta.modulation,
+                if rec.meta.source_kind == meta::KIND_DEMOD_AUDIO { "DEMOD AUDIO (not raw)" } else { "raw IQ 32 ksps cs16" },
+            ));
+            if !rec.meta.radio_name.is_empty() {
+                ui.label(format!("radio {}", rec.meta.radio_name));
+            }
+            if rec.meta.dropped > 0 {
+                ui.label(egui::RichText::new(format!("⚠ {} samples dropped (disk slow)", rec.meta.dropped)).color(caution()));
+            }
+        });
+        let mut star = rec.star;
+        let mut protect = rec.protected;
+        let mut delete = false;
+        ui.horizontal_wrapped(|ui| {
+            let playing = self.rec.player.as_ref().is_some_and(|(pid, _)| *pid == id);
+            if playing {
+                if ui.button("■ Stop").clicked() {
+                    self.rec.player = None;
+                }
+            } else if ui.button("▶ Play").on_hover_text("Re-demodulates the raw IQ now, through the current decoder.").clicked() {
+                self.rec_play(id, 0);
+            }
+            ui.checkbox(&mut star, "★ Star");
+            ui.checkbox(&mut protect, "🔒 Protect").on_hover_text("Never removed by overwrite-oldest.");
+            if ui.button("Export WAV…").on_hover_text("Demodulates now and writes a WAV. The WAV is not kept by REC.").clicked() {
+                self.rec_export_wav(&rec);
+            }
+            if ui.button("Export raw…").on_hover_text("Raw IQ (or archive) plus the JSON sidecar.").clicked() {
+                self.rec_export_raw(&rec);
+            }
+            if rec.archived {
+                if ui.add_enabled(self.rec.job.is_none(), egui::Button::new("Unarchive")).clicked() {
+                    let dir = self.rec.dir.clone();
+                    let one = rec.clone();
+                    self.rec_job("Unarchiving", move |db, st, _| {
+                        let r = hsrec::archive::unarchive_one(&db, &dir, &one);
+                        st.lock().expect("job").lines.push(r.err().unwrap_or_else(|| "Unarchived.".into()));
+                    });
+                    return;
+                }
+            } else if ui.add_enabled(self.rec.job.is_none() && !rec.meta.end_utc.is_empty(), egui::Button::new("Archive")).clicked() {
+                self.rec_start_archive(vec![rec.clone()]);
+            }
+            if ui.button("Delete").on_hover_text("Removes the raw file, its row, and its cache. Undo for 60 s.").clicked() {
+                delete = true;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Notes");
+            let r = ui.add(egui::TextEdit::singleline(&mut self.rec.notes_edit).desired_width(400.0));
+            if r.lost_focus() && self.rec.notes_edit != rec.notes {
+                if let Some(db) = &self.rec.db {
+                    let _ = db.set_notes(id, &self.rec.notes_edit);
+                }
+                self.rec_reload(true);
+            }
+        });
+        let mut changed = false;
+        if let Some(db) = &self.rec.db {
+            if star != rec.star {
+                let _ = db.set_flag(id, "star", star);
+                changed = true;
+            }
+            if protect != rec.protected {
+                let _ = db.set_flag(id, "protected", protect);
+                changed = true;
+            }
+        }
+        if changed {
+            self.rec_reload(true);
+        }
+        if delete {
+            self.rec_delete(&rec);
+        }
+    }
+
+    fn rec_delete(&mut self, rec: &Recording) {
+        if rec.meta.end_utc.is_empty() {
+            self.rec.note = "Still recording; delete it after it ends.".into();
+            return;
+        }
+        if let Some((_, trash, _)) = self.rec.undo.take() {
+            let _ = std::fs::remove_dir_all(trash);
+        }
+        if self.rec.player.as_ref().is_some_and(|(id, _)| *id == rec.id) {
+            self.rec.player = None;
+        }
+        let trash = self.rec.dir.join(".trash").join(rec.id.to_string());
+        let _ = std::fs::create_dir_all(&trash);
+        let raw = self.rec.dir.join(&rec.raw_path);
+        let side = hsrec::storage::sidecar_for(&raw);
+        let _ = std::fs::rename(&raw, trash.join("raw"));
+        let _ = std::fs::rename(&side, trash.join("side"));
+        if let Some(db) = &self.rec.db {
+            let _ = db.delete(rec.id);
+        }
+        for kind in ["waveform"] {
+            let _ = std::fs::remove_file(hsrec::cache::entry_path(&self.rec.dir, rec.id, kind, &hsrec::cache::decoder_version()));
+        }
+        self.rec.waveforms.remove(&rec.id);
+        self.rec.undo = Some((rec.clone(), trash, Instant::now()));
+        self.rec.selected = None;
+        self.rec.note = format!("Deleted {}. Undo is below for 60 s.", rec.meta.lane());
+        self.rec_reload(true);
+    }
+
+    fn rec_undo(&mut self) {
+        let Some((rec, trash, _)) = self.rec.undo.take() else { return };
+        let raw = self.rec.dir.join(&rec.raw_path);
+        let _ = std::fs::rename(trash.join("raw"), &raw);
+        let _ = std::fs::rename(trash.join("side"), hsrec::storage::sidecar_for(&raw));
+        let _ = std::fs::remove_dir_all(&trash);
+        if let Some(db) = &self.rec.db {
+            let _ = db.restore(&rec);
+        }
+        self.rec.note = "Delete undone.".into();
+        self.rec_reload(true);
+    }
+
+    fn rec_raw_path(&self, rec: &Recording) -> Option<PathBuf> {
+        if rec.offline() {
+            hsrec::export::locate(rec, &self.rec.drives)
+        } else {
+            Some(self.rec.dir.join(&rec.raw_path))
+        }
+    }
+
+    fn rec_export_wav(&mut self, rec: &Recording) {
+        let Some(src) = self.rec_raw_path(rec) else { return };
+        let name = format!("{}.wav", Path::new(&rec.raw_path).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "rec".into()).trim_end_matches(".cs16"));
+        let Some(dst) = rfd::FileDialog::new().set_file_name(&name).add_filter("WAV", &["wav"]).save_file() else { return };
+        let meta = rec.meta.clone();
+        // Analog: discriminator audio. Digital: the discriminator stream the
+        // decoder reads (speech decode for WAV needs the station decoder).
+        std::thread::spawn(move || {
+            if let Ok(audio) = hsrec::replay::decode_all(&src, &meta) {
+                let _ = hsrec::replay::write_wav(&dst, &audio, hsrec::replay::OUT_RATE);
+            }
+        });
+        self.rec.note = "Writing WAV in the background.".into();
+    }
+
+    fn rec_export_raw(&mut self, rec: &Recording) {
+        let Some(src) = self.rec_raw_path(rec) else { return };
+        let Some(folder) = rfd::FileDialog::new().pick_folder() else { return };
+        let side = hsrec::storage::sidecar_for(&src);
+        let mut ok = src.file_name().map(|n| std::fs::copy(&src, folder.join(n)).is_ok()).unwrap_or(false);
+        if side.exists() {
+            ok &= side.file_name().map(|n| std::fs::copy(&side, folder.join(n)).is_ok()).unwrap_or(false);
+        }
+        self.rec.note = if ok { format!("Raw IQ and sidecar copied to {}.", folder.display()) } else { "Raw export failed.".into() };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn icon_three_states() {
+        assert_eq!(icon_state(false, false), IconState::Off);
+        assert_eq!(icon_state(true, false), IconState::Armed);
+        assert_eq!(icon_state(true, true), IconState::Writing);
+        assert_eq!(icon_color(IconState::Off), egui::Color32::BLACK);
+        assert_ne!(icon_color(IconState::Armed), icon_color(IconState::Writing));
+        assert!(icon_text(IconState::Writing).contains("recording"));
+    }
+
+    #[test]
+    fn key_lamps() {
+        assert!(matches!(key_lamp(RecMode::Off), KeyLamp::Dark));
+        assert!(matches!(key_lamp(RecMode::Marked), KeyLamp::Red));
+        assert!(matches!(key_lamp(RecMode::All), KeyLamp::Amber));
+    }
+
+    #[test]
+    fn page_name_round_trip() {
+        assert_eq!(super::super::page_name(super::super::Page::Rec), "REC");
+        assert!(super::super::page_from_name("REC") == super::super::Page::Rec);
+    }
+
+    #[test]
+    fn marks_round_trip_and_old_files_load_unmarked() {
+        let tg: crate::talkgroups::Talkgroup = serde_json::from_str(r#"{"name":"Fire","tg":101}"#).unwrap();
+        assert!(!tg.record);
+        let mut tg = tg;
+        tg.record = true;
+        let text = serde_json::to_string(&tg).unwrap();
+        assert!(text.contains("\"record\":true"));
+        tg.record = false;
+        assert!(!serde_json::to_string(&tg).unwrap().contains("record"));
+        let ch: crate::channels::Channel = serde_json::from_str(r#"{"name":"Ops","hz":155000000.0}"#).unwrap();
+        assert!(!ch.record);
+    }
+
+    #[test]
+    fn rec_face_persists_modes() {
+        let mut f = config::RecFace::default();
+        assert!(f.is_default());
+        f.talkgroups = RecMode::Marked;
+        f.channels = RecMode::All;
+        let text = serde_json::to_string(&f).unwrap();
+        let back: config::RecFace = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, f);
+        assert!(back.armed());
+        let old: config::RecFace = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.cap_gb, 20.0);
+    }
+}

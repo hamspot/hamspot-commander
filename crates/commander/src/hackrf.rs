@@ -939,6 +939,11 @@ struct Ddc {
     prev_i: f32,
     prev_q: f32,
     have_prev: bool,
+    /// REC tap: when on, each half of the boxcar (250 samples, 32 ksps) is
+    /// appended to `tap_out` as cs16. The discriminator is unchanged.
+    tap_on: bool,
+    half: (f32, f32),
+    tap_out: Vec<i16>,
 }
 
 impl Ddc {
@@ -956,6 +961,9 @@ impl Ddc {
             prev_i: 0.0,
             prev_q: 0.0,
             have_prev: false,
+            tap_on: false,
+            half: (0.0, 0.0),
+            tap_out: Vec::new(),
         };
         ddc.set_offset(offset);
         ddc
@@ -996,8 +1004,19 @@ impl Ddc {
         self.acc_i += bi;
         self.acc_q += bq;
         self.filled += 1;
+        if self.tap_on && self.filled == hsrec::dsp::REC_BOX {
+            self.half = (self.acc_i, self.acc_q);
+            let n = hsrec::dsp::REC_BOX as f32;
+            self.tap_out.push(hsrec::dsp::store_i16(self.acc_i / n));
+            self.tap_out.push(hsrec::dsp::store_i16(self.acc_q / n));
+        }
         if self.filled < BOX {
             return None;
+        }
+        if self.tap_on {
+            let n = (BOX - hsrec::dsp::REC_BOX) as f32;
+            self.tap_out.push(hsrec::dsp::store_i16((self.acc_i - self.half.0) / n));
+            self.tap_out.push(hsrec::dsp::store_i16((self.acc_q - self.half.1) / n));
         }
         let mi = self.acc_i / BOX as f32;
         let mq = self.acc_q / BOX as f32;
@@ -1061,6 +1080,19 @@ impl Bank {
 
     fn dc_mean(&self) -> (f32, f32) {
         (self.dc.i, self.dc.q)
+    }
+
+    /// Turn the REC tap on the voice mixer on or off.
+    pub fn set_tap(&mut self, on: bool) {
+        self.voice.tap_on = on;
+        if !on {
+            self.voice.tap_out.clear();
+        }
+    }
+
+    /// Channelised IQ since the last call (32 ksps cs16 at the voice frequency).
+    pub fn take_tap(&mut self) -> Vec<i16> {
+        std::mem::take(&mut self.voice.tap_out)
     }
 
     pub fn set_voice(&mut self, hz: Option<f64>) {
@@ -1138,6 +1170,8 @@ pub struct Session {
     /// A change replaces the voice process and leaves the control decoders.
     key_csv: Option<String>,
     voice_hz: Arc<AtomicU64>,
+    /// Radio id the REC tap files its IQ under.
+    rec_key: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     failed: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
@@ -1151,6 +1185,10 @@ pub struct Session {
 }
 
 impl Session {
+    pub fn set_rec_key(&self, id: u64) {
+        self.rec_key.store(id, Ordering::Relaxed);
+    }
+
     pub fn set_voice(&self, hz: u64) {
         self.voice_hz.store(hz, Ordering::Relaxed);
     }
@@ -1514,6 +1552,8 @@ pub fn start(
     };
     let voice_next = Arc::new(Mutex::new(None));
     let voice_slot = Arc::clone(&voice_next);
+    let rec_key = Arc::new(AtomicU64::new(0));
+    let rec_flag = Arc::clone(&rec_key);
     let worker = thread::spawn(move || {
         run_bank(
             iq,
@@ -1527,6 +1567,7 @@ pub fn start(
             stop_flag,
             failed_flag,
             pump,
+            rec_flag,
         )
     });
     Ok(Session {
@@ -1541,6 +1582,7 @@ pub fn start(
         p2_word: site.map(str::to_string),
         key_csv,
         voice_hz,
+        rec_key,
         stop,
         failed,
         worker: Some(worker),
@@ -1589,6 +1631,7 @@ fn run_bank(
     stop: Arc<AtomicBool>,
     failed: Arc<AtomicBool>,
     mut spec: SpecPump,
+    rec_key: Arc<AtomicU64>,
 ) {
     let mut bank = Bank::new(center, control_hz);
     // A full playback pipe must not stall this read. hackrf_transfer stops
@@ -1617,7 +1660,15 @@ fn run_bank(
         for out in &mut control_out {
             out.clear();
         }
+        let tap = hz != 0 && crate::rec_live::tap_on();
+        bank.set_tap(tap);
         bank.push(&buf[..n], &mut voice_out, &mut control_out);
+        if tap {
+            let data = bank.take_tap();
+            if !data.is_empty() {
+                crate::rec_live::push(rec_key.load(Ordering::Relaxed), hz, data);
+            }
+        }
         let (mean_i, mean_q) = bank.dc_mean();
         spec.push(&buf[..n], center, mean_i, mean_q);
         if let Some(play) = play.as_mut() {
@@ -1918,6 +1969,41 @@ fn collect(stderr: impl Read, sink: Arc<Mutex<Vec<String>>>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rec_tap_replays_like_live_voice() {
+        // Synthetic FM 1 kHz tone, 2.5 kHz deviation, 60 kHz above centre.
+        let center = 851_000_000.0;
+        let cs8 = hsrec::dsp::synth_fm_cs8(60_000.0, 1_000.0, 2_500.0, 0.2, 100.0);
+        let mut bank = Bank::new(center, &[]);
+        bank.set_voice(Some(center + 60_000.0));
+        bank.set_tap(true);
+        let mut live = Vec::new();
+        let mut tap = Vec::new();
+        for block in cs8.chunks(16_384) {
+            bank.push(block, &mut live, &mut []);
+            tap.extend(bank.take_tap());
+        }
+        // 32 ksps complex: two halves per live 16 kHz sample.
+        assert_eq!(tap.len() / 2, live.len() / 3 * 2 + 2);
+        let mut replay = Vec::new();
+        hsrec::dsp::Replayer::default().push(&tap, &mut replay);
+        let skip = 4_800;
+        let n = replay.len().min(live.len()) - skip;
+        let worst = live[skip..skip + n]
+            .iter()
+            .zip(&replay[skip..skip + n])
+            .map(|(a, b)| (*a as i32 - *b as i32).abs())
+            .max()
+            .unwrap();
+        // Same discriminator; only cs16 rounding differs.
+        assert!(worst < 120, "max diff {worst}");
+        let hz = hsrec::dsp::zero_cross_hz(&replay[skip..], 48_000.0);
+        assert!((hz - 1_000.0).abs() < 30.0, "{hz}");
+        bank.set_tap(false);
+        bank.push(&cs8[..16_384], &mut live, &mut []);
+        assert!(bank.take_tap().is_empty());
+    }
+
     use super::*;
 
     #[test]

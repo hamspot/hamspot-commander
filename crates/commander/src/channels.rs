@@ -30,6 +30,9 @@ pub struct Channel {
     /// a switch. Old files load with it clear, and a clear flag is omitted.
     #[serde(default, skip_serializing_if = "is_false")]
     pub invert: bool,
+    /// Marked for recording (right-click). Absent means not marked.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub record: bool,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -169,6 +172,7 @@ pub fn add_control(zone: &mut ChannelZone, hz: f64, rfss: u32, site: u32) -> boo
         name = format!("{name} {rfss}-{site}");
     }
     zone.channels.push(Channel {
+        record: false,
         name,
         hz,
         mode,
@@ -241,7 +245,7 @@ mod tests {
     fn an_adjacent_site_becomes_a_control_memory() {
         let mut zone = ChannelZone {
             name: "1.027 Newport".into(),
-            channels: vec![Channel {
+            channels: vec![Channel { record: false,
                 name: "859.9625c".into(),
                 hz: 859_962_500.0,
                 mode: "FM".into(),
@@ -264,7 +268,7 @@ mod tests {
     fn an_adjacent_site_marks_an_existing_memory_as_control() {
         let mut zone = ChannelZone {
             name: "1.027 Newport".into(),
-            channels: vec![Channel {
+            channels: vec![Channel { record: false,
                 name: "voice".into(),
                 hz: 858_962_500.0,
                 mode: "FM".into(),
@@ -287,7 +291,7 @@ mod tests {
             version: 1,
             zones: vec![ChannelZone {
                 name: "Memories".into(),
-                channels: vec![Channel {
+                channels: vec![Channel { record: false,
                     name: "20 m".into(),
                     hz: 14_153_608.0,
                     mode: "USB".into(),
@@ -387,7 +391,7 @@ mod tests {
             zones: vec![
                 ChannelZone {
                     name: "Other site".into(),
-                    channels: vec![Channel {
+                    channels: vec![Channel { record: false,
                         name: "other".into(),
                         hz: 851_012_500.0,
                         mode: "FM".into(),
@@ -400,7 +404,7 @@ mod tests {
                 ChannelZone {
                     name: "This site".into(),
                     channels: vec![
-                        Channel {
+                        Channel { record: false,
                             name: "voice".into(),
                             hz: 852_000_000.0,
                             mode: "FM".into(),
@@ -409,7 +413,7 @@ mod tests {
                             vocoder: String::new(),
             invert: false,
                         },
-                        Channel {
+                        Channel { record: false,
                             name: "cc".into(),
                             hz: 858_512_500.0,
                             mode: "FM".into(),
@@ -427,7 +431,7 @@ mod tests {
         assert_eq!(listed[0].0, 858_512_500.0);
         assert_eq!(listed[0].2, "cc");
         assert!(zone_controls(&file, 4).is_empty());
-        file.zones[1].channels.push(Channel {
+        file.zones[1].channels.push(Channel { record: false,
             name: "locked".into(),
             hz: 859_000_000.0,
             mode: "FM".into(),

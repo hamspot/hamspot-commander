@@ -2121,6 +2121,7 @@ fn tick_hackrf(
         Arc::clone(wake),
     ) {
         Ok(session) => {
+            session.set_rec_key(slot.id);
             session.set_voice(slot.hackrf_voice);
             slot.hackrf = Some(session);
             slot.hackrf_last_err.clear();
