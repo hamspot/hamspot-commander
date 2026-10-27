@@ -1,4 +1,5 @@
 //! HamSpot Commander REC library (no GUI dependencies).
+pub mod archive;
 pub mod cache;
 pub mod db;
 pub mod dsp;
