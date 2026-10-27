@@ -32,6 +32,7 @@ mod rx_pipe;
 mod scan;
 mod tools;
 mod group_box;
+mod estop;
 mod toggle;
 
 /// Config page groups, in page order, with their elbow colours.
@@ -60,7 +61,19 @@ fn cfg_colour(name: &str) -> egui::Color32 {
 
 /// Thin titled elbow around one Config group.
 fn cfg_group<R>(ui: &mut egui::Ui, name: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    group_box::group_box(ui, name, cfg_colour(name), add)
+    if cfg_group_has_estop(name) {
+        group_box::group_box_estop(ui, name, cfg_colour(name), add)
+    } else {
+        group_box::group_box(ui, name, cfg_colour(name), add)
+    }
+}
+
+/// Config groups whose devices can transmit, key an amplifier or move
+/// something carry the E-STOP in their bar (issue #198).
+pub(crate) const ESTOP_GROUPS: [&str; 5] = ["Radio", "Rotator", "Amplifier", "Automation patch", "RF patch"];
+
+fn cfg_group_has_estop(name: &str) -> bool {
+    ESTOP_GROUPS.contains(&name)
 }
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -1925,6 +1938,18 @@ impl App {
         let hub = cat::Hub::spawn(Arc::clone(&face), kick, ctx.clone());
         let rotators = rot::Hub::spawn(ctx.clone());
         let amplifiers = amp::Hub::spawn(ctx.clone());
+        {
+            // E-STOP fan-out: wake every device hub the moment any copy of
+            // the button is pressed. Each hub also checks the flag on its own.
+            let (h, r, a) = (Arc::clone(&hub), Arc::clone(&rotators), Arc::clone(&amplifiers));
+            estop::on_engage(Box::new(move || {
+                h.wake();
+                r.estop();
+                a.estop();
+            }));
+            // Start engaged if Commander was closed with the E-STOP engaged.
+            estop::load_persisted(config::station_dir().join("estop-state"));
+        }
         let shared_thread = Arc::clone(&shared);
         let wake_thread = Arc::clone(&wake);
         let face_thread = Arc::clone(&face);
@@ -2957,7 +2982,11 @@ impl eframe::App for App {
                     Some(rec_ui::BarPlace::InFrame { compact }) if self.page == Page::Rec => Some(compact),
                     _ => None,
                 };
-                let slot_w = in_frame.map(rec_ui::bar_slot_width);
+                // Every main page carries the E-STOP at the right end of its
+                // tan top bar (issue #198; Tune is the reference placement).
+                // REC's in-frame view controls share the same gap, to its left.
+                let estop_w = estop::button_width(estop::engaged()) + 16.0;
+                let slot_w = Some(in_frame.map(rec_ui::bar_slot_width).unwrap_or(0.0) + estop_w);
                 let (frame_rect, slot) = tools::frame_with_slot(ui, slot_w, |ui| {
                     if self.page == Page::Tune {
                         self.page_tune(ui, &mut snap);
@@ -2978,14 +3007,29 @@ impl eframe::App for App {
                             .show(ui, |ui| self.page_body(ui, &mut snap));
                     }
                 });
-                // REC's view controls sit in the gap opened in the top bar.
-                if let (Some(compact), Some(r)) = (in_frame, slot) {
-                    ui.scope_builder(egui::UiBuilder::new().max_rect(r).id_salt("rec-bar-in-frame"), |ui| {
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = rec_ui::BAR_GAP;
-                            self.rec_bar(ui, compact);
+                // REC's view controls and the E-STOP sit in the gap opened in the top bar.
+                if let Some(r) = slot {
+                    let (rec_r, stop_r) = (
+                        egui::Rect::from_min_max(r.min, egui::pos2(r.right() - estop_w, r.bottom())),
+                        egui::Rect::from_min_max(egui::pos2(r.right() - estop_w, r.top()), r.max),
+                    );
+                    if let Some(compact) = in_frame {
+                        ui.scope_builder(egui::UiBuilder::new().max_rect(rec_r).id_salt("rec-bar-in-frame"), |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = rec_ui::BAR_GAP;
+                                self.rec_bar(ui, compact);
+                            });
                         });
-                    });
+                    }
+                    ui.scope_builder(
+                        egui::UiBuilder::new()
+                            .max_rect(stop_r)
+                            .id_salt("estop-page-bar")
+                            .layout(egui::Layout::right_to_left(egui::Align::Center)),
+                        |ui| {
+                            estop::button(ui);
+                        },
+                    );
                 }
                 // REC's legal note rides the bottom elbow's bar, REC page only.
                 if self.page == Page::Rec {
@@ -11555,7 +11599,8 @@ impl App {
     }
 
     fn ptt(&mut self, ui: &mut egui::Ui, snap: &Snapshot, label: &str) {
-        let enabled = snap.online() && snap.caps.can_set_ptt;
+        let enabled = snap.online() && snap.caps.can_set_ptt && !estop::engaged();
+        let label = if estop::engaged() { "TX blocked: E-STOP" } else { label };
         if crate::toggle::add_toggle(ui, enabled, snap.ptt, label).clicked() {
             let next = !snap.ptt;
             if next {
@@ -11757,11 +11802,12 @@ fn drive(
         message: "starting dummy".into(),
     };
     let mut last = shared.lock().expect("ui").snap.clone();
+    let mut estop_retry = estop::Retry::default();
     loop {
         // The condvar is waited on `shared`. The hub's kick holds that same
         // mutex before it notifies, and this loop reads `face.connect` while
         // holding it, so a handed port is not missed.
-        let (cmds, connect, classic) = {
+        let (mut cmds, connect, classic) = {
             let mut guard = shared.lock().expect("ui");
             loop {
                 let demo = face.lock().expect("face").demo;
@@ -11846,14 +11892,33 @@ fn drive(
         if let Session::Live(rig) = &mut session {
             rig.set_follow(follow);
         }
+        // E-STOP choke point for the face radio: keying is refused, and the
+        // radio is unkeyed until it confirms (and again if a poll shows it
+        // keyed, for example by Gpredict on the same rigctld).
+        let estop_on = estop::engaged();
+        let estop_gen = estop::generation();
+        cmds.retain(|cmd| estop::allows_rig(cmd, estop_on));
+        let now = std::time::Instant::now();
+        let estop_send = estop_on
+            && (estop_retry.due(estop_on, estop_gen, now) || (last.ptt && estop_retry.confirmed == estop_gen));
+        if estop_send {
+            cmds.push(Command::SetPtt(false));
+        }
+        let mut estop_err: Option<String> = None;
         let mut sent = None;
         let mut remote = None;
         for cmd in &cmds {
             sent = Some(cmd.cat_line());
             match session.apply(cmd) {
                 Ok(()) => {}
-                Err(RigError::Remote(msg)) => remote = Some(msg),
+                Err(RigError::Remote(msg)) => {
+                    if matches!(cmd, Command::SetPtt(false)) && estop_send {
+                        estop_err = Some(msg.clone());
+                    }
+                    remote = Some(msg)
+                }
                 Err(RigError::Io(msg)) => {
+                    estop_err = Some(msg.clone());
                     let was_live = matches!(session, Session::Live(_));
                     session = Session::Down { message: msg };
                     if was_live {
@@ -11865,6 +11930,26 @@ fn drive(
             }
         }
 
+        if estop_send {
+            let name = "selected radio";
+            if session.is_down() {
+                estop_err.get_or_insert_with(|| "radio offline".into());
+            }
+            match estop_err {
+                None => {
+                    estop_retry.tried(estop_gen, true, now);
+                    estop::report(estop_gen, estop::Kind::Transmitter, name, estop::Outcome::Stopped);
+                }
+                Some(err) if err.contains("RPRT -11") => {
+                    estop_retry.tried(estop_gen, true, now);
+                    estop::report(estop_gen, estop::Kind::Transmitter, name, estop::Outcome::NoStopSupport);
+                }
+                Some(err) => {
+                    estop_retry.tried(estop_gen, false, now);
+                    estop::report(estop_gen, estop::Kind::Transmitter, name, estop::Outcome::Failed(err));
+                }
+            }
+        }
         let mut snap = match session.poll() {
             Ok(snap) => snap,
             Err(RigError::Io(msg)) => {

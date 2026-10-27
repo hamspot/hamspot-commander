@@ -189,8 +189,14 @@ impl Tools {
 
     fn nav(&mut self, ui: &mut egui::Ui) {
         let theme = self.theme;
+        // Rotator: the E-STOP sits at the right end of this row (issue #198).
+        let estop = self.screen == Screen::Rotator;
+        let estop_w = crate::estop::button_width(crate::estop::engaged()) + 8.0;
+        ui.horizontal(|ui| {
+        let max_w = if estop { (ui.available_width() - estop_w).max(0.0) } else { ui.available_width() };
         egui::ScrollArea::horizontal()
             .id_salt("tool-nav")
+            .max_width(max_w)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
             for (index, (screen, label)) in SCREENS.iter().enumerate() {
@@ -217,6 +223,13 @@ impl Tools {
             }
                 });
             });
+        if estop {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.set_min_height(theme.bar_thin);
+                crate::estop::button(ui);
+            });
+        }
+        });
         if !self.open_note.is_empty() {
             readout(ui, &theme, &self.open_note, false);
         }

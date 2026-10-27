@@ -195,6 +195,8 @@ enum AmpCmd {
     Select(u64),
     Replace(Vec<AmplifierSpec>),
     Control(u64, Control),
+    /// Wake the supervisor for the E-STOP (see [`crate::estop`]).
+    EStop,
     Shutdown,
 }
 
@@ -213,6 +215,7 @@ struct Slot {
     make: String,
     model_label: String,
     held: Option<u16>,
+    estop: crate::estop::Retry,
 }
 
 pub struct Hub {
@@ -703,6 +706,11 @@ impl Hub {
     }
 
     /// Operator action only. Nothing in Commander calls this on a timer or a load.
+    /// E-STOP: wake the supervisor so every amplifier goes to standby now.
+    pub fn estop(&self) {
+        self.send(AmpCmd::EStop);
+    }
+
     pub fn control(&self, id: u64, cmd: Control) {
         self.send(AmpCmd::Control(id, cmd));
     }
@@ -819,6 +827,7 @@ fn supervise(hub: Arc<Hub>, ctx: egui::Context) {
                     }
                 }
                 AmpCmd::Control(id, cmd) => control_slot(&mut slots, id, &cmd),
+                AmpCmd::EStop => {}
             }
         }
         if stop {
@@ -831,6 +840,9 @@ fn supervise(hub: Arc<Hub>, ctx: egui::Context) {
         let now = Instant::now();
         for slot in &mut slots {
             tick_slot(slot, now);
+        }
+        for slot in &mut slots {
+            estop_slot(slot, now);
         }
         if changed || slots.iter().any(|slot| slot.status_dirty) {
             publish(&hub, &slots, selected);
@@ -849,6 +861,12 @@ fn control_slot(slots: &mut [Slot], id: u64, cmd: &Control) {
     let Some(slot) = slots.iter_mut().find(|slot| slot.id == id) else {
         return;
     };
+    // E-STOP choke point: no operate while it is engaged.
+    if !crate::estop::allows_amp(cmd, crate::estop::engaged()) {
+        slot.status = "E-STOP engaged: operate refused".into();
+        slot.status_dirty = true;
+        return;
+    }
     let Some(port) = slot.port else {
         return;
     };
@@ -875,6 +893,7 @@ fn new_slot(id: u64, spec: AmplifierSpec, models: &[AmpModel]) -> Slot {
         make: String::new(),
         model_label: String::new(),
         held: None,
+        estop: crate::estop::Retry::default(),
     };
     label_slot(&mut slot, models);
     slot
@@ -1005,8 +1024,58 @@ fn stop_slot(slot: &mut Slot) {
     drop_child(slot);
 }
 
+/// While the E-STOP is engaged, put this amplifier in standby until it
+/// confirms, then put it back in standby if a poll shows it operating again.
+/// A backend without `set_powerstat` is shown as having no stop support.
+fn estop_slot(slot: &mut Slot, now: Instant) {
+    use crate::estop::{self, Kind, Outcome};
+    let on = estop::engaged();
+    let g = estop::generation();
+    if !on {
+        return;
+    }
+    let operating = matches!(slot.state.power, Some(Power::Operate | Power::On));
+    if slot.estop.confirmed == g && !operating {
+        return;
+    }
+    if slot.estop.confirmed == g && operating {
+        slot.estop.confirmed = 0;
+    }
+    if !slot.estop.due(on, g, now) {
+        return;
+    }
+    let name = slot.spec.name.clone();
+    let result = match slot.port {
+        Some(port) => AmpClient::open(port)
+            .and_then(|mut c| c.control(&Control::SetPower(Power::Standby))),
+        None => Err("ampctld not running".into()),
+    };
+    match result {
+        Ok(()) => {
+            slot.estop.tried(g, true, now);
+            estop::report(g, Kind::Amplifier, &name, Outcome::Stopped);
+            slot.status = "E-STOP: standby".into();
+            slot.next_poll = Some(now);
+        }
+        Err(err) if err.contains("RPRT -11") || err.contains("RPRT -4") => {
+            slot.estop.tried(g, true, now);
+            estop::report(g, Kind::Amplifier, &name, Outcome::NoStopSupport);
+            slot.status = "E-STOP: this amplifier has no standby command".into();
+        }
+        Err(err) => {
+            slot.estop.tried(g, false, now);
+            estop::report(g, Kind::Amplifier, &name, Outcome::Failed(err.clone()));
+            slot.status = format!("E-STOP: standby failed ({err}), retrying");
+        }
+    }
+    slot.status_dirty = true;
+}
+
 fn next_wait(slots: &[Slot], now: Instant) -> Duration {
     let mut wait = STATE_EVERY;
+    if crate::estop::engaged() {
+        wait = wait.min(crate::estop::RETRY_EVERY);
+    }
     for slot in slots {
         for at in [slot.retry_at, slot.next_poll].into_iter().flatten() {
             if at <= now {

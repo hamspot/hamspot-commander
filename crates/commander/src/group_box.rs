@@ -74,9 +74,24 @@ pub struct Layout {
     pub inner: Rect,
     /// Where the title may be drawn (inside the bar, right of the curve).
     pub title: Rect,
+    /// Gap at the right end of the bar for a control (the E-STOP), if asked.
+    pub slot: Option<Rect>,
 }
 
 pub fn layout(left: f32, top: f32, width: f32, content_h: f32, m: &Metrics) -> Layout {
+    layout_with_slot(left, top, width, content_h, m, 0.0)
+}
+
+/// [`layout`] with a `slot_w` gap at the right end of the bar, before the cap.
+/// The bar stops short of it. A group too narrow for title room keeps no slot.
+pub fn layout_with_slot(
+    left: f32,
+    top: f32,
+    width: f32,
+    content_h: f32,
+    m: &Metrics,
+    slot_w: f32,
+) -> Layout {
     let width = width.max(m.rail + m.gap + 1.0);
     let right = left + width;
     let inner = Rect::from_min_size(
@@ -90,11 +105,17 @@ pub fn layout(left: f32, top: f32, width: f32, content_h: f32, m: &Metrics) -> L
     } else {
         (right, None)
     };
+    let curve_w = (m.rail + m.r_in).max(2.0 * m.r_out);
+    let (bar_end, slot) = if slot_w > 0.0 && bar_end - slot_w - m.cap_gap > left + curve_w + m.title_pad {
+        let r = Rect::from_min_max(pos2(bar_end - slot_w, top), pos2(bar_end, top + m.bar));
+        (r.left() - m.cap_gap, Some(r))
+    } else {
+        (bar_end, None)
+    };
     let elbow = Rect::from_min_max(pos2(left, top), pos2(bar_end, bottom));
     let bar = Rect::from_min_max(pos2(left, top), pos2(bar_end, top + m.bar));
     let rail = Rect::from_min_max(pos2(left, top), pos2(left + m.rail, bottom));
     // rustcars sizes the swept corner block as max(rail + r_in, 2 * r_out).
-    let curve_w = (m.rail + m.r_in).max(2.0 * m.r_out);
     let title_left = (left + curve_w + m.title_pad).min(bar_end);
     let title = Rect::from_min_max(
         pos2(title_left, top),
@@ -108,7 +129,23 @@ pub fn layout(left: f32, top: f32, width: f32, content_h: f32, m: &Metrics) -> L
         cap,
         inner,
         title,
+        slot,
     }
+}
+
+/// Metrics for a group whose bar carries the E-STOP: the bar is tall enough
+/// for a [`crate::estop::BUTTON_H`] hit target plus a small margin.
+pub fn estop_metrics() -> Metrics {
+    Metrics { bar: crate::estop::BUTTON_H + 4.0, r_out: 16.0, ..Metrics::default() }
+}
+
+/// [`group_box`] with the shared E-STOP at the right end of its bar.
+pub fn group_box_estop<R>(ui: &mut Ui, title: &str, color: Color32, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let m = estop_metrics();
+    let w = crate::estop::button_width(crate::estop::engaged());
+    group_box_slot(ui, &m, title, color, w, add, |ui| {
+        crate::estop::button(ui);
+    })
 }
 
 /// Chrome shapes for `l` (no text). `bg` must be the colour behind the group:
@@ -144,16 +181,30 @@ pub fn group_box_with<R>(
     color: Color32,
     add: impl FnOnce(&mut Ui) -> R,
 ) -> R {
+    group_box_slot(ui, m, title, color, 0.0, add, |_| {})
+}
+
+/// The general form: `slot_w` > 0 opens a gap at the right end of the bar
+/// and `slot` draws into it (right-aligned, vertically centred).
+pub fn group_box_slot<R>(
+    ui: &mut Ui,
+    m: &Metrics,
+    title: &str,
+    color: Color32,
+    slot_w: f32,
+    add: impl FnOnce(&mut Ui) -> R,
+    slot_ui: impl FnOnce(&mut Ui),
+) -> R {
     let bg = ui.visuals().panel_fill;
     let slot = ui.painter().add(Shape::Noop);
     let avail = ui.available_rect_before_wrap();
     let (left, top, width) = (avail.left(), avail.top(), ui.available_width());
-    let probe = layout(left, top, width, 0.0, m);
+    let probe = layout_with_slot(left, top, width, 0.0, m, slot_w);
     let max = Rect::from_min_max(probe.inner.min, pos2(probe.inner.right(), f32::INFINITY));
     let mut child = ui.new_child(UiBuilder::new().max_rect(max).layout(*ui.layout()));
     let r = add(&mut child);
     let used = child.min_rect();
-    let l = layout(left, top, width, (used.bottom() - probe.inner.top()).max(0.0), m);
+    let l = layout_with_slot(left, top, width, (used.bottom() - probe.inner.top()).max(0.0), m, slot_w);
     let resp = ui.allocate_rect(l.outer, Sense::hover());
     let label = title.to_owned();
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Label, true, &label));
@@ -165,6 +216,14 @@ pub fn group_box_with<R>(
             title.to_uppercase(),
             FontId::proportional(m.title_size),
             ink_on(color),
+        );
+    }
+    if let Some(rect) = l.slot {
+        ui.scope_builder(
+            UiBuilder::new()
+                .max_rect(rect)
+                .layout(egui::Layout::right_to_left(egui::Align::Center)),
+            slot_ui,
         );
     }
     r
@@ -253,5 +312,45 @@ mod tests {
         });
         rx.recv_timeout(std::time::Duration::from_secs(10))
             .expect("headless group_box did not finish in 10 s (deadlock?)");
+    }
+
+    #[test]
+    fn slot_sits_at_right_end_before_cap() {
+        let m = estop_metrics();
+        assert!(m.bar >= crate::estop::BUTTON_H, "hit target fits in the bar");
+        let l = layout_with_slot(0.0, 0.0, 800.0, 40.0, &m, 120.0);
+        let slot = l.slot.expect("wide group has a slot");
+        let cap = l.cap.expect("cap");
+        assert_eq!(slot.right(), cap.left() - m.cap_gap);
+        assert_eq!(slot.width(), 120.0);
+        assert_eq!(slot.height(), m.bar);
+        assert_eq!(l.bar.right(), slot.left() - m.cap_gap);
+        assert!(l.title.right() <= slot.left());
+        // No slot asked: same as before.
+        assert_eq!(layout_with_slot(0.0, 0.0, 800.0, 40.0, &m, 0.0), layout(0.0, 0.0, 800.0, 40.0, &m));
+        // Too narrow for title room: no slot, bar unchanged.
+        let n = layout_with_slot(0.0, 0.0, 150.0, 0.0, &m, 120.0);
+        assert!(n.slot.is_none());
+        assert_eq!(n.bar.right(), 150.0);
+    }
+
+    #[test]
+    fn estop_group_runs_headless_without_deadlock() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let ctx = egui::Context::default();
+            for _ in 0..3 {
+                let input = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 400.0))),
+                    ..Default::default()
+                };
+                let mut out = ctx.run_ui(input, |ui| {
+                    group_box_estop(ui, "Rotator", rustcars::palette::OLIVE, |ui| ui.label("x"));
+                });
+                out.textures_delta.clear();
+            }
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10)).expect("deadlock?");
     }
 }
