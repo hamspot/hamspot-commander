@@ -155,9 +155,12 @@ pub struct DecoderCmd {
     pub env: Vec<(String, String)>,
 }
 
-/// pw-cat to the system default output.
+/// pw-cat to the system default output. `--raw` is required: without it
+/// pw-cat (PipeWire 1.x) opens `-` through libsndfile, which rejects headerless
+/// s16 with "Format not recognised" and exits. The copier then fails, the
+/// decoder's sox dies with "Broken pipe", and the replay reports no voice.
 pub fn default_play_argv() -> Vec<String> {
-    ["pw-cat", "-p", "--rate", "48000", "--channels", "1", "--format", "s16", "-"]
+    ["pw-cat", "-p", "--raw", "--rate", "48000", "--channels", "1", "--format", "s16", "-"]
         .iter()
         .map(|s| s.to_string())
         .collect()
@@ -547,6 +550,41 @@ mod tests {
         let p = Player::start(&path, &meta, 0, None, vec!["/nonexistent/pw-cat".into()]).unwrap();
         while !p.finished() { std::thread::sleep(Duration::from_millis(10)); }
         assert!(p.error.lock().unwrap().contains("audio output"));
+    }
+
+    #[test]
+    fn default_player_is_raw_pcm() {
+        let argv = default_play_argv();
+        assert_eq!(argv[0], "pw-cat");
+        assert!(argv.iter().any(|a| a == "--raw" || a == "-a"), "{argv:?}");
+        assert_eq!(argv.last().map(String::as_str), Some("-"));
+    }
+
+    /// The real pw-cat must stay alive on headerless PCM that arrives late.
+    /// Skipped when pw-cat or a PipeWire session is absent.
+    #[test]
+    fn default_player_accepts_late_raw_pcm() {
+        if std::process::Command::new("pw-cat").arg("--version").output().is_err() || std::env::var_os("XDG_RUNTIME_DIR").is_none() {
+            return;
+        }
+        let mut argv = default_play_argv();
+        // Silence only: zeros, half a second, after a pause like a decoder sync.
+        let mut c = Command::new(&argv.remove(0));
+        let mut child = c.args(&argv).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        let ok = stdin.write_all(&vec![0u8; 48_000]).is_ok();
+        std::thread::sleep(Duration::from_millis(200));
+        let alive = child.try_wait().unwrap().is_none();
+        drop(stdin);
+        let st = child.wait().unwrap();
+        if !alive && st.code() != Some(0) {
+            // No PipeWire daemon in this environment; nothing to check.
+            if std::process::Command::new("pw-cli").arg("info").output().map(|o| !o.status.success()).unwrap_or(true) {
+                return;
+            }
+        }
+        assert!(ok && (alive || st.success()), "pw-cat exited {st:?} on raw PCM");
     }
 
     #[test]
