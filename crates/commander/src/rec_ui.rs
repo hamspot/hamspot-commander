@@ -1022,14 +1022,6 @@ impl App {
             }
             let shown = timeline::layout(&recs, &lanes, &view, width, now).len();
             ui.label(format!("{} recordings ({shown} in view), {} lanes", recs.len(), lanes.len()));
-            if ui
-                .add_enabled_ui(self.rec.selected.is_some(), |ui| toolbar_toggle(ui, self.rec.detail_open, "Details", true))
-                .inner
-                .on_hover_text("Record / Playback dialog for the selected recording")
-                .clicked()
-            {
-                self.rec.detail_open = !self.rec.detail_open;
-            }
             if let Some((rec, _, _)) = &self.rec.undo {
                 let label = format!("Undo delete of {}", rec.meta.lane());
                 if ui.small_button(label).clicked() {
