@@ -258,7 +258,7 @@ pub fn matches(r: &Recording, query: &str) -> bool {
         r.meta.lane(),
         r.meta.channel_name,
         r.meta.talkgroup.map(|t| t.to_string()).unwrap_or_default(),
-        r.meta.radio_unit_id.map(|t| t.to_string()).unwrap_or_default(),
+        r.meta.unit_ids().iter().map(|t| t.to_string()).collect::<Vec<_>>().join(" "),
         r.notes,
         r.meta.radio_name
     )

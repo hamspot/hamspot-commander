@@ -103,9 +103,76 @@ pub struct Meta {
     /// Absent in recordings made before this field existed.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub decoder_params: std::collections::BTreeMap<String, String>,
+    /// Every radio heard talking on this call, first-heard first. The first
+    /// one is also `radio_unit_id`. Absent in older recordings.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub units: Vec<UnitSeen>,
+}
+
+/// One radio unit heard on a call, with when it was first and last seen
+/// (UTC ISO strings, as the control channel reported it).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnitSeen {
+    pub id: u32,
+    #[serde(default)]
+    pub first_utc: String,
+    #[serde(default)]
+    pub last_utc: String,
+}
+
+/// Add or refresh `id` in `units` (first-heard order kept). `true` if the
+/// list changed.
+pub fn note_unit(units: &mut Vec<UnitSeen>, id: u32, at_utc: &str) -> bool {
+    if id == 0 {
+        return false;
+    }
+    if let Some(u) = units.iter_mut().find(|u| u.id == id) {
+        if u.last_utc.as_str() < at_utc {
+            u.last_utc = at_utc.to_string();
+            return true;
+        }
+        return false;
+    }
+    units.push(UnitSeen { id, first_utc: at_utc.to_string(), last_utc: at_utc.to_string() });
+    true
+}
+
+/// Merge `more` into `units`: new radios appended, times widened.
+pub fn merge_units(units: &mut Vec<UnitSeen>, more: &[UnitSeen]) {
+    for m in more {
+        match units.iter_mut().find(|u| u.id == m.id) {
+            Some(u) => {
+                if !m.first_utc.is_empty() && (u.first_utc.is_empty() || m.first_utc < u.first_utc) {
+                    u.first_utc = m.first_utc.clone();
+                }
+                if m.last_utc > u.last_utc {
+                    u.last_utc = m.last_utc.clone();
+                }
+            }
+            None => units.push(m.clone()),
+        }
+    }
 }
 
 impl Meta {
+    /// Every radio ID on this call: `units`, or the lone `radio_unit_id`
+    /// of an older recording.
+    pub fn unit_ids(&self) -> Vec<u32> {
+        let mut v: Vec<u32> = self.units.iter().map(|u| u.id).collect();
+        if let Some(p) = self.radio_unit_id {
+            if !v.contains(&p) {
+                v.insert(0, p);
+            }
+        }
+        v
+    }
+    /// Set `units` and keep `radio_unit_id` = the first-heard radio.
+    pub fn set_units(&mut self, units: Vec<UnitSeen>) {
+        self.units = units;
+        if let Some(first) = self.units.first() {
+            self.radio_unit_id = Some(first.id);
+        }
+    }
     pub fn is_digital(&self) -> bool {
         !matches!(self.modulation.as_str(), "" | "fm" | "nfm" | "am" | "analog")
     }
@@ -142,6 +209,30 @@ mod tests {
         let tabs = source_tabs(&["rig_audio".into(), "hackrf_tg".into()]);
         assert_eq!(tabs, vec!["hackrf_tg", "hackrf_channels", "rig_audio"]);
         assert_eq!(source_tabs(&[]).len(), 2);
+    }
+
+    #[test]
+    fn units_note_merge_and_round_trip() {
+        let mut u = Vec::new();
+        assert!(note_unit(&mut u, 5, "2026-01-01T00:00:01Z"));
+        assert!(!note_unit(&mut u, 5, "2026-01-01T00:00:01Z"));
+        assert!(note_unit(&mut u, 5, "2026-01-01T00:00:09Z"));
+        assert!(note_unit(&mut u, 9, "2026-01-01T00:00:02Z"));
+        assert!(!note_unit(&mut u, 0, "2026-01-01T00:00:02Z"));
+        assert_eq!(u[0], UnitSeen { id: 5, first_utc: "2026-01-01T00:00:01Z".into(), last_utc: "2026-01-01T00:00:09Z".into() });
+        let mut a = vec![UnitSeen { id: 9, first_utc: "2026-01-01T00:00:05Z".into(), last_utc: "2026-01-01T00:00:05Z".into() }];
+        merge_units(&mut a, &u);
+        assert_eq!(a.iter().map(|x| x.id).collect::<Vec<_>>(), vec![9, 5]);
+        assert_eq!(a[0].first_utc, "2026-01-01T00:00:02Z");
+        let mut m = Meta::default();
+        m.set_units(a);
+        assert_eq!(m.radio_unit_id, Some(9));
+        let back: Meta = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(back, m);
+        // Old JSON without `units` still reads, and no empty list is written.
+        let old: Meta = serde_json::from_str(r#"{"source":"hackrf_tg","source_kind":"raw_iq","radio_unit_id":3,"raw_format":"cs16","sample_rate":1,"start_utc":""}"#).unwrap();
+        assert_eq!(old.unit_ids(), vec![3]);
+        assert!(!serde_json::to_string(&old).unwrap().contains("\"units\""));
     }
 
     #[test]

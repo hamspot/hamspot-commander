@@ -34,6 +34,9 @@ pub enum Cmd {
     Open { key: u64, meta: Meta },
     /// Close after the post-roll. `keep = false` deletes it (e.g. encrypted).
     Close { key: u64, keep: bool },
+    /// Radio units heard so far on the open call `key`. Merged into its
+    /// metadata; saved when the segment finishes.
+    Units { key: u64, units: Vec<crate::meta::UnitSeen> },
     Shutdown,
 }
 
@@ -220,6 +223,13 @@ impl Worker {
                         seg.closing = Some((0, false, Instant::now()));
                         self.finish(key);
                     }
+                }
+            }
+            Cmd::Units { key, units } => {
+                if let Some(seg) = self.segs.get_mut(&key) {
+                    let mut all = seg.meta.units.clone();
+                    crate::meta::merge_units(&mut all, &units);
+                    seg.meta.set_units(all);
                 }
             }
             Cmd::Shutdown => self.finish_all(),
