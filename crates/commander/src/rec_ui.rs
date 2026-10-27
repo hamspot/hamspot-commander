@@ -1,5 +1,6 @@
 //! REC (#119) on the face: right-click marks, REC keys, the REC page tab
 //! icon, source tabs, the timeline, replay, archive and export.
+
 //!
 //! HackRF sources record raw channelised IQ (32 ksps cs16) and every
 //! playback re-runs it through the current discriminator and decoder.
@@ -8,6 +9,12 @@ use super::{caution, folder_tab, radio_key, App, KeyLamp, Snapshot};
 use crate::{cat, config};
 use eframe::egui;
 use hsrec::db::{Db, Recording};
+
+/// Well-known `decoder_params` keys. Any `HAMSPOT_[A-Z0-9_]+` key is allowed.
+pub mod rec_params {
+    /// dsd-fme `-X` word (WACN, system id, NAC) for P25 Phase 2 voice.
+    pub const P25_X: &str = "HAMSPOT_P25_X";
+}
 use hsrec::meta::{self, Meta};
 use hsrec::segment::{self, Action, CallKey, Press, RecMode, Segmenter};
 use hsrec::timeline::{self, View};
@@ -352,6 +359,29 @@ impl App {
         }
     }
 
+    /// What the live decoder for `row` gets from its environment, as saved
+    /// `decoder_params` (see [`rec_params`]).
+    fn rec_live_params(&self, row: &cat::RadioRow, m: &Meta) -> std::collections::BTreeMap<String, String> {
+        let mut p = std::collections::BTreeMap::new();
+        if m.modulation == "p25" {
+            if let Some(word) = self.hackrf_p2_sent.get(&row.id) {
+                p.insert(rec_params::P25_X.to_string(), word.clone());
+            }
+            if let Some(b) = self.cc_site.get(&row.id) {
+                for (k, v) in [("HAMSPOT_P25_WACN", &b.wacn), ("HAMSPOT_P25_SYS", &b.sys), ("HAMSPOT_P25_NAC", &b.nac), ("HAMSPOT_P25_RFSS", &b.rfss), ("HAMSPOT_P25_SITE", &b.site)] {
+                    if !v.is_empty() { p.insert(k.to_string(), v.clone()); }
+                }
+            }
+        }
+        if !m.modulation.is_empty() {
+            p.insert("HAMSPOT_MODULATION".into(), m.modulation.clone());
+        }
+        if let Some(lna) = row.spec.lna_db { p.insert("HAMSPOT_HACKRF_LNA_DB".into(), lna.to_string()); }
+        if let Some(vga) = row.spec.vga_db { p.insert("HAMSPOT_HACKRF_VGA_DB".into(), vga.to_string()); }
+        p.retain(|k, _| hsrec::replay::param_key_ok(k));
+        p
+    }
+
     /// The call this HackRF radio should be recording now, and its metadata.
     fn rec_want(&self, row: &cat::RadioRow) -> (Option<CallKey>, Option<Meta>) {
         let face = &self.rec.face;
@@ -390,6 +420,11 @@ impl App {
                     m.offset_hz = hz - row.center_hz;
                     m.modulation = "p25".into();
                     m.decoder = serde_json::json!({ "script": row.spec.rx_pipe, "vocoder": "p25" });
+                    m.decoder_params = self.rec_live_params(row, &m);
+                    if let Some(b) = self.cc_site.get(&row.id) {
+                        m.system = format!("WACN {} SYS {}", b.wacn, b.sys);
+                        m.site = format!("RFSS {} Site {}", b.rfss, b.site);
+                    }
                     return (Some(key), Some(m));
                 }
             }
@@ -408,12 +443,26 @@ impl App {
                         m.decoder = serde_json::json!({
                             "script": row.spec.rx_pipe, "vocoder": ch.vocoder, "invert": ch.invert, "mode": ch.mode
                         });
+                        m.decoder_params = self.rec_live_params(row, &m);
                         return (Some(key), Some(m));
                     }
                 }
             }
         }
         (None, None)
+    }
+
+    /// Decoder params for a recording made before `decoder_params` existed:
+    /// the P25 site word this session learned for the same radio, if any.
+    /// The station file stores no WACN/system/NAC, so otherwise nothing.
+    fn rec_param_fallback(&self, m: &Meta) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        if m.modulation == "p25" && !m.decoder_params.contains_key(rec_params::P25_X) {
+            if let Some(word) = self.hackrf_p2_sent.get(&m.radio_id) {
+                out.push((rec_params::P25_X.to_string(), word.clone()));
+            }
+        }
+        out
     }
 
     fn rec_source(&self) -> String {
@@ -838,13 +887,15 @@ impl App {
         } else {
             self.rec.dir.join(&rec.raw_path)
         };
+        let fallback = self.rec_param_fallback(&rec.meta);
         let decoder = rec.meta.decoder.get("script").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty()).and_then(|script| {
-            let port = crate::rx_pipe::claim_voice_port().ok()?;
-            let argv = crate::rx_pipe::command_argv(script, port);
-            // The port is only used by the decoder's event output; the replay
-            // reads none, so it is released at once.
-            crate::rx_pipe::release_voice_port(port);
-            Some(hsrec::replay::DecoderCmd { argv, env: Vec::new() })
+            // The script's socat listens on this port for the whole replay, so
+            // the reservation rides with the player and is released when its
+            // thread ends (finish, stop, or a new selection).
+            let port = crate::rx_pipe::VoicePort::claim().ok()?;
+            let argv = crate::rx_pipe::command_argv(script, port.port());
+            let env = hsrec::replay::decoder_env(&rec.meta, &fallback);
+            Some(hsrec::replay::DecoderCmd { argv, env, hold: Some(std::sync::Arc::new(hsrec::replay::Hold(Box::new(port)))) })
         });
         match hsrec::replay::Player::start(&path, &rec.meta, from_ms, decoder, hsrec::replay::default_play_argv()) {
             Ok(p) => self.rec.player = Some((id, p)),
@@ -1154,6 +1205,11 @@ impl App {
                 ui.label(egui::RichText::new(format!("⚠ {} samples dropped (disk slow)", rec.meta.dropped)).color(caution()));
             }
         });
+        if !rec.meta.decoder_params.is_empty() {
+            let text = rec.meta.decoder_params.iter().map(|(k, v)| format!("{}={v}", k.trim_start_matches("HAMSPOT_"))).collect::<Vec<_>>().join("  ");
+            ui.label(egui::RichText::new(format!("decoder: {text}")).small().weak())
+                .on_hover_text("Saved decoder_params. Replay passes them to the decoder script as HAMSPOT_* environment variables.");
+        }
         let mut star = rec.star;
         let mut protect = rec.protected;
         let mut delete = false;

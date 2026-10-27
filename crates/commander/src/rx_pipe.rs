@@ -399,6 +399,27 @@ pub fn release_voice_port(port: u16) {
     VOICE_PORTS.lock().expect("voice ports").remove(&port);
 }
 
+/// A voice port reservation that lasts as long as this value. REC replay
+/// keeps one for the whole playback, so a live decoder that starts mid-replay
+/// takes the next port instead of the one the replay's socat listens on.
+#[derive(Debug)]
+pub struct VoicePort(u16);
+
+impl VoicePort {
+    pub fn claim() -> Result<Self, String> {
+        claim_voice_port().map(VoicePort)
+    }
+    pub fn port(&self) -> u16 {
+        self.0
+    }
+}
+
+impl Drop for VoicePort {
+    fn drop(&mut self) {
+        release_voice_port(self.0);
+    }
+}
+
 /// True when `command` is the P25 trunk receive script.
 ///
 /// That script is `-ft`: Phase 1 control and Phase 2 voice in one process.
@@ -1342,5 +1363,19 @@ mod tests {
         }
         release_voice_port(first);
         release_voice_port(second);
+    }
+
+    #[test]
+    fn held_voice_port_is_not_reused_until_dropped() {
+        let held = VoicePort::claim().expect("replay port");
+        let port = held.port();
+        for _ in 0..3 {
+            let other = claim_voice_port().expect("live port");
+            assert_ne!(other, port);
+            release_voice_port(other);
+        }
+        assert!(VOICE_PORTS.lock().unwrap().contains(&port));
+        drop(held);
+        assert!(!VOICE_PORTS.lock().unwrap().contains(&port));
     }
 }

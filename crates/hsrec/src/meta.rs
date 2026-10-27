@@ -97,6 +97,12 @@ pub struct Meta {
     /// Segment number when a long call was split (0 = first).
     #[serde(default)]
     pub part: u32,
+    /// Everything the live decoder got from its environment, saved so replay
+    /// re-demods the same way. Keys are env names (`HAMSPOT_[A-Z0-9_]+`);
+    /// replay passes them to the decoder script. Any decoder may add keys.
+    /// Absent in recordings made before this field existed.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub decoder_params: std::collections::BTreeMap<String, String>,
 }
 
 impl Meta {
@@ -136,5 +142,19 @@ mod tests {
         let tabs = source_tabs(&["rig_audio".into(), "hackrf_tg".into()]);
         assert_eq!(tabs, vec!["hackrf_tg", "hackrf_channels", "rig_audio"]);
         assert_eq!(source_tabs(&[]).len(), 2);
+    }
+
+    #[test]
+    fn decoder_params_round_trip_and_old_json_defaults() {
+        let mut m = Meta { source: "hackrf_tg".into(), source_kind: KIND_RAW_IQ.into(), raw_format: "cs16".into(), sample_rate: 1, start_utc: "x".into(), ..Default::default() };
+        let text = serde_json::to_string(&m).unwrap();
+        assert!(!text.contains("decoder_params"));
+        let old: Meta = serde_json::from_str(&text).unwrap();
+        assert!(old.decoder_params.is_empty());
+        m.decoder_params.insert("HAMSPOT_P25_X".into(), "BEE006BD6B5".into());
+        m.decoder_params.insert("HAMSPOT_GAIN_LNA".into(), "32".into());
+        let back: Meta = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(back.decoder_params, m.decoder_params);
+        assert_eq!(back.decoder_params.keys().next().unwrap(), "HAMSPOT_GAIN_LNA");
     }
 }

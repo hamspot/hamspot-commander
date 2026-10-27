@@ -152,7 +152,44 @@ pub fn write_wav(path: &Path, samples: &[i16], rate: u32) -> std::io::Result<()>
 #[derive(Clone, Debug, Default)]
 pub struct DecoderCmd {
     pub argv: Vec<String>,
+    /// Passed to the decoder after [`safe_env`]: unsafe keys are dropped.
     pub env: Vec<(String, String)>,
+    /// Kept alive until the replay thread ends (e.g. the decoder's UDP port
+    /// reservation), then dropped, which releases it.
+    pub hold: Option<Arc<Hold>>,
+}
+
+/// Something a replay keeps until it finishes.
+pub struct Hold(pub Box<dyn Send + Sync>);
+impl std::fmt::Debug for Hold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("Hold") }
+}
+
+/// Decoder parameter convention: env names `HAMSPOT_` + `[A-Z0-9_]+`.
+/// Anything else (PATH, LD_PRELOAD, lower case, `=`) is refused, so a
+/// recording or an import from a thumb drive cannot inject the loader.
+pub fn param_key_ok(key: &str) -> bool {
+    key.len() > "HAMSPOT_".len()
+        && key.starts_with("HAMSPOT_")
+        && key.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// The pairs of `env` that may reach a decoder script.
+pub fn safe_env(env: &[(String, String)]) -> Vec<(String, String)> {
+    env.iter()
+        .filter(|(k, v)| param_key_ok(k) && !v.contains('\0') && v.len() <= 4096)
+        .cloned()
+        .collect()
+}
+
+/// Decoder env for `meta`: its saved `decoder_params`, then `overrides`
+/// (later wins). Unsafe keys are dropped.
+pub fn decoder_env(meta: &Meta, overrides: &[(String, String)]) -> Vec<(String, String)> {
+    let mut map = meta.decoder_params.clone();
+    for (k, v) in overrides {
+        map.insert(k.clone(), v.clone());
+    }
+    safe_env(&map.into_iter().collect::<Vec<_>>())
 }
 
 /// pw-cat to the system default output. `--raw` is required: without it
@@ -201,7 +238,7 @@ pub fn render(path: &Path, meta: &Meta, decoder: Option<&DecoderCmd>) -> std::io
     };
     let mut c = Command::new(&cmd.argv[0]);
     c.args(&cmd.argv[1..])
-        .envs(cmd.env.iter().cloned())
+        .envs(safe_env(&cmd.env))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -347,7 +384,7 @@ impl Player {
                     Some(cmd) if meta.is_digital() && meta.source_kind != KIND_DEMOD_AUDIO && !cmd.argv.is_empty() => {
                         let mut c = Command::new(&cmd.argv[0]);
                         c.args(&cmd.argv[1..])
-                            .envs(cmd.env.iter().cloned())
+                            .envs(safe_env(&cmd.env))
                             .stdin(Stdio::piped())
                             .stdout(Stdio::piped())
                             .stderr(Stdio::piped())
@@ -423,6 +460,8 @@ impl Player {
             if let Err(err) = result {
                 *e.lock().expect("replay err") = err.to_string();
             }
+            // Release whatever the decoder held (its UDP port) before done.
+            drop(decoder);
             d.store(true, Ordering::Relaxed);
         })?;
         Ok(Self { stop, done, pos_ms: pos, error, heard_bytes, heard_peak, decoder_ran, decoder_status, decoder_stderr, played_ms })
@@ -483,6 +522,76 @@ mod tests {
     use crate::db::tests::tempdir;
     use crate::dsp::*;
     use crate::meta::*;
+
+    #[test]
+    fn param_keys_are_validated() {
+        assert!(param_key_ok("HAMSPOT_P25_X"));
+        assert!(param_key_ok("HAMSPOT_TV_STD2"));
+        for bad in ["PATH", "LD_PRELOAD", "HAMSPOT_", "HAMSPOT_p25", "HAMSPOT_A=B", "HAMSPOT_A B", "XHAMSPOT_A"] {
+            assert!(!param_key_ok(bad), "{bad}");
+        }
+        let env = safe_env(&[("LD_PRELOAD".into(), "/x.so".into()), ("HAMSPOT_A".into(), "1".into()), ("HAMSPOT_B".into(), "a\0b".into())]);
+        assert_eq!(env, vec![("HAMSPOT_A".to_string(), "1".to_string())]);
+    }
+
+    #[test]
+    fn decoder_env_merges_overrides() {
+        let mut m = Meta::default();
+        m.decoder_params.insert("HAMSPOT_P25_X".into(), "OLD".into());
+        m.decoder_params.insert("PATH".into(), "/evil".into());
+        let env = decoder_env(&m, &[("HAMSPOT_P25_X".into(), "NEW".into()), ("HAMSPOT_Z".into(), "z".into())]);
+        assert_eq!(env, vec![("HAMSPOT_P25_X".into(), "NEW".into()), ("HAMSPOT_Z".into(), "z".into())]);
+    }
+
+    fn env_stub(dir: &Path) -> (String, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let out = dir.join("env.txt");
+        let script = dir.join("stub.rxpipe");
+        std::fs::write(&script, format!("#!/bin/sh\nenv > '{}'\ncat\n", out.display())).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (script.display().to_string(), out)
+    }
+
+    #[test]
+    fn render_passes_params_to_decoder() {
+        let dir = tempdir("replay-env");
+        let (path, mut meta) = fm_file(&dir, 700.0);
+        meta.modulation = "p25".into();
+        meta.decoder_params.insert("HAMSPOT_P25_X".into(), "BEE006BD6B5".into());
+        meta.decoder_params.insert("LD_PRELOAD".into(), "/nope.so".into());
+        let (script, out) = env_stub(&dir);
+        let cmd = DecoderCmd { argv: vec![script, "23997".into()], env: decoder_env(&meta, &[]), hold: None };
+        let r = render(&path, &meta, Some(&cmd)).unwrap();
+        assert_eq!(r.decoder_status, Some(0));
+        let env = std::fs::read_to_string(out).unwrap();
+        assert!(env.contains("HAMSPOT_P25_X=BEE006BD6B5"), "{env}");
+        assert!(!env.contains("/nope.so"));
+    }
+
+    #[test]
+    fn player_passes_env_and_drops_hold_at_end() {
+        let dir = tempdir("replay-env2");
+        let (path, mut meta) = fm_file(&dir, 700.0);
+        meta.modulation = "p25".into();
+        let (script, out) = env_stub(&dir);
+        let held = Arc::new(());
+        let cmd = DecoderCmd {
+            argv: vec![script, "23996".into()],
+            env: vec![("HAMSPOT_P25_X".into(), "ABC".into()), ("PATH".into(), "/evil".into())],
+            hold: Some(Arc::new(Hold(Box::new(held.clone())))),
+        };
+        let p = Player::start(&path, &meta, 0, Some(cmd), vec!["sh".into(), "-c".into(), "cat > /dev/null".into()]).unwrap();
+        assert!(Arc::strong_count(&held) >= 2);
+        let t0 = Instant::now();
+        while !p.finished() && t0.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(p.finished());
+        assert_eq!(Arc::strong_count(&held), 1, "hold released when replay ends");
+        let env = std::fs::read_to_string(out).unwrap();
+        assert!(env.contains("HAMSPOT_P25_X=ABC"));
+        assert!(!env.contains("PATH=/evil"));
+    }
 
     #[test]
     fn synthetic_fm_replays_to_tone() {
@@ -611,7 +720,7 @@ mod live_player {
         let meta: Meta = serde_json::from_str(&std::fs::read_to_string(raw.with_extension("json")).unwrap()).unwrap();
         let out = std::env::temp_dir().join("hsrec-player-out.raw");
         let play = vec!["sh".into(), "-c".into(), format!("cat > {}", out.display())];
-        let dec = DecoderCmd { argv: vec![script, "23998".into()], env: Vec::new() };
+        let dec = DecoderCmd { argv: vec![script, "23998".into()], ..Default::default() };
         let p = Player::start(&raw, &meta, 0, Some(dec), play).unwrap();
         while !p.finished() {
             std::thread::sleep(Duration::from_millis(100));

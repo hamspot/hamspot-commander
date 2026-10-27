@@ -13,7 +13,7 @@ const USAGE: &str = "usage: commander-rec <archive|unarchive|list|verify|stats|e
   verify    [--archived-only]
   stats     [--cap-gb 20]
   export    --to DIR [--label NAME] [--move] [--older-than AGE] [--dry-run]
-  render-wav RAW OUT.wav [--decoder SCRIPT] [--env K=V]   (no --station; re-demod one file)
+  render-wav RAW OUT.wav [--decoder SCRIPT] [--param HAMSPOT_K=V]...   (no --station; re-demod one file)
 example crontab:
   15 3 * * * nice -n 19 ionice -c3 commander-rec archive --older-than 7d --station ~/stations/SAFE-T.HSCommander";
 
@@ -65,7 +65,7 @@ fn expand(p: &str) -> String {
     }
 }
 
-/// `commander-rec render-wav RAW OUT.wav [--decoder SCRIPT] [--env K=V]...`
+/// `commander-rec render-wav RAW OUT.wav [--decoder SCRIPT] [--param HAMSPOT_K=V]...`
 /// Re-demodulates one recording (sidecar `RAW` with .json beside it) the way
 /// playback does and writes the speaker audio to a WAV. Reads nothing else.
 fn render_wav(args: &[String]) -> u8 {
@@ -77,9 +77,9 @@ fn render_wav(args: &[String]) -> u8 {
         match a.as_str() {
             "--decoder" => {
                 let Some(script) = it.next() else { eprintln!("--decoder needs a path"); return 2 };
-                decoder = Some(hsrec::replay::DecoderCmd { argv: vec![script.clone(), "23999".into()], env: Vec::new() });
+                decoder = Some(hsrec::replay::DecoderCmd { argv: vec![script.clone(), "23999".into()], ..Default::default() });
             }
-            "--env" => {
+            "--env" | "--param" => {
                 let Some(kv) = it.next().and_then(|kv| kv.split_once('=')) else { eprintln!("--env K=V"); return 2 };
                 env.push((kv.0.to_string(), kv.1.to_string()));
             }
@@ -87,7 +87,7 @@ fn render_wav(args: &[String]) -> u8 {
         }
     }
     let [raw, out] = pos.as_slice() else {
-        eprintln!("usage: commander-rec render-wav RAW OUT.wav [--decoder SCRIPT] [--env K=V]");
+        eprintln!("usage: commander-rec render-wav RAW OUT.wav [--decoder SCRIPT] [--param HAMSPOT_K=V]...");
         return 2;
     };
     let raw = std::path::PathBuf::from(raw);
@@ -100,7 +100,16 @@ fn render_wav(args: &[String]) -> u8 {
         }
     };
     if let Some(d) = decoder.as_mut() {
-        d.env = env;
+        // Saved decoder_params, then --param overrides. Keys must be HAMSPOT_*.
+        for (k, _) in &env {
+            if !hsrec::replay::param_key_ok(k) {
+                eprintln!("commander-rec: --param {k}: ignored (keys are HAMSPOT_[A-Z0-9_]+)");
+            }
+        }
+        d.env = hsrec::replay::decoder_env(&meta, &env);
+        for (k, v) in &d.env {
+            println!("param {k}={v}");
+        }
     }
     match hsrec::replay::render(&raw, &meta, decoder.as_ref()) {
         Ok(r) => {
