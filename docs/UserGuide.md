@@ -481,6 +481,8 @@ The span runs from 0.5 seconds to 30 days. A recording in progress is a red bloc
 
 The lane names sit on a shelf over the timeline's left edge that fades out like a shadow. A long name runs on past the shelf into its lane at full brightness, drawn over the recordings, and fades out just before halfway across. Clicks, drags and the wheel on that faded text go to the timeline. When there are more lanes than fit, a thin scrollbar appears in a narrow strip right of the timeline.
 
+The timeline never shows the future: NOW is its right edge. Zooming out, **FIT**, **TODAY** and **DAY ▶** all stop there, and zooming out while at NOW keeps NOW at the right. While the right edge is on NOW the view follows it (**LIVE** on); pan into the past and it stays put.
+
 The red NOW line has a translucent red tint on its left, just wide enough for the **NOW** label. It is strongest at the line and fades to clear toward the past. Nothing right of NOW is tinted, and there is no tint when NOW is off screen. The lanes, recordings, NOW line and label all show through it. It is only paint: clicks, drags and the wheel work there as on the rest of the timeline.
 
 A faint watermark along the frame's bottom bar reads: "Recording radio traffic may be regulated where you are; that is your responsibility. Encrypted traffic is never recorded. Nothing is uploaded." Hover over it to read it at full contrast.

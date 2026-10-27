@@ -1026,20 +1026,17 @@ impl App {
                 BarAction::DayBack => view.day(view.start + view.span / 2, -1),
                 BarAction::Today => view.day(now, 0),
                 BarAction::DayForward => view.day(view.start + view.span / 2, 1),
-                BarAction::ZoomOut => {
-                    view.zoom(BUTTON_ZOOM, w / 2.0, w);
-                    view.live = false;
-                }
-                BarAction::ZoomIn => {
-                    view.zoom(1.0 / BUTTON_ZOOM, w / 2.0, w);
-                    view.live = false;
-                }
+                BarAction::ZoomOut => view.zoom_at(BUTTON_ZOOM, w / 2.0, w, now),
+                BarAction::ZoomIn => view.zoom_at(1.0 / BUTTON_ZOOM, w / 2.0, w, now),
                 BarAction::Fit => view = timeline::fit(&recs, now),
                 BarAction::Live => view = View::live(now, view.span),
                 BarAction::Data => self.rec.data_open = !self.rec.data_open,
                 BarAction::PlayNext => self.rec.play_next = !self.rec.play_next,
             }
+            // Never show the future: Today / Day ▶ / Fit stop at NOW.
+            view.clamp(now);
         }
+        view.clamp(now);
         self.rec.bar_live = view.live;
         // The timeline spans the full width; the lane shelf is drawn over its left side.
         // The plot stops short of a gutter on the right for the lane scrollbar.
@@ -1310,9 +1307,9 @@ impl App {
         }
         if zoom_scroll.abs() > 0.5 {
             let anchor = wheel_pos.map(|p| p.x - axis.left()).unwrap_or(width).clamp(0.0, width);
-            view.zoom(wheel_zoom_factor(zoom_scroll), anchor, width);
-            view.live = false;
+            view.zoom_at(wheel_zoom_factor(zoom_scroll), anchor, width, now);
         }
+        view.clamp(now);
         // Store only once there is something to frame, so the first rows fit.
         if !recs.is_empty() || self.rec.views.contains_key(&source) {
             self.rec.views.insert(source, view);

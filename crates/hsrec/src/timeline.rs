@@ -64,6 +64,32 @@ impl View {
             self.start = now - self.span;
         }
     }
+    /// Zoom that keeps NOW pinned at the right edge when the view is live,
+    /// otherwise anchors at `anchor_x`; never shows the future afterwards.
+    pub fn zoom_at(&mut self, factor: f64, anchor_x: f32, width: f32, now: i64) {
+        // Zooming out at NOW keeps NOW pinned; zooming in uses the anchor.
+        let pinned = (self.live || self.end() >= now) && factor > 1.0;
+        self.zoom(factor, if pinned { width } else { anchor_x }, width);
+        self.clamp(now);
+    }
+    /// Apply [`clamp_view`]. Live means "right edge on NOW": a view whose
+    /// right edge lands on NOW follows it; one in the past stays put.
+    /// Call after [`View::follow`].
+    pub fn clamp(&mut self, now: i64) {
+        let (start, span) = clamp_view(self.start, self.span, now);
+        self.start = start;
+        self.span = span;
+        self.live = self.end() >= now;
+    }
+}
+
+/// The timeline never shows the future: span within
+/// [`MIN_SPAN_MS`]..=[`MAX_SPAN_MS`], and the right edge at most `now`
+/// (shifted left, span kept). Returns `(start, span)`.
+pub fn clamp_view(start: i64, span: i64, now: i64) -> (i64, i64) {
+    let span = span.clamp(MIN_SPAN_MS, MAX_SPAN_MS);
+    let start = start.min(now.saturating_sub(span));
+    (start, span)
 }
 
 /// Tick step for the axis so labels are about 90 px apart.
@@ -344,6 +370,63 @@ mod tests {
         assert_eq!(v.t(300.0, 600.0), 30_000);
         assert_eq!(ellipsize("abcdef", 4), "abc\u{2026}");
         assert_eq!(ellipsize("abc", 4), "abc");
+    }
+
+    #[test]
+    fn clamp_view_never_future() {
+        let now = 1_000_000_000;
+        // Past view untouched.
+        assert_eq!(clamp_view(now - 50_000, 10_000, now), (now - 50_000, 10_000));
+        // Pan right past now: shifted back so end == now.
+        assert_eq!(clamp_view(now + 5_000, 10_000, now), (now - 10_000, 10_000));
+        // Tiny / huge spans clamp.
+        assert_eq!(clamp_view(now - 10, 1, now), (now - MIN_SPAN_MS, MIN_SPAN_MS));
+        assert_eq!(clamp_view(0, i64::MAX / 4, now).1, MAX_SPAN_MS);
+        assert_eq!(clamp_view(0, i64::MAX / 4, now).0, now - MAX_SPAN_MS);
+    }
+
+    #[test]
+    fn zoom_and_day_at_now_edge() {
+        let now = 1_000_000_000;
+        // Zoom out while live keeps NOW at the right edge.
+        let mut v = View::live(now, 60_000);
+        v.zoom_at(2.0, 100.0, 600.0, now);
+        assert_eq!((v.end(), v.span, v.live), (now, 120_000, true));
+        // Zoom in anchored near the right edge from a past view that would overshoot.
+        let mut v = View { start: now - 61_000, span: 60_000, live: false };
+        v.zoom_at(1.0 / 1.18, 599.0, 600.0, now);
+        assert!(v.end() <= now);
+        // Zoom out in the past anchored at the left would run into the future: clamped.
+        let mut v = View { start: now - 70_000, span: 60_000, live: false };
+        v.zoom_at(3.0, 0.0, 600.0, now);
+        assert_eq!(v.end(), now);
+        assert!(v.live);
+        // Day forward from yesterday stops at now.
+        let mut v = View { start: now - 3 * 86_400_000, span: 86_400_000, live: false };
+        v.day(now - 86_400_000, 1);
+        v.clamp(now);
+        assert_eq!(v.end(), now);
+        // Today: last 24 h ending at now.
+        v.day(now, 0);
+        v.clamp(now);
+        assert!(v.end() == now && v.span == 86_400_000);
+    }
+
+    #[test]
+    fn now_advancing_with_and_without_pin() {
+        let mut v = View::live(1_000_000, 60_000);
+        v.follow(1_005_000);
+        v.clamp(1_005_000);
+        assert_eq!(v.end(), 1_005_000);
+        let mut p = View { start: 0, span: 60_000, live: false };
+        p.follow(1_005_000);
+        p.clamp(1_005_000);
+        assert_eq!((p.start, p.live), (0, false));
+        // Resize changes nothing in time; fit never ends in the future.
+        let r = recs();
+        let f = fit(&r, 0);
+        let (s, sp) = clamp_view(f.start, f.span, 0);
+        assert!(s + sp <= 0);
     }
 
     #[test]
