@@ -309,6 +309,18 @@ pub fn device_id_hex(id: &[u8; 12]) -> String {
     id.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// The id as the device's About screen prints it: three little-endian
+/// 32-bit words, `SN: %08x-%08x-%08x` in NanoVNA2-firmware ui.cpp.
+pub fn device_id_sn(id: &[u8; 12]) -> String {
+    let word = |i: usize| u32::from_le_bytes([id[i], id[i + 1], id[i + 2], id[i + 3]]);
+    format!("{:08x}-{:08x}-{:08x}", word(0), word(4), word(8))
+}
+
+/// All zero or all 0xff: what a blank register file or a bad read gives.
+pub fn device_id_suspect(id: &[u8; 12]) -> bool {
+    id.iter().all(|&b| b == 0) || id.iter().all(|&b| b == 0xff)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CaptureMeta {
     pub width: u16,

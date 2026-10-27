@@ -1057,7 +1057,12 @@ impl NanoVna {
             line(&mut out, "DEV AVG/POWER", if id.power_and_average() { "yes".into() } else { "needs FW 1.0.2".into() });
         }
         if let Some(dev) = live.device_id {
-            line(&mut out, "DEVICE ID", proto::device_id_hex(&dev));
+            if live.id_reliable {
+                line(&mut out, "DEVICE SN", proto::device_id_sn(&dev));
+            } else {
+                line(&mut out, "DEVICE ID", "ID unreliable (reads disagreed)".into());
+                line(&mut out, "NOTE", device::POWER_NOTE.into());
+            }
         }
         line(&mut out, "MAX POINTS", proto::POINTS_MAX.to_string());
         line(&mut out, "SWEEPS", self.sweep_count.to_string());
@@ -2060,6 +2065,10 @@ impl NanoVna {
         if live.lost {
             warn.push("CHECK USB");
         }
+        let id_bad = device::power_note(live).is_some();
+        if id_bad {
+            warn.push("ID UNRELIABLE: POWER CYCLE VNA");
+        }
         if !warn.is_empty() {
             left.push_str(&format!("  ⚠ {}", warn.join(" · ")));
         }
@@ -2086,7 +2095,7 @@ impl NanoVna {
             egui::Align2::LEFT_CENTER,
             left,
             font.clone(),
-            palette::TEXT,
+            if id_bad { LOST_TEXT } else { palette::TEXT },
         );
         painter.text(
             Pos2::new(rect.right() - 8.0, rect.center().y),
@@ -3572,6 +3581,15 @@ impl NanoVna {
 
     fn cal_body(&mut self, ui: &mut Ui, theme: &LcarsTheme, live: &device::Live) {
         let id = live.device_id.map(|bytes| proto::device_id_hex(&bytes));
+        if let Some(note) = device::power_note(live) {
+            ui.label(
+                egui::RichText::new(note)
+                    .monospace()
+                    .strong()
+                    .size(theme.data_size)
+                    .color(LOST_TEXT),
+            );
+        }
         if !self.note.is_empty() {
             ui.label(
                 egui::RichText::new(&self.note)
