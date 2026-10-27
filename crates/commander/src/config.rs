@@ -1619,4 +1619,28 @@ mod tests {
         assert_eq!(file.tune.freq_hz, 145_800_000.0);
         assert!(parse(&to_string(&file).unwrap()).is_ok());
     }
+
+    #[test]
+    fn examples_stations_load() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/stations");
+        let modems = vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../modems")];
+        let mut seen = 0;
+        for entry in fs::read_dir(&dir).expect("examples/stations") {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("HSCommander") {
+                continue;
+            }
+            seen += 1;
+            let (file, warnings) = load_file_in(&path, &modems).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            assert!(warnings.is_empty(), "{}: refused pipes {warnings:?}", path.display());
+            for band in file.bsp.zones.iter().flat_map(|zone| zone.bands.iter()) {
+                assert!(band.lo_hz >= 1_000_000.0 && band.hi_hz <= 6_000_000_000.0, "{}", band.name);
+            }
+            for c in file.channels.zones.iter().flat_map(|zone| zone.channels.iter()) {
+                assert!(c.hz >= 1_000_000.0 && c.hz <= 6_000_000_000.0, "{}", c.name);
+            }
+            assert!(file.radios.iter().all(|r| !r.audio.tx), "{}: example stations never transmit", path.display());
+        }
+        assert!(seen > 0, "no example stations found");
+    }
 }
