@@ -39,13 +39,13 @@ pub(crate) const CONFIG_GROUPS: [(&str, egui::Color32); 9] = {
     [
         ("Station", TAN),
         ("Display", TEXT_MUTED),
-        ("Trunking", PLUM),
         ("Radio", SLATE),
-        ("Audio", TEAL),
-        ("Automation", PLUM),
         ("Rotator", OLIVE),
         ("Amplifier", BRICK),
-        ("Patch bay", TAN),
+        ("Trunking", PLUM),
+        ("Audio patch", TEAL),
+        ("Automation patch", PLUM),
+        ("RF patch", TAN),
     ]
 };
 
@@ -4261,6 +4261,8 @@ impl App {
                 }
             });
         });
+        self.cat_frame(ui);
+        self.rotator_amp_frame(ui);
         cfg_group(ui, "Trunking", |ui| {
             ui.horizontal(|ui| {
                 ui.label("Trunk voice hang")
@@ -4288,7 +4290,6 @@ impl App {
                 }
             });
         });
-        self.cat_frame(ui);
         self.audio_frame(ui);
         self.automation_frame(ui, snap);
         let radios: Vec<(String, bool)> = self
@@ -4303,7 +4304,7 @@ impl App {
         }
         let amps = self.amplifiers.view();
         let link = patchbay::AmpLink { rows: &amps.rows, models: &self.amp_models };
-        cfg_group(ui, "Patch bay", |ui| {
+        cfg_group(ui, "RF patch", |ui| {
             patchbay::show(ui, &mut self.patchbay, &mut self.patchbay_ui, &radios, &link);
         });
         for action in self.patchbay_ui.take_actions() {
@@ -4568,9 +4569,8 @@ impl App {
     fn automation_frame(&mut self, ui: &mut egui::Ui, snap: &Snapshot) {
         let radios = self.hub.view();
         let rots = self.rotators.view();
-        let mut select = None;
         let mut follow = None;
-        cfg_group(ui, "Automation", |ui| {
+        cfg_group(ui, "Automation patch", |ui| {
             ui.horizontal(|ui| {
                 ui.label("Automation");
                 if ui
@@ -4604,6 +4604,15 @@ impl App {
                 }
             }
         });
+        if let Some((id, on)) = follow {
+            self.hub.set_follow(id, on);
+        }
+    }
+
+    /// Rotator and Amplifier groups, shown under Radio.
+    fn rotator_amp_frame(&mut self, ui: &mut egui::Ui) {
+        let rots = self.rotators.view();
+        let mut select = None;
         cfg_group(ui, "Rotator", |ui| {
             egui::Grid::new("rotators")
                 .striped(true)
@@ -4696,9 +4705,6 @@ impl App {
         });
         if let Some(id) = select {
             self.rotators.select(id);
-        }
-        if let Some((id, on)) = follow {
-            self.hub.set_follow(id, on);
         }
     }
 
@@ -4821,7 +4827,7 @@ impl App {
         let mut pipe_apply = None;
         let mut tx_apply = None;
         let mut pipe_editor_open: Option<(u64, bool, String)> = None;
-        cfg_group(ui, "Audio", |ui| {
+        cfg_group(ui, "Audio patch", |ui| {
             ui.horizontal(|ui| {
                 ui.label("Audio");
                 if ui
@@ -12140,4 +12146,29 @@ fn fixed_slider(ui: &mut egui::Ui, label: &str, value: f64) {
         false,
         egui::Slider::new(&mut value, 0.0..=1.0).text(format!("{label}: {shown}")),
     );
+}
+
+#[cfg(test)]
+mod config_order_tests {
+    #[test]
+    fn config_groups_run_in_page_order() {
+        let names: Vec<&str> = crate::CONFIG_GROUPS.iter().map(|(n, _)| *n).collect();
+        let want = [
+            "Station", "Display", "Radio", "Rotator", "Amplifier",
+            "Trunking", "Audio patch", "Automation patch", "RF patch",
+        ];
+        assert_eq!(names, want);
+        // page_config must call the groups in the same order.
+        let src = include_str!("main.rs");
+        let body = &src[src.find("fn page_config(").unwrap()..];
+        let body = &body[..body.find("\n    fn ").unwrap()];
+        let pos = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        let seq = [
+            pos("cfg_group(ui, \"Station\""), pos("cfg_group(ui, \"Display\""),
+            pos("self.cat_frame(ui)"), pos("self.rotator_amp_frame(ui)"),
+            pos("cfg_group(ui, \"Trunking\""), pos("self.audio_frame(ui)"),
+            pos("self.automation_frame(ui, snap)"), pos("cfg_group(ui, \"RF patch\""),
+        ];
+        assert!(seq.windows(2).all(|w| w[0] < w[1]), "{seq:?}");
+    }
 }

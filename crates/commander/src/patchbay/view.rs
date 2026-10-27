@@ -80,7 +80,7 @@ pub fn show(ui: &mut egui::Ui, bay: &mut PatchBay, st: &mut UiState, radios: &[(
     bay.sync_radios(radios);
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.horizontal(|ui| {
-            ui.label("RF patch bay");
+            ui.label("RF patch");
             ui.label(
                 egui::RichText::new("VISUAL ONLY: cables here do not switch, key or tune any hardware")
                     .color(TX)
