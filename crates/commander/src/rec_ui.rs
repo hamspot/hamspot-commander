@@ -1149,24 +1149,16 @@ impl App {
                         gp.rect_filled(full, egui::CornerRadius::ZERO, egui::Color32::from_rgb(20, 20, 26));
                     }
                 }
-                // Lane names run on past the shelf into the lane, under the
-                // blocks, fading out by halfway across. Painted only: input
-                // passes through to the grid. The part on the solid shelf is
-                // drawn again on top of the shelf further down.
+                // Lane names run on past the shelf into the lane, fading out
+                // only by halfway across. They are drawn after the shelf (full
+                // contrast) further down; painted only, so input past the
+                // solid shelf passes through to the grid.
                 let label_font = egui::FontId::monospace(12.0);
                 let now_w_pre = ui.fonts_mut(|f| f.layout_no_wrap("NOW".into(), egui::FontId::monospace(10.0), egui::Color32::WHITE).size().x);
                 let label_cap = lane_label_cap(width, width);
                 let _ = now_w_pre;
                 let solid_end = shelf_w * timeline::SHELF_OPAQUE_FRAC;
                 let lane_ink = |ui: &egui::Ui, selected: bool, cell: egui::Rect| if selected || ui.rect_contains_pointer(cell) { egui::Color32::WHITE } else { ui.visuals().text_color() };
-                for (i, name) in lanes.iter().enumerate() {
-                    let y = rect.top() + lane_top[i];
-                    let cell = egui::Rect::from_min_size(egui::pos2(label_rect.left(), y), egui::vec2(solid_end, row_h));
-                    let ink = lane_ink(ui, sel_lane.as_deref() == Some(name.as_str()), cell);
-                    let job = lane_label_job(ui, name, &label_font, ink, LABEL_PAD, solid_end, label_cap, true);
-                    let g = ui.fonts_mut(|f| f.layout_job(job));
-                    gp.galley(egui::pos2(cell.left() + LABEL_PAD, cell.center().y - g.size().y / 2.0), g, ink);
-                }
                 if lanes.is_empty() {
                     gp.text(grid.center(), egui::Align2::CENTER_CENTER, "No recordings in this view.", egui::FontId::proportional(14.0), weak);
                 }
@@ -1271,9 +1263,9 @@ impl App {
                     let cell = egui::Rect::from_min_size(egui::pos2(label_rect.left(), y), egui::vec2(solid_end, row_h));
                     let resp = ui.interact(cell, ui.scope_id().with(("rec-lane", i)), egui::Sense::click());
                     let ink = lane_ink(ui, selected, cell);
-                    let job = lane_label_job(ui, name, &label_font, ink, LABEL_PAD, solid_end, label_cap, false);
+                    let job = lane_label_job(ui, name, &label_font, ink, LABEL_PAD, label_cap);
                     let g = ui.fonts_mut(|f| f.layout_job(job));
-                    ui.painter_at(label_rect).galley(egui::pos2(cell.left() + LABEL_PAD, cell.center().y - g.size().y / 2.0), g, ink);
+                    ui.painter_at(grid).galley(egui::pos2(cell.left() + LABEL_PAD, cell.center().y - g.size().y / 2.0), g, ink);
                     if resp.clicked() {
                         lane_click = Some(name.clone());
                     }
@@ -1884,10 +1876,9 @@ pub fn lane_label_alpha(x: f32, cap: f32) -> f32 {
     ((cap - x) / LABEL_FADE).clamp(0.0, 1.0)
 }
 
-/// One lane name as a per-character coloured job. `under` selects the
-/// characters past the solid shelf (drawn under the blocks); otherwise the
-/// ones on the solid shelf (drawn over it). Characters past `cap` are dropped.
-fn lane_label_job(ui: &egui::Ui, name: &str, font: &egui::FontId, ink: egui::Color32, pad: f32, solid_end: f32, cap: f32, under: bool) -> egui::text::LayoutJob {
+/// One lane name as a per-character coloured job: full ink, fading only in
+/// the last `LABEL_FADE` before `cap`. Characters past `cap` are dropped.
+fn lane_label_job(ui: &egui::Ui, name: &str, font: &egui::FontId, ink: egui::Color32, pad: f32, cap: f32) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
     let mut buf = [0u8; 4];
     let mut x = pad;
@@ -1897,8 +1888,7 @@ fn lane_label_job(ui: &egui::Ui, name: &str, font: &egui::FontId, ink: egui::Col
         if mid >= cap {
             break;
         }
-        let on_solid = mid < solid_end;
-        let a = if on_solid != under { lane_label_alpha(mid, cap) } else { 0.0 };
+        let a = lane_label_alpha(mid, cap);
         job.append(c.encode_utf8(&mut buf), 0.0, egui::TextFormat::simple(font.clone(), ink.gamma_multiply(a)));
         x += w;
     }

@@ -472,7 +472,7 @@ One **lane** per talkgroup or channel and one **block** per recording, like a se
 
 The span runs from 0.5 seconds to 30 days. A recording in progress is a red block that grows.
 
-The lane names sit on a shelf over the timeline's left edge that fades out like a shadow. A long name runs on past the shelf into its lane, behind the recordings, and fades out by halfway across. Clicks, drags and the wheel on that faded text go to the timeline. When there are more lanes than fit, a thin scrollbar appears in a narrow strip right of the timeline.
+The lane names sit on a shelf over the timeline's left edge that fades out like a shadow. A long name runs on past the shelf into its lane at full brightness, drawn over the recordings, and fades out just before halfway across. Clicks, drags and the wheel on that faded text go to the timeline. When there are more lanes than fit, a thin scrollbar appears in a narrow strip right of the timeline.
 
 The red NOW line has a translucent red tint on its left, just wide enough for the **NOW** label. It is strongest at the line and fades to clear toward the past. Nothing right of NOW is tinted, and there is no tint when NOW is off screen. The lanes, recordings, NOW line and label all show through it. It is only paint: clicks, drags and the wheel work there as on the rest of the timeline.
 
