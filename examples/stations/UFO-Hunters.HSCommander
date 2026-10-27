@@ -1,0 +1,1783 @@
+{
+  "version": 1,
+  "bsp_name": "ufo-hunters.json",
+  "bsp": {
+    "version": 1,
+    "zones": [
+      {
+        "name": "Air",
+        "color": [
+          200,
+          170,
+          90
+        ],
+        "bands": [
+          {
+            "name": "VHF Airband",
+            "chip": "air",
+            "lo_hz": 118000000,
+            "hi_hz": 137000000,
+            "home_hz": 121500000,
+            "mode": "AM",
+            "segments": [
+              {
+                "lo_hz": 118000000,
+                "hi_hz": 137000000,
+                "use": "voice",
+                "service": "aero"
+              }
+            ]
+          },
+          {
+            "name": "Mil UHF Air",
+            "chip": "milair",
+            "lo_hz": 225000000,
+            "hi_hz": 400000000,
+            "home_hz": 243000000,
+            "mode": "AM",
+            "segments": [
+              {
+                "lo_hz": 225000000,
+                "hi_hz": 328600000,
+                "use": "voice",
+                "service": "military"
+              },
+              {
+                "lo_hz": 328600000,
+                "hi_hz": 335400000,
+                "use": "digital",
+                "service": "aero"
+              },
+              {
+                "lo_hz": 335400000,
+                "hi_hz": 400000000,
+                "use": "voice",
+                "service": "military"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "Land mobile",
+        "color": [
+          72,
+          140,
+          168
+        ],
+        "bands": [
+          {
+            "name": "VHF High",
+            "chip": "vhi",
+            "lo_hz": 148000000,
+            "hi_hz": 174000000,
+            "home_hz": 155670000,
+            "mode": "FM",
+            "segments": [
+              {
+                "lo_hz": 148000000,
+                "hi_hz": 150800000,
+                "use": "mixed",
+                "service": "military"
+              },
+              {
+                "lo_hz": 150800000,
+                "hi_hz": 162012500,
+                "use": "mixed",
+                "service": "government"
+              },
+              {
+                "lo_hz": 162012500,
+                "hi_hz": 174000000,
+                "use": "mixed",
+                "service": "military"
+              }
+            ]
+          },
+          {
+            "name": "UHF LMR",
+            "chip": "uhf",
+            "lo_hz": 450000000,
+            "hi_hz": 470000000,
+            "home_hz": 460550000,
+            "mode": "FM",
+            "segments": [
+              {
+                "lo_hz": 450000000,
+                "hi_hz": 470000000,
+                "use": "mixed",
+                "service": "government"
+              }
+            ]
+          },
+          {
+            "name": "800 trunking",
+            "chip": "t800",
+            "lo_hz": 851000000,
+            "hi_hz": 861000000,
+            "home_hz": 856212500,
+            "mode": "FM",
+            "segments": [
+              {
+                "lo_hz": 851000000,
+                "hi_hz": 861000000,
+                "use": "mixed",
+                "service": "government"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "Ham / personal",
+        "color": [
+          110,
+          170,
+          110
+        ],
+        "bands": [
+          {
+            "name": "CB",
+            "chip": "cb",
+            "lo_hz": 26965000,
+            "hi_hz": 27405000,
+            "home_hz": 27185000,
+            "mode": "AM",
+            "segments": [
+              {
+                "lo_hz": 26965000,
+                "hi_hz": 27405000,
+                "use": "voice",
+                "service": "cb"
+              }
+            ]
+          },
+          {
+            "name": "2 m",
+            "chip": "2m",
+            "lo_hz": 144000000,
+            "hi_hz": 148000000,
+            "home_hz": 146520000,
+            "mode": "FM",
+            "segments": [
+              {
+                "lo_hz": 144000000,
+                "hi_hz": 144100000,
+                "use": "cw",
+                "service": "ham"
+              },
+              {
+                "lo_hz": 144100000,
+                "hi_hz": 148000000,
+                "use": "voice",
+                "service": "ham"
+              }
+            ]
+          },
+          {
+            "name": "70 cm",
+            "chip": "70cm",
+            "lo_hz": 420000000,
+            "hi_hz": 450000000,
+            "home_hz": 446000000,
+            "mode": "FM",
+            "segments": [
+              {
+                "lo_hz": 420000000,
+                "hi_hz": 450000000,
+                "use": "mixed",
+                "service": "ham"
+              }
+            ]
+          },
+          {
+            "name": "FRS/GMRS",
+            "chip": "gmrs",
+            "lo_hz": 462550000,
+            "hi_hz": 467725000,
+            "home_hz": 462562500,
+            "mode": "FM",
+            "segments": [
+              {
+                "lo_hz": 462550000,
+                "hi_hz": 467725000,
+                "use": "voice"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "Radar / L-band",
+        "color": [
+          180,
+          80,
+          80
+        ],
+        "bands": [
+          {
+            "name": "DME/TACAN + SSR",
+            "chip": "dme",
+            "lo_hz": 960000000,
+            "hi_hz": 1215000000,
+            "home_hz": 1090000000,
+            "mode": "AM",
+            "segments": [
+              {
+                "lo_hz": 960000000,
+                "hi_hz": 1029000000,
+                "use": "mixed",
+                "service": "aero"
+              },
+              {
+                "lo_hz": 1029000000,
+                "hi_hz": 1031000000,
+                "use": "mixed",
+                "service": "aero"
+              },
+              {
+                "lo_hz": 1031000000,
+                "hi_hz": 1089000000,
+                "use": "mixed",
+                "service": "aero"
+              },
+              {
+                "lo_hz": 1089000000,
+                "hi_hz": 1091000000,
+                "use": "mixed",
+                "service": "aero"
+              },
+              {
+                "lo_hz": 1091000000,
+                "hi_hz": 1215000000,
+                "use": "mixed",
+                "service": "aero"
+              }
+            ]
+          },
+          {
+            "name": "L-band radar (ARSR) + CRIIS",
+            "chip": "lrad",
+            "lo_hz": 1215000000,
+            "hi_hz": 1400000000,
+            "home_hz": 1300000000,
+            "mode": "AM",
+            "segments": [
+              {
+                "lo_hz": 1215000000,
+                "hi_hz": 1240000000,
+                "use": "mixed",
+                "service": "government"
+              },
+              {
+                "lo_hz": 1240000000,
+                "hi_hz": 1350000000,
+                "use": "mixed",
+                "service": "aero"
+              },
+              {
+                "lo_hz": 1350000000,
+                "hi_hz": 1390000000,
+                "use": "digital",
+                "service": "military"
+              },
+              {
+                "lo_hz": 1390000000,
+                "hi_hz": 1400000000,
+                "use": "mixed"
+              }
+            ]
+          },
+          {
+            "name": "H-line radio astronomy",
+            "chip": "hline",
+            "lo_hz": 1400000000,
+            "hi_hz": 1427000000,
+            "home_hz": 1420405750,
+            "mode": "AM",
+            "segments": [
+              {
+                "lo_hz": 1400000000,
+                "hi_hz": 1427000000,
+                "use": "mixed"
+              }
+            ]
+          },
+          {
+            "name": "GNSS / Iridium / satcom (the '1.6 GHz')",
+            "chip": "l16",
+            "lo_hz": 1525000000,
+            "hi_hz": 1660500000,
+            "home_hz": 1626000000,
+            "mode": "AM",
+            "segments": [
+              {
+                "lo_hz": 1525000000,
+                "hi_hz": 1559000000,
+                "use": "digital",
+                "service": "marine"
+              },
+              {
+                "lo_hz": 1559000000,
+                "hi_hz": 1610000000,
+                "use": "digital",
+                "service": "government"
+              },
+              {
+                "lo_hz": 1610000000,
+                "hi_hz": 1626500000,
+                "use": "mixed"
+              },
+              {
+                "lo_hz": 1626500000,
+                "hi_hz": 1660500000,
+                "use": "digital",
+                "service": "marine"
+              }
+            ]
+          },
+          {
+            "name": "ACTS telemetry",
+            "chip": "acts",
+            "lo_hz": 1780000000,
+            "hi_hz": 1850000000,
+            "home_hz": 1819000000,
+            "mode": "AM",
+            "segments": [
+              {
+                "lo_hz": 1780000000,
+                "hi_hz": 1850000000,
+                "use": "mixed",
+                "service": "military"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "S-band radar / ISM",
+        "color": [
+          200,
+          110,
+          60
+        ],
+        "bands": [
+          {
+            "name": "ISM 2.4 GHz / drones",
+            "chip": "ism24",
+            "lo_hz": 2400000000,
+            "hi_hz": 2483500000,
+            "home_hz": 2440000000,
+            "mode": "FM",
+            "segments": [
+              {
+                "lo_hz": 2400000000,
+                "hi_hz": 2483500000,
+                "use": "mixed"
+              }
+            ]
+          },
+          {
+            "name": "S-band ASR / NEXRAD",
+            "chip": "srad",
+            "lo_hz": 2700000000,
+            "hi_hz": 3000000000,
+            "home_hz": 2800000000,
+            "mode": "AM",
+            "segments": [
+              {
+                "lo_hz": 2700000000,
+                "hi_hz": 2900000000,
+                "use": "mixed",
+                "service": "aero"
+              },
+              {
+                "lo_hz": 2900000000,
+                "hi_hz": 3000000000,
+                "use": "mixed",
+                "service": "government"
+              }
+            ]
+          },
+          {
+            "name": "5.8 GHz FPV video",
+            "chip": "fpv",
+            "lo_hz": 5725000000,
+            "hi_hz": 5875000000,
+            "home_hz": 5800000000,
+            "mode": "FM",
+            "segments": [
+              {
+                "lo_hz": 5725000000,
+                "hi_hz": 5875000000,
+                "use": "mixed"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "ISM UHF",
+        "color": [
+          150,
+          150,
+          150
+        ],
+        "bands": [
+          {
+            "name": "433 ISM sensors",
+            "chip": "ism433",
+            "lo_hz": 433050000,
+            "hi_hz": 434790000,
+            "home_hz": 433920000,
+            "mode": "FM",
+            "segments": [
+              {
+                "lo_hz": 433050000,
+                "hi_hz": 434790000,
+                "use": "mixed"
+              }
+            ]
+          },
+          {
+            "name": "915 ISM",
+            "chip": "ism915",
+            "lo_hz": 902000000,
+            "hi_hz": 928000000,
+            "home_hz": 915000000,
+            "mode": "FM",
+            "segments": [
+              {
+                "lo_hz": 902000000,
+                "hi_hz": 928000000,
+                "use": "mixed"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "OTHER HW (not HackRF)",
+        "color": [
+          120,
+          120,
+          140
+        ],
+        "bands": [
+          {
+            "name": "VLF / natural radio (needs <1 MHz hw)",
+            "chip": "vlf",
+            "lo_hz": 3000,
+            "hi_hz": 30000,
+            "home_hz": 24000,
+            "mode": "USB",
+            "segments": [
+              {
+                "lo_hz": 3000,
+                "hi_hz": 30000,
+                "use": "mixed"
+              }
+            ]
+          },
+          {
+            "name": "LF/MF NDB (needs <1 MHz hw)",
+            "chip": "ndb",
+            "lo_hz": 190000,
+            "hi_hz": 535000,
+            "home_hz": 414000,
+            "mode": "CW",
+            "segments": [
+              {
+                "lo_hz": 190000,
+                "hi_hz": 535000,
+                "use": "mixed",
+                "service": "aero"
+              }
+            ]
+          },
+          {
+            "name": "X-band radar (needs >6 GHz hw)",
+            "chip": "xrad",
+            "lo_hz": 9300000000,
+            "hi_hz": 9500000000,
+            "home_hz": 9410000000,
+            "mode": "AM",
+            "segments": [
+              {
+                "lo_hz": 9300000000,
+                "hi_hz": 9500000000,
+                "use": "mixed",
+                "service": "marine"
+              }
+            ]
+          },
+          {
+            "name": "Ku satcom downlink (needs >6 GHz hw)",
+            "chip": "ku",
+            "lo_hz": 10700000000,
+            "hi_hz": 12750000000,
+            "home_hz": 11700000000,
+            "mode": "AM",
+            "segments": [
+              {
+                "lo_hz": 10700000000,
+                "hi_hz": 12750000000,
+                "use": "mixed"
+              }
+            ]
+          },
+          {
+            "name": "Ka satcom downlink (needs >6 GHz hw)",
+            "chip": "ka",
+            "lo_hz": 17700000000,
+            "hi_hz": 21200000000,
+            "home_hz": 19000000000,
+            "mode": "AM",
+            "segments": [
+              {
+                "lo_hz": 17700000000,
+                "hi_hz": 21200000000,
+                "use": "mixed"
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "channels": {
+    "version": 1,
+    "zones": [
+      {
+        "name": "SKW Uintah Basin public safety",
+        "channels": [
+          {
+            "name": "SKW Uintah Co Sheriff/Vernal PD 155.670",
+            "hz": 155670000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "SKW Vernal PD 155.640",
+            "hz": 155640000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "SKW Ft Duchesne Tribal PD 155.415",
+            "hz": 155415000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "SKW Uintah SAR 156.105",
+            "hz": 156105000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "SKW Uinta Basin EMS 155.055",
+            "hz": 155055000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "SKW Gold Cross EMS 460.550",
+            "hz": 460550000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "SKW Duchesne Law (Steamboat) 155.370",
+            "hz": 155370000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "SKW Duchesne Fire/EMS W (Tabby) 155.835",
+            "hz": 155835000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "SKW Duchesne SAR 151.010",
+            "hz": 151010000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "SKW Roosevelt PD/UHP 155.325",
+            "hz": 155325000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "SKW UHP Duchesne-Uintah link 453.225",
+            "hz": 453225000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "SKW UHP Bruin Peak 155.880",
+            "hz": 155880000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "SKW UHP Hoy Mtn 156.0825",
+            "hz": 156082500,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "SKW UCA P25 Roosevelt Hill CC 769.26875",
+            "hz": 769268750,
+            "mode": "FM",
+            "control": true,
+            "encrypted": false
+          }
+        ]
+      },
+      {
+        "name": "SKW Uintah Basin ham",
+        "channels": [
+          {
+            "name": "SKW W7BAR Grizzly Ridge 147.040",
+            "hz": 147040000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "SKW W7BAR Blue Mtn 147.100",
+            "hz": 147100000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "SKW KG7DSO Tabby Mtn 147.340",
+            "hz": 147340000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "SKW W7BAR Uintah EOC 449.900",
+            "hz": 449900000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "SKW W7BYU Vernal 449.700 (status unknown)",
+            "hz": 449700000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          }
+        ]
+      },
+      {
+        "name": "A51 NTTR / Groom air (AM)",
+        "channels": [
+          {
+            "name": "A51 Nellis Control West VHF 119.350",
+            "hz": 119350000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "A51 Nellis Control West UHF 254.400",
+            "hz": 254400000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "A51 Area 51 Ops Coffee Tree 123.225",
+            "hz": 123225000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "A51 Dreamland MOA Control 126.150",
+            "hz": 126150000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "A51 Dreamland MOA UHF 261.100",
+            "hz": 261100000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "A51 Dreamland MOA 255.800",
+            "hz": 255800000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "A51 Dreamland R-4807A Blond Girl 126.600",
+            "hz": 126600000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "A51 Groom Lake MOA 361.300",
+            "hz": 361300000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "A51 Range Control 259.400",
+            "hz": 259400000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "A51 Blackjack VHF 123.550",
+            "hz": 123550000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "A51 Blackjack Range UHF 377.800",
+            "hz": 377800000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "A51 Blackjack 139.750",
+            "hz": 139750000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "A51 Darkstar AWACS 391.800",
+            "hz": 391800000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "A51 Coyote MOA Rachel area 379.100",
+            "hz": 379100000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "A51 Salt Lake Center near Rachel 385.800",
+            "hz": 385800000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "A51 NTTR Fire aircraft 120.525",
+            "hz": 120525000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "A51 Janet Ops Gold Coast KLAS 118.700",
+            "hz": 118700000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "A51 TTR Silverbow Tower 124.750",
+            "hz": 124750000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "A51 TTR Silverbow Tower UHF 257.950",
+            "hz": 257950000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "A51 TTR Base Ops Ridge Line 119.450",
+            "hz": 119450000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "A51 Nellis AFB Tower 132.550",
+            "hz": 132550000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "A51 Nellis Approach W 135.100",
+            "hz": 135100000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "A51 Groom Lake VOR MCY 117.500",
+            "hz": 117500000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "A51 NOAA WX Las Vegas 162.550",
+            "hz": 162550000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          }
+        ]
+      },
+      {
+        "name": "A51 Lincoln/Nye ground",
+        "channels": [
+          {
+            "name": "A51 Lincoln Co SO Ch2 voice 154.860",
+            "hz": 154860000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "A51 Lincoln Co SAR mutual aid 155.160",
+            "hz": 155160000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "A51 Lincoln Co Fire/EMS 153.845",
+            "hz": 153845000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "A51 Alamo Fire 153.920",
+            "hz": 153920000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "A51 Nye Co SO Tonopah 154.830",
+            "hz": 154830000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "A51 NV LE mutual aid 155.655",
+            "hz": 155655000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "A51 Old Bus 856.525 (OLD)",
+            "hz": 856525000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "A51 NSRS P25 Mt Wilson CC 856.2125",
+            "hz": 856212500,
+            "mode": "FM",
+            "control": true,
+            "encrypted": false
+          },
+          {
+            "name": "A51 NSRS P25 Highland Pk CC 854.1375",
+            "hz": 854137500,
+            "mode": "FM",
+            "control": true,
+            "encrypted": false
+          },
+          {
+            "name": "A51 N7ARR Alamo 2m 147.240",
+            "hz": 147240000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "A51 W7AOR Pioche 2m 147.120",
+            "hz": 147120000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "A51 N7ARR Tonopah 2m 146.640",
+            "hz": 146640000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          }
+        ]
+      },
+      {
+        "name": "WATCH Radar / telemetry (waterfall only)",
+        "channels": [
+          {
+            "name": "WATCH A51 CRIIS telemetry 1355.000",
+            "hz": 1355000000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "WATCH A51 CRIIS telemetry 1366.000",
+            "hz": 1366000000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "WATCH A51 RCS range CRIIS 1373.700",
+            "hz": 1373700000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "WATCH A51 RCS range CRIIS 1375.700",
+            "hz": 1375700000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "WATCH A51 ACTS telemetry 1819.000",
+            "hz": 1819000000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "WATCH A51 ACTS telemetry 1845.000",
+            "hz": 1845000000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "WATCH SSR interrogation 1030",
+            "hz": 1030000000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "WATCH ADS-B / Mode S 1090",
+            "hz": 1090000000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "WATCH GPS L2 1227.60",
+            "hz": 1227600000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "WATCH GPS L1 1575.42",
+            "hz": 1575420000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "WATCH GLONASS L1 1602.000",
+            "hz": 1602000000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "WATCH Iridium 1626.000 (simplex ring)",
+            "hz": 1626000000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "WATCH Hydrogen line 1420.405",
+            "hz": 1420405750,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          }
+        ]
+      },
+      {
+        "name": "Distress / universal",
+        "channels": [
+          {
+            "name": "Guard VHF 121.500",
+            "hz": 121500000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "Guard UHF 243.000",
+            "hz": 243000000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "ACARS 131.550",
+            "hz": 131550000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "2m national simplex 146.520",
+            "hz": 146520000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "70cm national simplex 446.000",
+            "hz": 446000000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "FRS/GMRS ch1 462.5625",
+            "hz": 462562500,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "MURS ch1 151.820",
+            "hz": 151820000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "CB ch19 27.185",
+            "hz": 27185000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "CB ch9 emergency 27.065",
+            "hz": 27065000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          }
+        ]
+      },
+      {
+        "name": "ENC A51 NTTR P25 sites (awareness only)",
+        "channels": [
+          {
+            "name": "ENC A51 NTTR Tonopah Radar Peak 385.9125",
+            "hz": 385912500,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Tonopah Radar Peak 386.3375",
+            "hz": 386337500,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Tonopah Radar Peak 386.6500",
+            "hz": 386650000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Tonopah Radar Peak 387.2500",
+            "hz": 387250000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Tonopah Radar Peak 387.5500",
+            "hz": 387550000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Antelope Peak TTR 385.8125",
+            "hz": 385812500,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Antelope Peak TTR 386.2500",
+            "hz": 386250000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Antelope Peak TTR 386.5500",
+            "hz": 386550000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Antelope Peak TTR 386.8500",
+            "hz": 386850000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Antelope Peak TTR 387.3500",
+            "hz": 387350000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Antelope Peak TTR 387.7250",
+            "hz": 387725000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Antelope Peak TTR 388.7000",
+            "hz": 388700000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Cedar Peak 385.7750",
+            "hz": 385775000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Cedar Peak 386.1875",
+            "hz": 386187500,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Cedar Peak 386.4875",
+            "hz": 386487500,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Cedar Peak 386.9125",
+            "hz": 386912500,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Cedar Peak 387.2750",
+            "hz": 387275000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Cedar Peak 387.6625",
+            "hz": 387662500,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Cedar Peak 388.1125",
+            "hz": 388112500,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Halligan Mesa Basecamp 385.6250",
+            "hz": 385625000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Halligan Mesa Basecamp 386.3750",
+            "hz": 386375000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Halligan Mesa Basecamp 386.7000",
+            "hz": 386700000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Halligan Mesa Basecamp 387.2125",
+            "hz": 387212500,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Halligan Mesa Basecamp 387.5125",
+            "hz": 387512500,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Bald Mtn 385.7250",
+            "hz": 385725000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Bald Mtn 386.1250",
+            "hz": 386125000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Bald Mtn 386.5250",
+            "hz": 386525000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Bald Mtn 386.9375",
+            "hz": 386937500,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Bald Mtn 387.3250",
+            "hz": 387325000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Papoose Mtn 385.6750",
+            "hz": 385675000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Papoose Mtn 385.9625",
+            "hz": 385962500,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Papoose Mtn 386.2750",
+            "hz": 386275000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Papoose Mtn 386.5750",
+            "hz": 386575000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Papoose Mtn 386.8875",
+            "hz": 386887500,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Black Mtn 385.0875",
+            "hz": 385087500,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Black Mtn 385.7000",
+            "hz": 385700000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Black Mtn 386.0125",
+            "hz": 386012500,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Black Mtn 388.0000",
+            "hz": 388000000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 NTTR Black Mtn 388.5000",
+            "hz": 388500000,
+            "mode": "FM",
+            "control": false,
+            "encrypted": true
+          }
+        ]
+      },
+      {
+        "name": "HOP A51 HAVE QUICK (cannot be followed)",
+        "channels": [
+          {
+            "name": "HOP HAVE QUICK 225.150",
+            "hz": 225150000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "HOP HAVE QUICK 235.050",
+            "hz": 235050000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "HOP HAVE QUICK 239.950",
+            "hz": 239950000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "HOP HAVE QUICK 252.925",
+            "hz": 252925000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "HOP HAVE QUICK 257.250",
+            "hz": 257250000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "HOP HAVE QUICK 262.450",
+            "hz": 262450000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "HOP HAVE QUICK 267.850",
+            "hz": 267850000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "HOP HAVE QUICK 271.950",
+            "hz": 271950000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "HOP HAVE QUICK 279.750",
+            "hz": 279750000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "HOP HAVE QUICK 284.150",
+            "hz": 284150000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "HOP HAVE QUICK 289.050",
+            "hz": 289050000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "HOP HAVE QUICK 293.550",
+            "hz": 293550000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "HOP HAVE QUICK 298.650",
+            "hz": 298650000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "HOP HAVE QUICK 303.275",
+            "hz": 303275000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "HOP HAVE QUICK 308.750",
+            "hz": 308750000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "HOP HAVE QUICK 314.450",
+            "hz": 314450000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          }
+        ]
+      },
+      {
+        "name": "OLD A51 gates",
+        "channels": [
+          {
+            "name": "OLD A51 North Gate 310.125",
+            "hz": 310125000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "OLD A51 South Gate 314.525",
+            "hz": 314525000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          }
+        ]
+      },
+      {
+        "name": "WATCH Inmarsat STD-C (data, not voice)",
+        "channels": [
+          {
+            "name": "WATCH Inmarsat 4F3 AOR-W STD-C 1537.700",
+            "hz": 1537700000,
+            "mode": "USB",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "WATCH Inmarsat 3F5 AOR-E/POR STD-C 1541.450",
+            "hz": 1541450000,
+            "mode": "USB",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "WATCH Inmarsat IOR STD-C 1537.100",
+            "hz": 1537100000,
+            "mode": "USB",
+            "control": false,
+            "encrypted": false
+          }
+        ]
+      },
+      {
+        "name": "OTHER HW only (HackRF refuses these)",
+        "channels": [
+          {
+            "name": "Hessdalen station radar 9450 (needs >6 GHz hw)",
+            "hz": 9450000000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "X-band marine radar 9410 (needs >6 GHz hw)",
+            "hz": 9410000000,
+            "mode": "AM",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "OLD Groom NDB PYD 414 kHz (needs <1 MHz hw)",
+            "hz": 414000,
+            "mode": "CW",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "OLD TTR NDB XSD 278 kHz (needs <1 MHz hw)",
+            "hz": 278000,
+            "mode": "CW",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "VLF NAA Cutler 24.0 kHz (needs <1 MHz hw)",
+            "hz": 24000,
+            "mode": "USB",
+            "control": false,
+            "encrypted": false
+          },
+          {
+            "name": "VLF NLK Jim Creek 24.8 kHz (needs <1 MHz hw)",
+            "hz": 24800,
+            "mode": "USB",
+            "control": false,
+            "encrypted": false
+          }
+        ]
+      }
+    ]
+  },
+  "talkgroups": {
+    "version": 1,
+    "zones": [
+      {
+        "name": "ENC A51 NTTR P25 (WACN 33744 SYS 001, all encrypted)",
+        "talkgroups": [
+          {
+            "name": "ENC TTR Security Cactus",
+            "tg": 1201,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 Technicians",
+            "tg": 1426,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 Tower",
+            "tg": 1557,
+            "encrypted": true
+          },
+          {
+            "name": "ENC Gravel Trucks",
+            "tg": 1711,
+            "encrypted": true
+          },
+          {
+            "name": "ENC Emergency patch",
+            "tg": 1903,
+            "encrypted": true
+          },
+          {
+            "name": "ENC Phoenix Dispatch",
+            "tg": 2001,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 Fire/EMT Dispatch",
+            "tg": 2005,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 Fire Dispatch",
+            "tg": 2006,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 Security Tac-1",
+            "tg": 2201,
+            "encrypted": true
+          },
+          {
+            "name": "ENC A51 Security Tac-2 Rider",
+            "tg": 2202,
+            "encrypted": true
+          },
+          {
+            "name": "ENC Cattle Man",
+            "tg": 2210,
+            "encrypted": true
+          }
+        ]
+      },
+      {
+        "name": "ENC Nellis/Creech/NNSS P25 (encrypted groups only)",
+        "talkgroups": [
+          {
+            "name": "ENC unknown",
+            "tg": 49,
+            "encrypted": true
+          },
+          {
+            "name": "ENC Security",
+            "tg": 60,
+            "encrypted": true
+          },
+          {
+            "name": "ENC Nellis Security",
+            "tg": 62,
+            "encrypted": true
+          },
+          {
+            "name": "ENC unknown",
+            "tg": 63,
+            "encrypted": true
+          },
+          {
+            "name": "ENC unknown",
+            "tg": 64,
+            "encrypted": true
+          },
+          {
+            "name": "ENC Nellis Security",
+            "tg": 70,
+            "encrypted": true
+          },
+          {
+            "name": "ENC Nellis Police/surveillance",
+            "tg": 222,
+            "encrypted": true
+          },
+          {
+            "name": "ENC LV DOE Bldg Security",
+            "tg": 31218,
+            "encrypted": true
+          },
+          {
+            "name": "ENC LV DOE Bldg Security",
+            "tg": 31219,
+            "encrypted": true
+          },
+          {
+            "name": "ENC Security TAC-5",
+            "tg": 31222,
+            "encrypted": true
+          },
+          {
+            "name": "ENC Security TAC-6",
+            "tg": 31223,
+            "encrypted": true
+          }
+        ]
+      }
+    ]
+  },
+  "tune": {
+    "show_spread": true,
+    "step_hz": 100,
+    "zone_sel": 0,
+    "band_sel": 0,
+    "band_mem": {},
+    "host": "127.0.0.1",
+    "port": "4532",
+    "freq_hz": 121500000,
+    "mode": "AM",
+    "passband_hz": 8000,
+    "sub_freq_hz": 0,
+    "sub_mode": "",
+    "rit_hz": 0,
+    "split": false
+  },
+  "levels": {},
+  "radios": [
+    {
+      "driver": "hackrf",
+      "name": "HackRF",
+      "model": 0,
+      "device": "",
+      "park": false,
+      "follow": false,
+      "audio": {
+        "input": "",
+        "output": "",
+        "rx": true,
+        "tx": false
+      }
+    }
+  ],
+  "audio": {
+    "devices": [],
+    "links": []
+  },
+  "rotators": [
+    {
+      "name": "Dummy",
+      "model": 1
+    }
+  ],
+  "page": "Channels",
+  "scan_zones": [
+    0,
+    2,
+    3
+  ]
+}
