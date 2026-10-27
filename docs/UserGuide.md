@@ -407,7 +407,7 @@ The REC key state is saved in the station file and restored on launch; the REC t
 
 The tab has a record icon on the left of its name: **black** when no REC key is lit, **dark red** when armed, **bright red** while raw IQ is being written. Hover the icon for the same words. Across the top are source tabs, **HackRF TG** and **HackRF Channels** (always shown, even when empty), plus any other source found in the database.
 
-Under them: the REC state in words, the disk meter, search, the cap, archive, export, rescan and clear-cache controls, then the timeline.
+Under them: the REC state in words and the disk meter, then the timeline. The timeline grows to fill all free height above the details row (never less than four lane rows); a taller window shows more lanes, and extra lanes scroll with the wheel over the lane names. The timeline toolbar starts with **Search** (TG, channel, radio id, notes), followed by the day, zoom, Fit, Live, Play next and a small **Data** button. **Data** opens one *Data* dialog, shared by both source tabs, with three groups: **Storage** (disk use, Cap GB, overwrite oldest), **Archive** (Archive older than N d, Rescan, Clear cache) and **Drive** (thumb-drive copy, move, re-attach, import). Close it with its ✕ or the Data button; it starts closed each session. Job progress and Cancel show both in the tab and in the dialog.
 
 **Timeline.** One lane per talkgroup or channel, one block per recording, like a security camera viewer. The timeline runs the full width; the lane names sit on a shelf over its left side that fades out like a shadow. The wheel over the lane names scrolls the lanes (a scrollbar appears when they overflow); click a name to highlight its lane. The wheel over the timeline zooms, and the faded part of the shelf passes clicks and the wheel through to the timeline. Drag to pan, **Fit** frames the most recent recordings, ◀ Day / Today / Day ▶ to jump, **● Live / Now** to follow the present (the red NOW line). A recording in progress is a red block that grows. EMERG and PRI calls are tagged and outlined; archived blocks say `zst`, offline ones are grey and say `offline`. Waveform thumbnails are drawn once they are generated in the background.
 
@@ -435,7 +435,7 @@ There is no live compression. **Archive older than N d** (or Archive on one reco
 
 ### Thumb drives
 
-With a drive mounted under `/media` or `/run/media`, pick it in **Drive** and Copy or Move the selected recording or those older than N days. Files and sidecars go to `HamSpot-REC/` on the drive with an `index.json`. A **move deletes the local copy only after the copy on the drive verifies by sha256**. Moved recordings stay listed as offline and play from the drive when it is attached; **Re-attach** copies them back (verified), and **Import** reads another Commander's `HamSpot-REC/index.json`. The export ends with a sync; then you may remove the drive.
+With a drive mounted under `/media` or `/run/media`, open **Data**, pick it under **Drive**, and Copy or Move the selected recording or those older than N days. Files and sidecars go to `HamSpot-REC/` on the drive with an `index.json`. A **move deletes the local copy only after the copy on the drive verifies by sha256**. Moved recordings stay listed as offline and play from the drive when it is attached; **Re-attach** copies them back (verified), and **Import** reads another Commander's `HamSpot-REC/index.json`. The export ends with a sync; then you may remove the drive.
 
 ### commander-rec (cron)
 

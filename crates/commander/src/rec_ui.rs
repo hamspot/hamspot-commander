@@ -29,7 +29,10 @@ pub const ROW_HOVER: &str = "Right-click: mark or unmark for recording (● REC)
 pub const PRIVACY: &str = "Recording radio traffic may be regulated where you are; that is your responsibility. \
 Encrypted traffic is never recorded. Nothing is uploaded.";
 /// Room left under the timeline for the detail panel and privacy line.
-const TIMELINE_RESERVE: f32 = 110.0;
+/// Height kept below the timeline for the details row, notes, hint and disclaimer.
+const TIMELINE_RESERVE: f32 = 190.0;
+/// The timeline never shrinks below this many lane rows.
+const TIMELINE_MIN_LANES: f32 = 4.0;
 const LANE_H: f32 = 22.0;
 const AXIS_H: f32 = 20.0;
 
@@ -171,6 +174,8 @@ pub struct RecUi {
     drive_pick: usize,
     drives_at: Option<Instant>,
     usage: Option<hsrec::storage::Usage>,
+    /// Data dialog (storage, archive, drive) open. Session only.
+    data_open: bool,
 }
 
 fn rows_meta(rows: &[cat::RadioRow], id: u64) -> Option<&cat::RadioRow> {
@@ -520,7 +525,8 @@ impl App {
         });
         ui.add_space(4.0);
         self.rec_status_row(ui);
-        self.rec_tools_row(ui);
+        self.rec_job_row(ui);
+        self.rec_data_window(ui.ctx());
         ui.separator();
         self.rec_timeline(ui);
         ui.separator();
@@ -569,12 +575,50 @@ impl App {
         }
     }
 
-    fn rec_tools_row(&mut self, ui: &mut egui::Ui) {
+    fn rec_job_row(&mut self, ui: &mut egui::Ui) {
+        if let Some(job) = &self.rec.job {
+            let st = job.state.lock().expect("rec job");
+            ui.horizontal(|ui| {
+                let frac = if st.total == 0 { 0.0 } else { st.done as f32 / st.total as f32 };
+                ui.add(egui::ProgressBar::new(frac).desired_width(240.0).text(format!("{} {}/{}", st.label, st.done, st.total)));
+                if ui.button("Cancel").clicked() {
+                    job.cancel.store(true, Ordering::Relaxed);
+                }
+            });
+        }
+    }
+
+    /// The Data dialog: storage cap, archive/rescan/cache, and drive export.
+    /// One window shared by both source tabs (the state was never per tab).
+    fn rec_data_window(&mut self, ctx: &egui::Context) {
+        if !self.rec.data_open {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Data")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(420.0)
+            .show(ctx, |ui| self.rec_data_body(ui));
+        if !open {
+            self.rec.data_open = false;
+        }
+    }
+
+    fn rec_data_body(&mut self, ui: &mut egui::Ui) {
         let mut cap_changed = false;
+        ui.label(egui::RichText::new("Storage").strong());
+        if let Some(u) = &self.rec.usage {
+            let color = match u.level() {
+                hsrec::storage::Level::Ok => ui.visuals().text_color(),
+                hsrec::storage::Level::Warn80 => caution(),
+                _ => egui::Color32::from_rgb(240, 60, 50),
+            };
+            // text() carries the warning words, so colour is never the only cue.
+            ui.label(egui::RichText::new(format!("Disk {}", u.text())).color(color));
+        }
         ui.horizontal_wrapped(|ui| {
-            ui.label("Search");
-            ui.add(egui::TextEdit::singleline(&mut self.rec.query).desired_width(140.0).hint_text("TG, channel, radio id, notes"));
-            ui.separator();
             ui.label("Cap GB");
             if ui.add(egui::DragValue::new(&mut self.rec.face.cap_gb).range(0.1..=100_000.0).speed(0.5)).changed() {
                 cap_changed = true;
@@ -586,7 +630,10 @@ impl App {
             {
                 cap_changed = true;
             }
-            ui.separator();
+        });
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("Archive").strong());
+        ui.horizontal_wrapped(|ui| {
             let busy = self.rec.job.is_some();
             if self.rec.archive_days <= 0.0 {
                 self.rec.archive_days = 7.0;
@@ -619,8 +666,9 @@ impl App {
             self.rec.drives = hsrec::export::removable_drives();
             self.rec.drives_at = Some(Instant::now());
         }
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("Drive").strong());
         ui.horizontal_wrapped(|ui| {
-            ui.label("Drive");
             if self.rec.drives.is_empty() {
                 ui.label(egui::RichText::new("no removable drive under /media or /run/media").weak());
             } else {
@@ -656,16 +704,7 @@ impl App {
                 }
             }
         });
-        if let Some(job) = &self.rec.job {
-            let st = job.state.lock().expect("rec job");
-            ui.horizontal(|ui| {
-                let frac = if st.total == 0 { 0.0 } else { st.done as f32 / st.total as f32 };
-                ui.add(egui::ProgressBar::new(frac).desired_width(240.0).text(format!("{} {}/{}", st.label, st.done, st.total)));
-                if ui.button("Cancel").clicked() {
-                    job.cancel.store(true, Ordering::Relaxed);
-                }
-            });
-        }
+        self.rec_job_row(ui);
         if cap_changed {
             self.rec.face_dirty = true;
             crate::rec_live::recorder().send(Cmd::Cap { gb: self.rec.face.cap_gb, overwrite_oldest: self.rec.face.overwrite_oldest });
@@ -921,6 +960,8 @@ impl App {
         let width = width_all.max(1.0);
         let shelf_w = timeline::shelf_width(width_all);
         ui.horizontal(|ui| {
+            ui.label("Search");
+            ui.add(egui::TextEdit::singleline(&mut self.rec.query).desired_width(search_width(width_all)).hint_text("TG, channel, radio…"));
             if ui.button("◀ Day").clicked() {
                 view.day(view.start + view.span / 2, -1);
             }
@@ -947,6 +988,14 @@ impl App {
             let shown = timeline::layout(&recs, &lanes, &view, width, now).len();
             ui.label(format!("{} recordings ({shown} in view), {} lanes", recs.len(), lanes.len()));
             ui.checkbox(&mut self.rec.play_next, "Play next");
+            let data = egui::RichText::new("Data").small().weak();
+            if ui
+                .add(egui::Button::new(data).selected(self.rec.data_open))
+                .on_hover_text("Storage cap, archive, rescan, cache, and thumb-drive copy/move")
+                .clicked()
+            {
+                self.rec.data_open = !self.rec.data_open;
+            }
         });
         let blocks = timeline::layout(&recs, &lanes, &view, width, now);
         let subs: Vec<usize> = (0..lanes.len())
@@ -955,7 +1004,9 @@ impl App {
         let lane_h: Vec<f32> = subs.iter().map(|n| *n as f32 * LANE_H).collect();
         let lane_top: Vec<f32> = lane_h.iter().scan(0.0, |y, h| { let top = *y; *y += *h; Some(top) }).collect();
         let body_h: f32 = lane_h.iter().sum::<f32>().max(LANE_H * 2.0);
-        let viewport_h = (ui.available_height() - AXIS_H - TIMELINE_RESERVE).max(LANE_H * 3.0);
+        let viewport_h = timeline_viewport_h(ui.available_height());
+        // Fill the viewport even with few lanes, so the grid takes all free height.
+        let body_h = body_h.max(viewport_h);
         let weak = ui.visuals().weak_text_color();
         let bg = egui::Color32::from_rgb(14, 14, 18);
         let step = timeline::tick_step(view.span, width);
@@ -1013,8 +1064,9 @@ impl App {
         let player = self.rec.player.as_ref().map(|(id, pl)| (*id, pl.pos_ms.load(Ordering::Relaxed) as i64));
         egui::ScrollArea::vertical()
             .id_salt(("rec-timeline", source.clone()))
+            .min_scrolled_height(viewport_h)
             .max_height(viewport_h)
-            .auto_shrink([false, true])
+            .auto_shrink([false, false])
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
             .show(ui, |ui| {
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(width_all, body_h), egui::Sense::hover());
@@ -1380,6 +1432,21 @@ mod tests {
     }
 
     #[test]
+    fn timeline_fills_free_height_with_a_floor() {
+        assert_eq!(timeline_viewport_h(800.0), 800.0 - AXIS_H - TIMELINE_RESERVE);
+        assert!(timeline_viewport_h(1200.0) > timeline_viewport_h(800.0));
+        assert_eq!(timeline_viewport_h(100.0), LANE_H * TIMELINE_MIN_LANES);
+        assert_eq!(timeline_viewport_h(f32::INFINITY), LANE_H * 12.0);
+    }
+
+    #[test]
+    fn search_width_fits_narrow_panels() {
+        assert_eq!(search_width(1000.0), 120.0);
+        assert_eq!(search_width(400.0), 80.0);
+        assert_eq!(search_width(3000.0), 140.0);
+    }
+
+    #[test]
     fn key_lamps() {
         assert!(matches!(key_lamp(RecMode::Off), KeyLamp::Dark));
         assert!(matches!(key_lamp(RecMode::Marked), KeyLamp::Red));
@@ -1423,6 +1490,22 @@ mod tests {
 
 /// Lane shelf: theme-dark fill, opaque on the left and fading to clear on the
 /// right (see `timeline::shelf_alpha`).
+/// Search box width in the timeline toolbar: narrow enough that the
+/// toolbar fits a ~1000 px panel on one line.
+pub fn search_width(avail: f32) -> f32 {
+    (avail * 0.12).clamp(80.0, 140.0)
+}
+
+/// Lane viewport height: all the free panel height above the reserved
+/// details block, with a floor so it never collapses.
+pub fn timeline_viewport_h(avail: f32) -> f32 {
+    let min = LANE_H * TIMELINE_MIN_LANES;
+    if !avail.is_finite() {
+        return LANE_H * 12.0;
+    }
+    (avail - AXIS_H - TIMELINE_RESERVE).max(min)
+}
+
 fn paint_shelf(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
     let solid_w = rect.width() * timeline::SHELF_OPAQUE_FRAC;
     let solid = egui::Rect::from_min_size(rect.min, egui::vec2(solid_w, rect.height()));
