@@ -32,6 +32,7 @@ mod rx_pipe;
 mod scan;
 mod tools;
 mod group_box;
+mod hfdata;
 mod toggle;
 
 /// Config page groups, in page order, with their elbow colours.
@@ -280,6 +281,8 @@ struct App {
     /// Page to show when Tools is torn off. Clicking Tools then focuses that
     /// window. This is never `Page::Tools`.
     page_return: Page,
+    /// HF Data page state.
+    hf: hfdata::HfState,
     /// Saved page-tab order. Empty means the built-in order.
     tab_order: Vec<String>,
     /// Pointer held on a page tab. It becomes a move only after the pointer
@@ -1179,6 +1182,8 @@ enum Page {
     Config,
     /// Recordings (#119): source tabs and the timeline.
     Rec,
+    /// HF data decode window (#217): slot clock, presets, decode list.
+    HfData,
 }
 
 const PAGES: &[(Page, &str)] = &[
@@ -1186,6 +1191,7 @@ const PAGES: &[(Page, &str)] = &[
     (Page::Plan, "Plan"),
     (Page::Channels, "Channels"),
     (Page::Rec, "REC"),
+    (Page::HfData, "HF Data"),
     (Page::Meters, "Meters"),
     (Page::Timers, "Timers"),
     (Page::Levels, "Levels"),
@@ -1993,6 +1999,7 @@ impl App {
             fine_lock: None,
             page: Page::Tune,
             page_return: Page::Tune,
+            hf: hfdata::HfState::default(),
             tab_order: Vec::new(),
             tab_press: None,
             plan,
@@ -3035,6 +3042,7 @@ impl App {
             Page::Meters => self.page_meters(ui, snap),
             Page::Levels => self.page_levels(ui, snap),
             Page::Rec => self.page_rec(ui, snap),
+            Page::HfData => self.page_hfdata(ui, snap),
             Page::Config => self.page_config(ui, snap),
         }
     }
