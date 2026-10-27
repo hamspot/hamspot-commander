@@ -435,7 +435,7 @@ The TG tabs and Channels have a **REC** key above LOAD and SAVE.
 | Double-click or Shift+click | amber | All traffic |
 | Click again when lit | dark | Off |
 
-The REC state is saved and comes back on the next start. A talkgroup recording starts with the call, continues through re-keys in the voice hang, and has about 250 ms of padding at each end. A channel recording runs while the scanner holds a voice channel. Long calls are split every 5 minutes.
+The REC state is saved and comes back on the next start. A talkgroup recording starts with the call, continues through re-keys in the voice hang, and has about 250 ms of padding at each end. A talkgroup recording only runs while the voice decoder is decoding voice: about 1 second after the last voice frame (plus the voice hang) the recording closes, even if the control channel still lists the call, and a call that shows no voice within 3 seconds isn't kept open. A known control channel is never recorded as a talkgroup. A channel recording runs while the scanner holds a voice channel. A call still going at the **Max segment** length (Data dialog, default 120 s) is split into a new recording straight away, so nothing is lost; the timeline shows two blocks.
 
 <!-- screenshot: rec-02 — Arming a channel for recording. -->
 
@@ -509,7 +509,7 @@ Clicking a block opens this dialog. It follows the selection; close it with ✕ 
 From the top:
 
 1. **Header**: lane, time range and length.
-2. **Playback**: **▶ Play** / **■ Stop**, **★ Star**, **🔒 Protect** (never removed by overwrite-oldest), **Play next**, tags, and one status line.
+2. **Playback**: **▶ Play** / **■ Stop**, **★ Star**, **🔒 Protect** (never removed by overwrite-oldest), **Play next**, tags, and one status line. **Output** chooses where replay plays: **System default** (as before), or any audio output on the computer, such as wired speakers, a USB headset or a Bluetooth device. **Refresh** lists the outputs again. The choice is saved with the station. If the chosen output isn't there, replay plays to the system default and the dialog says so in words.
 3. **Notes**, then **Export WAV…** (decoded now), **Export raw…** (raw IQ plus its sidecar), **Archive** / **Unarchive** and **Delete** (undo for 60 s).
 4. **Metadata**: a label/value grid with a **📋 Copy** button.
 5. **Decoder parameters**: the decoder settings saved with the recording, collapsed by default.
@@ -533,7 +533,7 @@ Recordings made before decoder parameters were saved have none. For those, a P25
 
 | Group | Controls |
 | --- | --- |
-| **Storage** | Disk use, **Cap GB**, **Overwrite oldest unprotected at cap** |
+| **Storage** | Disk use, **Cap GB**, **Overwrite oldest unprotected at cap**, **Max segment** (seconds, 10–3600, default 120) |
 | **Archive** | **Archive older than** N days, **Rescan**, **Clear cache** |
 | **Drive** | Pick a mounted drive, **Copy selected**, **Copy older than**, **Move selected**, **Move older than**, **Re-attach**, **Import** |
 

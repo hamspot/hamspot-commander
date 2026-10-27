@@ -46,6 +46,13 @@ pub const VOICE_HANG_MAX_MS: u32 = 15_000;
 /// ended, even while it still syncs. Without it a dead carrier that never
 /// sends a terminator would hold the radio forever.
 pub const VOICE_SILENCE_LIMIT: std::time::Duration = std::time::Duration::from_millis(6000);
+/// A call let go for silence comes back when the control channel repeats its
+/// grant update. That repeat gets this long, not the full
+/// [`VOICE_SILENCE_LIMIT`], to show a voice frame.
+pub const VOICE_REPICK_GRACE: std::time::Duration = std::time::Duration::from_millis(2000);
+/// How long a call let go for silence counts as "the same call" for
+/// [`VOICE_REPICK_GRACE`].
+pub const VOICE_REPICK_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
@@ -171,6 +178,8 @@ pub struct VoiceHold {
     override_hold: bool,
     priority: Vec<u32>,
     overrides: Vec<String>,
+    /// The call last let go because no voice frame came, and when.
+    silent: Option<((f64, u32), std::time::Instant)>,
 }
 
 impl Default for VoiceHold {
@@ -182,6 +191,7 @@ impl Default for VoiceHold {
             override_hold: true,
             priority: Vec::new(),
             overrides: Vec::new(),
+            silent: None,
         }
     }
 }
@@ -218,6 +228,22 @@ impl VoiceHold {
         self.ending = None;
     }
 
+    /// `call` started, or the radio landed on its channel. A call that was
+    /// just let go for silence and is offered again by a repeated grant
+    /// update only gets [`VOICE_REPICK_GRACE`] to show a voice frame.
+    pub fn begin_call(&mut self, call: (f64, u32), now: std::time::Instant) {
+        self.begin(now);
+        if let Some((gone, at)) = self.silent {
+            let same = gone.1 == call.1 && (gone.0 - call.0).abs() < 1.0;
+            if same && now.saturating_duration_since(at) < VOICE_REPICK_WINDOW {
+                let back = VOICE_SILENCE_LIMIT.saturating_sub(VOICE_REPICK_GRACE);
+                self.voice_at = Some(now.checked_sub(back).unwrap_or(now));
+            } else {
+                self.silent = None;
+            }
+        }
+    }
+
     /// The call was let go.
     pub fn clear(&mut self) {
         self.voice_at = None;
@@ -231,6 +257,7 @@ impl VoiceHold {
     /// A voice frame. `true` when it ended a hang.
     pub fn voice(&mut self, now: std::time::Instant) -> bool {
         self.voice_at = Some(now);
+        self.silent = None;
         self.ending.take().is_some()
     }
 
@@ -305,7 +332,7 @@ pub fn wide_hold_step(
         return WideHold::Free;
     };
     if !hold.active() {
-        hold.begin(now);
+        hold.begin_call(call, now);
     }
     if encrypted_end {
         hold.clear();
@@ -329,7 +356,11 @@ pub fn wide_hold_step(
         }
     }
     if hold.expired(now) {
+        let silent = !hold.in_hang();
         hold.clear();
+        if silent {
+            hold.silent = Some((call, now));
+        }
         return WideHold::Release;
     }
     WideHold::Keep(call)

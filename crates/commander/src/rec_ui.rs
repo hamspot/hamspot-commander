@@ -16,7 +16,7 @@ pub mod rec_params {
     pub const P25_X: &str = "HAMSPOT_P25_X";
 }
 use hsrec::meta::{self, Meta};
-use hsrec::segment::{self, Action, CallKey, Press, RecMode, Segmenter};
+use hsrec::segment::{self, Action, CallKey, Press, RecMode, Segmenter, VoiceGate};
 use hsrec::timeline::{self, View};
 use hsrec::writer::Cmd;
 use std::collections::{HashMap, HashSet};
@@ -148,6 +148,13 @@ pub struct RecUi {
     dir: PathBuf,
     db_path: PathBuf,
     seg: HashMap<u64, Segmenter>,
+    /// Per radio: talkgroup calls only record while the voice decoder speaks.
+    gate: HashMap<u64, VoiceGate>,
+    /// Audio outputs listed for the replay output menu.
+    sinks: Vec<hsrec::replay::Sink>,
+    sinks_listed: bool,
+    /// Where the current replay plays, as text for the dialog.
+    output_note: String,
     /// Radios whose voice decoder reported a non-clear algorithm this tick.
     pub enc: HashSet<u64>,
     marks_dirty: bool,
@@ -303,6 +310,7 @@ impl App {
         let hackrf: Vec<u64> = rows.iter().filter(|r| r.spec.driver == cat::RadioDriver::Hackrf).map(|r| r.id).collect();
         let gone: Vec<u64> = self.rec.seg.keys().copied().filter(|id| !hackrf.contains(id) || !armed).collect();
         for id in gone {
+            self.rec.gate.remove(&id);
             if let Some(mut s) = self.rec.seg.remove(&id) {
                 for a in s.stop() {
                     if let Action::Close { keep } = a {
@@ -318,8 +326,20 @@ impl App {
         for id in hackrf {
             let Some(row) = rows_meta(&rows, id) else { continue };
             let (want, meta) = self.rec_want(row);
+            // The follower can keep a talkgroup call picked with nothing on
+            // the voice channel. Record only while voice frames decode.
+            let want = if want.as_ref().is_some_and(|k| k.talkgroup.is_some()) {
+                let last = self.voice_frames.get(&id).copied();
+                self.rec.gate.entry(id).or_default().pass(want, last, hang, now)
+            } else {
+                self.rec.gate.remove(&id);
+                want
+            };
             let enc = self.rec.enc.remove(&id);
-            let actions = self.rec.seg.entry(id).or_default().step(want, enc, hang, now);
+            let max = Duration::from_secs(u64::from(
+                self.rec.face.max_segment_s.clamp(segment::MAX_SEGMENT_MIN_S, segment::MAX_SEGMENT_MAX_S),
+            ));
+            let actions = self.rec.seg.entry(id).or_default().step_max(want, enc, hang, Some(max), now);
             for a in actions {
                 match a {
                     Action::Open(_) => {
@@ -423,6 +443,10 @@ impl App {
                     // retunes for it; record once the new centre is live (the key
                     // carries the centre, so that starts a fresh segment).
                     if !hsrec::dsp::in_capture(hz - row.center_hz) {
+                        return (None, None);
+                    }
+                    // A known control channel is not a talkgroup call.
+                    if self.channels.zones.iter().flat_map(|z| z.channels.iter()).any(|c| c.control && (c.hz - hz).abs() < 1.0) {
                         return (None, None);
                     }
                     let key = CallKey { talkgroup: Some(tg), channel: String::new(), hz: hz.round() as u64, centre: row.center_hz.round() as u64 };
@@ -641,6 +665,20 @@ impl App {
                 .changed()
             {
                 cap_changed = true;
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Max segment");
+            let r = ui
+                .add(
+                    egui::DragValue::new(&mut self.rec.face.max_segment_s)
+                        .range(segment::MAX_SEGMENT_MIN_S..=segment::MAX_SEGMENT_MAX_S)
+                        .speed(1.0)
+                        .suffix(" s"),
+                )
+                .on_hover_text("A call still going at this length is split into a new recording, so nothing is lost. Default 120 s.");
+            if r.changed() {
+                self.rec.face_dirty = true;
             }
         });
         ui.add_space(6.0);
@@ -964,7 +1002,13 @@ impl App {
             let env = hsrec::replay::decoder_env(&rec.meta, &fallback);
             Some(hsrec::replay::DecoderCmd { argv, env, hold: Some(std::sync::Arc::new(hsrec::replay::Hold(Box::new(port)))) })
         });
-        match hsrec::replay::Player::start(&path, &rec.meta, from_ms, decoder, hsrec::replay::default_play_argv()) {
+        if !self.rec.face.output.is_empty() || !self.rec.sinks_listed {
+            self.rec.sinks = hsrec::replay::list_sinks();
+            self.rec.sinks_listed = true;
+        }
+        let (argv, missing) = hsrec::replay::pick_output(&self.rec.face.output, &self.rec.sinks);
+        self.rec.output_note = missing.unwrap_or_default();
+        match hsrec::replay::Player::start(&path, &rec.meta, from_ms, decoder, argv) {
             Ok(p) => self.rec.player = Some((id, p)),
             Err(e) => self.rec.note = format!("Playback: {e}"),
         }
@@ -1373,6 +1417,62 @@ impl App {
         v
     }
 
+    /// Replay output: which sink pw-cat plays to, shown as text.
+    fn rec_output_row(&mut self, ui: &mut egui::Ui) {
+        if !self.rec.sinks_listed {
+            self.rec.sinks = hsrec::replay::list_sinks();
+            self.rec.sinks_listed = true;
+        }
+        let label = |name: &str, sinks: &[hsrec::replay::Sink]| -> String {
+            if name.is_empty() {
+                return "System default".into();
+            }
+            match sinks.iter().find(|s| s.name == name) {
+                Some(s) if !s.description.is_empty() => format!("{} ({})", s.description, s.name),
+                Some(s) => s.name.clone(),
+                None => format!("{name} (not found)"),
+            }
+        };
+        let mut pick = None;
+        let mut refresh = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Output");
+            let current = label(&self.rec.face.output, &self.rec.sinks);
+            egui::ComboBox::from_id_salt("rec_output")
+                .selected_text(current)
+                .width(260.0)
+                .show_ui(ui, |ui| {
+                    if ui.selectable_label(self.rec.face.output.is_empty(), "System default").clicked() {
+                        pick = Some(String::new());
+                    }
+                    for s in &self.rec.sinks {
+                        let text = if s.description.is_empty() { s.name.clone() } else { format!("{} ({})", s.description, s.name) };
+                        if ui.selectable_label(self.rec.face.output == s.name, text).clicked() {
+                            pick = Some(s.name.clone());
+                        }
+                    }
+                });
+            if ui.button("Refresh").on_hover_text("List the audio outputs again.").clicked() {
+                refresh = true;
+            }
+        });
+        if refresh {
+            self.rec.sinks = hsrec::replay::list_sinks();
+        }
+        if let Some(name) = pick {
+            if name != self.rec.face.output {
+                self.rec.face.output = name;
+                self.rec.face_dirty = true;
+            }
+        }
+        let missing = !self.rec.face.output.is_empty() && !self.rec.sinks.iter().any(|s| s.name == self.rec.face.output);
+        if missing {
+            ui.label(egui::RichText::new(format!("⚠ Output {} not found; playing to the system default.", self.rec.face.output)).color(caution()));
+        } else if !self.rec.output_note.is_empty() {
+            ui.label(egui::RichText::new(&self.rec.output_note).color(caution()));
+        }
+    }
+
     /// Record / Playback dialog: follows the selection, one at a time.
     fn rec_detail_window(&mut self, ctx: &egui::Context) {
         if !self.rec.detail_open {
@@ -1437,6 +1537,7 @@ impl App {
             ui.checkbox(&mut protect, "🔒 Protect").on_hover_text("Never removed by overwrite-oldest.");
             ui.checkbox(&mut self.rec.play_next, "Play next");
         });
+        self.rec_output_row(ui);
         ui.horizontal_wrapped(|ui| {
             let red = egui::Color32::from_rgb(240, 60, 50);
             if !hsrec::dsp::in_capture(rec.meta.offset_hz) && rec.meta.source_kind != meta::KIND_DEMOD_AUDIO {

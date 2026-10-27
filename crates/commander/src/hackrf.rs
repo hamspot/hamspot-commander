@@ -395,13 +395,15 @@ pub fn keep_open(open: &mut Vec<(f64, u32, u64)>, call: (f64, u32), seq: u64) {
 /// Inputs for [`follow_capture`] after the shared hold has decided.
 /// A kept call offers no new grant and no end hint, so a butt-key, a dead
 /// carrier or another talkgroup's grant cannot move it. A release forces the
-/// end. A switch offers only the emergency or priority call.
+/// end, and drops the released call's own repeated grant update that update.
+/// A switch offers only the emergency or priority call.
 pub fn hold_inputs(
     step: &crate::follow::WideHold,
     fresh: Vec<(f64, u32)>,
     seen: (bool, bool, bool, bool),
     open: &mut Vec<(f64, u32, u64)>,
     seq: u64,
+    released: Option<(f64, u32)>,
 ) -> (Vec<(f64, u32)>, bool, bool, bool, bool) {
     use crate::follow::WideHold;
     match step {
@@ -410,7 +412,16 @@ pub fn hold_inputs(
             keep_open(open, *call, seq);
             (Vec::new(), false, false, false, false)
         }
-        WideHold::Release => (fresh, false, false, true, false),
+        // The released call's own grant update this update is not a new
+        // call. Without this a control channel that keeps repeating the
+        // update held a silent call forever.
+        WideHold::Release => {
+            let fresh = fresh
+                .into_iter()
+                .filter(|(_, tg)| released.is_none_or(|(_, gone)| gone != *tg))
+                .collect();
+            (fresh, false, false, true, false)
+        }
         WideHold::Switch(call) => (vec![*call], false, false, false, false),
     }
 }
@@ -2103,12 +2114,13 @@ mod tests {
             ),
             &mut open,
             state.3,
+            state.0,
         );
         let picked = follow_capture(
             center, &controls, None, true, true, open, state.3, state.0, &fresh, state.2, a, b, c, d,
         );
         if picked.call != state.0 {
-            if picked.call.is_some() { hold.begin(now); } else { hold.clear(); }
+            if let Some(call) = picked.call { hold.begin_call(call, now); } else { hold.clear(); }
         }
         state.0 = picked.call;
         state.1 = picked.open.clone();
@@ -2119,6 +2131,54 @@ mod tests {
 
     fn ms(n: u64) -> std::time::Duration {
         std::time::Duration::from_millis(n)
+    }
+
+    /// A held call with no voice frame and no terminator while the control
+    /// channel keeps repeating its grant update (every 0.5 s). Before the
+    /// fix every repeat restarted the 6 s silence limit and the call was
+    /// held for the whole 160 s run (the 156 s silent TG 10334 recording).
+    #[test]
+    fn silent_call_is_let_go_despite_repeating_grant_updates() {
+        use crate::follow::VoiceHold;
+        let t = std::time::Instant::now();
+        let mut hold = VoiceHold::default();
+        let mut state = (None, Vec::new(), None, 0);
+        let a = 858_512_500.0;
+        let mut run = 0u64;
+        let mut longest_after_first = 0u64;
+        let mut released = false;
+        for n in 0..1600u64 {
+            let fresh: Vec<(f64, u32)> = if n % 5 == 0 { vec![(a, 100)] } else { vec![] };
+            let p = wide_update(&mut hold, &mut state, &fresh, &[], &[], t + ms(n * 100));
+            if p.call.is_some() {
+                run += 1;
+                if released {
+                    longest_after_first = longest_after_first.max(run);
+                }
+            } else {
+                released = true;
+                run = 0;
+            }
+        }
+        assert!(released, "the silent call was never let go");
+        // Re-picks by the repeated grant only get the 2 s grace.
+        assert!(longest_after_first <= 21, "re-picked silent call held {longest_after_first} ticks");
+    }
+
+    /// The same repeating grant with voice frames keeps one unbroken call.
+    #[test]
+    fn talking_call_with_repeating_grant_updates_is_kept() {
+        use crate::follow::{CcEvent, VoiceHold};
+        let t = std::time::Instant::now();
+        let mut hold = VoiceHold::default();
+        let mut state = (None, Vec::new(), None, 0);
+        let a = 858_512_500.0;
+        for n in 0..1600u64 {
+            let fresh: Vec<(f64, u32)> = if n % 5 == 0 { vec![(a, 100)] } else { vec![] };
+            let events = if n % 2 == 0 { vec![CcEvent::Voice] } else { vec![] };
+            let p = wide_update(&mut hold, &mut state, &fresh, &[], &events, t + ms(n * 100));
+            assert_eq!(p.call, Some((a, 100)), "dropped at tick {n}");
+        }
     }
 
     #[test]

@@ -9212,6 +9212,7 @@ impl App {
                 ),
                 &mut open,
                 self.hackrf_seq,
+                previous,
             );
             let picked = crate::hackrf::follow_capture(
                 cluster,
@@ -9234,8 +9235,8 @@ impl App {
                     follow::clear_call(ident);
                 }
                 if let Some(hold) = self.hackrf_hold.get_mut(&tick.id) {
-                    if picked.call.is_some() {
-                        hold.begin(now);
+                    if let Some(call) = picked.call {
+                        hold.begin_call(call, now);
                     } else {
                         hold.clear();
                     }

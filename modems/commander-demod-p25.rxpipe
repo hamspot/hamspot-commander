@@ -170,12 +170,26 @@ socat -u "udp-listen:${port}" - </dev/null >"$voice" &
 listener=$!
 # -m sums the two slots without the default 1/n cut, so a call on one slot
 # stays at full level while the idle slot is silence.
-sox -q -t raw -r 8000 -e signed -b 16 -c 2 "$voice" -t raw -r 48000 -e signed -b 16 -c 1 - remix -m 1,2 </dev/null &
+# --buffer 512 keeps little audio inside sox, so the tail is not held back.
+sox -q --buffer 512 -t raw -r 8000 -e signed -b 16 -c 2 "$voice" -t raw -r 48000 -e signed -b 16 -c 1 - remix -m 1,2 </dev/null &
 player=$!
 
-# One exit is the crash. The trap stops the other two on the way out.
+# One exit is the crash. The trap stops the others on the way out.
+# When the decoder is the one that ended (its input ran out, as on a
+# replay), the last voice is still in flight: in the UDP socket, in socat
+# and in sox. Let it drain: give socat a moment for the last datagrams,
+# stop it so sox reads end of file, then wait for sox to write the tail.
 set +e
 wait -n
 status=$?
+if ! kill -0 "$decoder" 2>/dev/null && kill -0 "$player" 2>/dev/null; then
+    decoder=""
+    sleep 0.3
+    kill "$listener" 2>/dev/null
+    wait "$listener" 2>/dev/null
+    listener=""
+    wait "$player" 2>/dev/null
+    player=""
+fi
 set -e
 exit "$status"

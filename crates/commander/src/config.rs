@@ -144,6 +144,21 @@ pub struct RecFace {
     pub overwrite_oldest: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub source_tab: String,
+    /// Longest recording segment in seconds. A call still going is split
+    /// into a new segment at this length.
+    #[serde(default = "default_max_segment", skip_serializing_if = "is_default_max_segment")]
+    pub max_segment_s: u32,
+    /// Replay output: a PipeWire / Pulse sink node name. Empty = system default.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub output: String,
+}
+
+fn default_max_segment() -> u32 {
+    hsrec::segment::MAX_SEGMENT_DEFAULT_S
+}
+
+fn is_default_max_segment(v: &u32) -> bool {
+    *v == default_max_segment()
 }
 
 fn default_rec_cap() -> f64 {
@@ -162,6 +177,8 @@ impl Default for RecFace {
             cap_gb: default_rec_cap(),
             overwrite_oldest: false,
             source_tab: String::new(),
+            max_segment_s: default_max_segment(),
+            output: String::new(),
         }
     }
 }

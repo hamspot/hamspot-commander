@@ -214,6 +214,83 @@ pub fn default_play_argv() -> Vec<String> {
         .collect()
 }
 
+/// pw-cat to one output, named by its PipeWire / Pulse sink node name. An
+/// empty or unsafe name plays to the system default, as
+/// [`default_play_argv`] does.
+pub fn play_argv(target: &str) -> Vec<String> {
+    let mut argv = default_play_argv();
+    if sink_name_ok(target) {
+        let dash = argv.len() - 1;
+        argv.insert(dash, target.to_string());
+        argv.insert(dash, "--target".to_string());
+    }
+    argv
+}
+
+/// A sink node name is plain text: no path, no option, no spaces.
+pub fn sink_name_ok(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 200
+        && !name.starts_with('-')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '@'))
+}
+
+/// One audio output the replay can play to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Sink {
+    /// Node name, the value stored in the station file.
+    pub name: String,
+    /// Human description, for the menu.
+    pub description: String,
+}
+
+/// Parse `LC_ALL=C pactl list sinks`.
+pub fn parse_sinks(text: &str) -> Vec<Sink> {
+    let mut out: Vec<Sink> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(name) = line.strip_prefix("Name:") {
+            let name = name.trim();
+            if sink_name_ok(name) {
+                out.push(Sink { name: name.to_string(), description: String::new() });
+            }
+        } else if let Some(desc) = line.strip_prefix("Description:") {
+            if let Some(last) = out.last_mut() {
+                if last.description.is_empty() {
+                    last.description = desc.trim().to_string();
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The outputs on this machine now. Empty when pactl is missing.
+pub fn list_sinks() -> Vec<Sink> {
+    Command::new("pactl")
+        .args(["list", "sinks"])
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| parse_sinks(&String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or_default()
+}
+
+/// The player command for the stored output. A stored name missing from
+/// `sinks` falls back to the system default; the second value says so.
+pub fn pick_output(stored: &str, sinks: &[Sink]) -> (Vec<String>, Option<String>) {
+    if stored.is_empty() {
+        return (default_play_argv(), None);
+    }
+    if sinks.iter().any(|s| s.name == stored) {
+        return (play_argv(stored), None);
+    }
+    (default_play_argv(), Some(format!("Output {stored} not found; playing to the system default.")))
+}
+
 /// Result of an offline render of one recording.
 #[derive(Debug, Default)]
 pub struct Render {
@@ -684,6 +761,33 @@ mod tests {
         let p = Player::start(&path, &meta, 0, None, vec!["/nonexistent/pw-cat".into()]).unwrap();
         while !p.finished() { std::thread::sleep(Duration::from_millis(10)); }
         assert!(p.error.lock().unwrap().contains("audio output"));
+    }
+
+    #[test]
+    fn output_target_argv() {
+        let argv = play_argv("bluez_output.08_EB_ED_83_32_13.1");
+        let n = argv.len();
+        assert_eq!(&argv[n - 3..], ["--target", "bluez_output.08_EB_ED_83_32_13.1", "-"]);
+        assert!(argv.iter().any(|a| a == "--raw"));
+        assert_eq!(play_argv(""), default_play_argv());
+        assert_eq!(play_argv("--help"), default_play_argv());
+        assert_eq!(play_argv("/dev/snd"), default_play_argv());
+        assert_eq!(play_argv("a b"), default_play_argv());
+    }
+
+    #[test]
+    fn sinks_parse_and_fallback() {
+        let text = "Sink #79\n\tState: SUSPENDED\n\tName: alsa_output.usb-C-Media.analog-stereo\n\tDescription: USB Audio Device Analog Stereo\n\nSink #113\n\tName: hamspot_2_rx\n\tDescription: hamspot 2 rx\n";
+        let sinks = parse_sinks(text);
+        assert_eq!(sinks.len(), 2);
+        assert_eq!(sinks[0].name, "alsa_output.usb-C-Media.analog-stereo");
+        assert_eq!(sinks[0].description, "USB Audio Device Analog Stereo");
+        let (argv, note) = pick_output("hamspot_2_rx", &sinks);
+        assert!(argv.contains(&"hamspot_2_rx".to_string()) && note.is_none());
+        let (argv, note) = pick_output("gone_sink", &sinks);
+        assert_eq!(argv, default_play_argv());
+        assert!(note.unwrap().contains("system default"));
+        assert_eq!(pick_output("", &sinks), (default_play_argv(), None));
     }
 
     #[test]
