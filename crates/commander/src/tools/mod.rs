@@ -432,7 +432,135 @@ pub fn frame(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) -> egui::Rect {
     let theme = LcarsTheme::default();
     let mut frame = rustcars::LcarsFrame::new(&theme, Side::Left, 1.0);
     frame.min_height = ui.available_height();
+    // The top bar's end cap: the tab strips below may turn it into a
+    // "more tabs" key. Same geometry as rustcars' LcarsFrame for Side::Left.
+    let outer = ui.available_rect_before_wrap();
+    let cap = egui::Rect::from_min_size(
+        egui::pos2(outer.right() - frame.cap_len, outer.top()),
+        egui::vec2(frame.cap_len, frame.thin),
+    );
+    ui.ctx().data_mut(|d| d.insert_temp(top_cap_id(ui.ctx()), cap));
     frame.show(ui, &theme, add).1
+}
+
+fn top_cap_id(ctx: &egui::Context) -> egui::Id {
+    egui::Id::NULL.with(("elbow-top-cap", ctx.viewport_id()))
+}
+
+/// Which tabs fit in `avail` px. `widths` are the tabs' real sizes, `gap` the
+/// spacing between them. Order is kept. The selected tab always stays in the
+/// row: if it would not fit, earlier tabs leave the row to make room.
+/// Returns (shown, hidden) as indices. When everything fits, hidden is empty.
+pub fn partition_tabs(
+    widths: &[f32],
+    gap: f32,
+    avail: f32,
+    selected: Option<usize>,
+) -> (Vec<usize>, Vec<usize>) {
+    let span = |idx: &[usize]| -> f32 {
+        idx.iter().map(|&i| widths[i]).sum::<f32>() + gap * idx.len().saturating_sub(1) as f32
+    };
+    let all: Vec<usize> = (0..widths.len()).collect();
+    if span(&all) <= avail {
+        return (all, Vec::new());
+    }
+    let mut shown: Vec<usize> = Vec::new();
+    for i in 0..widths.len() {
+        let mut next = shown.clone();
+        next.push(i);
+        if span(&next) <= avail {
+            shown = next;
+        } else {
+            break;
+        }
+    }
+    if let Some(sel) = selected.filter(|&s| s < widths.len()) {
+        if !shown.contains(&sel) {
+            loop {
+                let mut next = shown.clone();
+                next.push(sel);
+                if span(&next) <= avail || shown.is_empty() {
+                    shown = next;
+                    break;
+                }
+                shown.pop();
+            }
+        }
+    }
+    shown.sort_unstable();
+    let hidden = all.into_iter().filter(|i| !shown.contains(i)).collect();
+    (shown, hidden)
+}
+
+/// One row of tabs under the frame's top elbow. Tabs that do not fit leave the
+/// row, and the elbow's end cap becomes a "more tabs" key that lists them.
+/// When all fit, the cap stays plain chrome. `width(i)` is tab i's real
+/// width; `draw(ui, i, lead)` paints tab i and returns its response.
+/// Returns the index picked from the row or from the list.
+pub fn overflow_tab_row(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    labels: &[String],
+    selected: Option<usize>,
+    width: impl Fn(&egui::Ui, usize) -> f32,
+    mut draw: impl FnMut(&mut egui::Ui, usize, bool) -> egui::Response,
+) -> Option<usize> {
+    let widths: Vec<f32> = (0..labels.len()).map(|i| width(ui, i)).collect();
+    let gap = ui.spacing().item_spacing.x;
+    let (shown, hidden) = partition_tabs(&widths, gap, ui.available_width(), selected);
+    let mut picked = None;
+    ui.horizontal(|ui| {
+        for (n, &i) in shown.iter().enumerate() {
+            if draw(ui, i, n == 0).clicked() {
+                picked = Some(i);
+            }
+        }
+    });
+    if hidden.is_empty() {
+        return picked;
+    }
+    let Some(cap) = ui.ctx().data(|d| d.get_temp::<egui::Rect>(top_cap_id(ui.ctx()))) else {
+        return picked;
+    };
+    let id = ui.scope_id().with(("more-tabs", id_salt));
+    let resp = ui.interact(cap, id, egui::Sense::click());
+    paint_more_key(ui, cap, &resp);
+    let resp = resp.on_hover_text(format!("More tabs ({} hidden)", hidden.len()));
+    let l = format!("More tabs, {} hidden", hidden.len());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &l));
+    egui::Popup::menu(&resp).show(|ui| {
+        for &i in &hidden {
+            if ui.selectable_label(selected == Some(i), labels[i].to_uppercase()).clicked() {
+                picked = Some(i);
+                ui.close();
+            }
+        }
+    });
+    picked
+}
+
+/// The end cap as a key: a thin dark border and a small down-pointing
+/// triangle, both muted, so its new job shows by shape and not by colour.
+fn paint_more_key(ui: &egui::Ui, cap: egui::Rect, resp: &egui::Response) {
+    let theme = LcarsTheme::default();
+    let painter = ui.painter();
+    let ink = theme.bg.gamma_multiply(if resp.hovered() { 0.85 } else { 0.6 });
+    let r = rustcars::cap_radius(Cap::Right, cap.height());
+    painter.rect_stroke(cap.shrink(2.0), r, egui::Stroke::new(1.0, ink), egui::StrokeKind::Inside);
+    if resp.has_focus() {
+        painter.rect_stroke(cap.shrink(4.0), r, egui::Stroke::new(1.0, theme.text_hi), egui::StrokeKind::Inside);
+    }
+    let c = egui::pos2(cap.center().x - 2.0, cap.center().y + 1.0);
+    let s = (cap.height() * 0.18).clamp(3.0, 6.0);
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            egui::pos2(c.x - s, c.y - s * 0.6),
+            egui::pos2(c.x + s, c.y - s * 0.6),
+            egui::pos2(c.x, c.y + s * 0.6),
+        ],
+        ink,
+        egui::Stroke::NONE,
+    ));
 }
 
 /// The straight run of the bottom elbow's horizontal bar: right of the
@@ -514,6 +642,42 @@ pub fn bottom_bar_watermark(ui: &mut egui::Ui, frame_rect: egui::Rect, text: &st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_tabs_fit_hides_nothing() {
+        let (shown, hidden) = partition_tabs(&[50.0, 50.0, 50.0], 4.0, 158.0, Some(2));
+        assert_eq!(shown, vec![0, 1, 2]);
+        assert!(hidden.is_empty());
+    }
+
+    #[test]
+    fn overflow_hides_the_tail() {
+        let (shown, hidden) = partition_tabs(&[50.0, 50.0, 50.0, 50.0], 4.0, 110.0, Some(0));
+        assert_eq!(shown, vec![0, 1]);
+        assert_eq!(hidden, vec![2, 3]);
+    }
+
+    #[test]
+    fn selected_tab_stays_in_the_row() {
+        let (shown, hidden) = partition_tabs(&[50.0, 50.0, 50.0, 50.0], 4.0, 110.0, Some(3));
+        assert_eq!(shown, vec![0, 3]);
+        assert_eq!(hidden, vec![1, 2]);
+        // A wide selected tab pushes out more than one.
+        let (shown, _) = partition_tabs(&[50.0, 50.0, 50.0, 100.0], 4.0, 160.0, Some(3));
+        assert_eq!(shown, vec![0, 3]);
+        // Even when it alone is too wide, it is still shown.
+        let (shown, hidden) = partition_tabs(&[50.0, 200.0], 4.0, 100.0, Some(1));
+        assert_eq!(shown, vec![1]);
+        assert_eq!(hidden, vec![0]);
+    }
+
+    #[test]
+    fn no_selection_and_empty_rows() {
+        let (shown, hidden) = partition_tabs(&[80.0, 80.0], 4.0, 100.0, None);
+        assert_eq!((shown, hidden), (vec![0], vec![1]));
+        let (shown, hidden) = partition_tabs(&[], 4.0, 100.0, None);
+        assert!(shown.is_empty() && hidden.is_empty());
+    }
 
     #[test]
     fn watermark_splits_at_a_word_near_the_middle() {
