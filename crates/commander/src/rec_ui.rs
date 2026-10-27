@@ -1002,21 +1002,26 @@ impl App {
             if ui.button("Fit").on_hover_text("Fit to the most recent recordings").clicked() {
                 view = timeline::fit(&recs, now);
             }
-            if toolbar_toggle(ui, view.live, "Live / Now", false)
+            if toolbar_toggle(ui, view.live, LIVE_LABEL, false)
                 .on_hover_text("Follow the present (the red NOW line)")
                 .clicked()
             {
                 view = View::live(now, view.span);
             }
-            let shown = timeline::layout(&recs, &lanes, &view, width, now).len();
-            ui.label(format!("{} recordings ({shown} in view), {} lanes", recs.len(), lanes.len()));
-            ui.checkbox(&mut self.rec.play_next, "Play next");
-            if toolbar_toggle(ui, self.rec.data_open, "Data", true)
+            if toolbar_toggle(ui, self.rec.data_open, DATA_LABEL, true)
                 .on_hover_text("Storage cap, archive, rescan, cache, and thumb-drive copy/move")
                 .clicked()
             {
                 self.rec.data_open = !self.rec.data_open;
             }
+            if toolbar_toggle(ui, self.rec.play_next, PLAY_NEXT_LABEL, false)
+                .on_hover_text(play_next_hint(self.rec.play_next))
+                .clicked()
+            {
+                self.rec.play_next = !self.rec.play_next;
+            }
+            let shown = timeline::layout(&recs, &lanes, &view, width, now).len();
+            ui.label(format!("{} recordings ({shown} in view), {} lanes", recs.len(), lanes.len()));
             if ui
                 .add_enabled_ui(self.rec.selected.is_some(), |ui| toolbar_toggle(ui, self.rec.detail_open, "Details", true))
                 .inner
@@ -1613,8 +1618,16 @@ mod tests {
 
     #[test]
     fn toggle_text_marks_state_without_colour() {
-        assert_eq!(toggle_text(true, "Live / Now"), "● Live / Now");
-        assert_eq!(toggle_text(false, "Live / Now"), "○ Live / Now");
+        assert_eq!(toggle_text(true, LIVE_LABEL), "● Live");
+        assert_eq!(toggle_text(false, LIVE_LABEL), "○ Live");
+        assert_eq!(toggle_text(true, PLAY_NEXT_LABEL), "● ▶▶");
+    }
+
+    #[test]
+    fn toolbar_order_live_data_play_next() {
+        assert_eq!(TOOLBAR_ORDER, ["Live", "Data", "▶▶"]);
+        assert!(play_next_hint(true).contains("ON"));
+        assert!(play_next_hint(false).contains("OFF"));
     }
 
     #[test]
@@ -1788,6 +1801,18 @@ mod tests {
 /// Search box width in the timeline toolbar: narrow enough that the
 /// toolbar fits a ~1000 px panel on one line.
 /// Text for a toolbar toggle: the state is shown by a marker, never by colour alone.
+/// REC toolbar labels, left to right: Live, Data, then play-next.
+pub const LIVE_LABEL: &str = "Live";
+pub const DATA_LABEL: &str = "Data";
+/// Play next. "▶" is already used elsewhere on this page, so it renders in
+/// egui's default fonts; "⏭" (U+23ED) is not reliably covered.
+pub const PLAY_NEXT_LABEL: &str = "▶▶";
+pub const TOOLBAR_ORDER: [&str; 3] = [LIVE_LABEL, DATA_LABEL, PLAY_NEXT_LABEL];
+
+pub fn play_next_hint(on: bool) -> String {
+    format!("Play next: {}. When a recording finishes playing, play the following one.", if on { "ON" } else { "OFF" })
+}
+
 pub fn toggle_text(on: bool, label: &str) -> String {
     format!("{} {label}", if on { "●" } else { "○" })
 }
