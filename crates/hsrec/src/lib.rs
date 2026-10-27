@@ -3,6 +3,7 @@ pub mod archive;
 pub mod cache;
 pub mod db;
 pub mod dsp;
+pub mod export;
 pub mod meta;
 pub mod replay;
 pub mod segment;
