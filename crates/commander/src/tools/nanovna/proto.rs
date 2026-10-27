@@ -316,6 +316,14 @@ pub fn device_id_sn(id: &[u8; 12]) -> String {
     format!("{:08x}-{:08x}-{:08x}", word(0), word(4), word(8))
 }
 
+/// The SN with the leading zeros of each 32-bit word dropped, so
+/// `00000001-0000abcd-12345678` shows as `1-abcd-12345678`. A zero word
+/// shows as `0`. The full form stays in [`device_id_sn`].
+pub fn device_id_sn_compact(id: &[u8; 12]) -> String {
+    let word = |i: usize| u32::from_le_bytes([id[i], id[i + 1], id[i + 2], id[i + 3]]);
+    format!("{:x}-{:x}-{:x}", word(0), word(4), word(8))
+}
+
 /// All zero or all 0xff: what a blank register file or a bad read gives.
 pub fn device_id_suspect(id: &[u8; 12]) -> bool {
     id.iter().all(|&b| b == 0) || id.iter().all(|&b| b == 0xff)
@@ -459,5 +467,38 @@ mod tests {
         assert_eq!(clear_fifo(), [WRITE1, ADDR_FIFO, 0]);
         assert_eq!(read_fifo(3), [READ_FIFO, ADDR_FIFO, 3]);
         assert_eq!(READ2, 0x11);
+    }
+}
+
+#[cfg(test)]
+mod sn_compact_tests {
+    use super::*;
+
+    fn id(words: [u32; 3]) -> [u8; 12] {
+        let mut out = [0u8; 12];
+        for (i, w) in words.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn compact_sn_drops_leading_zeros_per_word() {
+        assert_eq!(device_id_sn_compact(&id([0x12345678, 1, 0xdeadbeef])), "12345678-1-deadbeef");
+        assert_eq!(device_id_sn_compact(&id([0x0000abcd, 0x00100000, 0x0f])), "abcd-100000-f");
+    }
+
+    #[test]
+    fn compact_sn_keeps_a_zero_word_as_zero() {
+        assert_eq!(device_id_sn_compact(&id([0, 0x20, 0])), "0-20-0");
+        assert_eq!(device_id_sn_compact(&[0u8; 12]), "0-0-0");
+    }
+
+    #[test]
+    fn compact_sn_full_words_are_unchanged() {
+        let v = id([0xffffffff, 0x80000000, 0x10000000]);
+        assert_eq!(device_id_sn_compact(&v), "ffffffff-80000000-10000000");
+        assert_eq!(device_id_sn(&v), "ffffffff-80000000-10000000");
+        assert_eq!(device_id_sn(&id([1, 2, 3])), "00000001-00000002-00000003");
     }
 }

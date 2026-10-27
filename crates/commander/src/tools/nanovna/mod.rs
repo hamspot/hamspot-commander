@@ -1058,7 +1058,8 @@ impl NanoVna {
         }
         if let Some(dev) = live.device_id {
             if live.id_reliable {
-                line(&mut out, "DEVICE SN", proto::device_id_sn(&dev));
+                line(&mut out, "DEVICE SN", proto::device_id_sn_compact(&dev));
+                line(&mut out, "SN (FULL)", proto::device_id_sn(&dev));
             } else {
                 line(&mut out, "DEVICE ID", "ID unreliable (reads disagreed)".into());
                 line(&mut out, "NOTE", device::POWER_NOTE.into());
@@ -1069,6 +1070,11 @@ impl NanoVna {
         line(&mut out, "SWEEP ERRORS", live.sweep_errors.to_string());
         if let Some(ms) = self.sweep_ms {
             line(&mut out, "SWEEP TIME", format!("{} ms", ms.round()));
+        }
+        line(&mut out, "CALIBRATION", self.cal_state.label().to_string());
+        let warn = status_warnings(live);
+        if !warn.is_empty() {
+            line(&mut out, "WARNINGS", warn.join(" · "));
         }
         line(&mut out, "STATUS", live.status.clone());
         out.trim_end().to_string()
@@ -2021,32 +2027,41 @@ impl NanoVna {
         };
         let avg = self.host_average_value().max(1);
         let mode = if !self.run { "HOLD" } else if self.single { "SINGLE" } else { "CONT" };
-        let mut left = format!(
-            "CH1  START {} · STOP {} · {} PTS · AVG {} · {mode}",
+        let summary = format!(
+            "CH1  START {} · STOP {} · {} PTS",
             display::fmt_hz(start),
             display::fmt_hz(stop),
             points,
-            avg,
         );
-        left.push_str(&format!("  {}", self.cal_state.label()));
+        let mut cal_text = self.cal_state.label().to_string();
         if let Some(set) = cal {
             let name = if set.name.is_empty() { &set.zone } else { &set.name };
             if !name.is_empty() {
-                left.push_str(&format!(" {name}"));
+                cal_text.push_str(&format!(" {name}"));
             }
         }
-        let device = if live.connected {
-            let fw = live
-                .identity
-                .as_ref()
-                .map(|id| format!("  FW {}.{}", id.fw_major, id.fw_minor))
-                .unwrap_or_default();
-            format!("NANOVNA V2 · {}{fw}", self.face.port)
-        } else if live.lost {
-            "DISCONNECTED".to_string()
-        } else {
-            "NOT CONNECTED".to_string()
-        };
+        // Warnings carry text, never colour alone.
+        let warn = status_warnings(live);
+        let id_bad = device::power_note(live).is_some();
+        // Priority: warnings are never dropped, then the sweep summary,
+        // then mode and cal, then AVG. Issue 68 (status line overlap).
+        let mut segs: Vec<(String, u8)> = vec![
+            (summary, 3),
+            (format!("AVG {avg}"), 1),
+            (mode.to_string(), 2),
+            (cal_text, 2),
+        ];
+        if !warn.is_empty() {
+            segs.push((format!("⚠ {}", warn.join(" · ")), u8::MAX));
+        }
+        let device = device_short(live, &self.face.port);
+        let leds = status_leds(live, self.cal_state, cal.is_some_and(|set| restored(set, &self.run_started)), self.run && live.connected);
+        // The full line, for copying: everything the bar and popup know.
+        let fw = live
+            .identity
+            .as_ref()
+            .map(|id| format!(" · FW {}.{}", id.fw_major, id.fw_minor))
+            .unwrap_or_default();
         let mut time = self
             .sweep_ms
             .map(|ms| format!(" · {} ms/SWEEP", ms.round()))
@@ -2054,29 +2069,13 @@ impl NanoVna {
         if live.connected {
             time.push_str(&format!(" · #{}", self.sweep_count));
         }
-        // Warnings carry text, never colour alone.
-        let mut warn = Vec::new();
-        if live.identity.is_some_and(|id| !id.power_and_average()) {
-            warn.push("FW < 1.0.2: NO DEV AVG/POWER");
-        }
-        if live.sweep_errors > 0 && live.connected {
-            warn.push("SWEEP ERRORS");
-        }
-        if live.lost {
-            warn.push("CHECK USB");
-        }
-        let id_bad = device::power_note(live).is_some();
-        if id_bad {
-            warn.push("ID UNRELIABLE: POWER CYCLE VNA");
-        }
-        if !warn.is_empty() {
-            left.push_str(&format!("  ⚠ {}", warn.join(" · ")));
-        }
-        let status_line = format!("{left}  {device}{time}");
+        let all: Vec<&str> = segs.iter().map(|(t, _)| t.as_str()).collect();
+        let status_line = format!("{}  {device}{fw}{time}", all.join("  "));
         if resp.hovered() {
             painter.rect_stroke(rect, 0.0, Stroke::new(1.0, palette::TAN), egui::StrokeKind::Inside);
         }
         // single = details, double = reconnect, triple = copy the status line.
+        // A click on an LED is a click on the bar: it opens the device details.
         let key = self.key_op(keys::Group::Status);
         if click_n(ui, &resp) == 3 || key == Some(3) {
             ui.ctx().copy_text(status_line.clone());
@@ -2087,23 +2086,44 @@ impl NanoVna {
         } else if click_n(ui, &resp) == 1 || key == Some(1) {
             self.details_open = !self.details_open;
         }
-        let resp = resp.on_hover_text(keys::hint(keys::Group::Status));
-        let _ = resp;
         let font = egui::FontId::monospace(theme.data_size * 0.8);
-        painter.text(
-            Pos2::new(rect.left() + 8.0, rect.center().y),
+        let right_color = if live.connected { palette::TEXT } else if live.lost { LOST_TEXT } else { palette::TEXT_MUTED };
+        let right_galley = painter.layout_no_wrap(device.clone(), font.clone(), right_color);
+        let char_w = painter.layout_no_wrap("0".into(), font.clone(), palette::TEXT).size().x.max(1.0);
+        let text_x = rect.right() - 8.0 - right_galley.size().x;
+        painter.galley(Pos2::new(text_x, rect.center().y - right_galley.size().y / 2.0), right_galley, right_color);
+        // LEDs just left of the device text.
+        let led_r = 4.0;
+        let led_step = 13.0;
+        let mut led_x = text_x - 10.0 - led_r;
+        let mut hover_tip: Option<String> = None;
+        let hover = resp.hover_pos();
+        for led in leds.iter().rev() {
+            let c = Pos2::new(led_x, rect.center().y);
+            painter.circle_filled(c, led_r, led.color);
+            painter.circle_stroke(c, led_r, Stroke::new(1.0, Color32::from_black_alpha(160)));
+            if hover.is_some_and(|p| (p - c).length() <= led_step / 2.0 + 1.0) {
+                hover_tip = Some(led.tip.clone());
+            }
+            led_x -= led_step;
+        }
+        let right_start = led_x + led_step - led_r;
+        let left_x = rect.left() + 8.0;
+        let left_w = (right_start - 12.0 - left_x).max(0.0);
+        let left = fit_status(&segs, (left_w / char_w).floor() as usize);
+        let left_rect = Rect::from_min_max(Pos2::new(left_x, rect.top()), Pos2::new(left_x + left_w, rect.bottom()));
+        ui.painter_at(left_rect).text(
+            Pos2::new(left_x, rect.center().y),
             egui::Align2::LEFT_CENTER,
             left,
-            font.clone(),
+            font,
             if id_bad { LOST_TEXT } else { palette::TEXT },
         );
-        painter.text(
-            Pos2::new(rect.right() - 8.0, rect.center().y),
-            egui::Align2::RIGHT_CENTER,
-            format!("{device}{time}"),
-            font,
-            if live.connected { palette::TEXT } else if live.lost { LOST_TEXT } else { palette::TEXT_MUTED },
-        );
+        let tip = match hover_tip {
+            Some(t) => format!("{t}\n\n{}", keys::hint(keys::Group::Status)),
+            None => format!("{status_line}\n\n{}", keys::hint(keys::Group::Status)),
+        };
+        let _ = resp.on_hover_text(tip);
     }
 
     /// The instrument key panel down the left: FORMAT, DISPLAY, MARKER, SWEEP · CAL.
@@ -5075,6 +5095,116 @@ const TRACE_COLORS: [Color32; 4] = [
 ];
 /// MATH label text: brick is too dark for text on the strip.
 /// Disconnected / lost text: brick fails 4.5:1 as text, this light red passes. Issue 73.
+/// One status LED: its colour and the text that says what it means.
+#[derive(Clone, Debug, PartialEq)]
+struct Led {
+    color: Color32,
+    tip: String,
+}
+
+const LED_OK: Color32 = Color32::from_rgb(0x5E, 0xC2, 0x5A);
+const LED_WARN: Color32 = Color32::from_rgb(0xE8, 0xA8, 0x30);
+const LED_BAD: Color32 = Color32::from_rgb(0xE0, 0x4A, 0x3C);
+const LED_OFF: Color32 = Color32::from_rgb(0x55, 0x55, 0x55);
+
+/// The status-line warnings, also listed in the device details.
+fn status_warnings(live: &device::Live) -> Vec<&'static str> {
+    let mut warn = Vec::new();
+    if live.identity.is_some_and(|id| !id.power_and_average()) {
+        warn.push("FW < 1.0.2: NO DEV AVG/POWER");
+    }
+    if live.sweep_errors > 0 && live.connected {
+        warn.push("SWEEP ERRORS");
+    }
+    if live.lost {
+        warn.push("CHECK USB");
+    }
+    if device::power_note(live).is_some() {
+        warn.push("ID UNRELIABLE: POWER CYCLE VNA");
+    }
+    warn
+}
+
+/// Device type and port only, e.g. `NANOVNA V2 · ttyACM0`.
+fn device_short(live: &device::Live, port: &str) -> String {
+    if live.connected {
+        let name = Path::new(port).file_name().and_then(|n| n.to_str()).unwrap_or(port);
+        if name.is_empty() { "NANOVNA V2".into() } else { format!("NANOVNA V2 · {name}") }
+    } else if live.lost {
+        "DISCONNECTED".into()
+    } else {
+        "NOT CONNECTED".into()
+    }
+}
+
+/// LINK, ID, CAL, SWEEP lamps, left to right.
+fn status_leds(live: &device::Live, cal: cal::CalState, restored: bool, sweeping: bool) -> [Led; 4] {
+    let led = |color, tip: &str| Led { color, tip: tip.to_string() };
+    let link = if live.connected {
+        led(LED_OK, "LINK: connected")
+    } else if live.lost {
+        led(LED_BAD, "LINK: disconnected (lost), check USB")
+    } else {
+        led(LED_OFF, "LINK: not connected")
+    };
+    let id = match (live.connected, live.device_id.is_some(), live.id_reliable) {
+        (true, true, true) => led(LED_OK, "ID: serial number read and checked"),
+        (true, true, false) => led(LED_BAD, "ID UNRELIABLE: POWER CYCLE VNA"),
+        _ => led(LED_OFF, "ID: no device id"),
+    };
+    let calibrated = match cal {
+        cal::CalState::Exact if restored => led(LED_OK, "CAL: restored calibration applied"),
+        cal::CalState::Exact => led(LED_OK, "CAL: calibration applied"),
+        cal::CalState::Interp => led(LED_WARN, "CAL INT: calibration interpolated onto this grid"),
+        cal::CalState::Off => led(LED_WARN, "CAL OFF: correction turned off"),
+        cal::CalState::Uncal => led(LED_OFF, "UNCAL: no calibration for this sweep"),
+    };
+    let sweep = if !live.connected {
+        led(LED_OFF, "SWEEP: idle, not connected")
+    } else if live.sweep_errors > 0 {
+        led(LED_WARN, "SWEEP: running with sweep errors")
+    } else if sweeping || live.busy {
+        led(LED_OK, "SWEEP: sweeping")
+    } else {
+        led(LED_OFF, "SWEEP: held")
+    };
+    [link, id, calibrated, sweep]
+}
+
+/// Joins the status segments with two spaces in their order, dropping the
+/// lowest-priority segment (rightmost first on a tie) until the text fits
+/// in `max` characters. Priority `u8::MAX` is never dropped; if that alone
+/// is too long it is cut with an ellipsis. Never returns more than `max`.
+fn fit_status(segs: &[(String, u8)], max: usize) -> String {
+    let mut keep: Vec<bool> = vec![true; segs.len()];
+    let join = |keep: &[bool]| {
+        segs.iter().zip(keep).filter(|(_, k)| **k).map(|((t, _), _)| t.as_str()).collect::<Vec<_>>().join("  ")
+    };
+    loop {
+        let text = join(&keep);
+        if text.chars().count() <= max {
+            return text;
+        }
+        let drop = segs
+            .iter()
+            .enumerate()
+            .filter(|(i, (_, p))| keep[*i] && *p != u8::MAX)
+            .min_by_key(|(i, (_, p))| (*p, usize::MAX - *i))
+            .map(|(i, _)| i);
+        match drop {
+            Some(i) => keep[i] = false,
+            None => {
+                if max == 0 {
+                    return String::new();
+                }
+                let mut cut: String = text.chars().take(max - 1).collect();
+                cut.push('…');
+                return cut;
+            }
+        }
+    }
+}
+
 const LOST_TEXT: Color32 = Color32::from_rgb(0xFF, 0x8A, 0x7A);
 const MATH_TEXT: Color32 = Color32::from_rgb(0xFF, 0x99, 0x88);
 /// Memory traces. Drawn dashed on Cartesian panes.
@@ -6545,6 +6675,64 @@ mod tests {
         assert_eq!(pick_cal(&cals, Some("zz"), hf).unwrap().id, "bb");
         assert_eq!(pick_cal(&cals, None, hf).unwrap().id, "bb");
         assert!(pick_cal(&cals, Some("aa"), |s| s.zone == "UHF").is_none());
+    }
+
+        #[test]
+    fn status_fit_keeps_everything_when_wide() {
+        let segs = vec![("A".to_string(), 3), ("BB".to_string(), 1), ("C".to_string(), 2)];
+        assert_eq!(fit_status(&segs, 100), "A  BB  C");
+    }
+
+    #[test]
+    fn status_fit_drops_lowest_priority_first_and_never_overflows() {
+        let segs = vec![
+            ("CH1 START 2 MHz".to_string(), 3),
+            ("AVG 1".to_string(), 1),
+            ("CONT".to_string(), 2),
+            ("CAL".to_string(), 2),
+            ("⚠ CHECK USB".to_string(), u8::MAX),
+        ];
+        let full = fit_status(&segs, 1000);
+        assert!(full.contains("AVG 1"));
+        let t = fit_status(&segs, full.chars().count() - 1);
+        assert!(!t.contains("AVG") && t.contains("CONT") && t.contains("CAL"));
+        // CAL (rightmost of the tie) goes before CONT.
+        let t = fit_status(&segs, "CH1 START 2 MHz  CONT  ⚠ CHECK USB".chars().count());
+        assert_eq!(t, "CH1 START 2 MHz  CONT  ⚠ CHECK USB");
+        let t = fit_status(&segs, 11);
+        assert_eq!(t, "⚠ CHECK USB");
+        for max in 0..60 {
+            assert!(fit_status(&segs, max).chars().count() <= max, "max {max}");
+        }
+        assert_eq!(fit_status(&segs, 5), "⚠ CH…");
+    }
+
+    #[test]
+    fn device_short_is_type_and_port_only() {
+        let mut live = device::Live { connected: true, ..device::Live::default() };
+        assert_eq!(device_short(&live, "/dev/ttyACM0"), "NANOVNA V2 · ttyACM0");
+        live.connected = false;
+        live.lost = true;
+        assert_eq!(device_short(&live, "/dev/ttyACM0"), "DISCONNECTED");
+    }
+
+    #[test]
+    fn status_leds_reflect_link_id_cal_and_warn_in_text() {
+        let mut live = device::Live { connected: true, device_id: Some([0; 12]), id_reliable: false, ..device::Live::default() };
+        let leds = status_leds(&live, cal::CalState::Exact, true, true);
+        assert_eq!(leds[0].color, LED_OK);
+        assert_eq!(leds[1].color, LED_BAD);
+        assert!(leds[1].tip.contains("UNRELIABLE"));
+        assert!(leds[2].tip.contains("restored"));
+        assert_eq!(leds[3].color, LED_OK);
+        live.id_reliable = true;
+        assert_eq!(status_leds(&live, cal::CalState::Uncal, false, false)[1].color, LED_OK);
+        assert_eq!(status_leds(&live, cal::CalState::Uncal, false, false)[2].color, LED_OFF);
+        let lost = device::Live { lost: true, ..device::Live::default() };
+        let leds = status_leds(&lost, cal::CalState::Uncal, false, true);
+        assert_eq!(leds[0].color, LED_BAD);
+        assert_eq!(leds[3].color, LED_OFF);
+        assert!(leds.iter().all(|l| !l.tip.is_empty()));
     }
 
     #[test]
