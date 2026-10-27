@@ -371,6 +371,14 @@ pub fn id_text(id: &[u8; 12], reliable: bool) -> String {
     }
 }
 
+/// Red note when the id reads disagreed or all timed out. A NanoVNA on a
+/// marginal battery and a weak USB hub tends to power cycle mid-read.
+pub const POWER_NOTE: &str = "Device ID unreliable. The NanoVNA may be power cycling: check battery charge and USB hub power, then power cycle the device and reconnect.";
+
+pub fn power_note(live: &Live) -> Option<&'static str> {
+    (live.connected && live.device_id.is_some() && !live.id_reliable).then_some(POWER_NOTE)
+}
+
 /// Result of the voted device id read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IdRead {
@@ -668,6 +676,20 @@ mod tests {
         assert_eq!((got.id, got.reliable), (Z, false));
         let (got, _) = run(vec![Ok(Z), Ok(A), Ok(A)]);
         assert_eq!((got.id, got.reliable), (A, true));
+    }
+
+    #[test]
+    fn the_power_note_shows_only_for_an_unreliable_connected_id() {
+        let mut live = Live { connected: true, device_id: Some(Z), id_reliable: false, ..Live::default() };
+        assert_eq!(power_note(&live), Some(POWER_NOTE));
+        live.id_reliable = true;
+        assert_eq!(power_note(&live), None);
+        live = Live::default();
+        assert_eq!(power_note(&live), None);
+        // Three timeouts give an unreliable id, so the note shows.
+        let (got, _) = run(vec![t(), t(), t()]);
+        live = Live { connected: true, device_id: Some(got.id), id_reliable: got.reliable, ..Live::default() };
+        assert!(power_note(&live).is_some());
     }
 
     #[test]
