@@ -26,12 +26,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub const ROW_HOVER: &str = "Right-click: mark or unmark for recording (● REC).";
+/// Shown only as the REC page watermark on the bottom elbow bar.
 pub const PRIVACY: &str = "Recording radio traffic may be regulated where you are; that is your responsibility. \
 Encrypted traffic is never recorded. Nothing is uploaded.";
-/// Height kept below the timeline for the one-line hint and disclaimer
-/// footer. The selected recording's details live in the Record / Playback
+/// Height kept below the timeline for the one-line usage hint. The
+/// disclaimer is a watermark on the frame's bottom bar. The selected recording's details live in the Record / Playback
 /// dialog, so nothing else is reserved.
-const TIMELINE_RESERVE: f32 = 40.0;
+const TIMELINE_RESERVE: f32 = 24.0;
 /// Lane rows stretch to fill spare height, up to this multiple of LANE_H.
 const LANE_GROW_MAX: f32 = 2.0;
 /// The timeline never shrinks below this many lane rows.
@@ -501,7 +502,6 @@ impl App {
     pub(super) fn page_rec(&mut self, ui: &mut egui::Ui, _snap: &Snapshot) {
         if self.config_path.is_empty() {
             ui.label("Open or save a station first. Recordings live beside the station file.");
-            ui.label(egui::RichText::new(PRIVACY).weak());
             return;
         }
         if self.rec.db.is_none() {
@@ -512,7 +512,6 @@ impl App {
                     drop(db);
                 }
             }
-            ui.label(egui::RichText::new(PRIVACY).weak());
             return;
         }
         self.rec_poll_jobs();
@@ -535,7 +534,7 @@ impl App {
         self.rec_data_window(ui.ctx());
         self.rec_detail_window(ui.ctx());
         self.rec_timeline(ui);
-        ui.label(egui::RichText::new(format!("Click a block to select it and play from that point. Drag pans, wheel over lanes scrolls, wheel over the timeline zooms.  {PRIVACY}")).weak().small());
+        ui.label(egui::RichText::new("Click a block to select it and play from that point. Drag pans, wheel over lanes scrolls, wheel over the timeline zooms.").weak().small());
         if self.rec.player.is_some() || self.rec.job.is_some() || self.rec_icon() == IconState::Writing {
             ui.ctx().request_repaint_after(Duration::from_millis(200));
         }
@@ -1068,6 +1067,8 @@ impl App {
                 gp.text(egui::pos2(x + 2.0, grid.top() + 2.0), egui::Align2::LEFT_TOP, local.format(fmt).to_string(), egui::FontId::monospace(11.0), weak);
             }
             paint_shelf(&painter, egui::Rect::from_min_size(axis.min, egui::vec2(shelf_w, AXIS_H)), bg);
+            let now_w = ui.fonts_mut(|f| f.layout_no_wrap("NOW".into(), egui::FontId::monospace(10.0), weak).size().x);
+            paint_shelf_right(&painter, right_shelf_rect(axis, now_w), NOW_SHELF);
             painter.text(axis.left_center() + egui::vec2(6.0, 0.0), egui::Align2::LEFT_CENTER, "Lane", egui::FontId::monospace(11.0), weak);
         }
         // Wheel: over the opaque shelf it scrolls the lanes (the scroll area
@@ -1220,7 +1221,16 @@ impl App {
                 let now_x = grid.left() + view.x(now, width);
                 if now_x >= grid.left() && now_x <= grid.right() {
                     gp.line_segment([egui::pos2(now_x, grid.top()), egui::pos2(now_x, grid.bottom())], egui::Stroke::new(1.0, egui::Color32::from_rgb(240, 60, 50)));
-                    gp.text(egui::pos2(now_x - 2.0, grid.bottom() - 2.0), egui::Align2::RIGHT_BOTTOM, "NOW", egui::FontId::monospace(10.0), egui::Color32::from_rgb(240, 60, 50));
+                }
+                // Dark red shelf on the right edge, mirroring the lane shelf,
+                // just wide enough for the NOW label. Purely painted: input
+                // still goes to the grid underneath.
+                let now_font = egui::FontId::monospace(10.0);
+                let now_w = ui.fonts_mut(|f| f.layout_no_wrap("NOW".into(), now_font.clone(), egui::Color32::WHITE).size().x);
+                let rshelf = right_shelf_rect(grid.intersect(rect), now_w);
+                paint_shelf_right(&ui.painter_at(rect), rshelf, NOW_SHELF);
+                if now_x >= grid.left() && now_x <= grid.right() {
+                    gp.text(egui::pos2(now_x - 2.0, grid.bottom() - 2.0), egui::Align2::RIGHT_BOTTOM, "NOW", now_font, egui::Color32::from_rgb(255, 90, 75));
                 }
                 if let Some(tip) = block_tip {
                     gresp.on_hover_text(tip);
@@ -1438,7 +1448,6 @@ impl App {
                 delete = true;
             }
         });
-        ui.label(egui::RichText::new(PRIVACY).weak().small());
         ui.separator();
         // Metadata scrolls on its own so the block above never leaves view.
         egui::ScrollArea::vertical().id_salt(("rec-meta-scroll", id)).auto_shrink([false, true]).show(ui, |ui| {
@@ -1635,6 +1644,16 @@ mod tests {
     #[test]
     fn timeline_fills_free_height_with_a_floor() {
         assert_eq!(timeline_viewport_h(800.0), 800.0 - AXIS_H - TIMELINE_RESERVE);
+    }
+
+    #[test]
+    fn right_shelf_is_one_and_a_half_labels_clamped() {
+        assert_eq!(right_shelf_w(18.0), 40.0);
+        assert_eq!(right_shelf_w(40.0), 60.0);
+        assert_eq!(right_shelf_w(200.0), 90.0);
+        assert_eq!(right_shelf_w(f32::NAN), 40.0);
+        let r = right_shelf_rect(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(500.0, 300.0)), 40.0);
+        assert_eq!((r.left(), r.right(), r.height()), (440.0, 500.0, 300.0));
         assert!(timeline_viewport_h(1200.0) > timeline_viewport_h(800.0));
         assert_eq!(timeline_viewport_h(100.0), LANE_H * TIMELINE_MIN_LANES);
         assert_eq!(timeline_viewport_h(f32::INFINITY), LANE_H * 12.0);
@@ -1774,6 +1793,40 @@ pub fn lane_row_h(rows: usize, viewport_h: f32) -> f32 {
         return LANE_H;
     }
     (viewport_h / rows as f32).clamp(LANE_H, LANE_H * LANE_GROW_MAX)
+}
+
+/// Dark red of the right-hand NOW shelf (kin to the armed REC icon's red).
+const NOW_SHELF: egui::Color32 = egui::Color32::from_rgb(72, 10, 8);
+
+/// Right shelf width: 1.5x the NOW label, clamped to 40..90 px.
+pub fn right_shelf_w(label_w: f32) -> f32 {
+    if !label_w.is_finite() {
+        return 40.0;
+    }
+    (label_w * 1.5).clamp(40.0, 90.0)
+}
+
+/// Full-height strip at the right edge of `area`, `right_shelf_w` wide.
+fn right_shelf_rect(area: egui::Rect, label_w: f32) -> egui::Rect {
+    let w = right_shelf_w(label_w).min(area.width());
+    egui::Rect::from_min_max(egui::pos2(area.right() - w, area.top()), area.max)
+}
+
+/// Mirror of `paint_shelf`: opaque at the right edge, fading out leftward.
+fn paint_shelf_right(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let solid_w = rect.width() * timeline::SHELF_OPAQUE_FRAC;
+    let solid = egui::Rect::from_min_max(egui::pos2(rect.right() - solid_w, rect.top()), rect.max);
+    painter.rect_filled(solid, egui::CornerRadius::ZERO, color);
+    let mut mesh = egui::Mesh::default();
+    let clear = egui::Color32::TRANSPARENT;
+    let (x0, x1, y0, y1) = (rect.left(), solid.left(), rect.top(), rect.bottom());
+    mesh.colored_vertex(egui::pos2(x0, y0), clear);
+    mesh.colored_vertex(egui::pos2(x1, y0), color);
+    mesh.colored_vertex(egui::pos2(x1, y1), color);
+    mesh.colored_vertex(egui::pos2(x0, y1), clear);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    painter.add(egui::Shape::mesh(mesh));
 }
 
 fn paint_shelf(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {

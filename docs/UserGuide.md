@@ -385,7 +385,9 @@ REC records HackRF traffic for later playback. It saves the **raw radio data**, 
 
 **Encrypted traffic is never recorded.** An encrypted talkgroup or channel cannot be marked, and a call whose voice decoder reports a non-clear algorithm is discarded, even with a filled key.
 
-Recording radio traffic may be regulated where you are; that is your responsibility. Nothing is uploaded.
+On the REC page, a faint watermark along the frame's bottom bar reads: "Recording radio traffic may be regulated where you are; that is your responsibility. Encrypted traffic is never recorded. Nothing is uploaded." Hover over it to read it at full contrast.
+
+The timeline's right edge carries a dark red shelf, the mirror of the lane-name shelf on the left: opaque at the edge and fading out to the left, just wide enough for the red **NOW** label, which stays readable on top. It is only paint; clicks, drags and the wheel work there as on the rest of the timeline.
 
 ### Marking
 

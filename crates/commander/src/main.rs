@@ -2901,7 +2901,7 @@ impl eframe::App for App {
                 .show(ui, |ui| {
                 // Tune owns the wheel. Plan and Channels own a bandspread click.
                 // A scroll area would take those pointers and move the page.
-                tools::frame(ui, |ui| {
+                let frame_rect = tools::frame(ui, |ui| {
                     if self.page == Page::Tune {
                         self.page_tune(ui, &mut snap);
                     } else if self.page == Page::Plan {
@@ -2921,6 +2921,10 @@ impl eframe::App for App {
                             .show(ui, |ui| self.page_body(ui, &mut snap));
                     }
                 });
+                // REC's legal note rides the bottom elbow's bar, REC page only.
+                if self.page == Page::Rec {
+                    tools::bottom_bar_watermark(ui, frame_rect, rec_ui::PRIVACY);
+                }
             });
         }
 
