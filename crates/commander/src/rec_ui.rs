@@ -28,9 +28,12 @@ use std::time::{Duration, Instant};
 pub const ROW_HOVER: &str = "Right-click: mark or unmark for recording (● REC).";
 pub const PRIVACY: &str = "Recording radio traffic may be regulated where you are; that is your responsibility. \
 Encrypted traffic is never recorded. Nothing is uploaded.";
-/// Room left under the timeline for the detail panel and privacy line.
-/// Height kept below the timeline for the details row, notes, hint and disclaimer.
-const TIMELINE_RESERVE: f32 = 190.0;
+/// Height kept below the timeline for the one-line hint and disclaimer
+/// footer. The selected recording's details live in the Record / Playback
+/// dialog, so nothing else is reserved.
+const TIMELINE_RESERVE: f32 = 40.0;
+/// Lane rows stretch to fill spare height, up to this multiple of LANE_H.
+const LANE_GROW_MAX: f32 = 2.0;
 /// The timeline never shrinks below this many lane rows.
 const TIMELINE_MIN_LANES: f32 = 4.0;
 const LANE_H: f32 = 22.0;
@@ -176,6 +179,8 @@ pub struct RecUi {
     usage: Option<hsrec::storage::Usage>,
     /// Data dialog (storage, archive, drive) open. Session only.
     data_open: bool,
+    /// Record / Playback dialog shown for the selected recording.
+    detail_open: bool,
 }
 
 fn rows_meta(rows: &[cat::RadioRow], id: u64) -> Option<&cat::RadioRow> {
@@ -527,12 +532,9 @@ impl App {
         self.rec_status_row(ui);
         self.rec_job_row(ui);
         self.rec_data_window(ui.ctx());
-        ui.separator();
+        self.rec_detail_window(ui.ctx());
         self.rec_timeline(ui);
-        ui.separator();
-        self.rec_detail(ui);
-        ui.add_space(6.0);
-        ui.label(egui::RichText::new(PRIVACY).weak().small());
+        ui.label(egui::RichText::new(format!("Click a block to select it and play from that point. Drag pans, wheel over lanes scrolls, wheel over the timeline zooms.  {PRIVACY}")).weak().small());
         if self.rec.player.is_some() || self.rec.job.is_some() || self.rec_icon() == IconState::Writing {
             ui.ctx().request_repaint_after(Duration::from_millis(200));
         }
@@ -567,12 +569,6 @@ impl App {
                     .color(egui::Color32::from_rgb(240, 60, 50)),
             );
         }
-        if !self.rec.note.is_empty() {
-            ui.label(egui::RichText::new(&self.rec.note).color(caution()));
-        }
-        if let Some(line) = self.rec.log.last() {
-            ui.label(egui::RichText::new(line).weak());
-        }
     }
 
     fn rec_job_row(&mut self, ui: &mut egui::Ui) {
@@ -600,7 +596,13 @@ impl App {
             .collapsible(false)
             .resizable(false)
             .default_width(420.0)
-            .show(ctx, |ui| self.rec_data_body(ui));
+            .show(ctx, |ui| {
+                self.rec_data_body(ui);
+                if !self.rec.note.is_empty() {
+                    ui.separator();
+                    ui.label(egui::RichText::new(&self.rec.note).color(caution()));
+                }
+            });
         if !open {
             self.rec.data_open = false;
         }
@@ -972,11 +974,11 @@ impl App {
                 view.day(view.start + view.span / 2, 1);
             }
             if ui.button("−").on_hover_text("Zoom out").clicked() {
-                view.zoom(2.0, width / 2.0, width);
+                view.zoom(BUTTON_ZOOM, width / 2.0, width);
                 view.live = false;
             }
             if ui.button("+").on_hover_text("Zoom in").clicked() {
-                view.zoom(0.5, width / 2.0, width);
+                view.zoom(1.0 / BUTTON_ZOOM, width / 2.0, width);
                 view.live = false;
             }
             if ui.button("Fit").on_hover_text("Fit to the most recent recordings").clicked() {
@@ -996,15 +998,30 @@ impl App {
             {
                 self.rec.data_open = !self.rec.data_open;
             }
+            let details = egui::RichText::new("Details").small().weak();
+            if ui
+                .add_enabled(self.rec.selected.is_some(), egui::Button::new(details).selected(self.rec.detail_open))
+                .on_hover_text("Record / Playback dialog for the selected recording")
+                .clicked()
+            {
+                self.rec.detail_open = !self.rec.detail_open;
+            }
+            if let Some((rec, _, _)) = &self.rec.undo {
+                let label = format!("Undo delete of {}", rec.meta.lane());
+                if ui.small_button(label).clicked() {
+                    self.rec_undo();
+                }
+            }
         });
         let blocks = timeline::layout(&recs, &lanes, &view, width, now);
         let subs: Vec<usize> = (0..lanes.len())
             .map(|l| blocks.iter().filter(|b| b.lane == l).map(|b| b.sub + 1).max().unwrap_or(1))
             .collect();
-        let lane_h: Vec<f32> = subs.iter().map(|n| *n as f32 * LANE_H).collect();
+        let viewport_h = timeline_viewport_h(ui.available_height());
+        let row_h = lane_row_h(subs.iter().sum(), viewport_h);
+        let lane_h: Vec<f32> = subs.iter().map(|n| *n as f32 * row_h).collect();
         let lane_top: Vec<f32> = lane_h.iter().scan(0.0, |y, h| { let top = *y; *y += *h; Some(top) }).collect();
         let body_h: f32 = lane_h.iter().sum::<f32>().max(LANE_H * 2.0);
-        let viewport_h = timeline_viewport_h(ui.available_height());
         // Fill the viewport even with few lanes, so the grid takes all free height.
         let body_h = body_h.max(viewport_h);
         let weak = ui.visuals().weak_text_color();
@@ -1045,7 +1062,22 @@ impl App {
         });
         let zoom_scroll = if zoom_here {
             ui.input_mut(|i| {
-                let d = i.smooth_scroll_delta.y;
+                // Raw delta, once per event: the smoothed delta repeats a
+                // notch over several frames, which zoomed tenfold per click.
+                let page = i.content_rect().height();
+                let d: f32 = i
+                    .raw
+                    .events
+                    .iter()
+                    .map(|e| match e {
+                        egui::Event::MouseWheel { unit, delta, .. } => match unit {
+                            egui::MouseWheelUnit::Point => delta.y,
+                            egui::MouseWheelUnit::Line => delta.y * NOTCH_PTS,
+                            egui::MouseWheelUnit::Page => delta.y * page,
+                        },
+                        _ => 0.0,
+                    })
+                    .sum();
                 i.smooth_scroll_delta.y = 0.0;
                 d
             })
@@ -1098,8 +1130,8 @@ impl App {
                 let mut block_tip: Option<String> = None;
                 for b in &blocks {
                     let Some(r) = by_id.get(&b.id) else { continue };
-                    let y = rect.top() + lane_top[b.lane] + b.sub as f32 * LANE_H;
-                    let br = egui::Rect::from_min_max(egui::pos2(grid.left() + b.x0.max(0.0), y + 3.0), egui::pos2(grid.left() + b.x1.min(width), y + LANE_H - 3.0));
+                    let y = rect.top() + lane_top[b.lane] + b.sub as f32 * row_h;
+                    let br = egui::Rect::from_min_max(egui::pos2(grid.left() + b.x0.max(0.0), y + 3.0), egui::pos2(grid.left() + b.x1.min(width), y + row_h - 3.0));
                     if br.width() <= 0.0 {
                         continue;
                     }
@@ -1179,7 +1211,7 @@ impl App {
                     let full = egui::Rect::from_min_size(egui::pos2(rect.left(), y), egui::vec2(width_all, lane_h[i]));
                     let selected = sel_lane.as_deref() == Some(name.as_str());
                     let _ = full;
-                    let cell = egui::Rect::from_min_size(egui::pos2(label_rect.left(), y), egui::vec2(shelf_w * timeline::SHELF_OPAQUE_FRAC, LANE_H));
+                    let cell = egui::Rect::from_min_size(egui::pos2(label_rect.left(), y), egui::vec2(shelf_w * timeline::SHELF_OPAQUE_FRAC, row_h));
                     let resp = ui.interact(cell, ui.scope_id().with(("rec-lane", i)), egui::Sense::click());
                     let ink = if selected || resp.hovered() { egui::Color32::WHITE } else { ui.visuals().text_color() };
                     ui.painter_at(label_rect).text(cell.left_center() + egui::vec2(6.0, 0.0), egui::Align2::LEFT_CENTER, timeline::ellipsize(name, max_chars), egui::FontId::monospace(12.0), ink);
@@ -1201,7 +1233,7 @@ impl App {
         }
         if zoom_scroll.abs() > 0.5 {
             let anchor = wheel_pos.map(|p| p.x - axis.left()).unwrap_or(width).clamp(0.0, width);
-            view.zoom(if zoom_scroll > 0.0 { 0.8 } else { 1.25 }, anchor, width);
+            view.zoom(wheel_zoom_factor(zoom_scroll), anchor, width);
             view.live = false;
         }
         // Store only once there is something to frame, so the first rows fit.
@@ -1213,58 +1245,108 @@ impl App {
                 self.rec.notes_edit = self.rec.rows.iter().find(|r| r.id == id).map(|r| r.notes.clone()).unwrap_or_default();
             }
             self.rec.selected = Some(id);
+            self.rec.detail_open = true;
             // Click plays from the clicked point (seek).
             self.rec_play(id, at);
         }
         self.rec_waveforms(want_wf);
     }
 
-    fn rec_detail(&mut self, ui: &mut egui::Ui) {
-        let Some(id) = self.rec.selected else {
-            ui.label(egui::RichText::new("Click a block to play it from that point. Drag to pan. Wheel over the lane names scrolls lanes; wheel over the timeline zooms.").weak());
-            if let Some((rec, _, _)) = &self.rec.undo {
-                let label = format!("Undo delete of {}", rec.meta.lane());
-                if ui.button(label).clicked() {
-                    self.rec_undo();
-                }
+    /// Label/value rows for the selected recording; missing fields omitted.
+    fn rec_meta_rows(&self, rec: &Recording) -> Vec<(&'static str, String)> {
+        let m = &rec.meta;
+        let local = |utc: &str| {
+            chrono::DateTime::parse_from_rfc3339(utc)
+                .map(|t| t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S %Z").to_string())
+                .unwrap_or_else(|_| if utc.is_empty() { "recording…".into() } else { utc.to_string() })
+        };
+        let mut v: Vec<(&'static str, String)> = Vec::new();
+        let mut put = |k: &'static str, s: String| {
+            if !s.trim().is_empty() {
+                v.push((k, s));
             }
+        };
+        put("Source kind", if m.source_kind == meta::KIND_DEMOD_AUDIO { "demod audio (rig's own audio, not raw)".into() } else { m.source_kind.clone() });
+        put("Source tab", meta::source_label(&m.source));
+        put("Radio", if m.radio_name.is_empty() { String::new() } else { format!("{} (id {})", m.radio_name, m.radio_id) });
+        if m.channel_hz > 0.0 { put("Frequency", format!("{:.4} MHz", m.channel_hz / 1e6)); }
+        if m.centre_hz > 0.0 { put("Capture centre", format!("{:.4} MHz (offset {:+.1} kHz)", m.centre_hz / 1e6, m.offset_hz / 1e3)); }
+        if m.bandwidth_hz > 0.0 { put("Bandwidth", format!("{:.1} kHz", m.bandwidth_hz / 1e3)); }
+        put("Modulation", m.modulation.clone());
+        put("System", m.system.clone());
+        put("Site", m.site.clone());
+        if let Some(tg) = m.talkgroup { put("Talkgroup", format!("{} ({tg})", m.talkgroup_name)); }
+        put("Channel", m.channel_name.clone());
+        if let Some(u) = m.radio_unit_id { put("Radio unit ID", u.to_string()); }
+        put("Start", local(&m.start_utc));
+        put("End", local(&m.end_utc));
+        put("Duration", format!("{:.1} s", m.duration_ms as f64 / 1000.0));
+        let kind = if m.raw_format == "cs16" { "raw IQ" } else { "audio" };
+        put("Sample rate / format", format!("{kind} {} ksps {}", m.sample_rate / 1000, m.raw_format));
+        put("File", self.rec_raw_path(rec).map(|p| p.display().to_string()).unwrap_or_else(|| rec.raw_path.clone()));
+        if m.bytes > 0 { put("Size", format!("{:.1} MB", m.bytes as f64 / 1e6)); }
+        if rec.archived { put("Archive", format!("{} level {}, {:.1} MB", rec.codec, rec.level, rec.compressed_bytes as f64 / 1e6)); }
+        put("Location", rec.location.clone());
+        put("SHA-256", rec.sha256.clone());
+        put("Chain", m.chain.clone());
+        if !m.gains.is_null() { put("Gains", m.gains.to_string()); }
+        if !m.decoder.is_null() { put("Decoder", m.decoder.to_string()); }
+        put("Software", m.sw_version.clone());
+        if m.part > 0 { put("Part", m.part.to_string()); }
+        if m.dropped > 0 { put("Dropped samples", format!("⚠ {} (disk slow)", m.dropped)); }
+        v
+    }
+
+    /// Record / Playback dialog: follows the selection, one at a time.
+    fn rec_detail_window(&mut self, ctx: &egui::Context) {
+        if !self.rec.detail_open {
+            return;
+        }
+        let Some(id) = self.rec.selected else {
+            self.rec.detail_open = false;
             return;
         };
         let Some(rec) = self.rec.rows.iter().find(|r| r.id == id).cloned() else {
             self.rec.selected = None;
+            self.rec.detail_open = false;
             return;
         };
+        let mut open = true;
+        // Fixed title = fixed id: egui keeps its position for the session while the
+        // contents follow the selection.
+        egui::Window::new("Record / Playback")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(480.0)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().max_height(ctx.content_rect().height() * 0.8).show(ui, |ui| self.rec_detail(ui, rec));
+            });
+        if !open {
+            self.rec.detail_open = false;
+        }
+    }
+
+    fn rec_detail(&mut self, ui: &mut egui::Ui, rec: Recording) {
+        let id = rec.id;
         let local = |utc: &str| {
             chrono::DateTime::parse_from_rfc3339(utc)
                 .map(|t| t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string())
                 .unwrap_or_else(|_| if utc.is_empty() { "recording…".into() } else { utc.to_string() })
         };
-        ui.horizontal_wrapped(|ui| {
-            ui.strong(rec.meta.lane());
-            ui.label(format!(
-                "{} → {}  {:.1} s  {:.4} MHz  {}  {}",
-                local(&rec.meta.start_utc),
-                local(&rec.meta.end_utc),
-                rec.meta.duration_ms as f64 / 1000.0,
-                rec.meta.channel_hz / 1e6,
-                rec.meta.modulation,
-                if rec.meta.source_kind == meta::KIND_DEMOD_AUDIO { "DEMOD AUDIO (not raw)" } else { "raw IQ 32 ksps cs16" },
-            ));
-            if !rec.meta.radio_name.is_empty() {
-                ui.label(format!("radio {}", rec.meta.radio_name));
-            }
-            if rec.meta.dropped > 0 {
-                ui.label(egui::RichText::new(format!("⚠ {} samples dropped (disk slow)", rec.meta.dropped)).color(caution()));
-            }
-        });
-        if !rec.meta.decoder_params.is_empty() {
-            let text = rec.meta.decoder_params.iter().map(|(k, v)| format!("{}={v}", k.trim_start_matches("HAMSPOT_"))).collect::<Vec<_>>().join("  ");
-            ui.label(egui::RichText::new(format!("decoder: {text}")).small().weak())
-                .on_hover_text("Saved decoder_params. Replay passes them to the decoder script as HAMSPOT_* environment variables.");
-        }
+        // Header
+        ui.heading(rec.meta.lane());
+        ui.label(format!(
+            "{} → {}   {:.1} s",
+            local(&rec.meta.start_utc),
+            local(&rec.meta.end_utc),
+            rec.meta.duration_ms as f64 / 1000.0
+        ));
+        ui.separator();
+        // Playback
+        ui.strong("Playback");
         let mut star = rec.star;
         let mut protect = rec.protected;
-        let mut delete = false;
         ui.horizontal_wrapped(|ui| {
             let playing = self.rec.player.as_ref().is_some_and(|(pid, _)| *pid == id);
             if playing {
@@ -1276,6 +1358,72 @@ impl App {
             }
             ui.checkbox(&mut star, "★ Star");
             ui.checkbox(&mut protect, "🔒 Protect").on_hover_text("Never removed by overwrite-oldest.");
+            ui.checkbox(&mut self.rec.play_next, "Play next");
+        });
+        ui.horizontal_wrapped(|ui| {
+            let red = egui::Color32::from_rgb(240, 60, 50);
+            if !hsrec::dsp::in_capture(rec.meta.offset_hz) && rec.meta.source_kind != meta::KIND_DEMOD_AUDIO {
+                ui.label(egui::RichText::new("OUT OF BAND").small().strong().color(red));
+            }
+            if self.rec.no_voice.contains(&id) {
+                ui.label(egui::RichText::new("no voice").small().strong().color(caution()));
+            }
+            if rec.meta.emergency { ui.label(egui::RichText::new("EMERGENCY").small().strong().color(red)); }
+            if rec.meta.priority { ui.label(egui::RichText::new("PRIORITY").small()); }
+            if rec.archived { ui.label(egui::RichText::new("archived (zst)").small()); }
+            if rec.offline() { ui.label(egui::RichText::new("offline").small()); }
+            if rec.missing { ui.label(egui::RichText::new("MISSING").small().color(red)); }
+        });
+        // One status line: the latest transport / action message.
+        if !self.rec.note.is_empty() {
+            ui.label(egui::RichText::new(&self.rec.note).color(caution()));
+        }
+        ui.separator();
+        // Metadata
+        let rows = self.rec_meta_rows(&rec);
+        ui.horizontal(|ui| {
+            ui.strong("Metadata");
+            if ui.small_button("📋 Copy").on_hover_text("Copy all metadata and decoder parameters").clicked() {
+                let mut text: Vec<String> = vec![rec.meta.lane()];
+                text.extend(rows.iter().map(|(k, v)| format!("{k}: {v}")));
+                text.extend(rec.meta.decoder_params.iter().map(|(k, v)| format!("{k}={v}")));
+                ui.ctx().copy_text(text.join("\n"));
+            }
+        });
+        egui::Grid::new(("rec-meta", id)).num_columns(2).striped(true).spacing([12.0, 2.0]).show(ui, |ui| {
+            for (k, v) in &rows {
+                ui.label(egui::RichText::new(*k).weak());
+                ui.add(egui::Label::new(v).wrap());
+                ui.end_row();
+            }
+        });
+        if !rec.meta.decoder_params.is_empty() {
+            egui::CollapsingHeader::new(format!("Decoder parameters ({})", rec.meta.decoder_params.len()))
+                .id_salt("rec-decoder-params")
+                .show(ui, |ui| {
+                    ui.label(egui::RichText::new("Replay passes these to the decoder script as environment variables.").small().weak());
+                    egui::Grid::new(("rec-params", id)).num_columns(2).striped(true).show(ui, |ui| {
+                        for (k, v) in &rec.meta.decoder_params {
+                            ui.monospace(k);
+                            ui.monospace(v);
+                            ui.end_row();
+                        }
+                    });
+                });
+        }
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("Notes");
+            let r = ui.add(egui::TextEdit::singleline(&mut self.rec.notes_edit).desired_width(f32::INFINITY));
+            if r.lost_focus() && self.rec.notes_edit != rec.notes {
+                if let Some(db) = &self.rec.db {
+                    let _ = db.set_notes(id, &self.rec.notes_edit);
+                }
+                self.rec_reload(true);
+            }
+        });
+        let mut delete = false;
+        ui.horizontal_wrapped(|ui| {
             if ui.button("Export WAV…").on_hover_text("Demodulates now and writes a WAV. The WAV is not kept by REC.").clicked() {
                 self.rec_export_wav(&rec);
             }
@@ -1299,16 +1447,8 @@ impl App {
                 delete = true;
             }
         });
-        ui.horizontal(|ui| {
-            ui.label("Notes");
-            let r = ui.add(egui::TextEdit::singleline(&mut self.rec.notes_edit).desired_width(400.0));
-            if r.lost_focus() && self.rec.notes_edit != rec.notes {
-                if let Some(db) = &self.rec.db {
-                    let _ = db.set_notes(id, &self.rec.notes_edit);
-                }
-                self.rec_reload(true);
-            }
-        });
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new(PRIVACY).weak().small());
         let mut changed = false;
         if let Some(db) = &self.rec.db {
             if star != rec.star {
@@ -1354,7 +1494,7 @@ impl App {
         self.rec.waveforms.remove(&rec.id);
         self.rec.undo = Some((rec.clone(), trash, Instant::now()));
         self.rec.selected = None;
-        self.rec.note = format!("Deleted {}. Undo is below for 60 s.", rec.meta.lane());
+        self.rec.note = format!("Deleted {}. Undo is in the toolbar for 60 s.", rec.meta.lane());
         self.rec_reload(true);
     }
 
@@ -1432,6 +1572,35 @@ mod tests {
     }
 
     #[test]
+    fn wheel_zoom_is_fine_clamped_and_anchored() {
+        let notch = wheel_zoom_factor(-NOTCH_PTS);
+        assert!((notch - 1.18).abs() < 1e-9);
+        assert!((wheel_zoom_factor(NOTCH_PTS) * notch - 1.0).abs() < 1e-9);
+        assert!((wheel_zoom_factor(-4.0) - 1.0).abs() < 0.02);
+        assert_eq!(wheel_zoom_factor(-10_000.0), MAX_FRAME_ZOOM);
+        assert_eq!(wheel_zoom_factor(10_000.0), 1.0 / MAX_FRAME_ZOOM);
+        assert_eq!(wheel_zoom_factor(f32::NAN), 1.0);
+        let mut v = View { start: 1_000_000, span: 60_000, live: false };
+        let (w, x) = (1000.0, 250.0);
+        let before = v.t(x, w);
+        v.zoom(wheel_zoom_factor(NOTCH_PTS), x, w);
+        assert!((v.t(x, w) - before).abs() <= 1);
+        assert!(v.span < 60_000);
+        for _ in 0..200 { v.zoom(wheel_zoom_factor(NOTCH_PTS), x, w); }
+        assert_eq!(v.span, timeline::MIN_SPAN_MS);
+    }
+
+    #[test]
+    fn lane_rows_grow_to_fill_but_cap() {
+        assert_eq!(lane_row_h(0, 500.0), LANE_H);
+        assert_eq!(lane_row_h(4, 500.0), LANE_H * LANE_GROW_MAX);
+        assert_eq!(lane_row_h(100, 500.0), LANE_H);
+        let h = lane_row_h(15, 500.0);
+        assert!(h > LANE_H && h < LANE_H * LANE_GROW_MAX && (h * 15.0 - 500.0).abs() < 0.01);
+        assert_eq!(lane_row_h(3, f32::INFINITY), LANE_H);
+    }
+
+    #[test]
     fn timeline_fills_free_height_with_a_floor() {
         assert_eq!(timeline_viewport_h(800.0), 800.0 - AXIS_H - TIMELINE_RESERVE);
         assert!(timeline_viewport_h(1200.0) > timeline_viewport_h(800.0));
@@ -1504,6 +1673,35 @@ pub fn timeline_viewport_h(avail: f32) -> f32 {
         return LANE_H * 12.0;
     }
     (avail - AXIS_H - TIMELINE_RESERVE).max(min)
+}
+
+/// One toolbar −/+ step.
+pub const BUTTON_ZOOM: f64 = 1.5;
+/// Points of wheel delta in one mouse notch (egui's line scroll speed).
+const NOTCH_PTS: f32 = 40.0;
+/// Span change per notch (18 %).
+const NOTCH_ZOOM: f64 = 1.18;
+/// Largest span change from one frame's wheel input.
+const MAX_FRAME_ZOOM: f64 = 1.5;
+
+/// Span multiplier for a wheel delta (points, + = away from you = zoom in).
+/// Exponential, so touchpad deltas zoom proportionally finer; clamped so a
+/// burst of notches never jumps more than MAX_FRAME_ZOOM in one frame.
+pub fn wheel_zoom_factor(delta_y: f32) -> f64 {
+    if !delta_y.is_finite() {
+        return 1.0;
+    }
+    let k = NOTCH_ZOOM.ln() / NOTCH_PTS as f64;
+    (-(delta_y as f64) * k).exp().clamp(1.0 / MAX_FRAME_ZOOM, MAX_FRAME_ZOOM)
+}
+
+/// Lane row height: the base height, grown to fill the viewport when there
+/// are few rows (capped at LANE_GROW_MAX x), so the area looks filled.
+pub fn lane_row_h(rows: usize, viewport_h: f32) -> f32 {
+    if rows == 0 || !viewport_h.is_finite() {
+        return LANE_H;
+    }
+    (viewport_h / rows as f32).clamp(LANE_H, LANE_H * LANE_GROW_MAX)
 }
 
 fn paint_shelf(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {

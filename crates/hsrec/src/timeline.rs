@@ -11,8 +11,8 @@ pub fn ms_to_utc(ms: i64) -> String {
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
-pub const MIN_SPAN_MS: i64 = 10_000;
-pub const MAX_SPAN_MS: i64 = 7 * 86_400_000;
+pub const MIN_SPAN_MS: i64 = 500;
+pub const MAX_SPAN_MS: i64 = 30 * 86_400_000;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct View {
