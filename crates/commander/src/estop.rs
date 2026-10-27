@@ -127,6 +127,7 @@ impl State {
         }
     }
 
+    #[allow(dead_code)] // used by tests
     pub fn all_settled(&self) -> bool {
         self.devices.iter().all(|d| d.outcome.settled())
     }

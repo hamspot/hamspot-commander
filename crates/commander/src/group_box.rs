@@ -78,6 +78,7 @@ pub struct Layout {
     pub slot: Option<Rect>,
 }
 
+#[allow(dead_code)] // used by tests
 pub fn layout(left: f32, top: f32, width: f32, content_h: f32, m: &Metrics) -> Layout {
     layout_with_slot(left, top, width, content_h, m, 0.0)
 }
