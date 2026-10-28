@@ -23,3 +23,12 @@ The octagon radius is about half the text height, kept 2 px clear of the border.
 The fixed 24 px `BUTTON_H` is gone, and the Config E-STOP group bars went back from
 28 px (r_out 16) to the normal 16 px (r_out 12) `Metrics::default()`. The tan top bar
 and the Tools tab row were not enlarged for it.
+
+## HF data decode window (#217)
+
+- Code lives in `crates/commander/src/hfdata/`. One **HF Data** page (not one window per decoder) with mode toggles; a tabbed or per-decoder split can come later.
+- Plug-in point: `registry::DecodeMode` (turns one decoder stdout line into a `Decode`) plus a `Factory` registered with `Registry::register`. `Session` drains an `mpsc::Receiver<String>` of decoder lines into the shared `DecodeList`. The rxpipe/patch bay wiring that feeds that channel belongs to the first mode issue (#206) and #171/#172.
+- `registry::parse_wsjt_line` parses `HHMMSS SNR DT FREQ ~ MSG`; time of day is resolved to the latest instant not in the future (midnight rollover). Rows stamped more than 2 s ahead are refused and counted on screen.
+- Slots count from the Unix epoch; lengths must divide a UTC day (`SlotLen::new`).
+- Clock check: `chronyc -c tracking`, then `timedatectl`, on a thread once a minute. Warn above 1.0 s, when unsynchronised, or when neither answers.
+- Presets: `share/hfdata/presets.json` (embedded, `deny_unknown_fields`, no paths). All `checked: false`. Several common dials sit in the ARRL plan's CW segments (e.g. FT8 7.074, FT4 7.0475, WSPR 7.0386); the page states the segment rather than hiding it.

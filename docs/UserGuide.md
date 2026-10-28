@@ -15,7 +15,7 @@ The program is licensed under the GNU General Public License, version 3 or later
 7. [Channels and scanning](#ch7)
 8. [Trunked systems: Talkgroups, Radio IDs and Keys](#ch8)
 9. [REC: recording and playback](#ch9)
-10. [Meters, Levels and Timers](#ch10)
+10. [Meters, Levels, Timers and HF Data](#ch10)
 11. [Config: radios, audio and automation](#ch11)
 12. [Tools](#ch12)
 13. [Pipe files](#ch13)
@@ -173,7 +173,7 @@ Reboot into the persistent entry again and check that your station is still ther
 
 ## 4.1 Page row
 
-The top of the window is one row of page tabs. The default order is **Tune**, **Plan**, **Channels**, then any **TG** and **ID** tabs, then **REC**, **Meters**, **Timers**, **Levels**, **Keys**, **Tools** and **Config**.
+The top of the window is one row of page tabs. The default order is **Tune**, **Plan**, **Channels**, then any **TG** and **ID** tabs, then **REC**, **HF Data**, **Meters**, **Timers**, **Levels**, **Keys**, **Tools** and **Config**.
 
 - A radio that follows a trunked system adds a **TG** tab (its talkgroups) and, once radios have been heard, an **ID** tab. The label is the radio's name plus TG or ID, for example `HackRF TG`.
 - **Rearrange** tabs by dragging one off the row and dropping it on another tab. A small sideways nudge still counts as a click. The order is saved in the station file.
@@ -626,7 +626,7 @@ Hamlib and GQRX radios give only demodulated audio, and REC does not record them
 
 <a id="ch10"></a>
 
-# 10. Meters, Levels and Timers
+# 10. Meters, Levels, Timers and HF Data
 
 ## 10.1 Meters
 
@@ -650,6 +650,19 @@ Sliders for AF gain, RF gain, AGC, RF power, noise reduction, IF shift, filter w
 Station clocks at fixed offsets (no daylight saving time), a 10-minute **ID timer** that warns you to identify, a **countdown** (click +1 min, double-click +5 min, triple-click +10 min), and a **stopwatch** with laps. **Copy time** copies a timestamp.
 
 <!-- screenshot: timers-01 — Station clocks and timers. -->
+
+## 10.4 HF Data
+
+The **HF Data** page is the shared window for HF data modes such as FT8, FT4, WSPR and JS8. It receives only; nothing here transmits.
+
+- **UTC Slot Clock.** The time in UTC, and a bar for the current slot of the chosen mode: FT8 and JS8 use 15 s slots, FT4 7.5 s and WSPR 2 minutes. The bar says whether the slot is even or odd, when it started and how long is left.
+- **Clock check.** Slotted modes need the computer clock within about one second of UTC. Commander asks chrony (or, failing that, timedatectl) once a minute and prints the answer, for example `Clock OK: offset +0.003 s (chrony)`. A clock more than 1 s off, one that is not synchronised, or one that cannot be checked shows a line starting **CLOCK WARNING** that says why.
+- **Mode.** One toggle per mode (● on, ○ off). Choosing a mode changes the slot bar, the presets and the decode list source.
+- **Dial Presets.** The usual dial frequencies for the chosen mode. Click one to tune the radio there and set USB. Beside each preset is where it falls in the loaded band plan (for example `40 m CW, CW segment (not marked digital)`) and, until checked against a published list, **UNVERIFIED frequency**. If the radio is offline the buttons are greyed and a line says so.
+- **Decodes.** Newest slot first, then by audio offset: UTC, signal-to-noise in dB, time offset (DT), audio offset in Hz above the dial, mode and message. Repeats of the same message in the same slot are shown once. **Clear list** empties the list (nothing is saved, so nothing is lost). The list holds the latest 500 rows.
+- **No decoder yet.** This version has no HF data decoders. The Decodes box says `No FT8 decoder in this version of Commander` (or the mode you chose). The clock, slot bar and presets work without one.
+
+Decoded text is only shown. Demodulated audio is never saved.
 
 ---
 
