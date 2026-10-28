@@ -3017,7 +3017,7 @@ impl eframe::App for App {
                 // Every main page carries the E-STOP at the right end of its
                 // tan top bar (issue #198; Tune is the reference placement).
                 // REC's in-frame view controls share the same gap, to its left.
-                let estop_w = estop::button_width(estop::engaged()) + 16.0;
+                let estop_w = estop::button_width(ui, estop::engaged()) + 16.0;
                 let slot_w = Some(in_frame.map(rec_ui::bar_slot_width).unwrap_or(0.0) + estop_w);
                 let (frame_rect, slot) = tools::frame_with_slot(ui, slot_w, |ui| {
                     if self.page == Page::Tune {

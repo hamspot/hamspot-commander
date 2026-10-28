@@ -293,29 +293,20 @@ impl Chord {
 
 // ---- Widget ----
 
-/// Standard egui button height for text `text_h` tall: the same rule
-/// `egui::Button` uses (`max(interact_size.y, text + 2 * button_padding.y)`).
-pub fn button_height(interact_y: f32, text_h: f32, pad_y: f32) -> f32 {
-    interact_y.max(text_h + 2.0 * pad_y)
+/// The font of the app's standard buttons: the LCARS tab/nav buttons
+/// (`rustcars::lcars_button`) draw their labels in Antonio `header_size`
+/// (22 pt). E-STOP and RELEASE use exactly this font (#200).
+pub fn std_button_font(_ui: &egui::Ui) -> egui::FontId {
+    egui::FontId::proportional(rustcars::LcarsTheme::default().header_size)
 }
 
-/// The font a plain `ui.button("…")` really draws with. In egui 0.37 a
-/// `&str`/`RichText` label resolves through `FontSelection::Default`
-/// (override font, else override text style, else **Body**), so with the
-/// rustcars theme that is Antonio 15 pt, not the 22 pt `TextStyle::Button`.
-/// (The 22 pt Button style was what inflated the old E-STOP, #200.)
-pub fn std_button_font(ui: &egui::Ui) -> egui::FontId {
-    egui::FontSelection::Default.resolve(ui.style())
-}
-
-/// THE height of the E-STOP and RELEASE buttons (#200): the height a plain
-/// `ui.button("…")` gets in this `ui` (its font's one-line galley height plus
-/// `2 * button_padding.y`, at least `interact_size.y`). One function for both
-/// buttons and every placement, so they cannot drift. 27 px with the theme.
-pub fn std_button_height(ui: &egui::Ui) -> f32 {
-    let g = ui.painter().layout_no_wrap("E".into(), std_button_font(ui), egui::Color32::BLACK);
-    let sp = ui.spacing();
-    button_height(sp.interact_size.y, g.size().y, sp.button_padding.y)
+/// THE height of the E-STOP and RELEASE buttons (#200): the height of the
+/// app's standard buttons, the LCARS tabs, which are `bar_thin` (40 px) tall,
+/// the same as the tan top bar the E-STOP sits in. One value for both buttons.
+/// (The previous attempt used a plain `ui.button` height, 25-27 px, which on
+/// screen looked tiny next to the 40 px tabs.)
+pub fn std_button_height(_ui: &egui::Ui) -> f32 {
+    rustcars::LcarsTheme::default().bar_thin
 }
 
 /// Corner radius of the E-STOP and RELEASE buttons: square, as David asked.
@@ -344,9 +335,26 @@ pub fn octagon_points(c: egui::Pos2, r: f32) -> Vec<egui::Pos2> {
         .collect()
 }
 
-/// Width the button needs (for reserving a slot in a bar).
-pub fn button_width(engaged: bool) -> f32 {
-    if engaged { 250.0 } else { 104.0 }
+fn galley_w(ui: &egui::Ui, text: &str, font: egui::FontId) -> f32 {
+    ui.painter().layout_no_wrap(text.into(), font, egui::Color32::BLACK).size().x
+}
+
+fn square_w(ui: &egui::Ui, label: &str, octagon: bool) -> f32 {
+    let font = std_button_font(ui);
+    let text_h = ui.painter().layout_no_wrap("E".into(), font.clone(), egui::Color32::BLACK).size().y;
+    let r = octagon_radius(std_button_height(ui), text_h);
+    let icon = if octagon { 2.0 * r + 4.0 } else { 0.0 };
+    galley_w(ui, label, font) + icon + 2.0 * ui.spacing().button_padding.x
+}
+
+/// Width the control needs (for reserving a slot in a bar), measured with
+/// the real fonts. Engaged includes RELEASE. Nothing else sits in the bar.
+pub fn button_width(ui: &egui::Ui, engaged: bool) -> f32 {
+    if engaged {
+        square_w(ui, "E-STOP ENGAGED", true) + square_w(ui, "RELEASE", false) + 4.0
+    } else {
+        square_w(ui, "E-STOP", true)
+    }
 }
 
 /// One square, bordered button of [`std_button_height`] with the theme's
@@ -398,7 +406,6 @@ pub fn button(ui: &mut egui::Ui) -> bool {
     }
     if let Some(rel) = rel {
         let st = snapshot();
-        let failed = st.devices.iter().filter(|d| !d.outcome.settled()).count();
         let rel = rel.on_hover_ui(|ui| {
             ui.label("Release: back to normal operation. Nothing is keyed or moved by it.");
             if st.devices.is_empty() {
@@ -410,9 +417,6 @@ pub fn button(ui: &mut egui::Ui) -> bool {
         });
         if rel.clicked() {
             release();
-        }
-        if failed > 0 {
-            ui.label(format!("{failed} not confirmed"));
         }
     }
     pressed
@@ -586,14 +590,10 @@ mod tests {
     }
 
     #[test]
-    fn button_is_standard_height() {
-        let st = egui::Style::default();
-        let (iy, py) = (st.spacing.interact_size.y, st.spacing.button_padding.y);
-        // egui's default button: 18 px for 14 px-ish text.
-        assert_eq!(button_height(iy, 12.0, py), iy);
-        assert_eq!(button_height(iy, 20.0, py), 20.0 + 2.0 * py);
-        let h = button_height(iy, 14.0, py);
-        let r = octagon_radius(h, 14.0);
+    fn octagon_fits_the_tab_height() {
+        let t = rustcars::LcarsTheme::default();
+        let h = t.bar_thin;
+        let r = octagon_radius(h, 30.0);
         assert!(2.0 * r <= h - 4.0, "octagon not clipped");
         assert!(r >= 2.0);
     }
@@ -616,28 +616,57 @@ mod tests {
         out.textures_delta.clear();
     }
 
+    /// Font sizes of every text shape painted in `rect` this frame.
+    fn text_sizes_in(shapes: &[egui::epaint::ClippedShape], rect: egui::Rect) -> Vec<f32> {
+        let mut v = Vec::new();
+        for c in shapes {
+            if let egui::Shape::Text(t) = &c.shape {
+                if rect.contains(t.pos + egui::vec2(1.0, 1.0)) {
+                    for row in &t.galley.rows {
+                        for g in &row.glyphs {
+                            v.push(g.font_ascent + 0.0 * g.font_height);
+                        }
+                    }
+                }
+            }
+        }
+        v
+    }
+
     #[test]
-    fn estop_and_release_match_a_plain_button_headless() {
+    fn estop_and_release_match_the_tab_buttons_headless() {
+        // The app's standard button is the LCARS tab (CONFIG, KEYS…):
+        // rustcars::lcars_button, bar_thin tall, header_size text.
         let ctx = themed_ctx();
+        let t = rustcars::LcarsTheme::default();
         let mut got = None;
-        // Two frames: fonts are loaded at the first frame's start.
         for _ in 0..2 {
-            run(&ctx, &mut |ui| {
-                let plain = ui.button("CONFIG").rect;
-                let std_h = std_button_height(ui);
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 400.0))),
+                ..Default::default()
+            };
+            let mut rects = None;
+            let mut out = ctx.run_ui(input, |ui| {
+                let tab = rustcars::lcars_button(ui, &t, "CONFIG", rustcars::palette::TAN, egui::vec2(120.0, t.bar_thin), rustcars::Cap::None, true).rect;
                 let (stop, rel) = buttons(ui, true);
                 let armed = buttons(ui, false).0.rect;
-                got = Some((plain, std_h, stop.rect, rel.unwrap().rect, armed));
+                rects = Some((tab, stop.rect, rel.unwrap().rect, armed));
             });
+            let (tab, stop, rel, armed) = rects.unwrap();
+            let sizes = |r| text_sizes_in(&out.shapes, r);
+            out.textures_delta.clear();
+            got = Some((tab, stop, rel, armed, sizes(tab), sizes(stop), sizes(rel), sizes(armed)));
         }
-        let (plain, std_h, stop, rel, armed) = got.unwrap();
-        eprintln!("plain {:?} std {std_h} stop {:?} release {:?} armed {:?}", plain.size(), stop.size(), rel.size(), armed.size());
-        assert!((plain.height() - std_h).abs() < 0.01, "helper {std_h} vs ui.button {}", plain.height());
-        assert!((stop.height() - plain.height()).abs() < 0.01);
-        assert!((rel.height() - plain.height()).abs() < 0.01);
-        assert!((armed.height() - plain.height()).abs() < 0.01);
-        assert_eq!(stop.height(), rel.height());
-        // Same row, same vertical centre.
+        let (tab, stop, rel, armed, ft, fs, fr, fa) = got.unwrap();
+        eprintln!("tab {:?} stop {:?} release {:?} armed {:?}", tab.size(), stop.size(), rel.size(), armed.size());
+        eprintln!("ascent tab {:?} stop {:?} release {:?} armed {:?}", ft.first(), fs.first(), fr.first(), fa.first());
+        for r in [stop, rel, armed] {
+            assert!((r.height() - tab.height()).abs() < 0.01, "{} vs tab {}", r.height(), tab.height());
+        }
+        assert!(!ft.is_empty() && !fs.is_empty() && !fr.is_empty() && !fa.is_empty());
+        for f in fs.iter().chain(&fr).chain(&fa) {
+            assert!((f - ft[0]).abs() < 0.01, "label font differs from tab font");
+        }
         assert!((stop.center().y - rel.center().y).abs() < 0.01);
     }
 
@@ -647,7 +676,7 @@ mod tests {
         let mut got = None;
         for _ in 0..2 {
             run(&ctx, &mut |ui| {
-                let bar = egui::Rect::from_min_size(egui::pos2(0.0, 100.0), egui::vec2(600.0, 44.0));
+                let bar = egui::Rect::from_min_size(egui::pos2(0.0, 100.0), egui::vec2(600.0, 40.0));
                 let r = ui
                     .scope_builder(
                         egui::UiBuilder::new().max_rect(bar).layout(egui::Layout::right_to_left(egui::Align::Center)),

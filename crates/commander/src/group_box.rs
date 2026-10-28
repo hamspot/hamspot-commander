@@ -143,7 +143,7 @@ pub fn estop_metrics() -> Metrics {
 /// [`group_box`] with the shared E-STOP at the right end of its bar.
 pub fn group_box_estop<R>(ui: &mut Ui, title: &str, color: Color32, add: impl FnOnce(&mut Ui) -> R) -> R {
     let m = estop_metrics();
-    let w = crate::estop::button_width(crate::estop::engaged());
+    let w = crate::estop::button_width(ui, crate::estop::engaged());
     group_box_slot(ui, &m, title, color, w, add, |ui| {
         crate::estop::button(ui);
     })

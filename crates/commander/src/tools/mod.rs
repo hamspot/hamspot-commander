@@ -201,7 +201,7 @@ impl Tools {
         // Hardware screens (Rotator moves a motor, NanoVNA emits RF stimulus)
         // carry the E-STOP at the right end of this row (issue #198).
         let estop = matches!(self.screen, Screen::Rotator | Screen::NanoVna);
-        let estop_w = crate::estop::button_width(crate::estop::engaged()) + 8.0;
+        let estop_w = crate::estop::button_width(ui, crate::estop::engaged()) + 8.0;
         ui.horizontal(|ui| {
         let max_w = if estop { (ui.available_width() - estop_w).max(0.0) } else { ui.available_width() };
         egui::ScrollArea::horizontal()
