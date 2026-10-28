@@ -13,7 +13,7 @@ path = "src/main.rs"
 [dependencies]
 eframe = { version = "0.37", features = ["default_fonts", "glow", "persistence"] }
 egui = "0.37"
-rustcars = { git = "https://github.com/webaugur/rustcars", rev = "233158e7924a826178a0cd59c61686b6f3632678" }
+rustcars = { git = "https://github.com/webaugur/rustcars", rev = "873aa249e19376b91d7ca502e4628489e2df3711" }
 rusqlite = { version = "0.40", features = ["bundled"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 rigctl = { path = "../rigctl" }
