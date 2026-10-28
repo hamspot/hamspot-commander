@@ -645,6 +645,16 @@ pub fn bottom_bar_run(frame_rect: egui::Rect) -> egui::Rect {
     )
 }
 
+/// The bottom elbow's end cap (right of [`bottom_bar_run`]).
+pub fn bottom_end_cap(frame_rect: egui::Rect) -> egui::Rect {
+    let t = LcarsTheme::default();
+    let cap_len = 48.0;
+    egui::Rect::from_min_max(
+        egui::pos2(frame_rect.right() - cap_len, frame_rect.bottom() - t.bar_thin),
+        frame_rect.right_bottom(),
+    )
+}
+
 /// Split `text` at the word boundary nearest its middle. Never cuts a word.
 pub fn split_two_lines(text: &str) -> (String, String) {
     let mid = text.len() / 2;

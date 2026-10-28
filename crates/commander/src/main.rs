@@ -64,8 +64,17 @@ fn cfg_colour(name: &str) -> egui::Color32 {
 
 /// Thin titled elbow around one Config group. Its 16 px bar never carries
 /// the E-STOP: the 40 px page bar above already does on every page (#200).
+/// Every group is detachable: its end pill (DETACH/ATTACH) moves the group
+/// and everything in it to its own window.
 fn cfg_group<R>(ui: &mut egui::Ui, name: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    group_box::group_box(ui, name, cfg_colour(name), add)
+    group_box::GroupBox::new(name, cfg_colour(name))
+        .detachable(("config-group", name))
+        .show(ui, add)
+}
+
+/// Memory id of the whole Config page's detach state.
+fn config_page_detach_id() -> egui::Id {
+    group_box::DetachState::id("config-page")
 }
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -3052,6 +3061,17 @@ impl eframe::App for App {
                         },
                     );
                 }
+                // Config's whole page detaches from the bottom elbow's end pill.
+                if self.page == Page::Config {
+                    let id = config_page_detach_id();
+                    let mut st = group_box::DetachState::load(ui.ctx(), id);
+                    let cap = tools::bottom_end_cap(frame_rect);
+                    let pill = group_box::detach_pill(ui, cap, id.with("page-pill"), rustcars::palette::TAN, "Config", st.detached);
+                    if pill.clicked() {
+                        st.toggle();
+                        st.store(ui.ctx(), id);
+                    }
+                }
                 // REC's legal note rides the bottom elbow's bar, REC page only.
                 if self.page == Page::Rec {
                     tools::bottom_bar_watermark(ui, frame_rect, rec_ui::PRIVACY);
@@ -3076,6 +3096,7 @@ impl eframe::App for App {
         if self.amp_edit.is_some() {
             self.amplifier_window(&ctx);
         }
+        self.show_config_window(&ctx, &mut snap);
         self.show_meter_window(&ctx, &snap);
         self.show_tools_window(&ctx);
         self.show_vna_wizard(&ctx);
@@ -3102,7 +3123,13 @@ impl App {
             Page::Levels => self.page_levels(ui, snap),
             Page::Rec => self.page_rec(ui, snap),
             Page::HfData => self.page_hfdata(ui, snap),
-            Page::Config => self.page_config(ui, snap),
+            Page::Config => {
+                if group_box::DetachState::load(ui.ctx(), config_page_detach_id()).detached {
+                    ui.label(group_box::detached_stub_text("Config"));
+                } else {
+                    self.page_config(ui, snap);
+                }
+            }
         }
     }
 
@@ -8503,6 +8530,36 @@ impl App {
         ctx.request_repaint_of(viewport);
     }
 
+    /// The whole Config page in its own window while it is detached. Groups
+    /// detached on their own keep their own windows.
+    fn show_config_window(&mut self, ctx: &egui::Context, snap: &mut Snapshot) {
+        let id = config_page_detach_id();
+        let mut st = group_box::DetachState::load(ctx, id);
+        if !st.detached {
+            // A group detached on its own keeps its window on every page.
+            // Off the Config page, run the page hidden so those windows draw;
+            // attached groups there are not painted and take no clicks.
+            let any = CONFIG_GROUPS.iter().any(|(name, _)| {
+                group_box::DetachState::load(ctx, group_box::DetachState::id(("config-group", *name))).detached
+            });
+            if any && self.page != Page::Config {
+                egui::Area::new(egui::Id::NULL.with("config-hidden-host"))
+                    .fixed_pos(egui::pos2(0.0, 0.0))
+                    .interactable(false)
+                    .show(ctx, |ui| {
+                        ui.set_invisible();
+                        self.page_config(ui, snap);
+                    });
+            }
+            return;
+        }
+        let m = group_box::Metrics::default();
+        group_box::detached_window(ctx, id, &m, "Config", rustcars::palette::TAN, &mut st, |ui| {
+            self.page_config(ui, snap);
+        });
+        st.store(ctx, id);
+    }
+
     /// Open the meters as a native window when they are detached.
     /// The builder's position is fixed for the life of that window.
     fn show_meter_window(&mut self, ctx: &egui::Context, snap: &Snapshot) {
@@ -12350,6 +12407,67 @@ fn fixed_slider(ui: &mut egui::Ui, label: &str, value: f64) {
 
 #[cfg(test)]
 mod config_order_tests {
+    /// Every Config group detaches on its own and with the page (real font
+    /// and theme). Bodies run once a frame; groups never overlap.
+    #[test]
+    fn config_groups_detach_alone_and_with_the_page() {
+        use crate::group_box::{DetachState, detached_window, Metrics};
+        let ctx = egui::Context::default();
+        rustcars::install_lcars_font(&ctx);
+        rustcars::apply_theme(&ctx, &rustcars::LcarsTheme::default());
+        let names: Vec<&str> = crate::CONFIG_GROUPS.iter().map(|(n, _)| *n).collect();
+        let page_id = crate::config_page_detach_id();
+        let run = |ctx: &egui::Context| {
+            let mut runs = vec![0; names.len()];
+            let mut tops = Vec::new();
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 3000.0))),
+                    ..Default::default()
+                },
+                |ui| {
+                    let mut body = |ui: &mut egui::Ui, tops: &mut Vec<(f32, f32)>| {
+                        for (i, n) in names.iter().enumerate() {
+                            let before = ui.cursor().top();
+                            crate::cfg_group(ui, n, |ui| {
+                                runs[i] += 1;
+                                ui.label("row");
+                                ui.label("row");
+                            });
+                            tops.push((before, ui.min_rect().bottom()));
+                        }
+                    };
+                    let mut st = DetachState::load(ui.ctx(), page_id);
+                    if st.detached {
+                        ui.label(crate::group_box::detached_stub_text("Config"));
+                        let ctx = ui.ctx().clone();
+                        detached_window(&ctx, page_id, &Metrics::default(), "Config", rustcars::palette::TAN, &mut st, |ui| body(ui, &mut tops));
+                        st.store(&ctx, page_id);
+                    } else {
+                        body(ui, &mut tops);
+                    }
+                },
+            );
+            out.textures_delta.clear();
+            assert!(runs.iter().all(|&r| r == 1), "each group body once: {runs:?}");
+            for w in tops.windows(2) {
+                assert!(w[1].0 >= w[0].1 - 0.5, "groups overlap: {tops:?}");
+            }
+        };
+        let set = |id, d: bool| DetachState { detached: d, ..Default::default() }.store(&ctx, id);
+        let g = |n: &str| DetachState::id(("config-group", n));
+        for step in 0..4 {
+            match step {
+                1 => set(g("Audio patch"), true),
+                2 => set(page_id, true),
+                3 => { set(g("Audio patch"), false); set(page_id, false); }
+                _ => {}
+            }
+            run(&ctx);
+            run(&ctx);
+        }
+    }
+
     #[test]
     fn config_groups_run_in_page_order() {
         let names: Vec<&str> = crate::CONFIG_GROUPS.iter().map(|(n, _)| *n).collect();
