@@ -62,21 +62,10 @@ fn cfg_colour(name: &str) -> egui::Color32 {
         .unwrap_or(rustcars::palette::TAN)
 }
 
-/// Thin titled elbow around one Config group.
+/// Thin titled elbow around one Config group. Its 16 px bar never carries
+/// the E-STOP: the 40 px page bar above already does on every page (#200).
 fn cfg_group<R>(ui: &mut egui::Ui, name: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    if cfg_group_has_estop(name) {
-        group_box::group_box_estop(ui, name, cfg_colour(name), add)
-    } else {
-        group_box::group_box(ui, name, cfg_colour(name), add)
-    }
-}
-
-/// Config groups whose devices can transmit, key an amplifier or move
-/// something carry the E-STOP in their bar (issue #198).
-pub(crate) const ESTOP_GROUPS: [&str; 5] = ["Radio", "Rotator", "Amplifier", "Automation patch", "RF patch"];
-
-fn cfg_group_has_estop(name: &str) -> bool {
-    ESTOP_GROUPS.contains(&name)
+    group_box::group_box(ui, name, cfg_colour(name), add)
 }
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};

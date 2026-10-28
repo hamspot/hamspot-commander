@@ -134,20 +134,6 @@ pub fn layout_with_slot(
     }
 }
 
-/// Metrics for a group whose bar carries the E-STOP: the normal group bar.
-/// It was 28 px / r_out 16 to fit a 24 px button; #200 reverted that.
-pub fn estop_metrics() -> Metrics {
-    Metrics::default()
-}
-
-/// [`group_box`] with the shared E-STOP at the right end of its bar.
-pub fn group_box_estop<R>(ui: &mut Ui, title: &str, color: Color32, add: impl FnOnce(&mut Ui) -> R) -> R {
-    let m = estop_metrics();
-    let w = crate::estop::button_width(ui, crate::estop::engaged());
-    group_box_slot(ui, &m, title, color, w, add, |ui| {
-        crate::estop::button(ui);
-    })
-}
 
 /// Chrome shapes for `l` (no text). `bg` must be the colour behind the group:
 /// it carves the concave curve.
@@ -220,12 +206,15 @@ pub fn group_box_slot<R>(
         );
     }
     if let Some(rect) = l.slot {
-        ui.scope_builder(
+        // A child, not `scope_builder`: a scope allocates its rect in the
+        // parent and moves the cursor back up to the bar, so the next group
+        // would be drawn on top of this one (the #200 Config overlap).
+        let mut c = ui.new_child(
             UiBuilder::new()
                 .max_rect(rect)
                 .layout(egui::Layout::right_to_left(egui::Align::Center)),
-            slot_ui,
         );
+        slot_ui(&mut c);
     }
     r
 }
@@ -317,8 +306,7 @@ mod tests {
 
     #[test]
     fn slot_sits_at_right_end_before_cap() {
-        let m = estop_metrics();
-        assert_eq!(m, Metrics::default(), "E-STOP groups keep the normal bar (#200)");
+        let m = Metrics::default();
         assert_eq!((m.bar, m.r_out), (16.0, 12.0));
         let l = layout_with_slot(0.0, 0.0, 800.0, 40.0, &m, 120.0);
         let slot = l.slot.expect("wide group has a slot");
@@ -337,22 +325,58 @@ mod tests {
     }
 
     #[test]
-    fn estop_group_runs_headless_without_deadlock() {
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let ctx = egui::Context::default();
-            for _ in 0..3 {
-                let input = egui::RawInput {
-                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 400.0))),
-                    ..Default::default()
-                };
-                let mut out = ctx.run_ui(input, |ui| {
-                    group_box_estop(ui, "Rotator", rustcars::palette::OLIVE, |ui| ui.label("x"));
-                });
-                out.textures_delta.clear();
+    fn group_bars_never_draw_the_estop() {
+        // 16 px group bars are too short for the 40 px E-STOP (#200).
+        let src = include_str!("group_box.rs");
+        let call = ["crate::estop::", "button("].concat();
+        assert!(!src.contains(&call), "group_box must not draw the E-STOP");
+        let ctx = egui::Context::default();
+        for _ in 0..2 {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 400.0))),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| {
+                group_box(ui, "Rotator", rustcars::palette::OLIVE, |ui| ui.label("x"));
+            });
+            out.textures_delta.clear();
+            for c in &out.shapes {
+                if let egui::Shape::Text(t) = &c.shape {
+                    assert!(!t.galley.text().contains("E-STOP"));
+                }
             }
-            let _ = tx.send(());
-        });
-        rx.recv_timeout(std::time::Duration::from_secs(10)).expect("deadlock?");
+        }
+    }
+
+    #[test]
+    fn groups_stack_without_overlap() {
+        // Several groups in a row, with and without a bar slot, must lay out
+        // one after another (the Config page overlap, #200).
+        let ctx = egui::Context::default();
+        let mut rects = Vec::new();
+        for _ in 0..2 {
+            rects.clear();
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 2000.0))),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| {
+                for i in 0..6 {
+                    let before = ui.cursor().top();
+                    let m = Metrics::default();
+                    let slot = if i % 2 == 0 { 120.0 } else { 0.0 };
+                    group_box_slot(ui, &m, "G", rustcars::palette::OLIVE, slot, |ui| {
+                        for _ in 0..4 { ui.label("row"); }
+                    }, |ui| { ui.label("s"); });
+                    let after = ui.min_rect().bottom();
+                    rects.push((before, after));
+                }
+            });
+            out.textures_delta.clear();
+        }
+        for w in rects.windows(2) {
+            assert!(w[1].0 >= w[0].1 - 0.5, "group overlaps previous: {:?}", rects);
+            assert!(w[0].1 - w[0].0 > 40.0, "group collapsed: {:?}", rects);
+        }
     }
 }

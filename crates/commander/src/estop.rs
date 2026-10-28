@@ -711,4 +711,19 @@ mod tests {
     fn danger_text_contrast() {
         assert!(rustcars::contrast(DANGER, egui::Color32::BLACK) >= 4.5);
     }
+
+    #[test]
+    fn every_main_page_has_exactly_one_estop() {
+        // main.rs draws the E-STOP once, in the 40 px page-bar slot shared by
+        // every page (Config included); the Tools nav row (also 40 px) only
+        // on Rotator/NanoVNA; group bars never.
+        let call = ["estop::", "button(ui)"].concat();
+        let main = include_str!("main.rs");
+        assert_eq!(main.matches(&call).count(), 1, "one page-bar E-STOP for all pages");
+        let at = main.find(&call).unwrap();
+        let ctx_before = &main[..at];
+        assert!(ctx_before.rfind("id_salt(\"estop-page-bar\")").is_some());
+        assert_eq!(include_str!("tools/mod.rs").matches(&call).count(), 1);
+        assert_eq!(include_str!("group_box.rs").matches(&call).count(), 0);
+    }
 }
