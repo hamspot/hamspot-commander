@@ -518,9 +518,9 @@ pub fn step_summary(r: &StepResult) -> Vec<String> {
     let mut out = Vec::new();
     match s11_stats(&s) {
         Some(st) => out.push(format!(
-            "S11 at {}{tag}: resonance (min SWR) {:.2}:1 at {} · SWR<2 {}",
+            "S11 at {}{tag}: resonance (min SWR) {}:1 at {} · SWR<2 {}",
             r.step.ch0,
-            st.min_swr,
+            crate::tools::nanovna::display::fmt_swr(st.min_swr, 2),
             mhz(st.at_hz),
             match st.under2 {
                 Some((lo, hi)) => format!("{} – {} ({})", mhz(lo), mhz(hi), mhz(hi - lo)),

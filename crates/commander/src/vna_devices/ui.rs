@@ -512,13 +512,13 @@ pub fn compare_lines(a: &ScanSet, b: &ScanSet) -> Vec<String> {
         let pb = samples_of(sb.corrected.as_ref().unwrap_or(&sb.raw));
         if let (Some(x), Some(y)) = (s11_stats(&pa), s11_stats(&pb)) {
             out.push(format!(
-                "S11 at {}: resonance A {} / B {} (Δ {:+.1} kHz) · min SWR A {:.2} / B {:.2}",
+                "S11 at {}: resonance A {} / B {} (Δ {:+.1} kHz) · min SWR A {}:1 / B {}:1",
                 sa.step.ch0,
                 mhz(x.at_hz),
                 mhz(y.at_hz),
                 (y.at_hz - x.at_hz) / 1e3,
-                x.min_swr,
-                y.min_swr
+                crate::tools::nanovna::display::fmt_swr(x.min_swr, 2),
+                crate::tools::nanovna::display::fmt_swr(y.min_swr, 2)
             ));
         }
         if let (Some(ch1), Some(x), Some(y)) = (&sa.step.ch1, s21_stats(&pa), s21_stats(&pb)) {

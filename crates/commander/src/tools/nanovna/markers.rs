@@ -141,7 +141,7 @@ pub fn readout_text(fmt: Readout, sample: &Sample, z0: f64, index: usize, s21: b
         },
         Readout::Swr => {
             let v = rf::swr(sample.s11);
-            if v.is_finite() { format!("{v:.3} : 1") } else { "INF : 1".into() }
+            format!("{} : 1", crate::tools::nanovna::display::fmt_swr(v, 3))
         }
         Readout::Index => format!("#{index}"),
     }

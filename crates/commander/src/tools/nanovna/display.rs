@@ -30,6 +30,69 @@ impl Scale {
     }
 }
 
+/// Top of every SWR chart: 10:1. Points above it are clipped at the top edge.
+pub const SWR_MAX: f64 = 10.0;
+/// SWR graticule labels, taken from an analog SWR meter face.
+pub const SWR_TICKS: [f64; 7] = [1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 10.0];
+
+/// Height of an SWR value on a chart: 0 at the bottom (1:1), 1 at the top
+/// (10:1). Spaced like a meter face, linear in |Γ| = (s−1)/(s+1), so 2:1 sits
+/// about 40 % up and 3:1 about 60 %. Anything above 10:1, infinite SWR
+/// included, clips to the top; below 1 clamps to the bottom; NaN has no place.
+pub fn swr_height(swr: f64) -> Option<f64> {
+    if swr.is_nan() {
+        return None;
+    }
+    if swr >= SWR_MAX {
+        return Some(1.0);
+    }
+    if swr <= 1.0 {
+        return Some(0.0);
+    }
+    let g = |s: f64| (s - 1.0) / (s + 1.0);
+    Some(g(swr) / g(SWR_MAX))
+}
+
+/// Red the SWR trace turns above 3:1 (DANGER).
+pub const SWR_RED: (u8, u8, u8) = (0xD9, 0x42, 0x3A);
+/// SWR where the trace starts to fade to red, and where it is fully red.
+pub const SWR_WARN: f64 = 3.0;
+pub const SWR_RED_AT: f64 = 4.0;
+
+/// Trace colour for an SWR value: `base` at or below 3:1, blending to red
+/// by 4:1, red above (clipped and infinite included). NaN keeps `base`.
+pub fn swr_color(base: (u8, u8, u8), swr: f64) -> (u8, u8, u8) {
+    if swr.is_nan() || swr <= SWR_WARN {
+        return base;
+    }
+    let t = ((swr - SWR_WARN) / (SWR_RED_AT - SWR_WARN)).clamp(0.0, 1.0);
+    let mix = |a: u8, b: u8| (a as f64 + (b as f64 - a as f64) * t).round() as u8;
+    (mix(base.0, SWR_RED.0), mix(base.1, SWR_RED.1), mix(base.2, SWR_RED.2))
+}
+
+/// Inverse of `swr_height` on 0..=1 (1 maps to 10:1).
+pub fn swr_at_height(h: f64) -> f64 {
+    let g = h.clamp(0.0, 1.0) * (SWR_MAX - 1.0) / (SWR_MAX + 1.0);
+    (1.0 + g) / (1.0 - g)
+}
+
+/// True when an SWR value is off the top of the chart (infinite included).
+pub fn swr_clipped(swr: f64) -> bool {
+    swr > SWR_MAX
+}
+
+/// SWR number for display: ">10" above the chart top instead of a huge
+/// number, "N/A" when unknown, otherwise with `decimals` places.
+pub fn fmt_swr(swr: f64, decimals: usize) -> String {
+    if swr.is_nan() {
+        "N/A".into()
+    } else if swr > SWR_MAX {
+        ">10".into()
+    } else {
+        format!("{:.*}", decimals, swr.max(1.0))
+    }
+}
+
 /// The 1-2-5 step at or above `raw`.
 pub fn nice_step(raw: f64) -> f64 {
     if !(raw.is_finite() && raw > 0.0) {
@@ -238,6 +301,44 @@ pub fn next_peak(ys: &[f64], from: Option<usize>) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn swr_color_fades_to_red_between_three_and_four() {
+        let b = (10, 200, 30);
+        assert_eq!(swr_color(b, 1.0), b);
+        assert_eq!(swr_color(b, 3.0), b);
+        assert_eq!(swr_color(b, f64::NAN), b);
+        for v in [4.0, 6.0, 10.0, 150_000.0, f64::INFINITY] {
+            assert_eq!(swr_color(b, v), SWR_RED);
+        }
+        let steps: Vec<(u8, u8, u8)> = (0..=10).map(|i| swr_color(b, 3.0 + i as f64 / 10.0)).collect();
+        assert!(steps.windows(2).all(|w| w[1].0 >= w[0].0 && w[1].1 <= w[0].1), "{steps:?}");
+        assert!((swr_at_height(swr_height(3.0).unwrap()) - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn swr_height_is_fixed_one_to_ten_and_clips_spikes() {
+        assert_eq!(swr_height(1.0), Some(0.0));
+        assert_eq!(swr_height(0.5), Some(0.0));
+        assert_eq!(swr_height(10.0), Some(1.0));
+        assert_eq!(swr_height(150_000.0), Some(1.0));
+        assert_eq!(swr_height(f64::INFINITY), Some(1.0));
+        assert_eq!(swr_height(f64::NAN), None);
+        let h: Vec<f64> = SWR_TICKS.iter().map(|t| swr_height(*t).unwrap()).collect();
+        assert!(h.windows(2).all(|w| w[0] < w[1]), "{h:?}");
+        assert!((swr_height(2.0).unwrap() - 0.4074).abs() < 1e-3);
+        assert!((swr_height(3.0).unwrap() - 0.6111).abs() < 1e-3);
+        assert!(swr_clipped(f64::INFINITY) && swr_clipped(10.01) && !swr_clipped(10.0) && !swr_clipped(f64::NAN));
+    }
+
+    #[test]
+    fn swr_text_shows_over_ten_instead_of_huge_numbers() {
+        assert_eq!(fmt_swr(150_000.0, 2), ">10");
+        assert_eq!(fmt_swr(f64::INFINITY, 3), ">10");
+        assert_eq!(fmt_swr(f64::NAN, 2), "N/A");
+        assert_eq!(fmt_swr(2.618, 3), "2.618");
+        assert_eq!(fmt_swr(10.0, 2), "10.00");
+    }
 
     #[test]
     fn steps_follow_one_two_five() {

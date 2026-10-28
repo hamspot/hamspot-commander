@@ -3,7 +3,7 @@
 
 mod device;
 mod cal;
-mod display;
+pub(crate) mod display;
 mod layout;
 mod limits;
 mod markers;
@@ -1296,7 +1296,7 @@ impl NanoVna {
             "{}  {} Hz  SWR {}  RL {} dB  |Z| {} Ω  {} {:+}j Ω  Q {}  S21 {} dB  series {}  parallel {}",
             markers::slot_name(self.marker_on),
             sample.hz.round(),
-            num(rf::swr(sample.s11)),
+            display::fmt_swr(rf::swr(sample.s11), 3),
             num(rf::return_loss_db(sample.s11)),
             num(d.z_abs),
             num(d.r),
@@ -1721,7 +1721,8 @@ impl NanoVna {
 
     /// The scale the Cartesian pane uses: (scale, reference value, manual). Issue 69.
     fn shown_scale(&self, samples: Option<&[Sample]>) -> Option<(display::Scale, f64, bool)> {
-        if is_disk(self.view) {
+        // SWR panes are fixed 1:1 to 10:1 and never auto- or manually scaled.
+        if is_disk(self.view) || self.view == View::Swr {
             return None;
         }
         if let Some(m) = self.face.scales.get(self.key().as_str()) {
@@ -1910,6 +1911,8 @@ impl NanoVna {
             put(&mut x, &format!("{} {unit}/", display::fmt_tick(scale.per_div, scale.per_div / 10.0)), palette::TEXT);
             put(&mut x, &format!("REF {} {unit}", display::fmt_tick(ref_value, scale.per_div)), palette::TEXT);
             put(&mut x, if manual { "MAN" } else { "AUTO" }, palette::TEXT_MUTED);
+        } else if self.view == View::Swr {
+            put(&mut x, "FIXED 1–10:1", palette::TEXT_MUTED);
         }
         if self.show_memory && self.memory().is_some() {
             put(&mut x, &format!("MEM{}", self.mem_sel + 1), MEM_COLOR);
@@ -2004,7 +2007,7 @@ impl NanoVna {
                     display::fmt_hz(sample.hz),
                     self.value_text(self.view, sample, *index, z0, Some(&ys)),
                     format!("{} {:+}j Ω", num(d.r), num(d.x)),
-                    format!("{} : 1", num(rf::swr(sample.s11))),
+                    format!("{} : 1", display::fmt_swr(rf::swr(sample.s11), 3)),
                     delta,
                 ],
                 MARKER_COLORS[*slot % MARKER_COLORS.len()],
@@ -2711,7 +2714,7 @@ impl NanoVna {
         if self.swr_bw_on && !s21 {
             let swr: Vec<f64> = samples.iter().map(|s| rf::swr(s.s11)).collect();
             if let Some(b) = search::swr_band(&xs, &swr, 2.0) {
-                out.push((format!("SWR  min {:.2} @ {}", b.min_swr, display::fmt_hz(b.min_hz)), palette::TEXT));
+                out.push((format!("SWR  min {} : 1 @ {}", display::fmt_swr(b.min_swr, 2), display::fmt_hz(b.min_hz)), palette::TEXT));
                 out.push(match b.edges {
                     Some((lo, hi)) => (format!("     2:1 {}–{} ({})", display::fmt_hz(lo), display::fmt_hz(hi), display::fmt_hz(hi - lo)), palette::TEXT),
                     None => ("     never under 2:1".into(), palette::TEXT_MUTED),
@@ -3001,7 +3004,7 @@ impl NanoVna {
         let z0 = self.z0_value();
         if let Some(i) = display::search_min(&samples.iter().map(|s| rf::swr(s.s11)).collect::<Vec<_>>()) {
             let s = &samples[i];
-            readout(ui, theme, &format!("Lowest SWR {} : 1 at {}", num(rf::swr(s.s11)), display::fmt_hz(s.hz)), false);
+            readout(ui, theme, &format!("Lowest SWR {} : 1 at {}", display::fmt_swr(rf::swr(s.s11), 3), display::fmt_hz(s.hz)), false);
         }
         for item in rf::x_resonances(samples, z0).into_iter().take(4) {
             readout(
@@ -5053,7 +5056,7 @@ fn marker_value(view: View, sample: &Sample, z0: f64) -> String {
         View::PhaseS11 => format!("{} °", num(sample.s11.arg().to_degrees())),
         View::LinMagS21 => fmt_g(sample.s21.abs()),
         View::ReImS21 => format!("{} {:+}j", fmt_g(sample.s21.re), fmt_g(sample.s21.im)),
-        View::Swr => format!("{} : 1", num(rf::swr(sample.s11))),
+        View::Swr => format!("{} : 1", display::fmt_swr(rf::swr(sample.s11), 3)),
         View::ReturnLoss => format!("{} dB", num(rf::return_loss_db(sample.s11))),
         View::LinMag => fmt_g(sample.s11.abs()),
         View::ReIm => format!("{} {:+}j", fmt_g(sample.s11.re), fmt_g(sample.s11.im)),
@@ -5233,8 +5236,36 @@ fn paint_cartesian(
     for (ys, _) in traces {
         all.extend_from_slice(ys);
     }
+    // SWR panes use a fixed meter-face scale, 1:1 at the bottom to 10:1 at the top.
+    let swr_view = view == View::Swr;
+    let manual = if swr_view { None } else { manual };
     let scale = manual.map(|m| m.to_scale(10)).unwrap_or_else(|| display::auto_scale(&all, 10));
-    for (i, value) in scale.lines().into_iter().enumerate() {
+    if swr_view {
+        for (i, t) in display::SWR_TICKS.iter().enumerate() {
+            let y = plot.bottom() - display::swr_height(*t).unwrap_or(0.0) as f32 * plot.height();
+            painter.line_segment(
+                [Pos2::new(plot.left(), y), Pos2::new(plot.right(), y)],
+                Stroke::new(1.0, if i == 0 || *t == 2.0 || *t == display::SWR_MAX { GRID } else { GRID_FAINT }),
+            );
+            // 3:1 is where the trace turns red; mark it in text and a faint red line too.
+            let warn = *t == display::SWR_WARN;
+            if warn {
+                let (r, g, b) = display::SWR_RED;
+                painter.line_segment(
+                    [Pos2::new(plot.left(), y), Pos2::new(plot.right(), y)],
+                    Stroke::new(1.0, Color32::from_rgb(r, g, b).gamma_multiply(0.5)),
+                );
+            }
+            painter.text(
+                Pos2::new(plot.left() - 6.0, y),
+                egui::Align2::RIGHT_CENTER,
+                if warn { "3:1".to_string() } else { trim_num(*t) },
+                font.clone(),
+                palette::TEXT_MUTED,
+            );
+        }
+    }
+    for (i, value) in scale.lines().into_iter().enumerate().filter(|_| !swr_view) {
         let y = plot.top() + plot.height() * i as f32 / scale.divs as f32;
         painter.line_segment(
             [Pos2::new(plot.left(), y), Pos2::new(plot.right(), y)],
@@ -5276,24 +5307,26 @@ fn paint_cartesian(
     }
     painter.rect_stroke(plot, 0.0, Stroke::new(1.0, GRID), egui::StrokeKind::Inside);
     // Reference line and its triangle on the right edge, like the R&S ref marker.
-    let ref_value = manual.map(|m| m.ref_value).unwrap_or_else(|| display::auto_ref(&scale));
-    let ry = plot.top() + scale.fraction(ref_value) as f32 * plot.height();
-    let ref_stroke = Stroke::new(1.0, TRACE1);
-    let mut x = plot.left();
-    while x < plot.right() {
-        let end = (x + 6.0).min(plot.right());
-        painter.line_segment([Pos2::new(x, ry), Pos2::new(end, ry)], ref_stroke);
-        x += 10.0;
+    if !swr_view {
+        let ref_value = manual.map(|m| m.ref_value).unwrap_or_else(|| display::auto_ref(&scale));
+        let ry = plot.top() + scale.fraction(ref_value) as f32 * plot.height();
+        let ref_stroke = Stroke::new(1.0, TRACE1);
+        let mut x = plot.left();
+        while x < plot.right() {
+            let end = (x + 6.0).min(plot.right());
+            painter.line_segment([Pos2::new(x, ry), Pos2::new(end, ry)], ref_stroke);
+            x += 10.0;
+        }
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                Pos2::new(plot.right(), ry),
+                Pos2::new(plot.right() + 9.0, ry - 6.0),
+                Pos2::new(plot.right() + 9.0, ry + 6.0),
+            ],
+            TRACE1,
+            Stroke::NONE,
+        ));
     }
-    painter.add(egui::Shape::convex_polygon(
-        vec![
-            Pos2::new(plot.right(), ry),
-            Pos2::new(plot.right() + 9.0, ry - 6.0),
-            Pos2::new(plot.right() + 9.0, ry + 6.0),
-        ],
-        TRACE1,
-        Stroke::NONE,
-    ));
     if !(xmax > xmin) {
         return;
     }
@@ -5331,11 +5364,16 @@ fn paint_cartesian(
             );
         }
     }
-    let map = |x: f64, y: f64| {
-        Pos2::new(
-            plot.left() + ((x - xmin) / (xmax - xmin)) as f32 * plot.width(),
-            plot.top() + (scale.fraction(y) as f32).clamp(-0.02, 1.02) * plot.height(),
-        )
+    // None for a value with no place on the pane (NaN, or non-finite off SWR).
+    let map = |x: f64, y: f64| -> Option<Pos2> {
+        let fy = if swr_view {
+            1.0 - display::swr_height(y)? as f32
+        } else if y.is_finite() {
+            (scale.fraction(y) as f32).clamp(-0.02, 1.02)
+        } else {
+            return None;
+        };
+        Some(Pos2::new(plot.left() + ((x - xmin) / (xmax - xmin)) as f32 * plot.width(), plot.top() + fy * plot.height()))
     };
     let clip = painter.with_clip_rect(plot.expand(2.0));
     for (ys, color) in traces {
@@ -5348,19 +5386,47 @@ fn paint_cartesian(
         let dashed = *color == MEM_COLOR;
         let mut run = 0.0f32;
         for (x, y) in xs.iter().zip(ys.iter()) {
-            if !y.is_finite() {
+            let Some(pos) = map(*x, *y) else {
                 prev = None;
                 continue;
-            }
-            let pos = map(*x, *y);
+            };
             if let Some(was) = prev {
                 let len: f32 = was.distance(pos);
-                if !dashed || (run % 12.0) < 7.0 {
+                if swr_view && !dashed {
+                    swr_segment(&clip, plot, was, pos, *color);
+                } else if !dashed || (run % 12.0) < 7.0 {
                     clip.line_segment([was, pos], Stroke::new(2.0, *color));
                 }
                 run += len.max(1.0);
             }
             prev = Some(pos);
+        }
+    }
+    // SWR above 10:1 runs along the top edge; mark those stretches with a
+    // thick brick bar and say so in text, so a clipped trace never reads as 10:1.
+    if swr_view {
+        let mut any = false;
+        for (ys, _) in traces.iter().filter(|(ys, _)| ys.len() == xs.len()) {
+            for (i, y) in ys.iter().enumerate() {
+                if !display::swr_clipped(*y) {
+                    continue;
+                }
+                any = true;
+                let x0 = xs[i.saturating_sub(1)];
+                let x1 = xs[(i + 1).min(xs.len() - 1)];
+                let to_x = |x: f64| plot.left() + ((x - xmin) / (xmax - xmin)) as f32 * plot.width();
+                let (a, b) = ((to_x(x0) + to_x(xs[i])) / 2.0, (to_x(x1) + to_x(xs[i])) / 2.0);
+                clip.line_segment([Pos2::new(a.min(b) - 1.0, plot.top() + 2.0), Pos2::new(a.max(b) + 1.0, plot.top() + 2.0)], Stroke::new(4.0, palette::BRICK));
+            }
+        }
+        if any {
+            painter.text(
+                Pos2::new(plot.right() - 6.0, plot.top() + 8.0),
+                egui::Align2::RIGHT_TOP,
+                "CLIPPED: SWR ABOVE 10:1",
+                egui::FontId::monospace((label_px * 0.8).max(10.0)),
+                LOST_TEXT,
+            );
         }
     }
     // Limit lines, failing points and the PASS/FAIL chip. Issue 71.
@@ -5371,7 +5437,9 @@ fn paint_cartesian(
             continue;
         }
         let (va, vb) = (seg.at(a).unwrap_or(seg.start_v), seg.at(b).unwrap_or(seg.stop_v));
-        let (pa, pb) = (map(a, va), map(b, vb));
+        let (Some(pa), Some(pb)) = (map(a, va), map(b, vb)) else {
+            continue;
+        };
         clip.line_segment([pa, pb], limit_stroke);
         // Small ticks point to the failing side: up for a lower limit, down for an upper.
         let dir = if seg.upper { -6.0 } else { 6.0 };
@@ -5383,8 +5451,8 @@ fn paint_cartesian(
     if let (Some(verdict), Some((ys, _))) = (&overlay.verdict, traces.first()) {
         for i in &verdict.failing {
             if let (Some(x), Some(y)) = (xs.get(*i), ys.get(*i)) {
-                if y.is_finite() {
-                    clip.circle_stroke(map(*x, *y), 4.0, Stroke::new(2.0, palette::BRICK));
+                if let Some(p) = map(*x, *y) {
+                    clip.circle_stroke(p, 4.0, Stroke::new(2.0, palette::BRICK));
                 }
             }
         }
@@ -5398,11 +5466,39 @@ fn paint_cartesian(
     if let Some((ys, _)) = traces.first() {
         for (slot, index) in markers {
             if let (Some(x), Some(y)) = (xs.get(*index), ys.get(*index)) {
-                if y.is_finite() {
-                    paint_marker(painter, map(*x, *y), *slot, label_px);
+                if let Some(p) = map(*x, *y) {
+                    paint_marker(painter, p, *slot, label_px);
                 }
             }
         }
+    }
+}
+
+/// One SWR trace segment, coloured by SWR along its length: the trace colour
+/// up to 3:1, fading to red by 4:1. Split exactly at 3:1 and into short pieces
+/// through the fade so the change lands where the trace crosses 3:1.
+fn swr_segment(painter: &egui::Painter, plot: Rect, a: Pos2, b: Pos2, base: Color32) {
+    let h = |p: Pos2| ((plot.bottom() - p.y) / plot.height()).clamp(0.0, 1.0) as f64;
+    let (ha, hb) = (h(a), h(b));
+    let h3 = display::swr_height(display::SWR_WARN).unwrap_or(0.0);
+    let mut cuts = vec![0.0f64, 1.0];
+    if (ha - h3) * (hb - h3) < 0.0 {
+        cuts.push((h3 - ha) / (hb - ha));
+    }
+    if ha.max(hb) > h3 {
+        cuts.extend((1..12).map(|i| i as f64 / 12.0));
+    }
+    cuts.sort_by(f64::total_cmp);
+    let bc = (base.r(), base.g(), base.b());
+    for w in cuts.windows(2) {
+        if w[1] - w[0] < 1e-9 {
+            continue;
+        }
+        let mid = ha + (hb - ha) * (w[0] + w[1]) / 2.0;
+        // Pieces on the top edge are clipped (above 10:1): always red.
+        let swr = if mid >= 1.0 - 1e-6 { f64::INFINITY } else { display::swr_at_height(mid) };
+        let (r, g, bl) = display::swr_color(bc, swr);
+        painter.line_segment([a + (b - a) * w[0] as f32, a + (b - a) * w[1] as f32], Stroke::new(2.0, Color32::from_rgb(r, g, bl)));
     }
 }
 
@@ -5632,7 +5728,7 @@ fn paint_chart(
                     "|Γ| {:.3}  ∠ {:.1}°  SWR {}  RL {} dB",
                     r.mag,
                     r.angle_deg,
-                    if r.swr.is_finite() { format!("{:.2}", r.swr) } else { "INF".into() },
+                    display::fmt_swr(r.swr, 2),
                     if r.rl_db.is_finite() { format!("{:.2}", r.rl_db) } else { "INF".into() },
                 ))
             })
@@ -5762,7 +5858,7 @@ fn paint_chart(
                 format!(
                     "{}  SWR {}  RL {} dB  R {} Ω  X {} Ω",
                     display::fmt_hz(s.hz),
-                    num(rf::swr(s.s11)),
+                    display::fmt_swr(rf::swr(s.s11), 3),
                     num(rf::return_loss_db(s.s11)),
                     num(d.r),
                     num(d.x)
@@ -6465,6 +6561,95 @@ fn nearest_gamma(samples: &[Sample], pos: Pos2, center: Pos2, radius: f32) -> Op
 mod tests {
     use super::*;
     use std::fs;
+
+    /// Paint one SWR pane headless with the app's real theme and fonts and
+    /// return every shape (flattened). Issue: fixed 1:1–10:1 SWR scale.
+    fn paint_swr_pane(ys: &[f64]) -> (Rect, Vec<egui::Shape>) {
+        let ctx = egui::Context::default();
+        rustcars::install_lcars_font(&ctx);
+        rustcars::apply_theme(&ctx, &rustcars::LcarsTheme::default());
+        let rect = Rect::from_min_size(Pos2::new(10.0, 10.0), vec2(600.0, 300.0));
+        let xs: Vec<f64> = (0..ys.len()).map(|i| 7.0e6 + i as f64 * 1e4).collect();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(800.0, 400.0))),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| {
+            let traces = [(ys, SWR_TEST_TRACE)];
+            paint_cartesian(ui.painter(), rect, View::Swr, &xs, &traces, &[(0, 2)], 14.0, Some(display::ManualScale { ref_value: 0.0, ref_pos: 10.0, per_div: 1e5 }), &Overlay::default());
+        });
+        fn flat(s: &egui::Shape, v: &mut Vec<egui::Shape>) {
+            match s {
+                egui::Shape::Vec(xs) => xs.iter().for_each(|x| flat(x, v)),
+                other => v.push(other.clone()),
+            }
+        }
+        out.textures_delta.clear();
+        let mut v = Vec::new();
+        out.shapes.iter().for_each(|c| flat(&c.shape, &mut v));
+        (cart_plot(rect), v)
+    }
+
+    const SWR_TEST_TRACE: Color32 = Color32::from_rgb(1, 2, 3);
+
+    fn trace_points(shapes: &[egui::Shape]) -> Vec<Pos2> {
+        let mut v = Vec::new();
+        for s in shapes {
+            if let egui::Shape::LineSegment { points, stroke } = s {
+                if stroke.width == 2.0 {
+                    v.extend_from_slice(points);
+                }
+            }
+        }
+        v
+    }
+
+    fn texts(shapes: &[egui::Shape]) -> Vec<(String, Pos2)> {
+        shapes
+            .iter()
+            .filter_map(|s| match s {
+                egui::Shape::Text(t) => Some((t.galley.text().to_string(), t.galley.rect.translate(t.pos.to_vec2()).center())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn swr_chart_is_fixed_one_to_ten_and_clips_spikes_at_the_top() {
+        let calm = [1.2, 1.5, 2.0, 3.0, 1.1];
+        let spiky = [1.2, 150_000.0, 2.0, f64::INFINITY, f64::NAN, 3.0, 0.5, 1.1];
+        let (plot, a) = paint_swr_pane(&calm);
+        let (_, b) = paint_swr_pane(&spiky);
+        // Same labels at the same heights whatever the data (and a saved manual scale is ignored).
+        let labels = |sh: &[egui::Shape]| {
+            texts(sh).into_iter().filter(|(t, p)| p.x < plot.left() && ["1", "1.5", "2", "3:1", "4", "6", "10"].contains(&t.as_str())).collect::<Vec<_>>()
+        };
+        let (la, lb) = (labels(&a), labels(&b));
+        assert_eq!(la.len(), 7, "{la:?}");
+        assert_eq!(la, lb);
+        let at = |t: &str| la.iter().find(|(x, _)| x == t).unwrap().1.y;
+        assert!((at("10") - plot.top()).abs() < 1.0 && (at("1") - plot.bottom()).abs() < 1.0);
+        assert!(at("1") > at("1.5") && at("1.5") > at("2") && at("2") > at("3:1") && at("3:1") > at("4") && at("4") > at("6") && at("6") > at("10"));
+        // Calm data: no clip note. Spiky data: trace stays inside, spikes land on the top edge.
+        assert!(!texts(&a).iter().any(|(t, _)| t.contains("CLIPPED")));
+        assert!(texts(&b).iter().any(|(t, _)| t == "CLIPPED: SWR ABOVE 10:1"));
+        let pts = trace_points(&b);
+        assert!(!pts.is_empty());
+        assert!(pts.iter().all(|p| p.y >= plot.top() - 0.01 && p.y <= plot.bottom() + 0.01), "{pts:?}");
+        let on_top = pts.iter().filter(|p| (p.y - plot.top()).abs() < 0.01).count();
+        assert!(on_top >= 2, "150000:1 and INF must be drawn at the top edge, got {on_top}");
+        // Below 3:1 the trace keeps its colour; on the top edge it is red.
+        let red = { let (r, g, b) = display::SWR_RED; Color32::from_rgb(r, g, b) };
+        let segs: Vec<(f32, Color32)> = b.iter().filter_map(|s| match s {
+            egui::Shape::LineSegment { points, stroke } if stroke.width == 2.0 => Some(((points[0].y + points[1].y) / 2.0, stroke.color)),
+            _ => None,
+        }).collect();
+        assert!(segs.iter().filter(|(y, _)| (*y - plot.top()).abs() < 0.01).all(|(_, c)| *c == red));
+        let y3 = at("3:1");
+        assert!(segs.iter().filter(|(y, _)| *y > y3 + 0.5).all(|(_, c)| *c == SWR_TEST_TRACE));
+        // 0.5 clamps to the bottom line.
+        assert!(pts.iter().any(|p| (p.y - plot.bottom()).abs() < 0.01));
+    }
 
     #[test]
     fn header_flags_show_limit_verdict_with_readable_colours() {
