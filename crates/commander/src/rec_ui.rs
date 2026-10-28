@@ -195,8 +195,84 @@ struct Job {
     cancel: Arc<AtomicBool>,
 }
 
+/// How long before a call starts a sighting still counts for it: the grant
+/// that names the talking radio arrives just before the follower picks it.
+const UNIT_LOOKBACK_MS: i64 = 5_000;
+/// Sightings older than this are dropped.
+const UNIT_KEEP_MS: i64 = 60_000;
+
+fn utc_minus(at: &str, ms: i64) -> String {
+    chrono::DateTime::parse_from_rfc3339(at)
+        .map(|t| (t.with_timezone(&chrono::Utc) - chrono::Duration::milliseconds(ms)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        .unwrap_or_default()
+}
+
+pub fn utc_now() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+/// Radio units the control channel reported per talkgroup, for one HackRF,
+/// and the call it is on. Feeds `Meta::units` (issue #162).
+#[derive(Default, Debug)]
+pub struct CallUnits {
+    seen: Vec<(u32, meta::UnitSeen)>,
+    call: Option<(u32, String)>,
+}
+
+impl CallUnits {
+    /// Unit `unit` talking on talkgroup `tg` at `at` (UTC ISO).
+    pub fn sight(&mut self, tg: u32, unit: u32, at: &str) {
+        if unit == 0 {
+            return;
+        }
+        let keep = utc_minus(at, UNIT_KEEP_MS);
+        self.seen.retain(|(_, u)| u.last_utc >= keep);
+        match self.seen.iter_mut().find(|(t, u)| *t == tg && u.id == unit) {
+            Some((_, u)) => {
+                if u.last_utc.as_str() < at {
+                    u.last_utc = at.to_string();
+                }
+            }
+            None => self.seen.push((tg, meta::UnitSeen { id: unit, first_utc: at.into(), last_utc: at.into() })),
+        }
+    }
+    /// The follower moved to talkgroup `tg` (or to silence) at `at`.
+    pub fn begin(&mut self, tg: Option<u32>, at: &str) {
+        self.call = tg.map(|t| (t, at.to_string()));
+    }
+    /// Units heard on the current call, first-heard first.
+    pub fn units(&self) -> Vec<meta::UnitSeen> {
+        let Some((tg, start)) = &self.call else { return Vec::new() };
+        let from = utc_minus(start, UNIT_LOOKBACK_MS);
+        let mut v: Vec<meta::UnitSeen> =
+            self.seen.iter().filter(|(t, u)| t == tg && u.last_utc >= from).map(|(_, u)| u.clone()).collect();
+        v.sort_by(|a, b| a.first_utc.cmp(&b.first_utc));
+        v
+    }
+}
+
+/// "51007" or "51007 (+2: 42, 9)" for a call's radio IDs.
+pub fn units_text(m: &Meta) -> String {
+    let ids = m.unit_ids();
+    match ids.split_first() {
+        None => String::new(),
+        Some((first, [])) => first.to_string(),
+        Some((first, rest)) => format!(
+            "{first} (+{}: {})",
+            rest.len(),
+            rest.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(", ")
+        ),
+    }
+}
+
 #[derive(Default)]
 pub struct RecUi {
+    /// Per HackRF radio: units heard on its calls (#162).
+    pub call_units: HashMap<u64, CallUnits>,
+    /// Per HackRF radio: the unit list last sent to the open segment.
+    units_sent: HashMap<u64, Vec<meta::UnitSeen>>,
+    /// (unit, rows_gen, recordings) for the Radio IDs tab.
+    unit_count: Option<(u32, u64, usize)>,
     pub face: config::RecFace,
     /// Station path the recorder is set up for. None forces a redo.
     pub configured: Option<String>,
@@ -258,6 +334,19 @@ fn rows_meta(rows: &[cat::RadioRow], id: u64) -> Option<&cat::RadioRow> {
 }
 
 impl App {
+    /// How many recordings have radio `unit` on the call (Radio IDs tab).
+    pub(crate) fn rec_unit_count(&mut self, unit: u32) -> Option<usize> {
+        let gen = self.rec.rows_gen;
+        if let Some((u, g, n)) = self.rec.unit_count {
+            if u == unit && g == gen {
+                return Some(n);
+            }
+        }
+        let n = self.rec.db.as_ref()?.by_unit(unit).ok()?.len();
+        self.rec.unit_count = Some((unit, gen, n));
+        Some(n)
+    }
+
     fn rec_armed(&self) -> bool {
         self.rec.face.armed()
     }
@@ -426,6 +515,7 @@ impl App {
                 match a {
                     Action::Open(_) => {
                         if let Some(m) = meta.clone() {
+                            self.rec.units_sent.insert(id, m.units.clone());
                             recorder.send(Cmd::Open { key: id, meta: m });
                         }
                     }
@@ -434,6 +524,16 @@ impl App {
                             self.rec_log("REC: encrypted traffic on this call; segment discarded.".into());
                         }
                         recorder.send(Cmd::Close { key: id, keep });
+                        self.rec.units_sent.remove(&id);
+                    }
+                }
+            }
+            // Talkers who join mid-call go to the open segment as they appear.
+            if self.rec.seg.get(&id).is_some_and(|s| s.recording().is_some()) {
+                if let Some(m) = &meta {
+                    if !m.units.is_empty() && self.rec.units_sent.get(&id) != Some(&m.units) {
+                        self.rec.units_sent.insert(id, m.units.clone());
+                        recorder.send(Cmd::Units { key: id, units: m.units.clone() });
                     }
                 }
             }
@@ -545,6 +645,9 @@ impl App {
                     m.emergency = self.trunk_emergency.iter().any(|(_, _, t)| *t == tg);
                     m.channel_hz = hz;
                     m.offset_hz = hz - row.center_hz;
+                    if let Some(c) = self.rec.call_units.get(&row.id) {
+                        m.set_units(c.units());
+                    }
                     m.modulation = "p25".into();
                     m.decoder = serde_json::json!({ "script": hsrec::safepath::portable_decoder(&row.spec.rx_pipe), "vocoder": "p25" });
                     hsrec::safepath::portable_meta(&mut m);
@@ -1407,7 +1510,7 @@ impl App {
                     }
                     if hover.is_some_and(|p| br.expand(2.0).contains(p)) {
                         let start = chrono::DateTime::from_timestamp_millis(t0).unwrap_or_default().with_timezone(&chrono::Local);
-                        let unit = r.meta.radio_unit_id.map(|u| format!("\nRadio ID {u}")).unwrap_or_default();
+                        let unit = match units_text(&r.meta) { t if t.is_empty() => t, t => format!("\nRadio ID {t}") };
                         let tip = format!("{}\n{} ({:.1} s){unit}", r.meta.lane(), start.format("%Y-%m-%d %H:%M:%S"), r.meta.duration_ms as f64 / 1000.0);
                         block_tip = Some(tip);
                     }
@@ -1513,6 +1616,19 @@ impl App {
         if let Some(tg) = m.talkgroup { put("Talkgroup", format!("{} ({tg})", m.talkgroup_name)); }
         put("Channel", m.channel_name.clone());
         if let Some(u) = m.radio_unit_id { put("Radio unit ID", u.to_string()); }
+        let hhmmss = |utc: &str| {
+            chrono::DateTime::parse_from_rfc3339(utc)
+                .map(|t| t.with_timezone(&chrono::Local).format("%H:%M:%S").to_string())
+                .unwrap_or_default()
+        };
+        put(
+            "Radio IDs on call",
+            m.units
+                .iter()
+                .map(|u| format!("{} (heard {}–{})", u.id, hhmmss(&u.first_utc), hhmmss(&u.last_utc)))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
         put("Start", local(&m.start_utc));
         put("End", local(&m.end_utc));
         put("Duration", format!("{:.1} s", m.duration_ms as f64 / 1000.0));
@@ -1842,6 +1958,38 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn call_units_grant_before_call_and_mid_call_talker() {
+        let mut c = CallUnits::default();
+        // The grant naming the talker arrives just before the follower picks the call.
+        c.sight(100, 51007, "2026-01-01T10:00:00.000Z");
+        c.sight(200, 9, "2026-01-01T10:00:00.500Z");
+        c.begin(Some(100), "2026-01-01T10:00:01.000Z");
+        assert_eq!(c.units().iter().map(|u| u.id).collect::<Vec<_>>(), vec![51007]);
+        c.sight(100, 42, "2026-01-01T10:00:04.000Z");
+        c.sight(100, 51007, "2026-01-01T10:00:06.000Z");
+        let u = c.units();
+        assert_eq!(u.iter().map(|u| u.id).collect::<Vec<_>>(), vec![51007, 42]);
+        assert_eq!(u[0].last_utc, "2026-01-01T10:00:06.000Z");
+        let mut m = Meta::default();
+        m.set_units(u);
+        assert_eq!(m.radio_unit_id, Some(51007));
+        assert_eq!(units_text(&m), "51007 (+1: 42)");
+        // A stale sighting from long before the call does not count.
+        c.begin(Some(200), "2026-01-01T10:00:30.000Z");
+        assert!(c.units().is_empty());
+        c.begin(None, "2026-01-01T10:00:31.000Z");
+        assert!(c.units().is_empty());
+    }
+
+    #[test]
+    fn units_text_single_and_none() {
+        let mut m = Meta::default();
+        assert_eq!(units_text(&m), "");
+        m.radio_unit_id = Some(7);
+        assert_eq!(units_text(&m), "7");
+    }
 
     #[test]
     fn bar_order_and_caps() {

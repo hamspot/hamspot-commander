@@ -53,7 +53,19 @@ const MIGRATIONS: &[&str] = &["CREATE TABLE recordings (
         decoder_version TEXT NOT NULL,
         path TEXT NOT NULL,
         PRIMARY KEY (recording_id, kind, decoder_version)
-    );"];
+    );",
+    // 2: every radio unit heard on a recording. Older rows keep their
+    // `radio_unit_id` and are copied in as a single unit.
+    "CREATE TABLE recording_units (
+        recording_id INTEGER NOT NULL,
+        unit_id INTEGER NOT NULL,
+        first_utc TEXT NOT NULL DEFAULT '',
+        last_utc TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY (recording_id, unit_id)
+    );
+    CREATE INDEX rec_units_unit ON recording_units(unit_id);
+    INSERT OR IGNORE INTO recording_units (recording_id, unit_id, first_utc, last_utc)
+        SELECT id, radio_unit_id, start_utc, end_utc FROM recordings WHERE radio_unit_id IS NOT NULL;"];
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Recording {
@@ -235,7 +247,45 @@ impl Db {
                 serde_json::to_string(meta).unwrap_or_default(),
             ],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        let id = self.conn.last_insert_rowid();
+        self.put_units(id, meta)?;
+        Ok(id)
+    }
+
+    /// Replace the unit rows of recording `id` with `meta`'s units.
+    fn put_units(&self, id: i64, meta: &Meta) -> rusqlite::Result<()> {
+        self.conn.execute("DELETE FROM recording_units WHERE recording_id = ?1", [id])?;
+        let mut units = meta.units.clone();
+        if let Some(p) = meta.radio_unit_id {
+            if !units.iter().any(|u| u.id == p) {
+                units.insert(0, crate::meta::UnitSeen { id: p, first_utc: meta.start_utc.clone(), last_utc: meta.end_utc.clone() });
+            }
+        }
+        for u in units {
+            self.conn.execute(
+                "INSERT OR REPLACE INTO recording_units (recording_id, unit_id, first_utc, last_utc) VALUES (?1,?2,?3,?4)",
+                params![id, u.id, u.first_utc, u.last_utc],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Radio units heard on recording `id`, first-heard first.
+    pub fn units_of(&self, id: i64) -> rusqlite::Result<Vec<crate::meta::UnitSeen>> {
+        let mut st = self.conn.prepare(
+            "SELECT unit_id, first_utc, last_utc FROM recording_units WHERE recording_id = ?1 ORDER BY first_utc, rowid",
+        )?;
+        let rows = st.query_map([id], |r| Ok(crate::meta::UnitSeen { id: r.get(0)?, first_utc: r.get(1)?, last_utc: r.get(2)? }))?;
+        rows.collect()
+    }
+
+    /// Recordings on which radio `unit` was heard (any unit on the call), oldest first.
+    pub fn by_unit(&self, unit: u32) -> rusqlite::Result<Vec<Recording>> {
+        let mut st = self.conn.prepare(&format!(
+            "SELECT {COLS} FROM recordings WHERE id IN (SELECT recording_id FROM recording_units WHERE unit_id = ?1) ORDER BY start_utc"
+        ))?;
+        let rows = st.query_map([unit], row_rec)?;
+        rows.collect()
     }
 
     pub fn get(&self, id: i64) -> rusqlite::Result<Option<Recording>> {
@@ -286,9 +336,10 @@ impl Db {
 
     pub fn finish(&self, id: i64, meta: &Meta) -> rusqlite::Result<()> {
         self.conn.execute(
-            "UPDATE recordings SET end_utc = ?2, duration_ms = ?3, bytes = ?4, meta_json = ?5 WHERE id = ?1",
-            params![id, meta.end_utc, meta.duration_ms, meta.bytes, serde_json::to_string(meta).unwrap_or_default()],
+            "UPDATE recordings SET end_utc = ?2, duration_ms = ?3, bytes = ?4, meta_json = ?5, radio_unit_id = ?6 WHERE id = ?1",
+            params![id, meta.end_utc, meta.duration_ms, meta.bytes, serde_json::to_string(meta).unwrap_or_default(), meta.radio_unit_id],
         )?;
+        self.put_units(id, meta)?;
         Ok(())
     }
 
@@ -460,6 +511,55 @@ pub(crate) mod tests {
         let v: i64 = db.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(v as usize, MIGRATIONS.len());
         assert_eq!(db.all().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn units_saved_on_insert_and_finish_and_found_by_unit() {
+        let db = Db::open_in_memory().unwrap();
+        let mut m = meta(SOURCE_HACKRF_TG, Some(100), "2026-01-01T10:00:00Z", "");
+        m.set_units(vec![UnitSeen { id: 51007, first_utc: "2026-01-01T10:00:00Z".into(), last_utc: "2026-01-01T10:00:00Z".into() }]);
+        let id = db.insert("x", &m).unwrap();
+        assert_eq!(db.units_of(id).unwrap().len(), 1);
+        // A second talker joins mid-call; the row is rewritten on finish.
+        let mut all = m.units.clone();
+        note_unit(&mut all, 51007, "2026-01-01T10:00:03Z");
+        note_unit(&mut all, 42, "2026-01-01T10:00:04Z");
+        m.set_units(all);
+        m.end_utc = "2026-01-01T10:00:05Z".into();
+        db.finish(id, &m).unwrap();
+        let u = db.units_of(id).unwrap();
+        assert_eq!(u.iter().map(|u| u.id).collect::<Vec<_>>(), vec![51007, 42]);
+        assert_eq!(u[0].last_utc, "2026-01-01T10:00:03Z");
+        let r = db.get(id).unwrap().unwrap();
+        assert_eq!(r.meta.radio_unit_id, Some(51007));
+        assert_eq!(r.meta.unit_ids(), vec![51007, 42]);
+        assert_eq!(db.by_unit(42).unwrap().len(), 1);
+        assert_eq!(db.by_unit(4).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn old_v1_database_keeps_working_and_copies_its_unit() {
+        let dir = tempdir("db_v1_units");
+        let p = dir.join("S.HSREC.sqlite");
+        {
+            let c = Connection::open(&p).unwrap();
+            c.execute_batch(MIGRATIONS[0]).unwrap();
+            c.execute_batch("PRAGMA user_version = 1").unwrap();
+            c.execute(
+                "INSERT INTO recordings (source, raw_path, raw_format, sample_rate, start_utc, end_utc, radio_unit_id, meta_json)
+                 VALUES ('hackrf_tg','old.cs16','cs16',32000,'2026-01-01T00:00:00Z','2026-01-01T00:00:01Z',777,'{\"source\":\"hackrf_tg\",\"source_kind\":\"raw_iq\",\"radio_unit_id\":777,\"raw_format\":\"cs16\",\"sample_rate\":32000,\"start_utc\":\"2026-01-01T00:00:00Z\"}')",
+                [],
+            )
+            .unwrap();
+        }
+        let db = Db::open(&p).unwrap();
+        let v: i64 = db.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v as usize, MIGRATIONS.len());
+        let all = db.all().unwrap();
+        assert_eq!(all.len(), 1);
+        assert!(all[0].meta.units.is_empty());
+        assert_eq!(all[0].meta.unit_ids(), vec![777]);
+        assert_eq!(db.by_unit(777).unwrap().len(), 1);
     }
 
     #[test]

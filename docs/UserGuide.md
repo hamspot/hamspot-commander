@@ -386,7 +386,7 @@ When the call ends, the **voice hang** starts: the readout shows `· HANG` and t
 
 The **TG** tab is the talkgroup directory for one radio, in zones. Each row has a number and a name, and can be marked **Encrypted** or **Priority**. **FOLLOW** turns following on for that radio. **LOAD** and **SAVE** read and write talkgroup files, **Add** and **Delete** edit the list.
 
-The **ID** tab lists the radio IDs heard on that control channel, with what was learned about each (talkgroups, site, emergency or encrypted use). Commander fills it in and stores it in the station file. Select an ID to add a **Description**.
+The **ID** tab lists the radio IDs heard on that control channel, with what was learned about each (talkgroups, site, emergency or encrypted use). Commander fills it in and stores it in the station file. Select an ID to add a **Description**. The details also say how many recordings that radio was heard on.
 
 <!-- screenshot: chan-05 — The talkgroup directory learned from the control channel. -->
 <!-- screenshot: chan-06 — Radio IDs seen on the control channel. -->
@@ -462,7 +462,7 @@ When the window is too narrow for the full controls, they shorten to symbols: **
 
 | Control in the search row | What it does |
 | --- | --- |
-| **Search** | Filter lanes by talkgroup, channel, radio ID or notes |
+| **Search** | Filter lanes by talkgroup, channel, radio ID (any radio on the call) or notes |
 | **Undo delete** | Shown for 60 s after a delete |
 
 <!-- screenshot: rec-03 — The REC tab, armed and waiting. -->
@@ -517,7 +517,7 @@ From the top:
 1. **Header**: lane, time range and length.
 2. **Playback**: **▶ Play** / **■ Stop**, **★ Star**, **🔒 Protect** (never removed by overwrite-oldest), tags, and one status line. To play the following recording when one finishes, use the **▶▶** toggle in the REC bar. **Output** chooses where replay plays: **System default** (as before), or any audio output on the computer, such as wired speakers, a USB headset or a Bluetooth device. **Refresh** lists the outputs again. The choice is saved with the station. If the chosen output isn't there, replay plays to the system default and the dialog says so in words.
 3. **Notes**, then **Export WAV…** (decoded now), **Export raw…** (raw IQ plus its sidecar), **Archive** / **Unarchive** and **Delete** (undo for 60 s).
-4. **Metadata**: a label/value grid with a **📋 Copy** button.
+4. **Metadata**: a label/value grid with a **📋 Copy** button. For a talkgroup call, **Radio unit ID** is the first radio heard talking, and **Radio IDs on call** lists every radio heard on the call with the times it was first and last heard. Hovering a recording on the timeline shows the same IDs, and **Search** matches any of them. Recordings made before this was added show only the one radio ID they had, if any.
 5. **Decoder parameters**: the decoder settings saved with the recording, collapsed by default.
 
 Playback re-runs the raw signal through the current demodulator and, for digital modes, through the decoder pipe the recording names. It plays to your default audio output and never touches the radios' own audio. If the decoder can't be found, the status line says `decoder script not found: modems/…` and the call plays without voice decoding.

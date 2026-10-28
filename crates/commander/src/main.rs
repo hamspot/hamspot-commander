@@ -4070,6 +4070,9 @@ impl App {
                     }
                 }
                 follow::CcEvent::Unit(sight) => {
+                    if let Some(tg) = sight.last_tg {
+                        self.rec.call_units.entry(id).or_default().sight(tg, sight.id, &rec_ui::utc_now());
+                    }
                     if units::note(&mut self.units, sight) {
                         added = true;
                     }
@@ -9237,6 +9240,11 @@ impl App {
                 search,
             );
             if picked.call != previous {
+                self.rec
+                    .call_units
+                    .entry(tick.id)
+                    .or_default()
+                    .begin(picked.call.map(|(_, tg)| tg), &rec_ui::utc_now());
                 if let Some(ident) = self.cc_identity.get_mut(&tick.id) {
                     follow::clear_call(ident);
                 }
@@ -9540,6 +9548,13 @@ impl App {
         }
         ui.add_space(8.0);
         ui.label(egui::RichText::new(format!("Radio {unit_id}")).strong());
+        if let Some(n) = self.rec_unit_count(unit_id) {
+            ui.label(match n {
+                0 => "No recordings with this radio.".to_string(),
+                1 => "1 recording with this radio.".to_string(),
+                n => format!("{n} recordings with this radio."),
+            });
+        }
         if fact_line.is_empty() {
             ui.label("No extra detail yet.");
             return;
