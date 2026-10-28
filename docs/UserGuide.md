@@ -734,6 +734,22 @@ The RF patch group at the bottom of Config is a drawing of how coax runs in your
 
 <!-- screenshot: cfg-09 — The RF patch. -->
 
+### Scan a device with the VNA
+
+Any box with coax jacks on the RF patch can be measured with the NanoVNA, and every scan is kept.
+
+- **Add an RF device:** pick a kind in the list beside **Add RF device** and press it. Kinds include cavities and duplexers (TX, RX, COMMON), band-pass, notch, low-pass, high-pass, harmonic and crystal filters, circulators, isolators, directional couplers (IN, OUT, COUPLED, ISOLATED), splitters, hybrid combiners, receiver multicouplers, diplexers, triplexers, coax relays, baluns, attenuators, preamps, tower-top amplifiers, transverters, bias tees, surge arrestors, feedlines (with length and velocity factor), adapters, and **Custom N-port device** (set the number of ports). Every box has a **Notes** field.
+- **Open it in the VNA:** triple-click the box, or select it and press **Scan with VNA**. The NanoVNA page opens with a scan window for that device. A radio's own antenna jacks can be scanned too: pick the jack in the window.
+- **The scan window** walks you through: **Device** (the steps it will take), **Safety**, **Calibration** (it uses the calibration you made on the NanoVNA page and tells you if the sweep is uncalibrated), **Connect and scan** (one step per port pair), **Review and save**.
+- **Multi-port devices** are measured one pair at a time. Each step shows a picture and the same thing in words: which port goes to VNA **PORT 1 (CH0)**, which to **PORT 2 (CH1)**, and which ports get a **50 Ω load**. All steps are saved together as one scan.
+- The NanoVNA measures S11 and S21 only. Non-reciprocal devices (circulators, isolators, preamps) get a step in each direction.
+- **Radios, amplifiers and transverters** show: *Radio must be OFF or not transmitting; transmitting into a VNA port can damage it. Scanning a powered-off radio jack shows the impedance its input presents.* You must press **I confirm this device is off / not transmitting** before you can go on.
+- **TX LOCKOUT:** when the device is in a transmit path (a radio or amplifier port, or anything the patch connects to one, such as a transmitter feedline or a duplexer on the transmitter line), Commander locks out transmit for the whole station before the first sweep. A strip at the top of the window reads **TX LOCKOUT: VNA scan in progress on** *device*. While it shows, PTT/MOX and amplifier **Operate** are refused with the reason shown. It ends when the scan finishes or you cancel it. If the VNA disconnects mid-scan, or Commander stopped during a scan, it stays on until you press **Release TX lockout**.
+- **Without a VNA** the window says **NO VNA CONNECTED** and you can still read saved scans.
+- **History:** saved scans are listed newest first with a summary: resonance (lowest SWR) and its frequency, the span where SWR is under 2:1, and for two-port steps the best S21 and its −3 dB span. Mark one scan **A** and another **B** to compare them. A new scan never replaces an old one.
+- **Deleting:** select scan **A**, then use the red **Danger** box and confirm. Removing a device box from the patch does not delete its scans.
+- Scans are stored in the folder **`<station>.HSData/VNA/`** beside your station file, one folder per device.
+
 ---
 
 <a id="ch12"></a>
