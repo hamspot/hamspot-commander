@@ -38,3 +38,15 @@ docs/               user guide, agent notes, design docs
 ## License
 
 GPL-3.0-or-later. See `LICENSE`. The face uses [rustcars](https://github.com/webaugur/rustcars) (MIT, `licenses/rustcars-MIT.txt`); the bundled Antonio typeface is OFL 1.1 (`licenses/Antonio-OFL.txt`). The Tune layout loosely follows the Ham Radio Deluxe rig screen; Ham Radio Deluxe is a trademark of its owner and none of its icons, bitmaps or text are copied.
+
+## Web manual (GitHub Pages)
+
+Build the web version of the manual locally with one command:
+
+```bash
+scripts/build-docs.sh          # output in build/site (mkdocs-material; installs into build/venv if needed)
+scripts/build-docs.sh serve    # live preview at http://127.0.0.1:8000
+```
+
+`.github/workflows/pages.yml` (template: `scripts/pages-workflow.yml`; copy it there with `mkdir -p .github/workflows && cp scripts/pages-workflow.yml .github/workflows/pages.yml`) publishes it on every push to the default branch once
+Settings → Pages → Source is set to **GitHub Actions**. Release binaries stay on GitHub Releases.
