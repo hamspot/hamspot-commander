@@ -3526,6 +3526,23 @@ fn service_tx_pipe(slot: &mut Slot, graph: &crate::audio::AudioGraph, now: Insta
         return;
     }
     let command = slot.spec.tx_pipe.trim().to_string();
+    // E-STOP: no transmitter pipe runs while it is engaged. The command stays
+    // in the radio's settings, so after RELEASE the pipe is back as it was
+    // (normal operation; the pipe does not key the radio).
+    if crate::estop::engaged() && !command.is_empty() {
+        let was_running = slot.tx_pipe.is_some();
+        release_tx_pipe(slot);
+        set_tx_pipe_status(slot, "stopped by E-STOP");
+        if was_running {
+            crate::estop::report(
+                crate::estop::generation(),
+                crate::estop::Kind::Transmitter,
+                &format!("{} TX pipe", slot.spec.name),
+                crate::estop::Outcome::Stopped,
+            );
+        }
+        return;
+    }
     if command.is_empty() {
         release_tx_pipe(slot);
         set_tx_pipe_status(slot, "");

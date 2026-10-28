@@ -40,6 +40,7 @@ pub struct Tools {
     pub saved_pos: Option<egui::Pos2>,
     pub saved_size: Option<egui::Vec2>,
     theme: LcarsTheme,
+    estop_chord: crate::estop::Chord,
     calc: calculator::Calc,
     log: station_log::StationLog,
     ham: ham_rf::HamRf,
@@ -61,6 +62,7 @@ impl Tools {
         no_scroll_fade(ctx);
         Self {
             screen: Screen::Log,
+            estop_chord: crate::estop::Chord::default(),
             detached: false,
             dock: false,
             saved_pos: None,
@@ -156,6 +158,8 @@ impl Tools {
             });
         if in_window {
             self.remember_window(ui);
+            // The torn-off window has its own keyboard focus.
+            self.estop_chord.poll(ui.ctx());
         }
         self.screen(ui);
     }
@@ -189,8 +193,16 @@ impl Tools {
 
     fn nav(&mut self, ui: &mut egui::Ui) {
         let theme = self.theme;
+        // Rotator: the E-STOP sits at the right end of this row (issue #198).
+        // Hardware screens (Rotator moves a motor, NanoVNA emits RF stimulus)
+        // carry the E-STOP at the right end of this row (issue #198).
+        let estop = matches!(self.screen, Screen::Rotator | Screen::NanoVna);
+        let estop_w = crate::estop::button_width(crate::estop::engaged()) + 8.0;
+        ui.horizontal(|ui| {
+        let max_w = if estop { (ui.available_width() - estop_w).max(0.0) } else { ui.available_width() };
         egui::ScrollArea::horizontal()
             .id_salt("tool-nav")
+            .max_width(max_w)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
             for (index, (screen, label)) in SCREENS.iter().enumerate() {
@@ -217,6 +229,13 @@ impl Tools {
             }
                 });
             });
+        if estop {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.set_min_height(theme.bar_thin);
+                crate::estop::button(ui);
+            });
+        }
+        });
         if !self.open_note.is_empty() {
             readout(ui, &theme, &self.open_note, false);
         }

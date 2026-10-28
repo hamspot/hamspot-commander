@@ -13,3 +13,13 @@ Brief record of decisions and why. Dated when recorded here (2026-10-27) unless 
 - **Layout reference:** the Tune face loosely follows the Ham Radio Deluxe 5.21 rig screen (behaviour only; no icons, bitmaps or text copied).
 - **Data layout (proposal, not built):** `Foo.HSCommander` plus a `Foo.HSData/` folder; see `docs/design/data-layout.md` on branch `design-data-layout` and epic #148.
 - **Manual style (2026-10-27):** operator-only content, second person, tables for reference, screenshot placeholders as HTML comments with #149 ids.
+
+## E-STOP button height (#200, 2026-10-27)
+
+The E-STOP and RELEASE buttons use the standard egui button height
+(`estop::button_height` = `max(interact_size.y, button text + 2 * button_padding.y)`,
+the rule `egui::Button` uses) and the Button text style. Width follows the text.
+The octagon radius is about half the text height, kept 2 px clear of the border.
+The fixed 24 px `BUTTON_H` is gone, and the Config E-STOP group bars went back from
+28 px (r_out 16) to the normal 16 px (r_out 12) `Metrics::default()`. The tan top bar
+and the Tools tab row were not enlarged for it.

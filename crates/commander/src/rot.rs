@@ -122,6 +122,9 @@ enum RotCmd {
     SetPos(u64, f64, f64),
     Move(u64, Spin, i32),
     Stop(u64),
+    /// Wake the supervisor for the E-STOP. The stop itself is driven by
+    /// [`crate::estop`] on every pass while it is engaged.
+    EStop,
     Shutdown,
 }
 
@@ -177,6 +180,7 @@ struct Slot {
     make: String,
     model_label: String,
     held: Option<u16>,
+    estop: crate::estop::Retry,
 }
 
 pub struct Hub {
@@ -482,6 +486,11 @@ impl Hub {
         self.send(RotCmd::Move(id, spin, speed));
     }
 
+    /// E-STOP: wake the supervisor so it stops every rotator now.
+    pub fn estop(&self) {
+        self.send(RotCmd::EStop);
+    }
+
     pub fn stop(&self, id: u64) {
         self.send(RotCmd::Stop(id));
     }
@@ -545,7 +554,10 @@ fn supervise(hub: Arc<Hub>, ctx: egui::Context) {
     publish(&hub, &slots, selected);
     ctx.request_repaint();
     loop {
-        let cmds = std::mem::take(&mut *hub.cmds.lock().expect("rot cmds"));
+        let cmds = order_for_stop(
+            std::mem::take(&mut *hub.cmds.lock().expect("rot cmds")),
+            crate::estop::engaged(),
+        );
         let mut changed = !cmds.is_empty();
         let mut stop = false;
         for cmd in cmds {
@@ -587,6 +599,7 @@ fn supervise(hub: Arc<Hub>, ctx: egui::Context) {
                     control_slot(&mut slots, id, Control::Move(spin, speed))
                 }
                 RotCmd::Stop(id) => control_slot(&mut slots, id, Control::Stop),
+                RotCmd::EStop => {}
                 RotCmd::Select(id) => {
                     if slots.iter().any(|slot| slot.id == id) {
                         selected = id;
@@ -628,6 +641,9 @@ fn supervise(hub: Arc<Hub>, ctx: egui::Context) {
         for slot in &mut slots {
             tick_slot(slot, now);
         }
+        for slot in &mut slots {
+            estop_slot(slot, now);
+        }
         if changed || slots.iter().any(|slot| slot.status_dirty) {
             publish(&hub, &slots, selected);
             for slot in &mut slots {
@@ -647,6 +663,12 @@ fn control_slot(slots: &mut [Slot], id: u64, cmd: Control) {
     let Some(slot) = slots.iter_mut().find(|slot| slot.id == id) else {
         return;
     };
+    // E-STOP choke point: only `stop` reaches a rotator while it is engaged.
+    if !crate::estop::allows_rot(&cmd, crate::estop::engaged()) {
+        slot.status = "E-STOP engaged: move refused".into();
+        slot.status_dirty = true;
+        return;
+    }
     let Some(port) = slot.port else {
         return;
     };
@@ -673,6 +695,7 @@ fn new_slot(id: u64, spec: RotatorSpec, models: &[RotModel]) -> Slot {
         make: String::new(),
         model_label: String::new(),
         held: None,
+        estop: crate::estop::Retry::default(),
     };
     label_slot(&mut slot, models);
     slot
@@ -801,8 +824,77 @@ fn stop_slot(slot: &mut Slot) {
     slot.next_pos = None;
 }
 
+/// While the E-STOP is engaged, send `stop` until this rotator confirms it,
+/// then keep re-sending it every second so a move from an outside client
+/// (Gpredict talks to `rotctld` directly) is cancelled again. Each rotator has
+/// its own clock and a short socket timeout, so a dead one does not hold up
+/// the others.
+fn estop_slot(slot: &mut Slot, now: Instant) {
+    use crate::estop::{self, Kind, Outcome};
+    let on = estop::engaged();
+    let g = estop::generation();
+    if !on {
+        return;
+    }
+    if slot.estop.confirmed == g {
+        // Latched: re-assert once a second.
+        if slot.estop.next_try.is_none_or(|at| now >= at) {
+            if let Some(port) = slot.port {
+                let _ = PosClient::open(port).and_then(|mut c| c.control(&Control::Stop));
+            }
+            slot.estop.next_try = Some(now + Duration::from_secs(1));
+        }
+        return;
+    }
+    if !slot.estop.due(on, g, now) {
+        return;
+    }
+    let name = slot.spec.name.clone();
+    estop::report(g, Kind::Motor, &name, Outcome::Pending);
+    let result = match slot.port {
+        Some(port) => PosClient::open(port).and_then(|mut c| c.control(&Control::Stop)),
+        None => Err("rotctld not running".into()),
+    };
+    match result {
+        Ok(()) => {
+            slot.estop.tried(g, true, now);
+            slot.estop.next_try = Some(now + Duration::from_secs(1));
+            estop::report(g, Kind::Motor, &name, Outcome::Stopped);
+            slot.status = "E-STOP: stopped".into();
+        }
+        Err(err) => {
+            slot.estop.tried(g, false, now);
+            estop::report(g, Kind::Motor, &name, Outcome::Failed(err.clone()));
+            slot.status = format!("E-STOP: stop failed ({err}), retrying");
+        }
+    }
+    slot.status_dirty = true;
+}
+
+/// Queue order. A `stop` cancels every move queued before it for the same
+/// rotator, so it is never stuck behind them. While the E-STOP is engaged
+/// every move is dropped, and stops run first.
+fn order_for_stop(cmds: Vec<RotCmd>, engaged: bool) -> Vec<RotCmd> {
+    let is_move = |c: &RotCmd| matches!(c, RotCmd::SetPos(..) | RotCmd::Move(..));
+    let mut out: Vec<RotCmd> = Vec::with_capacity(cmds.len());
+    for cmd in cmds {
+        if let RotCmd::Stop(id) = cmd {
+            out.retain(|c| !matches!(c, RotCmd::SetPos(i, ..) | RotCmd::Move(i, ..) if *i == id));
+        }
+        out.push(cmd);
+    }
+    if engaged {
+        out.retain(|c| !is_move(c));
+        out.sort_by_key(|c| !matches!(c, RotCmd::Stop(_) | RotCmd::EStop));
+    }
+    out
+}
+
 fn next_wait(slots: &[Slot], now: Instant) -> Duration {
     let mut wait = POSITION_EVERY;
+    if crate::estop::engaged() {
+        wait = wait.min(crate::estop::RETRY_EVERY);
+    }
     for slot in slots {
         for at in [slot.retry_at, slot.next_pos].into_iter().flatten() {
             if at <= now {
@@ -1111,5 +1203,31 @@ mod tests {
         release_port(port);
         let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
         assert!(TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_err());
+    }
+
+    #[test]
+    fn stop_jumps_the_queue() {
+        let q = vec![
+            RotCmd::SetPos(1, 90.0, 0.0),
+            RotCmd::Move(2, Spin::Cw, 50),
+            RotCmd::Move(1, Spin::Cw, 50),
+            RotCmd::Stop(1),
+        ];
+        let out = order_for_stop(q, false);
+        assert_eq!(out.len(), 2);
+        assert!(matches!(out[0], RotCmd::Move(2, ..)));
+        assert!(matches!(out[1], RotCmd::Stop(1)));
+        let q = vec![
+            RotCmd::Select(3),
+            RotCmd::SetPos(1, 90.0, 0.0),
+            RotCmd::Move(2, Spin::Cw, 50),
+            RotCmd::Stop(2),
+            RotCmd::EStop,
+        ];
+        let out = order_for_stop(q, true);
+        assert!(matches!(out[0], RotCmd::Stop(2)));
+        assert!(matches!(out[1], RotCmd::EStop));
+        assert!(matches!(out[2], RotCmd::Select(3)));
+        assert_eq!(out.len(), 3, "moves dropped while engaged");
     }
 }
