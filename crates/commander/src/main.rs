@@ -33,6 +33,8 @@ mod scan;
 mod tools;
 mod group_box;
 mod toggle;
+mod tx_lockout;
+mod vna_devices;
 
 /// Config page groups, in page order, with their elbow colours.
 pub(crate) const CONFIG_GROUPS: [(&str, egui::Color32); 9] = {
@@ -336,6 +338,13 @@ struct App {
     /// RF patch bay on Config (#98). Visual only.
     patchbay: patchbay::PatchBay,
     patchbay_ui: patchbay::UiState,
+    /// Station-wide TX lockout (#219). VNA device scans hold it; E-Stop (#198)
+    /// is meant to join as a second holder.
+    tx_lockout: tx_lockout::TxLockout,
+    /// Last transmit refusal, shown in the lockout strip until dismissed.
+    tx_note: std::cell::RefCell<String>,
+    /// The open device scan wizard (#219).
+    vna_wiz: Option<vna_devices::ui::ScanWizard>,
     /// Read once from the desktop. The sine stays off. The speaker stays.
     reduced_motion: bool,
     /// Zones double-clicked into the scan list. Stored on the station file.
@@ -2024,6 +2033,9 @@ impl App {
             patchbay: Default::default(),
             rec: Default::default(),
             patchbay_ui: Default::default(),
+            tx_lockout: Default::default(),
+            tx_note: Default::default(),
+            vna_wiz: None,
             reduced_motion: pulse::system_reduced_motion(),
             scan_zones: BTreeSet::new(),
             monitor_zones: BTreeSet::new(),
@@ -2255,6 +2267,13 @@ impl App {
     }
 
     fn send(&self, cmd: Command) {
+        // Backstop for every keying path: nothing keys while TX is locked out.
+        if matches!(cmd, Command::SetPtt(true)) {
+            if let Err(why) = self.tx_lockout.refuse("PTT") {
+                *self.tx_note.borrow_mut() = why;
+                return;
+            }
+        }
         let mut guard = self.shared.lock().expect("rig thread");
         guard.cmds.push(cmd);
         self.wake.notify_one();
@@ -2927,6 +2946,7 @@ impl eframe::App for App {
                 }
             });
         });
+        self.tx_lockout_strip(ui);
         // The brightness sine is wall-clock. Nothing else signals the next
         // frame. An idle station has no tab inside the hang, so it does not
         // ask to be drawn again.
@@ -3013,6 +3033,7 @@ impl eframe::App for App {
         }
         self.show_meter_window(&ctx, &snap);
         self.show_tools_window(&ctx);
+        self.show_vna_wizard(&ctx);
         // Clicks in this frame already ran. A channel or zone pick stops
         // the scan before this hop, and service_cc has already stored any
         // neighbor announcement from the control channel we are held on.
@@ -4308,6 +4329,7 @@ impl App {
         cfg_group(ui, "RF patch", |ui| {
             patchbay::show(ui, &mut self.patchbay, &mut self.patchbay_ui, &radios, &link);
         });
+        let mut open_vna = false;
         for action in self.patchbay_ui.take_actions() {
             match action {
                 patchbay::Action::AddAmplifier(spec) => {
@@ -4320,7 +4342,22 @@ impl App {
                 patchbay::Action::Control(amp_id, cmd) => {
                     self.send_amp(&amp_id, cmd);
                 }
+                patchbay::Action::ScanDevice(id) => {
+                    if self.station_saved.is_none() || self.config_path.is_empty() {
+                        *self.tx_note.borrow_mut() = "Save the station first: VNA scans are kept in its .HSData/VNA folder.".into();
+                        continue;
+                    }
+                    if let Some(old) = self.vna_wiz.as_mut() {
+                        let mut tools = self.tools.lock().expect("tools");
+                        old.cancel(tools.nanovna_mut(), &mut self.tx_lockout);
+                    }
+                    self.vna_wiz = vna_devices::ui::ScanWizard::new(Path::new(&self.config_path), &self.patchbay, id);
+                    open_vna = true;
+                }
             }
+        }
+        if open_vna {
+            self.open_vna_page();
         }
     }
 
@@ -6012,9 +6049,72 @@ impl App {
         }
     }
 
+    /// Bring up Tools · NanoVNA for a device scan (#219).
+    fn open_vna_page(&mut self) {
+        let detached = {
+            let mut tools = self.tools.lock().expect("tools");
+            tools.screen = tools::Screen::NanoVna;
+            tools.detached
+        };
+        if !detached {
+            self.page = Page::Tools;
+        }
+    }
+
+    fn show_vna_wizard(&mut self, ctx: &egui::Context) {
+        let Some(w) = self.vna_wiz.as_mut() else { return };
+        let out = {
+            let mut tools = self.tools.lock().expect("tools");
+            w.show(ctx, tools.nanovna_mut(), &mut self.tx_lockout)
+        };
+        let closed = !w.open;
+        if closed {
+            self.vna_wiz = None;
+        }
+        if out == vna_devices::ui::Out::ShowVnaPage {
+            self.open_vna_page();
+        }
+    }
+
+    /// The app's status strip for the TX lockout: text, not colour alone.
+    fn tx_lockout_strip(&mut self, ui: &mut egui::Ui) {
+        let note = self.tx_note.borrow().clone();
+        let Some(banner) = self.tx_lockout.banner().or_else(|| (!note.is_empty()).then(String::new)) else { return };
+        let manual = self.tx_lockout.is_manual(vna_devices::LOCK_KEY);
+        let (mut release, mut dismiss) = (false, false);
+        egui::Panel::top("tx-lockout").show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                if !banner.is_empty() {
+                    ui.label(egui::RichText::new(&banner).color(egui::Color32::from_rgb(255, 176, 0)).strong());
+                }
+                if manual && ui.button("Release TX lockout").clicked() {
+                    release = true;
+                }
+                if !note.is_empty() {
+                    ui.label(format!("✖ {note}"));
+                    if ui.button("Dismiss").clicked() {
+                        dismiss = true;
+                    }
+                }
+            });
+        });
+        if release {
+            vna_devices::ui::release_by_user(&mut self.tx_lockout, Path::new(&self.config_path));
+        }
+        if dismiss {
+            self.tx_note.borrow_mut().clear();
+        }
+    }
+
     /// Send one command to the amplifier with this fixed id, looked up now.
     /// A missing or ambiguous id sends nothing (#96).
     fn send_amp(&self, amp_id: &str, cmd: amp::Control) -> bool {
+        if tx_lockout::amp_cmd_transmits(&cmd) {
+            if let Err(why) = self.tx_lockout.refuse("Amplifier OPERATE") {
+                *self.tx_note.borrow_mut() = why;
+                return false;
+            }
+        }
         let rows = self.amplifiers.view().rows;
         match patchbay::bind::resolve(amp_id, &rows) {
             Some(row) => {
@@ -6487,6 +6587,13 @@ impl App {
                 }
                 file.scan_zones.sort_unstable();
                 let station_path = Path::new(&self.config_path);
+                // A VNA scan that held the TX lockout did not finish last time.
+                if let Some(dev) = vna_devices::read_marker(station_path) {
+                    self.tx_lockout.make_manual(
+                        vna_devices::LOCK_KEY,
+                        &format!("the last VNA scan on {dev} did not finish cleanly; check the station, then press Release TX lockout"),
+                    );
+                }
                 match crate::tools::nanovna::load_beside(station_path, &mut file.nanovna) {
                     Ok(loaded) => {
                         if let Some(note) = &loaded.note {
@@ -11559,6 +11666,11 @@ impl App {
         if crate::toggle::add_toggle(ui, enabled, snap.ptt, label).clicked() {
             let next = !snap.ptt;
             if next {
+                if let Err(why) = self.tx_lockout.refuse("PTT/MOX") {
+                    self.plan_note = why;
+                    self.plan_note_ptt = true;
+                    return;
+                }
                 if let Some(why) = self.plan.transmit_block_on(
                     self.zone_sel,
                     self.band_sel,
