@@ -293,8 +293,18 @@ impl Chord {
 
 // ---- Widget ----
 
-/// Button height. The hit target is never shorter than this.
-pub const BUTTON_H: f32 = 24.0;
+/// Standard egui button height for text `text_h` tall: the same rule
+/// `egui::Button` uses (`max(interact_size.y, text + 2 * button_padding.y)`).
+/// The E-STOP and RELEASE use it so they match every other button (#200).
+pub fn button_height(interact_y: f32, text_h: f32, pad_y: f32) -> f32 {
+    interact_y.max(text_h + 2.0 * pad_y)
+}
+
+/// Octagon radius for a button `h` tall: about the text height, never
+/// touching the border (2 px clear top and bottom).
+pub fn octagon_radius(h: f32, text_h: f32) -> f32 {
+    (text_h / 2.0).min(h / 2.0 - 2.0).max(2.0)
+}
 
 /// Paint a stop-sign octagon (no font glyph) centred at `c`, radius `r`.
 pub fn paint_octagon(painter: &egui::Painter, c: egui::Pos2, r: f32, color: egui::Color32) {
@@ -326,11 +336,14 @@ pub fn button(ui: &mut egui::Ui) -> bool {
         .horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             let label = if on { "E-STOP ENGAGED" } else { "E-STOP" };
-            let font = egui::FontId::proportional(14.0);
+            let font = egui::TextStyle::Button.resolve(ui.style());
             let galley = ui.painter().layout_no_wrap(label.into(), font, egui::Color32::BLACK);
-            let icon = 16.0;
-            let w = (galley.size().x + icon + 18.0).max(90.0);
-            let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, BUTTON_H), egui::Sense::click());
+            let sp = ui.spacing();
+            let h = button_height(sp.interact_size.y, galley.size().y, sp.button_padding.y);
+            let r = octagon_radius(h, galley.size().y);
+            let icon = 2.0 * r;
+            let w = galley.size().x + icon + 18.0;
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
             let fill = if resp.hovered() { DANGER.gamma_multiply(0.85) } else { DANGER };
             let p = ui.painter();
             p.rect_filled(rect, 4.0, fill);
@@ -338,7 +351,7 @@ pub fn button(ui: &mut egui::Ui) -> bool {
             let stroke = egui::Stroke::new(if on { 3.0 } else { 1.5 }, egui::Color32::BLACK);
             p.rect_stroke(rect, 4.0, stroke, egui::StrokeKind::Inside);
             let c = egui::pos2(rect.left() + 6.0 + icon / 2.0, rect.center().y);
-            paint_octagon(p, c, icon / 2.0, egui::Color32::BLACK);
+            paint_octagon(p, c, r, egui::Color32::BLACK);
             p.galley(
                 egui::pos2(rect.left() + 10.0 + icon, rect.center().y - galley.size().y / 2.0),
                 galley,
@@ -355,8 +368,8 @@ pub fn button(ui: &mut egui::Ui) -> bool {
                 engage();
             }
             if on {
-                let rel = ui.add_sized(
-                    egui::vec2(80.0, BUTTON_H),
+                // Plain egui button: standard height, width from its text.
+                let rel = ui.add(
                     egui::Button::new(egui::RichText::new("RELEASE").color(egui::Color32::BLACK))
                         .fill(egui::Color32::from_rgb(0xF2, 0xC1, 0x4E))
                         .stroke(egui::Stroke::new(1.5, egui::Color32::BLACK)),
@@ -536,6 +549,19 @@ mod tests {
         // Focus loss clears held keys: no fire, and no stuck "down".
         assert!(!chord.update(frame(&ctx, vec![egui::Event::WindowFocused(false)])));
         assert!(!chord.update(frame(&ctx, vec![egui::Event::WindowFocused(true)])));
+    }
+
+    #[test]
+    fn button_is_standard_height() {
+        let st = egui::Style::default();
+        let (iy, py) = (st.spacing.interact_size.y, st.spacing.button_padding.y);
+        // egui's default button: 18 px for 14 px-ish text.
+        assert_eq!(button_height(iy, 12.0, py), iy);
+        assert_eq!(button_height(iy, 20.0, py), 20.0 + 2.0 * py);
+        let h = button_height(iy, 14.0, py);
+        let r = octagon_radius(h, 14.0);
+        assert!(2.0 * r <= h - 4.0, "octagon not clipped");
+        assert!(r >= 2.0);
     }
 
     #[test]

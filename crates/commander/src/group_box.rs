@@ -134,10 +134,10 @@ pub fn layout_with_slot(
     }
 }
 
-/// Metrics for a group whose bar carries the E-STOP: the bar is tall enough
-/// for a [`crate::estop::BUTTON_H`] hit target plus a small margin.
+/// Metrics for a group whose bar carries the E-STOP: the normal group bar.
+/// It was 28 px / r_out 16 to fit a 24 px button; #200 reverted that.
 pub fn estop_metrics() -> Metrics {
-    Metrics { bar: crate::estop::BUTTON_H + 4.0, r_out: 16.0, ..Metrics::default() }
+    Metrics::default()
 }
 
 /// [`group_box`] with the shared E-STOP at the right end of its bar.
@@ -318,7 +318,8 @@ mod tests {
     #[test]
     fn slot_sits_at_right_end_before_cap() {
         let m = estop_metrics();
-        assert!(m.bar >= crate::estop::BUTTON_H, "hit target fits in the bar");
+        assert_eq!(m, Metrics::default(), "E-STOP groups keep the normal bar (#200)");
+        assert_eq!((m.bar, m.r_out), (16.0, 12.0));
         let l = layout_with_slot(0.0, 0.0, 800.0, 40.0, &m, 120.0);
         let slot = l.slot.expect("wide group has a slot");
         let cap = l.cap.expect("cap");
