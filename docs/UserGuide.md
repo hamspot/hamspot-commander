@@ -419,7 +419,9 @@ REC records HackRF talkgroup calls and channel traffic so you can play them back
 
 REC needs a saved station. Recordings sit beside it ([chapter 15](#ch15)).
 
-<!-- screenshot: rec-01 — Creating the recordings database on first use. -->
+The recordings database is created for you the first time you arm REC or open the REC page. There is nothing to set up. The REC page always says whether recording is on, how many talkgroups and channels are marked, and whether the recorder is running. If the database or recordings folder can't be opened or created (for example a full disk, a folder you can't write to, a damaged database, or one from a newer Commander), the REC page and the REC bar say **REC is NOT recording** with the reason. Commander never overwrites a damaged database; move it aside and press REC again to start fresh.
+
+<!-- screenshot: rec-01 — The REC page before the first recording. -->
 
 ## 9.1 Marking what to record
 

@@ -46,6 +46,10 @@ pub struct Status {
     /// Bumped whenever rows change, so the UI can re-query.
     pub generation: AtomicU64,
     pub log: Mutex<Vec<String>>,
+    /// The writer has an open database and folder and can record.
+    pub ready: AtomicBool,
+    /// Why the writer cannot record (empty when fine).
+    pub error: Mutex<String>,
 }
 
 impl Status {
@@ -188,11 +192,22 @@ impl Worker {
                             Ok(_) => {}
                             Err(e) => self.status.note(format!("REC: recovery failed: {e}")),
                         }
+                        if let Err(e) = std::fs::create_dir_all(&rec_dir) {
+                            self.status.ready.store(false, Ordering::Relaxed);
+                            *self.status.error.lock().expect("rec error") = format!("cannot create the recordings folder: {e}");
+                            return;
+                        }
                         self.db = Some(db);
                         self.rec_dir = Some(rec_dir);
+                        self.status.ready.store(true, Ordering::Relaxed);
+                        self.status.error.lock().expect("rec error").clear();
                         self.status.generation.fetch_add(1, Ordering::Relaxed);
                     }
-                    Err(e) => self.status.note(format!("REC: cannot open database: {e}")),
+                    Err(e) => {
+                        self.status.ready.store(false, Ordering::Relaxed);
+                        *self.status.error.lock().expect("rec error") = format!("cannot open the recordings database: {e}");
+                        self.status.note(format!("REC: cannot open database: {e}"));
+                    }
                 }
             }
             Cmd::Cap { gb, overwrite_oldest } => {
@@ -488,6 +503,33 @@ mod tests {
         let mut x = meta("hackrf_tg", Some(7), "", "");
         x.channel_hz = 851e6;
         x
+    }
+
+    #[test]
+    fn missing_database_is_created_and_recording_starts() {
+        let dir = tempdir("writer-autocreate").join("new").join("station");
+        let mut w = worker(&dir);
+        assert!(w.status.ready.load(Ordering::Relaxed));
+        assert!(w.status.error.lock().unwrap().is_empty());
+        assert!(dir.join("S.HSREC.sqlite").exists());
+        w.command(Cmd::Open { key: 1, meta: m() });
+        assert!(w.status.writing.load(Ordering::Relaxed));
+        w.chunk(Chunk { key: 1, hz: 851, data: vec![2; 64_000] });
+        w.command(Cmd::Close { key: 1, keep: true });
+        assert_eq!(w.db.as_ref().unwrap().all().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn corrupt_database_is_reported_and_nothing_records() {
+        let dir = tempdir("writer-corrupt");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("S.HSREC.sqlite"), vec![0x5au8; 8192]).unwrap();
+        let mut w = worker(&dir);
+        assert!(!w.status.ready.load(Ordering::Relaxed));
+        assert!(w.status.error.lock().unwrap().contains("recordings database"));
+        w.command(Cmd::Open { key: 1, meta: m() });
+        assert!(!w.status.writing.load(Ordering::Relaxed));
+        assert_eq!(std::fs::read(dir.join("S.HSREC.sqlite")).unwrap(), vec![0x5au8; 8192]);
     }
 
     #[test]

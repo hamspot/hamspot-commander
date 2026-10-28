@@ -49,6 +49,8 @@ pub enum IconState {
     Armed,
     /// Raw IQ is being written right now.
     Writing,
+    /// The recorder cannot record (database or folder problem).
+    Error,
 }
 
 pub fn icon_state(armed: bool, writing: bool) -> IconState {
@@ -66,6 +68,7 @@ pub fn icon_color(state: IconState) -> egui::Color32 {
         IconState::Off => egui::Color32::from_rgb(0, 0, 0),
         IconState::Armed => egui::Color32::from_rgb(110, 14, 10),
         IconState::Writing => egui::Color32::from_rgb(196, 28, 20),
+        IconState::Error => egui::Color32::from_rgb(230, 140, 0),
     }
 }
 
@@ -91,7 +94,60 @@ pub fn icon_text(state: IconState) -> &'static str {
         IconState::Off => "REC off",
         IconState::Armed => "REC armed (waiting for traffic)",
         IconState::Writing => "REC: recording now",
+        IconState::Error => "REC error: NOT recording (see the REC page)",
     }
+}
+
+/// Honest REC state: writing only when the recorder has its database open
+/// and is writing; any open/create error wins over the armed keys.
+pub fn rec_state(armed: bool, ready: bool, writing: bool, error: Option<&str>) -> IconState {
+    if error.is_some_and(|e| !e.is_empty()) {
+        IconState::Error
+    } else if !armed {
+        IconState::Off
+    } else if ready && writing {
+        IconState::Writing
+    } else {
+        IconState::Armed
+    }
+}
+
+/// One line for the REC page and bar. Text carries the state, not colour.
+pub fn status_line(state: IconState, ready: bool, error: Option<&str>) -> String {
+    match state {
+        IconState::Error => format!(
+            "\u{26a0} REC is NOT recording: {}. Check free space and that the folder beside the station file is writable, then press REC again. A damaged or newer database is left untouched; move it aside to start fresh.",
+            error.unwrap_or("unknown error")
+        ),
+        IconState::Off => "REC off: nothing is being recorded.".into(),
+        IconState::Armed if !ready => "REC armed: starting the recorder\u{2026}".into(),
+        IconState::Armed => "REC armed: recorder ready, waiting for traffic.".into(),
+        IconState::Writing => "REC: recording now.".into(),
+    }
+}
+
+/// What an empty REC page says, so a blank window still gives hints.
+pub fn empty_hint(tg: RecMode, n_tg: usize, ch: RecMode, n_ch: usize, ready: bool, storage: &str) -> String {
+    let part = |what: &str, mode: RecMode, n: usize| match mode {
+        RecMode::Off => format!("{what}: OFF"),
+        RecMode::Marked => format!("{what}: ON for {n} marked"),
+        RecMode::All => format!("{what}: ON for all traffic"),
+    };
+    let on = tg != RecMode::Off || ch != RecMode::Off;
+    let mut t = format!(
+        "No recordings yet. Recording is {} ({}, {}). Recorder {}. Storage: {storage}.",
+        if on { "ON" } else { "OFF" },
+        part("talkgroups", tg, n_tg),
+        part("channels", ch, n_ch),
+        if ready { "running" } else { "not running" },
+    );
+    let marked_none = |m: RecMode, n: usize| m == RecMode::Off || (m == RecMode::Marked && n == 0);
+    if !on {
+        t.push_str(" Arm REC on the Talkgroups or Channels tab (red: marked, amber: all).");
+    } else if marked_none(tg, n_tg) && marked_none(ch, n_ch) {
+        t.push_str(" Nothing is marked: right-click a row to mark it.");
+    }
+    t
 }
 
 pub fn key_lamp(mode: RecMode) -> KeyLamp {
@@ -193,6 +249,8 @@ pub struct RecUi {
     bar_actions: Vec<BarAction>,
     /// Whether the shown view follows now, for the header bar's LIVE marker.
     bar_live: bool,
+    /// Why the database could not be opened or created (shown, never silent).
+    db_error: Option<String>,
 }
 
 fn rows_meta(rows: &[cat::RadioRow], id: u64) -> Option<&cat::RadioRow> {
@@ -205,9 +263,26 @@ impl App {
     }
 
     pub(super) fn rec_icon(&self) -> IconState {
-        let writing = self.rec.db.is_some()
-            && crate::rec_live::recorder().status.writing.load(Ordering::Relaxed);
-        icon_state(self.rec_armed(), writing)
+        let (ready, err) = self.rec_ready();
+        let writing = crate::rec_live::recorder().status.writing.load(Ordering::Relaxed);
+        rec_state(self.rec_armed(), ready, writing, err.as_deref())
+    }
+
+    /// Recorder can write (UI and writer both have the database), and any error.
+    fn rec_ready(&self) -> (bool, Option<String>) {
+        let status = &crate::rec_live::recorder().status;
+        let ready = self.rec.db.is_some() && status.ready.load(Ordering::Relaxed);
+        let err = self.rec.db_error.clone().or_else(|| {
+            let e = status.error.lock().map(|e| e.clone()).unwrap_or_default();
+            (!e.is_empty() && self.rec.db.is_some()).then_some(e)
+        });
+        (ready, err)
+    }
+
+    fn rec_marked_counts(&self) -> (usize, usize) {
+        let tg = self.talkgroups.zones.iter().flat_map(|z| z.talkgroups.iter()).filter(|r| r.record).count();
+        let ch = self.channels.zones.iter().flat_map(|z| z.channels.iter()).filter(|c| c.record).count();
+        (tg, ch)
     }
 
     /// Tooltip text for the REC page tab (warnings carry text, never colour alone).
@@ -249,6 +324,8 @@ impl App {
                     self.rec.face.channels = next;
                 }
                 self.rec.face_dirty = true;
+                // A new press retries a database that failed to open.
+                self.rec.db_error = None;
                 self.rec_log(format!("REC {what}: {}", next.label()));
             }
         }
@@ -289,7 +366,12 @@ impl App {
     pub(super) fn rec_frame(&mut self, snap: &Snapshot) {
         let path = self.config_path.clone();
         if self.rec.configured.as_deref() != Some(path.as_str()) {
-            self.rec_configure(&path);
+            self.rec_configure(&path, false);
+        }
+        // REC was armed after the station loaded without a database: create
+        // it quietly now instead of pretending to record.
+        if self.rec_armed() && self.rec.db.is_none() && self.rec.db_error.is_none() && !path.is_empty() {
+            self.rec_configure(&path, true);
         }
         if self.rec.marks_dirty || self.rec.face_dirty {
             self.rec.marks_dirty = false;
@@ -358,9 +440,10 @@ impl App {
         }
     }
 
-    fn rec_configure(&mut self, path: &str) {
+    fn rec_configure(&mut self, path: &str, force: bool) {
         self.rec.configured = Some(path.to_string());
         self.rec.db = None;
+        self.rec.db_error = None;
         self.rec.rows.clear();
         self.rec.waveforms.clear();
         self.rec.wf_asked.clear();
@@ -374,16 +457,21 @@ impl App {
         self.rec.db_path = hsrec::db::db_path_beside(station);
         // The UI only opens the database (and creates it) once REC was
         // used: armed, or the file already exists.
-        if !self.rec.db_path.exists() && !self.rec_armed() {
+        // `force`: REC armed or the REC page opened; a missing (or empty)
+        // database is created quietly.
+        if !self.rec.db_path.exists() && !self.rec_armed() && !force {
             return;
+        }
+        match Db::open(&self.rec.db_path) {
+            Ok(db) => self.rec.db = Some(db),
+            Err(e) => {
+                self.rec.db_error = Some(e.to_string());
+                return;
+            }
         }
         let recorder = crate::rec_live::recorder();
         recorder.send(Cmd::Configure { rec_dir: self.rec.dir.clone(), db_path: self.rec.db_path.clone() });
         recorder.send(Cmd::Cap { gb: self.rec.face.cap_gb, overwrite_oldest: self.rec.face.overwrite_oldest });
-        match Db::open(&self.rec.db_path) {
-            Ok(db) => self.rec.db = Some(db),
-            Err(e) => self.rec.note = format!("REC database: {e}"),
-        }
         if self.rec_armed() {
             let line = format!(
                 "REC resumed from the station file: talkgroups {}, channels {}.",
@@ -532,13 +620,20 @@ impl App {
             ui.label("Open or save a station first. Recordings live beside the station file.");
             return;
         }
+        if self.rec.db.is_none() && self.rec.db_error.is_none() {
+            let path = self.config_path.clone();
+            self.rec_configure(&path, true);
+        }
         if self.rec.db.is_none() {
-            ui.label("No recordings yet. Arm REC on the Talkgroups or Channels tab (red: marked, amber: all).");
-            if ui.button("Create the recordings database now").clicked() {
-                self.rec.configured = None;
-                if let Ok(db) = Db::open(&self.rec.db_path) {
-                    drop(db);
-                }
+            let err = self.rec.db_error.clone().unwrap_or_default();
+            ui.label(
+                egui::RichText::new(status_line(IconState::Error, false, Some(&err)))
+                    .strong()
+                    .color(egui::Color32::from_rgb(240, 60, 50)),
+            );
+            if ui.button("Try again").clicked() {
+                let path = self.config_path.clone();
+                self.rec_configure(&path, true);
             }
             return;
         }
@@ -564,6 +659,15 @@ impl App {
         }
         ui.add_space(4.0);
         self.rec_status_row(ui);
+        if self.rec.rows.is_empty() && self.rec.query.is_empty() {
+            let (n_tg, n_ch) = self.rec_marked_counts();
+            let storage = match self.rec.dir.file_name() {
+                Some(n) => format!("{} beside the station file", n.to_string_lossy()),
+                None => "beside the station file".into(),
+            };
+            let (ready, _) = self.rec_ready();
+            ui.label(empty_hint(self.rec.face.talkgroups, n_tg, self.rec.face.channels, n_ch, ready, &storage));
+        }
         self.rec_job_row(ui);
         self.rec_data_window(ui.ctx());
         self.rec_detail_window(ui.ctx());
@@ -580,7 +684,13 @@ impl App {
         ui.horizontal_wrapped(|ui| {
             let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
             paint_tab_glyph(ui.painter(), rect.center(), state);
-            ui.label(icon_text(state));
+            let (ready, err) = self.rec_ready();
+            let line = status_line(state, ready, err.as_deref());
+            if state == IconState::Error {
+                ui.label(egui::RichText::new(line).strong().color(egui::Color32::from_rgb(240, 60, 50)));
+            } else {
+                ui.label(line);
+            }
             ui.label(format!(
                 "   TG: {}   Channels: {}",
                 self.rec.face.talkgroups.label(),
@@ -1049,6 +1159,11 @@ impl App {
                 // The timeline applies the action; it may already be drawn.
                 ui.ctx().request_repaint();
             }
+        }
+        if self.rec_icon() == IconState::Error {
+            let (_, err) = self.rec_ready();
+            ui.label(egui::RichText::new("\u{26a0} REC NOT RECORDING").strong().color(egui::Color32::from_rgb(240, 60, 50)))
+                .on_hover_text(status_line(IconState::Error, false, err.as_deref()));
         }
     }
 
@@ -1793,6 +1908,32 @@ mod tests {
         assert_eq!(icon_state(false, false), IconState::Off);
         assert_eq!(icon_state(true, false), IconState::Armed);
         assert_eq!(icon_state(true, true), IconState::Writing);
+    }
+
+    #[test]
+    fn rec_state_is_honest() {
+        // Armed keys alone never claim recording.
+        assert_eq!(rec_state(false, false, false, None), IconState::Off);
+        assert_eq!(rec_state(true, false, false, None), IconState::Armed);
+        assert_eq!(rec_state(true, false, true, None), IconState::Armed);
+        assert_eq!(rec_state(true, true, true, None), IconState::Writing);
+        assert_eq!(rec_state(true, true, true, Some("disk full")), IconState::Error);
+        assert_eq!(rec_state(false, false, false, Some("")), IconState::Off);
+        let e = status_line(IconState::Error, false, Some("file is not a database"));
+        assert!(e.contains("NOT recording") && e.contains("file is not a database"), "{e}");
+        assert!(status_line(IconState::Armed, false, None).contains("starting"));
+        assert!(status_line(IconState::Off, false, None).contains("off"));
+    }
+
+    #[test]
+    fn empty_page_gives_hints() {
+        let t = empty_hint(RecMode::Marked, 3, RecMode::Off, 0, true, "S.recordings beside the station file");
+        assert!(t.contains("Recording is ON") && t.contains("3 marked") && t.contains("running") && t.contains("S.recordings"), "{t}");
+        assert!(!t.contains('/'), "no absolute path: {t}");
+        let off = empty_hint(RecMode::Off, 0, RecMode::Off, 0, false, "x");
+        assert!(off.contains("Recording is OFF") && off.contains("not running") && off.contains("Arm REC"), "{off}");
+        let none = empty_hint(RecMode::Marked, 0, RecMode::Off, 0, true, "x");
+        assert!(none.contains("Nothing is marked"), "{none}");
         assert_eq!(icon_color(IconState::Off), egui::Color32::BLACK);
         assert_ne!(icon_color(IconState::Armed), icon_color(IconState::Writing));
         // The row dot fits inside the gutter, left of the row text.

@@ -130,16 +130,40 @@ pub fn db_path_beside(station: &Path) -> std::path::PathBuf {
     station.with_file_name(format!("{stem}.HSREC.sqlite"))
 }
 
+/// An error with our own text, for cases SQLite itself would not report.
+fn fail(msg: String) -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR), Some(msg))
+}
+
 impl Db {
+    /// Open the recordings database, creating it (and its folder) quietly
+    /// when missing or zero bytes. Safe when the UI and `commander-rec`
+    /// open it at once: the schema is applied inside one IMMEDIATE
+    /// transaction behind a busy timeout. A file that is not a database, or
+    /// one from a newer Commander, is refused and never written to.
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| fail(format!("cannot create the folder for the recordings database: {e}")))?;
         }
         let conn = Connection::open(path)?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.busy_timeout(std::time::Duration::from_secs(10))?;
+        // Reading the header first refuses a damaged or newer file before any write.
+        let v = conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))?;
+        Self::check_version(v)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         Self::init(conn)
+    }
+
+    fn check_version(v: i64) -> rusqlite::Result<()> {
+        if v as usize > MIGRATIONS.len() {
+            return Err(fail(format!(
+                "recordings database is from a newer Commander (schema {v}, this build knows {})",
+                MIGRATIONS.len()
+            )));
+        }
+        Ok(())
     }
 
     pub fn open_in_memory() -> rusqlite::Result<Self> {
@@ -147,10 +171,27 @@ impl Db {
     }
 
     fn init(conn: Connection) -> rusqlite::Result<Self> {
-        let v = conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? as usize;
-        for (i, sql) in MIGRATIONS.iter().enumerate().skip(v) {
-            conn.execute_batch(sql)?;
-            conn.execute_batch(&format!("PRAGMA user_version = {}", i + 1))?;
+        let version = |c: &Connection| c.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0));
+        let v = version(&conn)?;
+        Self::check_version(v)?;
+        if (v as usize) < MIGRATIONS.len() {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let run = || -> rusqlite::Result<()> {
+                // Another process may have finished the schema while we waited.
+                let v = version(&conn)? as usize;
+                for (i, sql) in MIGRATIONS.iter().enumerate().skip(v) {
+                    conn.execute_batch(sql)?;
+                    conn.execute_batch(&format!("PRAGMA user_version = {}", i + 1))?;
+                }
+                Ok(())
+            };
+            match run() {
+                Ok(()) => conn.execute_batch("COMMIT")?,
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    return Err(e);
+                }
+            }
         }
         Ok(Self { conn })
     }
@@ -487,5 +528,95 @@ pub(crate) mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
         N.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod autocreate_tests {
+    use super::*;
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("hsrec-autocreate-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+    fn count(db: &Db) -> i64 {
+        db.conn.query_row("SELECT COUNT(*) FROM recordings", [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn missing_database_and_folder_are_created() {
+        let d = tmp("missing");
+        let p = d.join("a").join("b").join("S.HSREC.sqlite");
+        let db = Db::open(&p).unwrap();
+        assert_eq!(count(&db), 0);
+        assert!(p.exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn zero_byte_file_is_initialised() {
+        let d = tmp("zero");
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("S.HSREC.sqlite");
+        std::fs::write(&p, b"").unwrap();
+        assert_eq!(count(&Db::open(&p).unwrap()), 0);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn existing_database_is_kept() {
+        let d = tmp("keep");
+        let p = d.join("S.HSREC.sqlite");
+        {
+            let db = Db::open(&p).unwrap();
+            db.insert("x.raw", &Meta::default()).unwrap();
+        }
+        assert_eq!(count(&Db::open(&p).unwrap()), 1);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn corrupt_database_is_refused_and_untouched() {
+        let d = tmp("corrupt");
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("S.HSREC.sqlite");
+        let junk = vec![0x5au8; 8192];
+        std::fs::write(&p, &junk).unwrap();
+        assert!(Db::open(&p).is_err());
+        assert_eq!(std::fs::read(&p).unwrap(), junk);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn newer_schema_is_refused_and_untouched() {
+        let d = tmp("newer");
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("S.HSREC.sqlite");
+        {
+            let c = Connection::open(&p).unwrap();
+            c.execute_batch("CREATE TABLE future (x); PRAGMA user_version = 99;").unwrap();
+        }
+        let before = std::fs::read(&p).unwrap();
+        let e = Db::open(&p).err().expect("refused").to_string();
+        assert!(e.contains("newer"), "{e}");
+        assert_eq!(std::fs::read(&p).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn two_threads_create_at_once() {
+        let d = tmp("race");
+        let p = d.join("sub").join("S.HSREC.sqlite");
+        let hs: Vec<_> = (0..4)
+            .map(|_| {
+                let p = p.clone();
+                std::thread::spawn(move || Db::open(&p).map(|db| count(&db)))
+            })
+            .collect();
+        for h in hs {
+            assert_eq!(h.join().unwrap().unwrap(), 0);
+        }
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
