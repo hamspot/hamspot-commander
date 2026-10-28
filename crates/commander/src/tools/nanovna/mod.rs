@@ -8,7 +8,7 @@ mod layout;
 mod limits;
 mod markers;
 mod proto;
-mod rf;
+pub mod rf;
 mod keys;
 #[cfg(test)]
 mod a11y;
@@ -6950,5 +6950,127 @@ mod tests {
         assert_eq!(samples.len(), 2);
         assert!((samples[1].hz - 2_000_000.0).abs() < 1.0);
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+// ------------------------------------------------- patch-panel device scans (#219)
+
+/// What the device scan wizard needs to know about the VNA right now.
+pub struct DeviceScanView {
+    pub connected: bool,
+    pub status: String,
+    pub generation: u64,
+    pub vna_id: String,
+    pub start_hz: f64,
+    pub stop_hz: f64,
+    pub points: u16,
+    pub cal_note: String,
+}
+
+impl NanoVna {
+    pub fn device_scan_view(&self) -> DeviceScanView {
+        let live = self.session.snapshot();
+        let cal_note = match (self.cal_off, self.cal_state) {
+            (true, _) | (_, cal::CalState::Off) => "Correction OFF: raw values only.".to_string(),
+            (_, cal::CalState::Exact) => "Calibrated: a stored calibration matches this sweep exactly.".to_string(),
+            (_, cal::CalState::Interp) => "Calibrated: a stored calibration is interpolated onto this sweep.".to_string(),
+            (_, cal::CalState::Uncal) => "UNCALIBRATED: no stored calibration covers this sweep. Raw values are saved; run the calibration wizard first for corrected values.".to_string(),
+        };
+        DeviceScanView {
+            connected: live.connected,
+            status: live.status.clone(),
+            generation: live.generation,
+            vna_id: live.device_id.map(|id| proto::device_id_hex(&id)).unwrap_or_default(),
+            start_hz: self.face.start_hz,
+            stop_hz: self.face.stop_hz,
+            points: self.face.points,
+            cal_note,
+        }
+    }
+
+    /// Ask for one sweep for a device scan. Returns the first sweep generation
+    /// that belongs to this request. Raw sweeps are fine: no zone, no cal gate.
+    pub fn request_device_sweep(&mut self) -> Result<u64, String> {
+        let live = self.session.snapshot();
+        if !live.connected {
+            return Err("NO VNA CONNECTED. Connect the NanoVNA first.".into());
+        }
+        if self.wizard.is_some() {
+            return Err("Finish or close the calibration wizard first.".into());
+        }
+        // A sweep already in flight when the cables were changed is skipped.
+        let need = if self.run || live.busy { live.generation + 2 } else { live.generation + 1 };
+        self.sweep_zone = None;
+        self.shown_scan = None;
+        self.shown_id.clear();
+        self.history.clear();
+        self.blank_until_sweep = true;
+        self.single = true;
+        self.run = true;
+        Ok(need)
+    }
+
+    pub fn cancel_device_sweep(&mut self) {
+        self.run = false;
+        self.single = false;
+    }
+
+    /// The last sweep: raw, and corrected when a calibration applies.
+    pub fn device_scan_capture(&self) -> Option<(Vec<Sample>, Option<Vec<Sample>>)> {
+        let live = self.session.snapshot();
+        if live.sweep.len() < 2 {
+            return None;
+        }
+        let corrected = if self.cal_off || self.cal_state == cal::CalState::Uncal { None } else { self.display_trace(&live) };
+        Some((live.sweep.clone(), corrected))
+    }
+}
+
+/// The calibration wizard's wiring picture, for a patch-panel device: the
+/// device box with its ports on top, the NanoVNA with PORT 1 (CH0) and
+/// PORT 2 (CH1) below, a cable per used VNA port and a 50 Ω load on every
+/// terminated port. The caller prints the same connections as text.
+pub fn paint_device_wiring(ui: &mut Ui, device: &str, ports: &[String], ch0: &str, ch1: Option<&str>, loads: &[String]) {
+    let w = (ui.available_width()).clamp(360.0, 620.0);
+    let (rect, _) = ui.allocate_exact_size(vec2(w, 250.0), Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 4.0, Color32::from_rgb(12, 16, 22));
+    let dev = Rect::from_min_max(Pos2::new(rect.left() + 20.0, rect.top() + 10.0), Pos2::new(rect.right() - 20.0, rect.top() + 56.0));
+    painter.rect_filled(dev, 6.0, Color32::from_rgb(40, 46, 30));
+    painter.rect_stroke(dev, 6.0, Stroke::new(1.5, palette::SLATE), egui::StrokeKind::Inside);
+    painter.text(Pos2::new(dev.center().x, dev.top() + 14.0), egui::Align2::CENTER_CENTER, device, egui::FontId::proportional(15.0), palette::TEXT);
+    let n = ports.len().max(1) as f32;
+    let port_at = |i: usize| Pos2::new(dev.left() + dev.width() * (i as f32 + 0.5) / n, dev.bottom());
+    let vna = Rect::from_min_max(Pos2::new(rect.left() + 60.0, rect.bottom() - 60.0), Pos2::new(rect.right() - 60.0, rect.bottom() - 8.0));
+    painter.rect_filled(vna, 6.0, Color32::from_rgb(32, 42, 56));
+    painter.rect_stroke(vna, 6.0, Stroke::new(1.5, palette::SLATE), egui::StrokeKind::Inside);
+    painter.text(Pos2::new(vna.center().x, vna.bottom() - 12.0), egui::Align2::CENTER_CENTER, "NanoVNA V2", egui::FontId::proportional(13.0), palette::TEXT_MUTED);
+    let p1 = Pos2::new(vna.left() + vna.width() * 0.28, vna.top());
+    let p2 = Pos2::new(vna.left() + vna.width() * 0.72, vna.top());
+    for (at, name) in [(p1, "PORT 1 · CH0"), (p2, "PORT 2 · CH1")] {
+        painter.circle_filled(at, 9.0, palette::TAN);
+        painter.circle_filled(at, 3.5, Color32::from_rgb(18, 14, 10));
+        painter.text(Pos2::new(at.x, at.y + 12.0), egui::Align2::CENTER_TOP, name, egui::FontId::proportional(13.0), palette::TEXT);
+    }
+    for (i, name) in ports.iter().enumerate() {
+        let at = port_at(i);
+        painter.circle_filled(at, 8.0, palette::TAN);
+        painter.text(Pos2::new(at.x, at.y - 10.0), egui::Align2::CENTER_BOTTOM, name, egui::FontId::proportional(13.0), palette::TEXT);
+        let cable_to = if name == ch0 { Some((p1, "cable")) } else if Some(name.as_str()) == ch1 { Some((p2, "cable")) } else { None };
+        if let Some((to, label)) = cable_to {
+            painter.line_segment([at, to], Stroke::new(3.0, palette::TAN));
+            let mid = Pos2::new((at.x + to.x) * 0.5, (at.y + to.y) * 0.5);
+            painter.text(mid, egui::Align2::LEFT_CENTER, format!(" {label}"), egui::FontId::proportional(12.0), palette::TEXT);
+        } else if loads.contains(name) {
+            painter.line_segment([at, Pos2::new(at.x, at.y + 18.0)], Stroke::new(2.0, palette::TEAL));
+            let body = Rect::from_center_size(Pos2::new(at.x, at.y + 32.0), vec2(46.0, 22.0));
+            painter.rect_filled(body, 3.0, palette::TEAL);
+            painter.text(body.center(), egui::Align2::CENTER_CENTER, "50 Ω", egui::FontId::monospace(13.0), Color32::from_rgb(12, 16, 22));
+        } else {
+            painter.text(Pos2::new(at.x, at.y + 14.0), egui::Align2::CENTER_TOP, "not used", egui::FontId::proportional(12.0), palette::TEXT_MUTED);
+        }
+    }
+    if ch1.is_none() {
+        painter.text(Pos2::new(p2.x, p2.y - 14.0), egui::Align2::CENTER_BOTTOM, "empty", egui::FontId::proportional(12.0), palette::TEXT_MUTED);
     }
 }
