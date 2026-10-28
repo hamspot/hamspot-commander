@@ -23,6 +23,25 @@ pub fn try_lock(db_path: &Path) -> std::io::Result<Option<Lock>> {
     Ok(Some(Lock { _file: file, path }))
 }
 
+/// Blocking lock held only while a database is opened, created or migrated, so
+/// two openers (threads, or Commander and commander-rec) never race on the
+/// journal-mode switch or the schema. Separate from the archive lock above, so
+/// opening never waits for a long archive run. Released on drop.
+pub fn open_lock(db_path: &Path) -> std::io::Result<Lock> {
+    let path = PathBuf::from(format!("{}.open-lock", db_path.display()));
+    let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path)?;
+    loop {
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc == 0 {
+            return Ok(Lock { _file: file, path });
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

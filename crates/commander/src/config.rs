@@ -1033,14 +1033,16 @@ mod tests {
             return;
         }
         let file = load_file(path).expect("SAFE-T station");
-        assert_eq!(file.channels.zones.len(), 158);
+        // The live station file changes as David edits it, so check its shape,
+        // not exact counts (it was 158 zones / 927 channels, later 932).
+        assert!(!file.channels.zones.is_empty());
         let channels: Vec<_> = file
             .channels
             .zones
             .iter()
             .flat_map(|zone| zone.channels.iter())
             .collect();
-        assert_eq!(channels.len(), 927);
+        assert!(!channels.is_empty());
         assert!(channels.iter().any(|channel| channel.control));
         assert!(file.talkgroups.zones.len() > 1);
         assert!(file

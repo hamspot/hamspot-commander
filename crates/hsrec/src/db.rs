@@ -158,6 +158,10 @@ impl Db {
             std::fs::create_dir_all(dir)
                 .map_err(|e| fail(format!("cannot create the folder for the recordings database: {e}")))?;
         }
+        // One opener at a time sets up the file (#202 race: a second creator
+        // got "database is locked" from the WAL switch). Held until init ends.
+        let _guard = crate::lock::open_lock(path)
+            .map_err(|e| fail(format!("cannot lock the recordings database for opening: {e}")))?;
         let conn = Connection::open(path)?;
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
         // Reading the header first refuses a damaged or newer file before any write.
@@ -708,7 +712,7 @@ mod autocreate_tests {
     fn two_threads_create_at_once() {
         let d = tmp("race");
         let p = d.join("sub").join("S.HSREC.sqlite");
-        let hs: Vec<_> = (0..4)
+        let hs: Vec<_> = (0..8)
             .map(|_| {
                 let p = p.clone();
                 std::thread::spawn(move || Db::open(&p).map(|db| count(&db)))
