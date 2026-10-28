@@ -295,10 +295,34 @@ impl Chord {
 
 /// Standard egui button height for text `text_h` tall: the same rule
 /// `egui::Button` uses (`max(interact_size.y, text + 2 * button_padding.y)`).
-/// The E-STOP and RELEASE use it so they match every other button (#200).
 pub fn button_height(interact_y: f32, text_h: f32, pad_y: f32) -> f32 {
     interact_y.max(text_h + 2.0 * pad_y)
 }
+
+/// The font a plain `ui.button("…")` really draws with. In egui 0.37 a
+/// `&str`/`RichText` label resolves through `FontSelection::Default`
+/// (override font, else override text style, else **Body**), so with the
+/// rustcars theme that is Antonio 15 pt, not the 22 pt `TextStyle::Button`.
+/// (The 22 pt Button style was what inflated the old E-STOP, #200.)
+pub fn std_button_font(ui: &egui::Ui) -> egui::FontId {
+    egui::FontSelection::Default.resolve(ui.style())
+}
+
+/// THE height of the E-STOP and RELEASE buttons (#200): the height a plain
+/// `ui.button("…")` gets in this `ui` (its font's one-line galley height plus
+/// `2 * button_padding.y`, at least `interact_size.y`). One function for both
+/// buttons and every placement, so they cannot drift. 27 px with the theme.
+pub fn std_button_height(ui: &egui::Ui) -> f32 {
+    let g = ui.painter().layout_no_wrap("E".into(), std_button_font(ui), egui::Color32::BLACK);
+    let sp = ui.spacing();
+    button_height(sp.interact_size.y, g.size().y, sp.button_padding.y)
+}
+
+/// Corner radius of the E-STOP and RELEASE buttons: square, as David asked.
+pub const CORNER: egui::CornerRadius = egui::CornerRadius::ZERO;
+/// Border of both buttons (same in armed and engaged states).
+pub const BORDER: f32 = 1.5;
+const RELEASE_FILL: egui::Color32 = egui::Color32::from_rgb(0xF2, 0xC1, 0x4E);
 
 /// Octagon radius for a button `h` tall: about the text height, never
 /// touching the border (2 px clear top and bottom).
@@ -325,77 +349,87 @@ pub fn button_width(engaged: bool) -> f32 {
     if engaged { 250.0 } else { 104.0 }
 }
 
+/// One square, bordered button of [`std_button_height`] with the theme's
+/// Button text; `octagon` adds the stop sign before the text. Used by both
+/// E-STOP and RELEASE so their font, height, corners and border are identical.
+fn square_button(ui: &mut egui::Ui, label: &str, fill: egui::Color32, octagon: bool) -> egui::Response {
+    let font = std_button_font(ui);
+    let galley = ui.painter().layout_no_wrap(label.into(), font, egui::Color32::BLACK);
+    let h = std_button_height(ui);
+    let text_h = galley.size().y;
+    let pad_x = ui.spacing().button_padding.x;
+    let r = octagon_radius(h, text_h);
+    let icon = if octagon { 2.0 * r + 4.0 } else { 0.0 };
+    let w = galley.size().x + icon + 2.0 * pad_x;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
+    let fill = if resp.hovered() { fill.gamma_multiply(0.85) } else { fill };
+    let p = ui.painter();
+    p.rect_filled(rect, CORNER, fill);
+    p.rect_stroke(rect, CORNER, egui::Stroke::new(BORDER, egui::Color32::BLACK), egui::StrokeKind::Inside);
+    if octagon {
+        paint_octagon(p, egui::pos2(rect.left() + pad_x + r, rect.center().y), r, egui::Color32::BLACK);
+    }
+    p.galley(
+        egui::pos2(rect.left() + pad_x + icon, rect.center().y - text_h / 2.0),
+        galley,
+        egui::Color32::BLACK,
+    );
+    let l = label.to_owned();
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &l));
+    resp
+}
+
 /// The shared E-STOP control. Every copy reads and changes the one global
 /// state. Armed: one `E-STOP` button. Engaged: an `E-STOP ENGAGED` button
-/// (pressing it again does nothing harmful) and a `RELEASE` button. The
+/// (pressing it again does nothing harmful) and a `RELEASE` button.
 /// Returns true on the frame it was engaged, so the caller can wake the
 /// device hubs at once (they also poll [`engaged`] on their own).
 pub fn button(ui: &mut egui::Ui) -> bool {
     let on = engaged();
-    let resp = ui
-        .horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            let label = if on { "E-STOP ENGAGED" } else { "E-STOP" };
-            let font = egui::TextStyle::Button.resolve(ui.style());
-            let galley = ui.painter().layout_no_wrap(label.into(), font, egui::Color32::BLACK);
-            let sp = ui.spacing();
-            let h = button_height(sp.interact_size.y, galley.size().y, sp.button_padding.y);
-            let r = octagon_radius(h, galley.size().y);
-            let icon = 2.0 * r;
-            let w = galley.size().x + icon + 18.0;
-            let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
-            let fill = if resp.hovered() { DANGER.gamma_multiply(0.85) } else { DANGER };
-            let p = ui.painter();
-            p.rect_filled(rect, 4.0, fill);
-            // Visible border so it reads as a button; thicker when engaged.
-            let stroke = egui::Stroke::new(if on { 3.0 } else { 1.5 }, egui::Color32::BLACK);
-            p.rect_stroke(rect, 4.0, stroke, egui::StrokeKind::Inside);
-            let c = egui::pos2(rect.left() + 6.0 + icon / 2.0, rect.center().y);
-            paint_octagon(p, c, r, egui::Color32::BLACK);
-            p.galley(
-                egui::pos2(rect.left() + 10.0 + icon, rect.center().y - galley.size().y / 2.0),
-                galley,
-                egui::Color32::BLACK,
-            );
-            let resp = resp.on_hover_text(if on {
-                "E-STOP is engaged: transmit, amplifier operate and motion are blocked. Press RELEASE to re-arm."
-            } else {
-                "Emergency stop: unkey every transmitter, put amplifiers in standby and stop every rotator."
-            });
-            resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
-            let pressed = resp.clicked() && !on;
-            if pressed {
-                engage();
+    let (stop, rel) = buttons(ui, on);
+    let stop = stop.on_hover_text(if on {
+        "E-STOP is engaged: transmit, amplifier operate and motion are blocked. Press RELEASE to re-arm."
+    } else {
+        "Emergency stop: unkey every transmitter, put amplifiers in standby and stop every rotator."
+    });
+    let pressed = stop.clicked() && !on;
+    if pressed {
+        engage();
+    }
+    if let Some(rel) = rel {
+        let st = snapshot();
+        let failed = st.devices.iter().filter(|d| !d.outcome.settled()).count();
+        let rel = rel.on_hover_ui(|ui| {
+            ui.label("Release: back to normal operation. Nothing is keyed or moved by it.");
+            if st.devices.is_empty() {
+                ui.label("No devices were commanded.");
             }
-            if on {
-                // Plain egui button: standard height, width from its text.
-                let rel = ui.add(
-                    egui::Button::new(egui::RichText::new("RELEASE").color(egui::Color32::BLACK))
-                        .fill(egui::Color32::from_rgb(0xF2, 0xC1, 0x4E))
-                        .stroke(egui::Stroke::new(1.5, egui::Color32::BLACK)),
-                );
-                let st = snapshot();
-                let failed = st.devices.iter().filter(|d| !d.outcome.settled()).count();
-                let rel = rel.on_hover_ui(|ui| {
-                    ui.label("Release: back to normal operation. Nothing is keyed or moved by it.");
-                    if st.devices.is_empty() {
-                        ui.label("No devices were commanded.");
-                    }
-                    for d in &st.devices {
-                        ui.label(format!("{} {}: {}", d.kind.label(), d.name, d.outcome.label()));
-                    }
-                });
-                if rel.clicked() {
-                    release();
-                }
-                if failed > 0 {
-                    ui.label(format!("{failed} not confirmed"));
-                }
+            for d in &st.devices {
+                ui.label(format!("{} {}: {}", d.kind.label(), d.name, d.outcome.label()));
             }
-            pressed
-        })
-        .inner;
-    resp
+        });
+        if rel.clicked() {
+            release();
+        }
+        if failed > 0 {
+            ui.label(format!("{failed} not confirmed"));
+        }
+    }
+    pressed
+}
+
+/// Lay out the E-STOP (and, when `on`, RELEASE) in one row, vertically
+/// centred in the height the caller's bar slot gives it (equal margins).
+/// Pure layout: no global state is read or changed (headless tests use it).
+pub fn buttons(ui: &mut egui::Ui, on: bool) -> (egui::Response, Option<egui::Response>) {
+    ui.horizontal_centered(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        let label = if on { "E-STOP ENGAGED" } else { "E-STOP" };
+        let stop = square_button(ui, label, DANGER, true);
+        let rel = on.then(|| square_button(ui, "RELEASE", RELEASE_FILL, false));
+        (stop, rel)
+    })
+    .inner
 }
 
 #[cfg(test)]
@@ -562,6 +596,77 @@ mod tests {
         let r = octagon_radius(h, 14.0);
         assert!(2.0 * r <= h - 4.0, "octagon not clipped");
         assert!(r >= 2.0);
+    }
+
+    /// Headless frame with the app's real theme (rustcars Antonio font +
+    /// `apply_theme`), as `Tools::new` installs it.
+    fn themed_ctx() -> egui::Context {
+        let ctx = egui::Context::default();
+        rustcars::install_lcars_font(&ctx);
+        rustcars::apply_theme(&ctx, &rustcars::LcarsTheme::default());
+        ctx
+    }
+
+    fn run(ctx: &egui::Context, f: &mut dyn FnMut(&mut egui::Ui)) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 400.0))),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| f(ui));
+        out.textures_delta.clear();
+    }
+
+    #[test]
+    fn estop_and_release_match_a_plain_button_headless() {
+        let ctx = themed_ctx();
+        let mut got = None;
+        // Two frames: fonts are loaded at the first frame's start.
+        for _ in 0..2 {
+            run(&ctx, &mut |ui| {
+                let plain = ui.button("CONFIG").rect;
+                let std_h = std_button_height(ui);
+                let (stop, rel) = buttons(ui, true);
+                let armed = buttons(ui, false).0.rect;
+                got = Some((plain, std_h, stop.rect, rel.unwrap().rect, armed));
+            });
+        }
+        let (plain, std_h, stop, rel, armed) = got.unwrap();
+        eprintln!("plain {:?} std {std_h} stop {:?} release {:?} armed {:?}", plain.size(), stop.size(), rel.size(), armed.size());
+        assert!((plain.height() - std_h).abs() < 0.01, "helper {std_h} vs ui.button {}", plain.height());
+        assert!((stop.height() - plain.height()).abs() < 0.01);
+        assert!((rel.height() - plain.height()).abs() < 0.01);
+        assert!((armed.height() - plain.height()).abs() < 0.01);
+        assert_eq!(stop.height(), rel.height());
+        // Same row, same vertical centre.
+        assert!((stop.center().y - rel.center().y).abs() < 0.01);
+    }
+
+    #[test]
+    fn estop_buttons_are_centred_in_a_taller_bar() {
+        let ctx = themed_ctx();
+        let mut got = None;
+        for _ in 0..2 {
+            run(&ctx, &mut |ui| {
+                let bar = egui::Rect::from_min_size(egui::pos2(0.0, 100.0), egui::vec2(600.0, 44.0));
+                let r = ui
+                    .scope_builder(
+                        egui::UiBuilder::new().max_rect(bar).layout(egui::Layout::right_to_left(egui::Align::Center)),
+                        |ui| buttons(ui, true),
+                    )
+                    .inner;
+                got = Some((bar, r.0.rect, r.1.unwrap().rect));
+            });
+        }
+        let (bar, stop, rel) = got.unwrap();
+        for r in [stop, rel] {
+            let (above, below) = (r.top() - bar.top(), bar.bottom() - r.bottom());
+            assert!((above - below).abs() < 0.6, "above {above} below {below}");
+        }
+    }
+
+    #[test]
+    fn estop_buttons_are_square() {
+        assert_eq!(CORNER, egui::CornerRadius::ZERO);
     }
 
     #[test]
