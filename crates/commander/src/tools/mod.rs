@@ -102,6 +102,10 @@ impl Tools {
         self.nanovna.set_plan(plan);
     }
 
+    pub fn nanovna_mut(&mut self) -> &mut nanovna::NanoVna {
+        &mut self.nanovna
+    }
+
     pub fn nanovna_face(&self) -> nanovna::Face {
         self.nanovna.station_face()
     }

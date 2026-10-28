@@ -15,6 +15,9 @@ pub enum Kind {
     Meter,
     Load,
     Antenna,
+    /// Any other RF device, defined by the `rf_kinds.json` table (`Device::rf`)
+    /// or, for `custom`, by `Device::nports` (#219).
+    Rf,
 }
 
 impl Kind {
@@ -27,6 +30,7 @@ impl Kind {
             Kind::Meter => "SWR/power meter",
             Kind::Load => "Dummy load",
             Kind::Antenna => "Antenna",
+            Kind::Rf => "RF device",
         }
     }
 }
@@ -93,6 +97,42 @@ pub struct Device {
     pub sel: u8,
     /// Top-left corner on the panel, in panel points.
     pub pos: [f32; 2],
+    /// Stable random id that VNA scan files refer to (#219). Assigned once,
+    /// never reused, never derived from position or name.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub uid: String,
+    /// Key into the RF kind table for `Kind::Rf` (e.g. `duplexer`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub rf: String,
+    /// Port count for a custom N-port device.
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub nports: u8,
+    /// Free text: tuned state, part number, anything the operator wants.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub notes: String,
+    /// Feedline physical length in metres (0 = not given).
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    pub length_m: f64,
+    /// Feedline velocity factor (0 = not given).
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    pub vf: f64,
+}
+
+fn is_zero_u8(v: &u8) -> bool {
+    *v == 0
+}
+fn is_zero_f64(v: &f64) -> bool {
+    *v == 0.0
+}
+
+/// A new device uid: time and a process counter, hex. Unique enough for a
+/// station's own devices; never reused because ids only ever grow.
+pub fn new_uid() -> String {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    format!("{:x}{:04x}", t as u64, n & 0xffff)
 }
 
 fn default_ways() -> u8 {
@@ -121,6 +161,21 @@ impl Device {
             ways: default_ways(),
             sel: default_sel(),
             pos,
+            uid: new_uid(),
+            rf: String::new(),
+            nports: 0,
+            notes: String::new(),
+            length_m: 0.0,
+            vf: 0.0,
+        }
+    }
+
+    /// Shown kind name: the table label for `Kind::Rf`.
+    pub fn kind_label(&self) -> String {
+        if self.kind == Kind::Rf {
+            crate::vna_devices::kinds::label_of(&self.rf)
+        } else {
+            self.kind.label().to_string()
         }
     }
 
@@ -150,6 +205,10 @@ impl Device {
             Kind::Tuner | Kind::Meter => vec![port("IN", In, Coax), port("OUT", Out, Coax)],
             Kind::Load => vec![port("IN", In, Coax)],
             Kind::Antenna => vec![port("FEED", In, Coax)],
+            Kind::Rf => crate::vna_devices::kinds::ports_of(&self.rf, self.nports)
+                .into_iter()
+                .map(|(name, input)| port(&name, if input { In } else { Out }, Coax))
+                .collect(),
         }
     }
 
@@ -163,6 +222,7 @@ impl Device {
             (Kind::Amplifier, "INPUT") => vec!["OUTPUT".into()],
             (Kind::Tuner | Kind::Meter, "IN") => vec!["OUT".into()],
             (Kind::Switch, "COMMON") => vec![self.sel.clamp(1, self.ways.max(1)).to_string()],
+            (Kind::Rf, _) => crate::vna_devices::kinds::through_of(&self.rf, input),
             _ => Vec::new(),
         }
     }
@@ -229,6 +289,12 @@ impl PatchBay {
 
     /// Drop cables whose jacks no longer exist (switch made smaller, device gone).
     pub fn prune(&mut self) {
+        // Devices from before #219 gain a uid once; it is then saved.
+        for d in &mut self.devices {
+            if d.uid.is_empty() {
+                d.uid = new_uid();
+            }
+        }
         let ok = |bay: &PatchBay, j: &Jack| bay.device(j.device).and_then(|d| d.port(&j.port)).is_some();
         let keep: Vec<bool> = self.cables.iter().map(|c| ok(self, &c.from) && ok(self, &c.to)).collect();
         let mut i = 0;

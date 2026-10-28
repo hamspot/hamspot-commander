@@ -13,6 +13,7 @@ pub struct UiState {
     selected_dev: Option<u32>,
     note: String,
     amp_pick: usize,
+    rf_pick: String,
     actions: Vec<Action>,
 }
 
@@ -31,6 +32,9 @@ pub enum Action {
     /// Standby / Operate key on a bound box, by amplifier id. The caller
     /// resolves the id at send time and sends nothing if it is missing.
     Control(String, Control),
+    /// Open this device in the VNA as a new scan (#219): triple-click or the
+    /// Scan with VNA button.
+    ScanDevice(u32),
 }
 
 /// Configured amplifiers (live rows) and the single-sourced model list.
@@ -70,6 +74,7 @@ fn kind_color(kind: Kind) -> Color32 {
         Kind::Meter => Color32::from_rgb(255, 204, 153),
         Kind::Load => Color32::from_rgb(170, 170, 170),
         Kind::Antenna => Color32::from_rgb(153, 204, 255),
+        Kind::Rf => Color32::from_rgb(204, 221, 170),
     }
 }
 
@@ -122,6 +127,29 @@ fn toolbar(ui: &mut egui::Ui, bay: &mut PatchBay, st: &mut UiState, link: &AmpLi
                 st.selected_dev = Some(bay.add(kind, &format!("{} {n}", kind.label()), at));
             }
         }
+        let table = crate::vna_devices::kinds::table();
+        if st.rf_pick.is_empty() {
+            st.rf_pick = table[0].key.clone();
+        }
+        egui::ComboBox::from_id_salt("patchbay_rf")
+            .selected_text(crate::vna_devices::kinds::label_of(&st.rf_pick))
+            .show_ui(ui, |ui| {
+                for d in table {
+                    ui.selectable_value(&mut st.rf_pick, d.key.clone(), &d.label);
+                }
+            });
+        if ui.button("Add RF device").clicked() {
+            let label = crate::vna_devices::kinds::label_of(&st.rf_pick);
+            let n = bay.devices.iter().filter(|d| d.kind == Kind::Rf && d.rf == st.rf_pick).count() + 1;
+            let id = bay.add(Kind::Rf, &format!("{label} {n}"), at);
+            if let Some(d) = bay.devices.iter_mut().find(|d| d.id == id) {
+                d.rf = st.rf_pick.clone();
+                if d.rf == crate::vna_devices::kinds::CUSTOM {
+                    d.nports = 3;
+                }
+            }
+            st.selected_dev = Some(id);
+        }
     });
     let Some(id) = st.selected_dev else { return };
     let Some(dev) = bay.devices.iter_mut().find(|d| d.id == id) else {
@@ -130,7 +158,7 @@ fn toolbar(ui: &mut egui::Ui, bay: &mut PatchBay, st: &mut UiState, link: &AmpLi
     };
     let mut remove = false;
     ui.horizontal_wrapped(|ui| {
-        ui.label(format!("{}:", dev.kind.label()));
+        ui.label(format!("{}:", dev.kind_label()));
         if dev.kind == Kind::Radio {
             ui.label(&dev.name);
             ui.label(if dev.tx { "can transmit" } else { "receive only" });
@@ -155,10 +183,29 @@ fn toolbar(ui: &mut egui::Ui, bay: &mut PatchBay, st: &mut UiState, link: &AmpLi
                 }
             }
         }
-        if dev.kind != Kind::Radio && ui.button("Remove").clicked() {
+        if dev.kind == Kind::Rf && dev.rf == crate::vna_devices::kinds::CUSTOM {
+            ui.label("Ports");
+            ui.add(egui::DragValue::new(&mut dev.nports).range(1..=16));
+        }
+        if dev.kind == Kind::Rf && dev.rf == "feedline" {
+            ui.label("Length m");
+            ui.add(egui::DragValue::new(&mut dev.length_m).range(0.0..=10000.0).speed(0.1));
+            ui.label("Velocity factor");
+            ui.add(egui::DragValue::new(&mut dev.vf).range(0.0..=1.0).speed(0.01));
+        }
+        if ui.button("Scan with VNA").on_hover_text("Open this device in the VNA as a new scan. Triple-click the box does the same.").clicked() {
+            st.actions.push(Action::ScanDevice(id));
+        }
+        if dev.kind != Kind::Radio && ui.button("Remove").on_hover_text("Removes the box. Its saved VNA scans stay on disk.").clicked() {
             remove = true;
         }
     });
+    if let Some(dev) = bay.devices.iter_mut().find(|d| d.id == id) {
+        ui.horizontal(|ui| {
+            ui.label("Notes");
+            ui.add(egui::TextEdit::singleline(&mut dev.notes).hint_text("tuned state, part number…").desired_width(360.0));
+        });
+    }
     if remove {
         bay.remove_device(id);
         st.selected_dev = None;
@@ -326,11 +373,17 @@ fn canvas(ui: &mut egui::Ui, bay: &mut PatchBay, st: &mut UiState, link: &AmpLin
             st.drag = None;
         }
     }
-    if resp.clicked() {
+    let click = crate::vna_devices::box_click(resp.clicked(), resp.double_clicked(), resp.triple_clicked());
+    if click != crate::vna_devices::BoxClick::None {
         if let Some(at) = at {
             st.selected_cable = geom::cable_at(bay, at, 6.0);
             if st.selected_cable.is_none() {
                 st.selected_dev = geom::box_at(bay, at);
+                if click == crate::vna_devices::BoxClick::OpenVna {
+                    if let Some(id) = st.selected_dev {
+                        st.actions.push(Action::ScanDevice(id));
+                    }
+                }
             }
         }
     }
