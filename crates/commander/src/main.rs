@@ -74,10 +74,12 @@ fn cfg_group<R>(ui: &mut egui::Ui, name: &str, add: impl FnMut(&mut egui::Ui) ->
         .show(ui, add)
 }
 
-/// Where the whole-page Config detach pill goes: the top end cap, or the
-/// bottom one while the "more tabs" key owns the top cap.
+/// Where the whole-page Config detach pill goes: always the top end cap.
 fn config_page_pill_rect(ctx: &egui::Context, frame_rect: egui::Rect) -> egui::Rect {
-    tools::top_end_cap_free(ctx).unwrap_or_else(|| tools::bottom_end_cap(frame_rect))
+    tools::top_end_cap(ctx).unwrap_or_else(|| {
+        let t = rustcars::LcarsTheme::default();
+        egui::Rect::from_min_max(egui::pos2(frame_rect.right() - 48.0, frame_rect.top()), egui::pos2(frame_rect.right(), frame_rect.top() + t.bar_thin))
+    })
 }
 
 /// Memory id of the whole Config page's detach state.
@@ -3070,9 +3072,7 @@ impl eframe::App for App {
                     );
                 }
                 // Config's whole page detaches from the top elbow's end pill
-                // (top right, right of the E-STOP gap). Only while the tab row
-                // overflows does that cap belong to the "more tabs" key; then
-                // the pill uses the bottom end cap so neither is lost.
+                // (top right, right of the E-STOP gap).
                 if self.page == Page::Config {
                     let id = config_page_detach_id();
                     let mut st = group_box::DetachState::load(ui.ctx(), id);
@@ -12423,9 +12423,18 @@ fn fixed_slider(ui: &mut egui::Ui, label: &str, value: f64) {
 
 #[cfg(test)]
 mod config_order_tests {
-    /// Run one page frame like `ui()` does (real font and theme, E-STOP slot
-    /// in the top bar) and return (frame rect, E-STOP slot, pill rect).
-    fn page_pill(more_tabs: bool) -> (egui::Rect, egui::Rect, egui::Rect) {
+    struct Bar {
+        frame: egui::Rect,
+        cap: egui::Rect,
+        slot: Option<egui::Rect>,
+        pill: egui::Rect,
+        more: egui::Rect,
+        estop_w: f32,
+    }
+
+    /// Run one page frame like `ui()` does (real font and theme), with or
+    /// without the E-STOP slot in the top bar, and a tab row that overflows.
+    fn page_bar(with_slot: bool) -> Bar {
         let ctx = egui::Context::default();
         rustcars::install_lcars_font(&ctx);
         rustcars::apply_theme(&ctx, &rustcars::LcarsTheme::default());
@@ -12437,14 +12446,20 @@ mod config_order_tests {
                     ..Default::default()
                 },
                 |ui| {
-                    let more_id = crate::tools::more_tabs_id(ui.ctx());
-                    ui.ctx().data_mut(|d| d.insert_temp(more_id, more_tabs));
                     let estop_w = crate::estop::button_width(ui, false) + 16.0;
-                    let (frame_rect, slot) = crate::tools::frame_with_slot(ui, Some(estop_w), |ui| {
-                        ui.label("config");
+                    let labels: Vec<String> = (0..30).map(|i| format!("ZONE {i}")).collect();
+                    let (frame_rect, slot) = crate::tools::frame_with_slot(ui, with_slot.then_some(estop_w), |ui| {
+                        crate::tools::overflow_tab_row(ui, "t", &labels, Some(0), |_, _| 120.0, |ui, i, _| ui.button(&labels[i]));
                     });
-                    let pill = crate::config_page_pill_rect(ui.ctx(), frame_rect);
-                    got = Some((frame_rect, slot.expect("E-STOP slot"), pill));
+                    let ctx = ui.ctx().clone();
+                    got = Some(Bar {
+                        frame: frame_rect,
+                        cap: crate::tools::top_end_cap(&ctx).expect("cap"),
+                        slot,
+                        pill: crate::config_page_pill_rect(&ctx, frame_rect),
+                        more: crate::tools::more_button_rect_now(&ctx).expect("more"),
+                        estop_w,
+                    });
                 },
             );
             out.textures_delta.clear();
@@ -12453,23 +12468,43 @@ mod config_order_tests {
     }
 
     #[test]
-    fn config_page_pill_is_the_top_right_end_cap() {
-        let (frame, estop, pill) = page_pill(false);
-        let t = rustcars::LcarsTheme::default();
-        assert_eq!(pill.top(), frame.top(), "pill on the top bar, not the bottom: {pill:?} in {frame:?}");
-        assert!((pill.right() - frame.right()).abs() < 0.5, "pill at the right end: {pill:?}");
-        assert_eq!(pill.height(), t.bar_thin, "pill is the whole end cap");
-        assert!(pill.width() >= 40.0, "hit area: {pill:?}");
-        assert!(pill.left() >= estop.right(), "pill right of the E-STOP gap: {pill:?} vs {estop:?}");
-        assert!(!pill.intersects(estop), "pill does not overlap the E-STOP slot");
-        assert!(pill.bottom() < frame.center().y);
+    fn config_page_pill_is_always_the_top_right_end_cap() {
+        for with_slot in [true, false] {
+            let b = page_bar(with_slot);
+            let t = rustcars::LcarsTheme::default();
+            assert_eq!(b.pill, b.cap, "pill is the top end cap");
+            assert_eq!(b.pill.top(), b.frame.top(), "top bar, not bottom: {:?}", b.pill);
+            assert!((b.pill.right() - b.frame.right()).abs() < 0.5);
+            assert_eq!(b.pill.height(), t.bar_thin);
+            if let Some(slot) = b.slot {
+                assert!(b.pill.left() >= slot.right() && !b.pill.intersects(slot));
+            }
+        }
     }
 
     #[test]
-    fn config_page_pill_yields_the_top_cap_to_the_more_tabs_key() {
-        let (frame, _, pill) = page_pill(true);
-        assert_eq!(pill.bottom(), frame.bottom(), "bottom end cap while tabs overflow: {pill:?}");
-        assert!((pill.right() - frame.right()).abs() < 0.5);
+    fn more_tabs_button_left_of_the_pill_when_the_bar_is_free() {
+        let b = page_bar(false);
+        let gap = rustcars::LcarsTheme::default().frame_gap;
+        assert_eq!(b.more.width(), b.cap.width(), "same width as the end cap");
+        assert_eq!((b.more.top(), b.more.height()), (b.cap.top(), b.cap.height()));
+        assert_eq!(b.more.right(), b.cap.left() - gap, "immediately left of the pill");
+        assert!(!b.more.intersects(b.pill));
+    }
+
+    #[test]
+    fn more_tabs_button_goes_left_of_the_estop_slot() {
+        let b = page_bar(true);
+        let slot = b.slot.expect("E-STOP slot");
+        let gap = rustcars::LcarsTheme::default().frame_gap;
+        assert_eq!(b.more.width(), b.cap.width());
+        assert_eq!(b.more.top(), b.cap.top());
+        assert!(b.more.right() <= slot.left() - gap + 0.5, "left of the E-STOP slot: {:?} vs {slot:?}", b.more);
+        assert!(b.more.right() + gap <= slot.left() + 0.5, "its black gap ends where the slot begins");
+        assert!(!b.more.intersects(b.pill));
+        // E-STOP/RELEASE keep their full slot.
+        assert!((slot.width() - (b.estop_w - gap)).abs() < 0.5, "slot not squeezed: {slot:?}");
+        assert!((slot.right() - (b.cap.left() - gap)).abs() < 0.5);
     }
 
     /// Every Config group detaches on its own and with the page (real font

@@ -342,7 +342,7 @@ The station file keeps a copy of its plan, so a station always opens with the pl
 
 - **LOAD** and **SAVE** open and save plan files. **ADD** adds a zone with one band around the current frequency.
 - **Right-click a zone name** to rename or delete it.
-- **More zones than fit:** the ones that don't fit leave the row, and the rounded end of the tan bar above gets a thin outline and a small ▼ mark. Click it (or focus it and press Enter) for a list of the hidden zones, then pick one. The zone you have open always stays in the row.
+- **More zones than fit:** the ones that don't fit leave the row, and a **more tabs** button appears on the tan bar above: a rounded tan button with three dots and no text, as wide as the bar's rounded end, just left of the E-STOP. Hover it to read "More tabs". Click it (or focus it and press Enter) for a list of the hidden zones, then pick one. The zone you have open always stays in the row.
 - **Click a band row** to select it and tune its home frequency.
 - The editor on the right edits the band's Name, Home, Low, High and Mode. Click the dial inside a band to set its home.
 
@@ -464,7 +464,7 @@ The REC state is saved and comes back on the next start. A talkgroup recording s
 
 ## 9.3 The REC tab
 
-While REC is open, the timeline controls sit inside the tan bar at the top of the page, at its right end just before the rounded end cap. They are plain rectangular buttons, the same height as the bar. Below the bar, from top to bottom: source tabs (**HackRF TG**, **HackRF Channels**, plus any other source found; if they don't all fit, click the outlined end of the tan bar above them for a list of the rest, as on the Plan page), a status line (REC state, TG, Channels, disk use), the search row, and the timeline.
+While REC is open, the timeline controls sit inside the tan bar at the top of the page, at its right end just before the rounded end cap. They are plain rectangular buttons, the same height as the bar. Below the bar, from top to bottom: source tabs (**HackRF TG**, **HackRF Channels**, plus any other source found; if they don't all fit, click the three-dot **more tabs** button on the tan bar above them for a list of the rest, as on the Plan page), a status line (REC state, TG, Channels, disk use), the search row, and the timeline.
 
 | Control in the tan bar | What it does |
 | --- | --- |

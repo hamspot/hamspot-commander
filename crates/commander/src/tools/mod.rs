@@ -495,6 +495,9 @@ pub fn frame_with_slot(
     let id = top_cap_id(ui.ctx());
     ui.ctx().data_mut(|d| d.insert_temp(id, cap));
     let slot = slot_w.map(|w| top_slot(outer, frame.cap_len, frame.thin, w));
+    let cover_id = top_slot_cover_id(ui.ctx());
+    let cover = slot.map(|(c, _)| c);
+    ui.ctx().data_mut(|d| d.insert_temp(cover_id, cover));
     let rect = frame.show(ui, &theme, add).1;
     // Paint-over: the frame's chrome sits behind content, so this black
     // cover lands on top of the tan and opens the gap.
@@ -512,17 +515,37 @@ pub(crate) fn no_scroll_fade(ctx: &egui::Context) {
     ctx.global_style_mut(|s| s.spacing.scroll.fade.strength = 0.0);
 }
 
-pub(crate) fn more_tabs_id(ctx: &egui::Context) -> egui::Id {
-    egui::Id::NULL.with(("more-tabs-active", ctx.viewport_id()))
+fn top_slot_cover_id(ctx: &egui::Context) -> egui::Id {
+    egui::Id::NULL.with(("top-slot-cover", ctx.viewport_id()))
 }
 
 /// The top elbow's end cap (top right of the page frame), as laid out by
-/// [`frame_with_slot`] this frame, unless the "more tabs" key owns it now.
-/// `None` before the frame is drawn or while tabs overflow.
-pub fn top_end_cap_free(ctx: &egui::Context) -> Option<egui::Rect> {
-    let (cap_id, more_id) = (top_cap_id(ctx), more_tabs_id(ctx));
-    let (cap, more) = ctx.data(|d| (d.get_temp::<egui::Rect>(cap_id), d.get_temp::<bool>(more_id)));
-    if more.unwrap_or(false) { None } else { cap }
+/// [`frame_with_slot`] this frame.
+pub fn top_end_cap(ctx: &egui::Context) -> Option<egui::Rect> {
+    let cap_id = top_cap_id(ctx);
+    ctx.data(|d| d.get_temp::<egui::Rect>(cap_id))
+}
+
+/// Where the "more tabs" button goes on the top bar: the end cap's width,
+/// immediately left of the end cap; if the bar has a slot there (E-STOP /
+/// RELEASE, REC controls), left of that slot instead, so the slot keeps its
+/// full size. Pure geometry; `gap` is the frame gap.
+pub fn more_button_rect(cap: egui::Rect, cover: Option<egui::Rect>, gap: f32) -> egui::Rect {
+    let mut right = cap.left() - gap;
+    if let Some(c) = cover {
+        let want = egui::Rect::from_min_max(egui::pos2(right - cap.width(), cap.top()), egui::pos2(right, cap.bottom()));
+        if want.intersects(c) {
+            right = c.left();
+        }
+    }
+    egui::Rect::from_min_max(egui::pos2(right - cap.width(), cap.top()), egui::pos2(right, cap.bottom()))
+}
+
+/// [`more_button_rect`] for this frame's page bar.
+pub fn more_button_rect_now(ctx: &egui::Context) -> Option<egui::Rect> {
+    let cover_id = top_slot_cover_id(ctx);
+    let cover = ctx.data(|d| d.get_temp::<Option<egui::Rect>>(cover_id)).flatten();
+    top_end_cap(ctx).map(|cap| more_button_rect(cap, cover, LcarsTheme::default().frame_gap))
 }
 
 fn top_cap_id(ctx: &egui::Context) -> egui::Id {
@@ -598,14 +621,12 @@ pub fn overflow_tab_row(
             }
         }
     });
-    let more_id = more_tabs_id(ui.ctx());
-    let more = !hidden.is_empty();
-    ui.ctx().data_mut(|d| d.insert_temp(more_id, more));
-    if !more {
+    if hidden.is_empty() {
         return picked;
     }
-    let cap_id = top_cap_id(ui.ctx());
-    let Some(cap) = ui.ctx().data(|d| d.get_temp::<egui::Rect>(cap_id)) else {
+    // A button of its own on the top bar, left of the end cap (which is the
+    // Config detach pill) and of the E-STOP slot.
+    let Some(cap) = more_button_rect_now(ui.ctx()) else {
         return picked;
     };
     let id = ui.scope_id().with(("more-tabs", id_salt));
@@ -625,28 +646,29 @@ pub fn overflow_tab_row(
     picked
 }
 
-/// The end cap as a key: a thin dark border and a small down-pointing
-/// triangle, both muted, so its new job shows by shape and not by colour.
-fn paint_more_key(ui: &egui::Ui, cap: egui::Rect, resp: &egui::Response) {
+/// The "more tabs" button: a pill (round both ends) in the bar colour with a
+/// highlight outline, like the detach pill, and three painted dots. No text;
+/// the tooltip and accessibility label say "More tabs".
+fn paint_more_key(ui: &egui::Ui, rect: egui::Rect, resp: &egui::Response) {
     let theme = LcarsTheme::default();
     let painter = ui.painter();
-    let ink = theme.bg.gamma_multiply(if resp.hovered() { 0.85 } else { 0.6 });
-    let r = rustcars::cap_radius(Cap::Right, cap.height());
-    painter.rect_stroke(cap.shrink(2.0), r, egui::Stroke::new(1.0, ink), egui::StrokeKind::Inside);
+    let color = rustcars::palette::TAN;
+    let (fill, outline) = rustcars::group::pill_colors(color, false);
+    let gap = theme.frame_gap;
+    // Black gap on both sides so it reads as its own button on the bar.
+    painter.rect_filled(rect.expand2(egui::vec2(gap, 0.0)), 0.0, theme.bg);
+    let r = rustcars::cap_radius(Cap::Both, rect.height());
+    painter.rect_filled(rect, r, fill);
+    let w = if resp.hovered() { rustcars::group::PILL_BORDER + 0.5 } else { rustcars::group::PILL_BORDER };
+    painter.rect_stroke(rect, r, egui::Stroke::new(w, outline), egui::StrokeKind::Inside);
     if resp.has_focus() {
-        painter.rect_stroke(cap.shrink(4.0), r, egui::Stroke::new(1.0, theme.text_hi), egui::StrokeKind::Inside);
+        painter.rect_stroke(rect.shrink(3.0), r, egui::Stroke::new(1.0, rustcars::ink_on(fill)), egui::StrokeKind::Inside);
     }
-    let c = egui::pos2(cap.center().x - 2.0, cap.center().y + 1.0);
-    let s = (cap.height() * 0.18).clamp(3.0, 6.0);
-    painter.add(egui::Shape::convex_polygon(
-        vec![
-            egui::pos2(c.x - s, c.y - s * 0.6),
-            egui::pos2(c.x + s, c.y - s * 0.6),
-            egui::pos2(c.x, c.y + s * 0.6),
-        ],
-        ink,
-        egui::Stroke::NONE,
-    ));
+    let ink = rustcars::ink_on(fill);
+    let d = (rect.height() * 0.1).clamp(2.0, 4.0);
+    for k in [-1.0, 0.0, 1.0] {
+        painter.circle_filled(egui::pos2(rect.center().x + k * d * 3.0, rect.center().y), d, ink);
+    }
 }
 
 /// The straight run of the bottom elbow's horizontal bar: right of the
@@ -661,15 +683,6 @@ pub fn bottom_bar_run(frame_rect: egui::Rect) -> egui::Rect {
     )
 }
 
-/// The bottom elbow's end cap (right of [`bottom_bar_run`]).
-pub fn bottom_end_cap(frame_rect: egui::Rect) -> egui::Rect {
-    let t = LcarsTheme::default();
-    let cap_len = 48.0;
-    egui::Rect::from_min_max(
-        egui::pos2(frame_rect.right() - cap_len, frame_rect.bottom() - t.bar_thin),
-        frame_rect.right_bottom(),
-    )
-}
 
 /// Split `text` at the word boundary nearest its middle. Never cuts a word.
 pub fn split_two_lines(text: &str) -> (String, String) {
