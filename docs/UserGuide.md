@@ -803,7 +803,9 @@ For a **NanoVNA V2** (V2.2) over USB. When the screen opens and the station name
 <!-- screenshot: vna-01 — NanoVNA sweep with markers. -->
 <!-- screenshot: vna-03 — Choosing a NanoVNA. -->
 
-**Zone tabs.** **Cal** is first; the rest are your band-plan zones (HF, VHF, UHF…). Click a zone to show its last scan, or measure it if there is none. Double-click to measure again. **Scan** measures the selected zone, **Run** keeps sweeping until **Stop**. A zone being measured is dark red.
+**Zone tabs and band buttons.** **Cal** is first; the rest are your band-plan zones (HF, VHF, UHF…). Click a zone to select it and show its last scan; START and STOP don't change. Double-click a zone to load the whole zone (lowest to highest band edge) into START and STOP. Under SWEEP, **BAND PLAN** shows the selected zone's bands from the active band plan as buttons. Double-click one to load that band into START and STOP; a single click does nothing. If the band plan has no bands, a line says so and you type the limits.
+
+**Scan** sweeps the START and STOP shown, and never changes them. **Run** keeps sweeping until **Stop**. A zone whose range holds the sweep is dark red while it runs.
 
 **Chart.** Views are Smith (Y adds admittance), Polar, SWR, return loss, R and X, S21 dB, phase, unwrapped phase, group delay and TDR. **Layout·1/2/4** splits the chart into panes, **+Trace** adds up to four traces, each with its own format and pane. Double-click a pane header to fill the chart with it. Click the chart to drop the selected marker (M1–M4); hover a Smith chart to read impedance.
 
@@ -822,13 +824,13 @@ For a **NanoVNA V2** (V2.2) over USB. When the screen opens and the station name
 
 Commander keeps one calibration set per zone, in `Name.HSVNA` beside the station. The NanoVNA itself doesn't store it.
 
-1. Press **Scan** on an uncalibrated zone, or open the **Cal** tab. A dialog shows which jacks to fit.
+1. Press **Scan** when no stored calibration covers START to STOP (the dialog calibrates that span), or open the **Cal** tab. A dialog shows which jacks to fit.
 2. **Open**: nothing on S11 or S21, then **Measure open**.
 3. **Short** on S11, then **Measure short**.
 4. **50 Ω load** on S11, then **Measure load**.
 5. Optionally a cable from S11 to S21 (**Measure cable** or **Skip cable**) and a load on each jack (**Measure both** or **Skip loads**).
 
-Each piece is fitted once and every zone that needs it is swept before you move on. Then fit your antenna or device and press **Scan**. The **Cal** tab lists what's stored per zone, with a reload button per step and **Rescan all**. **Backup** and **Restore** save and load the sets as JSON; **Clear cal** removes them for the connected device. **Graph** beside a stored standard plots it against the ideal (click Smith, double-click return loss, triple-click phase), and **Err terms** plots the error terms, which helps spot a badly fitted standard.
+Each piece is fitted once; from **Scan** only the requested span is swept, and from **Rescan all** every zone is. Then fit your antenna or device and press **Scan**. The **Cal** tab lists what's stored per zone, with a reload button per step and **Rescan all**. **Backup** and **Restore** save and load the sets as JSON; **Clear cal** removes them for the connected device. **Graph** beside a stored standard plots it against the ideal (click Smith, double-click return loss, triple-click phase), and **Err terms** plots the error terms, which helps spot a badly fitted standard.
 
 The calibration badge reads, for example, RESTORED with its date, OTHER ID if the set came from a different serial, or CAL INT when it's interpolated.
 

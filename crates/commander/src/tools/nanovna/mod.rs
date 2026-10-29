@@ -366,17 +366,37 @@ impl VnaFile {
 /// A single click measures only when that zone has no stored scan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ZoneClick {
+    /// Select the tab and show its stored scan, if any. Limits do not change.
     Recall,
-    Measure,
+    /// Load the zone's band plan limits into START and STOP. Nothing sweeps.
+    Load,
 }
 
-fn zone_click(has_scan: bool, double: bool) -> ZoneClick {
-    if double || !has_scan {
-        ZoneClick::Measure
+fn zone_click(double: bool) -> ZoneClick {
+    if double {
+        ZoneClick::Load
     } else {
         ZoneClick::Recall
     }
 }
+
+/// The selected band plan zone's bands as (name, lo, hi), for the VNA band
+/// buttons. The active band plan drives these; there is no built-in list.
+fn plan_bands(plan: &crate::plan::BandPlan, zone_sel: usize) -> Vec<(String, f64, f64)> {
+    plan.zones
+        .get(zone_sel)
+        .map(|zone| {
+            zone.bands
+                .iter()
+                .filter(|b| b.lo_hz.is_finite() && b.hi_hz.is_finite() && b.hi_hz > b.lo_hz)
+                .map(|b| (if b.name.trim().is_empty() { "Band".to_string() } else { b.name.clone() }, b.lo_hz, b.hi_hz))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub(crate) const NO_PLAN_BANDS: &str = "No bands in the active band plan; enter limits by hand";
+pub(crate) const BAND_TIP: &str = "Double-click: load band into scan limits";
 
 /// Dark red, the same fill as the calibration measure button while it is held.
 const SCAN_TAB: Color32 = Color32::from_rgb(0x3A, 0x0C, 0x10);
@@ -1117,7 +1137,7 @@ impl NanoVna {
                 }
             } else {
                 self.run = false;
-                self.request_zone(live);
+                self.begin_scan(live);
             }
         }
     }
@@ -2862,25 +2882,41 @@ impl NanoVna {
             };
             ui.label(egui::RichText::new(why).size(theme.data_size * 0.75).color(palette::TEXT_MUTED));
         });
-        let presets = sweep::band_presets(floor, max_hz);
-        let mut pick: Option<(f64, f64)> = None;
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("BAND").size(theme.data_size * 0.75).color(palette::TEXT_MUTED));
-            egui::ComboBox::from_id_salt("vna-band-preset")
-                .width((width - 60.0).max(80.0))
-                .selected_text("Ham band preset")
-                .show_ui(ui, |ui| {
-                    for (name, lo, hi) in &presets {
-                        let text = format!("{name}  {} – {}", display::fmt_hz(*lo), display::fmt_hz(*hi));
-                        if ui.selectable_label(false, text).clicked() {
-                            pick = Some((*lo, *hi));
-                        }
+        // Band buttons from the active band plan (the selected zone tab).
+        // Double-click loads a band into START and STOP; single click does nothing.
+        let _ = (floor, max_hz);
+        let bands = plan_bands(&self.plan, self.zone_sel);
+        let any_bands = (0..self.plan.zones.len()).any(|i| !plan_bands(&self.plan, i).is_empty());
+        ui.label(egui::RichText::new("BAND PLAN").size(theme.data_size * 0.75).color(palette::TEXT_MUTED));
+        let mut hit: Option<(String, f64, f64, bool)> = None;
+        if !any_bands {
+            ui.label(egui::RichText::new(NO_PLAN_BANDS).size(theme.data_size * 0.75).color(palette::TEXT));
+        } else if bands.is_empty() {
+            let zone = self.zone_name().unwrap_or_default();
+            ui.label(
+                egui::RichText::new(format!("No bands in {zone}; pick another zone tab or enter limits by hand"))
+                    .size(theme.data_size * 0.75)
+                    .color(palette::TEXT),
+            );
+        } else {
+            let bw = ((width - 16.0) / 3.0).floor();
+            ui.horizontal_wrapped(|ui| {
+                for (name, lo, hi) in &bands {
+                    let resp = key_cap(ui, theme, name, false, bw, true).on_hover_text(format!(
+                        "{BAND_TIP}\n{} – {}",
+                        display::fmt_hz(*lo),
+                        display::fmt_hz(*hi)
+                    ));
+                    if resp.double_clicked() {
+                        hit = Some((name.clone(), *lo, *hi, true));
+                    } else if resp.clicked() && hit.is_none() {
+                        hit = Some((name.clone(), *lo, *hi, false));
                     }
-                });
-        });
-        if let Some((lo, hi)) = pick {
-            self.apply_edges(lo, hi);
-            self.note.clear();
+                }
+            });
+        }
+        if let Some((name, lo, hi, double)) = hit {
+            self.band_click(&name, lo, hi, double);
         }
     }
 
@@ -3153,8 +3189,7 @@ impl NanoVna {
             .device_id
             .map(|bytes| proto::device_id_hex(&bytes));
         let Some(scan) = self.scan_for(&name, id.as_deref()).cloned() else {
-            let live = self.session.snapshot();
-            self.request_zone(&live);
+            self.note = format!("No stored scan for {name}. Double-click a band to load its limits, then press Scan.");
             return;
         };
         self.history.clear();
@@ -3299,20 +3334,8 @@ impl NanoVna {
         })
     }
 
-    fn request_zone(&mut self, live: &device::Live) {
-        let Some(zone) = self.plan.zones.get(self.zone_sel).cloned() else {
-            self.note = "This station has no band plan to calibrate.".into();
-            return;
-        };
-        let Some((lo, hi)) = zone_limits(&zone) else {
-            self.note = format!("{} has no frequency limits.", zone.name);
-            return;
-        };
-        self.choose_span(live, &zone.name, lo, hi);
-    }
-
-    /// Scan the selected tab. Without a stored calibration this opens the
-    /// wizard and does not sweep the device under test.
+    /// Scan the typed START and STOP. Without a covering calibration this opens
+    /// the wizard for that span and does not sweep the device under test.
     fn begin_scan(&mut self, live: &device::Live) {
         self.run = false;
         self.run_state = Run::Idle;
@@ -3327,15 +3350,62 @@ impl NanoVna {
             );
             return;
         }
-        if self.plan.zones.is_empty() {
-            if self.setup_has_cal(live) && self.send_sweep() {
+        // Scan sweeps the START and STOP the user set. It used to sweep the
+        // selected band plan zone instead, which overwrote the limits with
+        // the zone's lowest and highest band edge (406.1–512 MHz on UHF).
+        let Some((lo, hi)) = self.typed_limits() else {
+            self.note = "START and STOP are not valid frequencies. Fix them, then press Scan.".into();
+            return;
+        };
+        if self.setup_has_cal(live) {
+            if self.send_sweep() {
+                self.sweep_zone = self.zone_containing(lo, hi);
+                self.shown_scan = None;
+                self.shown_id.clear();
+                self.history.clear();
+                self.blank_until_sweep = true;
                 self.run_state = Run::Queued;
-            } else {
-                self.note = "This sweep has no calibration. A scan needs open, short, and load.".into();
             }
             return;
         }
-        self.request_zone(live);
+        if self.plan.zones.is_empty() {
+            self.note = "This sweep has no calibration. A scan needs open, short, and load.".into();
+            return;
+        }
+        let label = self
+            .zone_containing(lo, hi)
+            .unwrap_or_else(|| format!("{} – {}", display::fmt_hz(lo), display::fmt_hz(hi)));
+        self.choose_span(live, &label, lo, hi);
+    }
+
+    /// START and STOP as typed, in Hz, when both parse and STOP is above START.
+    fn typed_limits(&self) -> Option<(f64, f64)> {
+        let lo = parse_hz(&self.start).ok()? as f64;
+        let hi = parse_hz(&self.stop).ok()? as f64;
+        (hi > lo).then_some((lo, hi))
+    }
+
+    /// The band plan zone whose limits hold this span, for the scan tab colour
+    /// and the stored scan's zone name.
+    fn zone_containing(&self, lo: f64, hi: f64) -> Option<String> {
+        self.plan.zones.iter().find_map(|zone| {
+            let (zlo, zhi) = zone_limits(zone)?;
+            (lo >= zlo - 1.0 && hi <= zhi + 1.0).then(|| zone.name.clone())
+        })
+    }
+
+    /// A band or zone button was clicked. Only a double-click loads the
+    /// limits; a single click leaves START and STOP alone.
+    fn band_click(&mut self, name: &str, lo: f64, hi: f64, double: bool) {
+        if !double {
+            return;
+        }
+        self.apply_edges(lo, hi);
+        self.note = format!(
+            "Loaded {name} into the scan limits: {} – {}. Press Scan to sweep it.",
+            display::fmt_hz(lo),
+            display::fmt_hz(hi)
+        );
     }
 
     fn apply_edges(&mut self, lo: f64, hi: f64) {
@@ -3427,11 +3497,13 @@ impl NanoVna {
             }
             return;
         }
-        let spans = self.missing_zones(&id);
-        if spans.is_empty() {
-            self.note = format!("{zone} has no frequency limits to calibrate.");
-            return;
-        }
+        // Calibrate just the span that was asked for. Walking every missing
+        // zone left START and STOP on the last zone's edges.
+        let spans = vec![ZoneSpan {
+            zone: zone.to_string(),
+            lo,
+            hi,
+        }];
         self.note.clear();
         self.wizard = Some(Wizard {
             spans,
@@ -3476,24 +3548,6 @@ impl NanoVna {
     }
 
     /// Every plan zone that does not yet have open, short, and load for this device.
-    fn missing_zones(&self, id: &str) -> Vec<ZoneSpan> {
-        let mut spans = Vec::new();
-        for zone in &self.plan.zones {
-            let Some((lo, hi)) = zone_limits(zone) else {
-                continue;
-            };
-            let (lo, hi) = self.programmed_edges(lo, hi);
-            if find_zone_cal(&self.face.cals, id, &zone.name, lo, hi).is_some() {
-                continue;
-            }
-            spans.push(ZoneSpan {
-                zone: zone.name.clone(),
-                lo,
-                hi,
-            });
-        }
-        spans
-    }
 
     fn wizard_measure(&mut self) {
         let Some(wiz) = self.wizard.clone() else {
@@ -3502,8 +3556,20 @@ impl NanoVna {
         let Some(standard) = wiz.step.standard() else {
             self.wizard = None;
             self.pending = None;
-            let live = self.session.snapshot();
-            self.request_zone(&live);
+            // Finish scans the span just calibrated (the selected zone's span
+            // after Rescan all), not the selected zone's full band plan range.
+            let name = self.zone_name();
+            if let Some(span) = wiz
+                .spans
+                .iter()
+                .find(|sp| Some(&sp.zone) == name.as_ref())
+                .or(wiz.spans.first())
+                .cloned()
+            {
+                let live = self.session.snapshot();
+                self.apply_edges(span.lo, span.hi);
+                self.choose_span(&live, &span.zone, span.lo, span.hi);
+            }
             return;
         };
         if let Some(w) = self.wizard.as_mut() {
@@ -3557,7 +3623,7 @@ impl NanoVna {
     }
 
     fn band_strip(&mut self, ui: &mut Ui, theme: &LcarsTheme, live: &device::Live) {
-        let mut measure = false;
+        let mut load = false;
         let mut recall = false;
         let names: Vec<String> = self.plan.zones.iter().map(|zone| zone.name.clone()).collect();
         let scanning = self.scanning_zone(live).map(str::to_string);
@@ -3579,24 +3645,30 @@ impl NanoVna {
                         hot.then_some(SCAN_TAB),
                         None,
                     );
+                    let resp = resp.on_hover_text(BAND_TIP);
                     if resp.clicked() || resp.double_clicked() {
                         self.cal_page = false;
                         self.zone_sel = idx;
                         let has_scan = self.scan_for(name, device_id.as_deref()).is_some();
-                        if zone_click(has_scan, resp.double_clicked()) == ZoneClick::Measure {
-                            measure = true;
+                        if zone_click(resp.double_clicked()) == ZoneClick::Load {
+                            load = true;
                             recall = false;
                         } else {
-                            measure = false;
-                            recall = true;
+                            load = false;
+                            recall = has_scan;
                         }
                     }
                 }
         });
         // The zone tabs and the elbow under them used to share an edge.
         ui.add_space(theme.frame_gap);
-        if measure {
-            self.request_zone(live);
+        let _ = live;
+        if load {
+            let zone = self.plan.zones.get(self.zone_sel).cloned();
+            match zone.as_ref().and_then(|z| zone_limits(z).map(|(lo, hi)| (z.name.clone(), lo, hi))) {
+                Some((name, lo, hi)) => self.band_click(&name, lo, hi, true),
+                None => self.note = NO_PLAN_BANDS.into(),
+            }
         } else if recall {
             self.recall_selected();
         }
@@ -7089,11 +7161,216 @@ mod tests {
     }
 
     #[test]
-    fn a_zone_click_loads_a_stored_scan_and_a_double_click_measures() {
-        assert_eq!(zone_click(true, false), ZoneClick::Recall);
-        assert_eq!(zone_click(false, false), ZoneClick::Measure);
-        assert_eq!(zone_click(true, true), ZoneClick::Measure);
-        assert_eq!(zone_click(false, true), ZoneClick::Measure);
+    fn a_zone_click_recalls_and_a_double_click_loads_limits() {
+        assert_eq!(zone_click(false), ZoneClick::Recall);
+        assert_eq!(zone_click(true), ZoneClick::Load);
+    }
+
+    fn safety_plan() -> crate::plan::BandPlan {
+        crate::plan::parse(include_str!("../../../../../bsp/publicsafety.json")).expect("plan")
+    }
+
+    fn vna_with(plan: &crate::plan::BandPlan, zone: usize) -> NanoVna {
+        let ctx = egui::Context::default();
+        let mut vna = NanoVna::from_face(&ctx, Face::default());
+        vna.set_plan(plan);
+        vna.zone_sel = zone;
+        vna.start = "144000000".into();
+        vna.stop = "148000000".into();
+        vna
+    }
+
+    #[test]
+    fn the_uhf_zone_spans_406_to_512_which_scan_used_to_force() {
+        let plan = safety_plan();
+        let uhf = plan.zones.iter().find(|z| z.name == "UHF").expect("uhf");
+        assert_eq!(zone_limits(uhf), Some((406.1e6, 512e6)));
+    }
+
+    #[test]
+    fn scan_keeps_the_typed_limits_in_every_state() {
+        let plan = safety_plan();
+        let uhf = plan.zones.iter().position(|z| z.name == "UHF").unwrap();
+        // Not connected, no port.
+        let mut vna = vna_with(&plan, uhf);
+        vna.begin_scan(&device::Live::default());
+        assert_eq!(
+            (vna.start.as_str(), vna.stop.as_str()),
+            ("144000000", "148000000")
+        );
+        assert!(vna.await_scan.is_none());
+        // Not connected, port saved: waits with the typed span.
+        vna.face.port = "/dev/null-test".into();
+        vna.begin_scan(&device::Live::default());
+        let (_, lo, hi) = vna.await_scan.clone().expect("waits");
+        assert_eq!((lo, hi), (144e6, 148e6));
+        assert_eq!(
+            (vna.start.as_str(), vna.stop.as_str()),
+            ("144000000", "148000000")
+        );
+        // Connected, no calibration: the wizard calibrates the typed span only.
+        let mut vna = vna_with(&plan, uhf);
+        let live = device::Live {
+            connected: true,
+            device_id: Some([1; 12]),
+            ..device::Live::default()
+        };
+        vna.begin_scan(&live);
+        let wiz = vna.wizard.clone().expect("wizard");
+        assert_eq!(wiz.spans.len(), 1);
+        assert_eq!((wiz.spans[0].lo, wiz.spans[0].hi), (144e6, 148e6));
+        vna.wizard_measure();
+        assert_eq!(
+            (vna.start.as_str(), vna.stop.as_str()),
+            ("144000000", "148000000")
+        );
+        // Connected with correction (covering calibration path): sweeps the typed span.
+        let mut vna = vna_with(&plan, uhf);
+        vna.cal_off = true;
+        vna.begin_scan(&live);
+        assert!(vna.run_state == Run::Queued);
+        assert_eq!((vna.face.start_hz, vna.face.stop_hz), (144e6, 148e6));
+        vna.begin_scan(&live);
+        assert_eq!(
+            (vna.start.as_str(), vna.stop.as_str()),
+            ("144000000", "148000000")
+        );
+    }
+
+    #[test]
+    fn band_buttons_come_from_the_active_band_plan() {
+        let plan = safety_plan();
+        let uhf = plan.zones.iter().position(|z| z.name == "UHF").unwrap();
+        let names: Vec<String> = plan_bands(&plan, uhf).into_iter().map(|b| b.0).collect();
+        assert_eq!(names, ["Federal UHF", "UHF", "T-band"]);
+        assert!(plan_bands(
+            &crate::plan::BandPlan {
+                version: 1,
+                zones: Vec::new()
+            },
+            0
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn no_hard_coded_ham_preset_list_remains() {
+        let sweep_src = include_str!("sweep.rs");
+        assert!(!sweep_src.contains(concat!("fn band", "_presets")));
+        assert!(!sweep_src.contains(concat!("ham_rf::bands::", "BANDS")));
+        let src = include_str!("mod.rs");
+        assert!(!src.contains(concat!("\"vna-band", "-preset\"")));
+        assert!(!src.contains(concat!("\"Ham band", " preset\"")));
+    }
+
+    /// Run the SWEEP panel headless with the app's real fonts and theme and
+    /// return the text drawn with its centre point.
+    fn panel_frame(
+        vna: &mut NanoVna,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        t: f64,
+    ) -> Vec<(String, Pos2)> {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(500.0, 900.0))),
+            time: Some(t),
+            events,
+            ..Default::default()
+        };
+        let live = device::Live::default();
+        let mut out = ctx.run_ui(input, |ui| {
+            let theme = LcarsTheme::default();
+            vna.sweep_panel(ui, &theme, &live, 380.0, 86.0);
+        });
+        out.textures_delta.clear();
+        fn flat(s: &egui::Shape, v: &mut Vec<(String, Pos2)>) {
+            match s {
+                egui::Shape::Vec(xs) => xs.iter().for_each(|x| flat(x, v)),
+                egui::Shape::Text(t) => {
+                    v.push((t.galley.job.text.clone(), t.pos + t.galley.size() / 2.0))
+                }
+                _ => {}
+            }
+        }
+        let mut v = Vec::new();
+        out.shapes.iter().for_each(|c| flat(&c.shape, &mut v));
+        v
+    }
+
+    fn click_events(pos: Pos2, pressed: bool) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            },
+        ]
+    }
+
+    #[test]
+    fn double_click_on_a_band_button_loads_it_and_single_click_does_not() {
+        let plan = safety_plan();
+        let vhf = plan.zones.iter().position(|z| z.name == "VHF").unwrap();
+        let mut vna = vna_with(&plan, vhf);
+        let ctx = egui::Context::default();
+        rustcars::install_lcars_font(&ctx);
+        rustcars::apply_theme(&ctx, &rustcars::LcarsTheme::default());
+        let mut texts = Vec::new();
+        for k in 0..3 {
+            texts = panel_frame(&mut vna, &ctx, Vec::new(), k as f64 * 0.01);
+        }
+        assert!(!texts.iter().any(|(t, _)| t.contains("Ham band")));
+        let pos = texts
+            .iter()
+            .find(|(t, _)| t == "VHF HIGH")
+            .unwrap_or_else(|| {
+                panic!(
+                    "VHF High not drawn: {:?}",
+                    texts.iter().map(|t| &t.0).collect::<Vec<_>>()
+                )
+            })
+            .1;
+        // Single click.
+        panel_frame(&mut vna, &ctx, click_events(pos, true), 1.0);
+        panel_frame(&mut vna, &ctx, click_events(pos, false), 1.05);
+        panel_frame(&mut vna, &ctx, Vec::new(), 2.0);
+        assert_eq!(
+            (vna.start.as_str(), vna.stop.as_str()),
+            ("144000000", "148000000")
+        );
+        // Double click.
+        panel_frame(&mut vna, &ctx, click_events(pos, true), 3.0);
+        panel_frame(&mut vna, &ctx, click_events(pos, false), 3.05);
+        panel_frame(&mut vna, &ctx, click_events(pos, true), 3.10);
+        panel_frame(&mut vna, &ctx, click_events(pos, false), 3.15);
+        assert_eq!(
+            (vna.start.as_str(), vna.stop.as_str()),
+            ("150800000", "174000000")
+        );
+        // The fields show the loaded values on the next frame.
+        let texts = panel_frame(&mut vna, &ctx, Vec::new(), 3.5);
+        let shown = display::fmt_hz(150.8e6);
+        assert!(
+            texts.iter().any(|(t, _)| *t == shown),
+            "START field shows {shown}: {:?}",
+            texts.iter().map(|t| &t.0).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn an_empty_band_plan_says_so_in_plain_text() {
+        let empty = crate::plan::BandPlan {
+            version: 1,
+            zones: Vec::new(),
+        };
+        let mut vna = vna_with(&empty, 0);
+        let ctx = egui::Context::default();
+        rustcars::install_lcars_font(&ctx);
+        rustcars::apply_theme(&ctx, &rustcars::LcarsTheme::default());
+        let texts = panel_frame(&mut vna, &ctx, Vec::new(), 0.0);
+        assert!(texts.iter().any(|(t, _)| t == NO_PLAN_BANDS));
     }
 
     #[test]

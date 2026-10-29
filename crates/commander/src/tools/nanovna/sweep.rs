@@ -1,5 +1,5 @@
 //! Pure sweep-setup logic for the VNA SWEEP panel: center and span, the
-//! clamps the NanoVNA V2.2 needs, typed frequencies, and ham band presets.
+//! clamps the NanoVNA V2.2 needs, and typed frequencies.
 //! Issue 68. Nothing here touches egui.
 
 /// Center and span of a start/stop pair.
@@ -68,20 +68,6 @@ pub fn parse_freq(text: &str) -> Option<f64> {
     (v.is_finite() && v >= 0.0).then_some(v * k)
 }
 
-/// One-click sweep ranges from the US ham band table, limited to what the
-/// board can sweep. A small margin either side shows the band edges.
-pub fn band_presets(floor: f64, max_hz: f64) -> Vec<(&'static str, f64, f64)> {
-    crate::tools::ham_rf::bands::BANDS
-        .iter()
-        .filter_map(|b| {
-            let (lo, hi) = (b.lo_mhz * 1e6, b.hi_mhz * 1e6);
-            let pad = (hi - lo) * 0.05;
-            let (lo, hi) = ((lo - pad).max(floor), (hi + pad).min(max_hz));
-            (hi > lo).then_some((b.name, lo.round(), hi.round()))
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,14 +100,5 @@ mod tests {
         assert_eq!(parse_freq("1.2 GHz"), Some(1.2e9));
         assert_eq!(parse_freq("7074000 Hz"), Some(7.074e6));
         assert_eq!(parse_freq("abc"), None);
-    }
-
-    #[test]
-    fn band_presets_fit_the_board() {
-        let p = band_presets(50e3, 3e9);
-        assert!(p.iter().all(|(_, lo, hi)| *lo >= 50e3 && *hi <= 3e9 && hi > lo));
-        assert!(p.iter().any(|(n, _, _)| *n == "20 m"));
-        // 2200 m (135.7 kHz) is above the 50 kHz floor; nothing passes 3 GHz.
-        assert!(p.iter().any(|(n, _, _)| *n == "2200 m"));
     }
 }
