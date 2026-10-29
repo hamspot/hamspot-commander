@@ -342,7 +342,7 @@ The station file keeps a copy of its plan, so a station always opens with the pl
 
 - **LOAD** and **SAVE** open and save plan files. **ADD** adds a zone with one band around the current frequency.
 - **Right-click a zone name** to rename or delete it.
-- **More zones than fit:** the ones that don't fit leave the row, and a **more tabs** button appears on the tan bar above: a rounded tan button with three dots and no text, as wide as the bar's rounded end, just left of the E-STOP. Hover it to read "More tabs". Click it (or focus it and press Enter) for a list of the hidden zones, then pick one. The zone you have open always stays in the row.
+- **More zones than fit:** the ones that don't fit leave the row, and a **more tabs** button appears on the tan bar above: a rounded tan button with three dots and no text, as wide as the bar's rounded end, directly left of the E-STOP (only while some tabs don't fit). Hover it to read "More tabs". Click it (or focus it and press Enter) for a list of the hidden zones, then pick one. The zone you have open always stays in the row.
 - **Click a band row** to select it and tune its home frequency.
 - The editor on the right edits the band's Name, Home, Low, High and Mode. Click the dial inside a band to set its home.
 

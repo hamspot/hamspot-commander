@@ -527,17 +527,14 @@ pub fn top_end_cap(ctx: &egui::Context) -> Option<egui::Rect> {
 }
 
 /// Where the "more tabs" button goes on the top bar: the end cap's width,
-/// immediately left of the end cap; if the bar has a slot there (E-STOP /
-/// RELEASE, REC controls), left of that slot instead, so the slot keeps its
-/// full size. Pure geometry; `gap` is the frame gap.
+/// always immediately left of the bar slot (E-STOP / RELEASE, plus REC's
+/// controls on REC), so the slot keeps its full size and the end cap stays
+/// the Config detach pill. A frame with no slot puts it left of the end cap.
 pub fn more_button_rect(cap: egui::Rect, cover: Option<egui::Rect>, gap: f32) -> egui::Rect {
-    let mut right = cap.left() - gap;
-    if let Some(c) = cover {
-        let want = egui::Rect::from_min_max(egui::pos2(right - cap.width(), cap.top()), egui::pos2(right, cap.bottom()));
-        if want.intersects(c) {
-            right = c.left();
-        }
-    }
+    let right = match cover {
+        Some(c) => c.left(),
+        None => cap.left() - gap,
+    };
     egui::Rect::from_min_max(egui::pos2(right - cap.width(), cap.top()), egui::pos2(right, cap.bottom()))
 }
 

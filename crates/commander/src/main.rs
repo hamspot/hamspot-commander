@@ -12482,14 +12482,37 @@ mod config_order_tests {
         }
     }
 
+    /// Dots painted by the more-tabs button (it is the only thing here that
+    /// paints circles).
+    fn more_button_dots(n_labels: usize) -> usize {
+        let ctx = egui::Context::default();
+        rustcars::install_lcars_font(&ctx);
+        rustcars::apply_theme(&ctx, &rustcars::LcarsTheme::default());
+        let mut dots = 0;
+        for _ in 0..2 {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1280.0, 800.0))),
+                    ..Default::default()
+                },
+                |ui| {
+                    let estop_w = crate::estop::button_width(ui, false) + 16.0;
+                    let labels: Vec<String> = (0..n_labels).map(|i| format!("ZONE {i}")).collect();
+                    crate::tools::frame_with_slot(ui, Some(estop_w), |ui| {
+                        crate::tools::overflow_tab_row(ui, "t", &labels, Some(0), |_, _| 120.0, |ui, i, _| ui.button(&labels[i]));
+                    });
+                },
+            );
+            out.textures_delta.clear();
+            dots = out.shapes.iter().filter(|c| matches!(c.shape, egui::Shape::Circle(_))).count();
+        }
+        dots
+    }
+
     #[test]
-    fn more_tabs_button_left_of_the_pill_when_the_bar_is_free() {
-        let b = page_bar(false);
-        let gap = rustcars::LcarsTheme::default().frame_gap;
-        assert_eq!(b.more.width(), b.cap.width(), "same width as the end cap");
-        assert_eq!((b.more.top(), b.more.height()), (b.cap.top(), b.cap.height()));
-        assert_eq!(b.more.right(), b.cap.left() - gap, "immediately left of the pill");
-        assert!(!b.more.intersects(b.pill));
+    fn more_tabs_button_only_when_tabs_overflow() {
+        assert_eq!(more_button_dots(3), 0, "all tabs fit: no button");
+        assert_eq!(more_button_dots(30), 3, "overflow: the three-dot button");
     }
 
     #[test]
@@ -12499,9 +12522,10 @@ mod config_order_tests {
         let gap = rustcars::LcarsTheme::default().frame_gap;
         assert_eq!(b.more.width(), b.cap.width());
         assert_eq!(b.more.top(), b.cap.top());
-        assert!(b.more.right() <= slot.left() - gap + 0.5, "left of the E-STOP slot: {:?} vs {slot:?}", b.more);
+        assert!((b.more.right() + gap - slot.left()).abs() < 0.5, "directly left of the E-STOP slot: {:?} vs {slot:?}", b.more);
         assert!(b.more.right() + gap <= slot.left() + 0.5, "its black gap ends where the slot begins");
         assert!(!b.more.intersects(b.pill));
+        assert_eq!(b.pill, b.cap, "pill unchanged on the top-right cap");
         // E-STOP/RELEASE keep their full slot.
         assert!((slot.width() - (b.estop_w - gap)).abs() < 0.5, "slot not squeezed: {slot:?}");
         assert!((slot.right() - (b.cap.left() - gap)).abs() < 0.5);
