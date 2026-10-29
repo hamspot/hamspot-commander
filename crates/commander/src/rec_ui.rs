@@ -775,7 +775,6 @@ impl App {
         self.rec_data_window(ui.ctx());
         self.rec_detail_window(ui.ctx());
         self.rec_timeline(ui);
-        ui.label(egui::RichText::new("Click a block to select it and play from that point. Drag pans, wheel over lanes scrolls, wheel over the timeline zooms.").weak().small());
         if self.rec.player.is_some() || self.rec.job.is_some() || self.rec_icon() == IconState::Writing {
             ui.ctx().request_repaint_after(Duration::from_millis(200));
         }
