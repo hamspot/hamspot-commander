@@ -58,7 +58,61 @@ pub struct Live {
     pub sweep_errors: u64,
     /// Set when the port vanished while connected, so the UI can warn.
     pub lost: bool,
+    /// Sweep commands finished, with or without data. The UI re-arms Run on
+    /// this, so a sweep that fails between two frames cannot stall Run.
+    pub sweeps_done: u64,
+    /// Why the last sweep command produced no data. Cleared by a good sweep.
+    pub last_sweep_error: Option<String>,
+    /// Consecutive good sweeps whose samples were bit-for-bit the same as the
+    /// sweep before. A live NanoVNA always has some noise, so 1 or more is a fault.
+    pub identical_run: u32,
+    /// Hash of the last good sweep's samples.
+    pub sweep_hash: u64,
+    /// Wall-clock time (local, HH:MM:SS) of the last good sweep.
+    pub sweep_time: Option<String>,
+    /// Plain-text log of what was sent and what came back, newest last.
+    pub log: Vec<String>,
 }
+
+/// Lines kept in [`Live::log`].
+pub const LOG_LINES: usize = 12;
+
+impl Live {
+    fn note(&mut self, line: String) {
+        let stamp = chrono::Local::now().format("%H:%M:%S%.3f");
+        self.log.push(format!("{stamp} {line}"));
+        let extra = self.log.len().saturating_sub(LOG_LINES);
+        if extra > 0 {
+            self.log.drain(..extra);
+        }
+    }
+}
+
+/// Hash of a sweep's samples, by bit pattern.
+pub fn sweep_hash(sweep: &[Sample]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for s in sweep {
+        for v in [s.hz, s.s11.re, s.s11.im, s.s21.re, s.s21.im] {
+            v.to_bits().hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
+/// Byte link to a V2: the real serial port, or an in-memory fake in tests.
+pub trait Link: std::io::Read + std::io::Write + Send {
+    /// Drop unread input.
+    fn clear_input(&mut self);
+}
+
+impl Link for Box<dyn serialport::SerialPort> {
+    fn clear_input(&mut self) {
+        let _ = self.clear(serialport::ClearBuffer::Input);
+    }
+}
+
+type Opener = Box<dyn Fn(&str) -> Result<Box<dyn Link>, String> + Send>;
 
 impl Default for Live {
     fn default() -> Self {
@@ -74,6 +128,12 @@ impl Default for Live {
             capture_png: None,
             sweep_errors: 0,
             lost: false,
+            sweeps_done: 0,
+            last_sweep_error: None,
+            identical_run: 0,
+            sweep_hash: 0,
+            sweep_time: None,
+            log: Vec::new(),
         }
     }
 }
@@ -96,12 +156,17 @@ pub struct Session {
 
 impl Session {
     pub fn start(ctx: egui::Context) -> Self {
+        Self::start_with(ctx, Box::new(|path: &str| open_port(path).map(|p| Box::new(p) as Box<dyn Link>)))
+    }
+
+    /// A session over any [`Link`]. Tests pass an in-memory V2.
+    pub fn start_with(ctx: egui::Context, opener: Opener) -> Self {
         let (tx, rx) = mpsc::channel();
         let live = Arc::new(Mutex::new(Live::default()));
         let shared = Arc::clone(&live);
         let thread = thread::Builder::new()
             .name("nanovna-v2".into())
-            .spawn(move || worker(rx, shared, ctx))
+            .spawn(move || worker(rx, shared, ctx, opener))
             .ok();
         Self {
             tx,
@@ -156,8 +221,8 @@ impl Drop for Session {
     }
 }
 
-fn worker(rx: Receiver<Cmd>, live: Arc<Mutex<Live>>, ctx: egui::Context) {
-    let mut port: Option<Box<dyn serialport::SerialPort>> = None;
+fn worker(rx: Receiver<Cmd>, live: Arc<Mutex<Live>>, ctx: egui::Context, opener: Opener) {
+    let mut port: Option<Box<dyn Link>> = None;
     let mut identity: Option<Identity> = None;
     let mut path_open = String::new();
     loop {
@@ -192,6 +257,11 @@ fn worker(rx: Receiver<Cmd>, live: Arc<Mutex<Live>>, ctx: egui::Context) {
         if crate::estop::engaged() && matches!(cmd, Cmd::Sweep { .. } | Cmd::Power(_)) {
             let mut guard = live.lock().expect("nanovna");
             guard.status = "E-STOP engaged: sweep blocked".into();
+            if matches!(cmd, Cmd::Sweep { .. }) {
+                guard.sweeps_done += 1;
+                guard.last_sweep_error = Some("E-STOP engaged: sweep blocked".into());
+                guard.note("sweep blocked: E-STOP engaged".into());
+            }
             drop(guard);
             crate::estop::report(
                 crate::estop::generation(),
@@ -214,8 +284,8 @@ fn worker(rx: Receiver<Cmd>, live: Arc<Mutex<Live>>, ctx: egui::Context) {
                     guard.lost = false;
                     guard.sweep_errors = 0;
                 }
-                match open_port(&path).and_then(|mut opened| {
-                    let id = identify(&mut *opened)?;
+                match opener(&path).and_then(|mut opened| {
+                    let id = identify(opened.as_mut())?;
                     Ok((opened, id.0, id.1))
                 }) {
                     Ok((opened, id, id_read)) => {
@@ -263,10 +333,39 @@ fn worker(rx: Receiver<Cmd>, live: Arc<Mutex<Live>>, ctx: egui::Context) {
                 points,
             } => {
                 if let Some(port) = port.as_mut() {
-                    match read_sweep(port.as_mut(), identity, start_hz, step_hz, points) {
+                    live.lock().expect("nanovna").note(format!(
+                        "sent sweep start {start_hz} Hz step {step_hz} Hz {points} pts"
+                    ));
+                    let got = read_sweep(port.as_mut(), identity, start_hz, step_hz, points);
+                    let mut guard = live.lock().expect("nanovna");
+                    guard.sweeps_done += 1;
+                    drop(guard);
+                    match got {
                         Ok(sweep) => {
                             let mut guard = live.lock().expect("nanovna");
                             guard.generation = guard.generation.wrapping_add(1);
+                            let hash = sweep_hash(&sweep);
+                            if guard.generation > 1 && hash == guard.sweep_hash && !guard.sweep.is_empty() {
+                                guard.identical_run += 1;
+                            } else {
+                                guard.identical_run = 0;
+                            }
+                            guard.sweep_hash = hash;
+                            guard.last_sweep_error = None;
+                            guard.sweep_time = Some(chrono::Local::now().format("%H:%M:%S").to_string());
+                            let line = format!(
+                                "sweep #{} ok: {} pts, {} bytes, hash {:016x}{}",
+                                guard.generation,
+                                sweep.len(),
+                                sweep.len() * proto::RECORD_LEN,
+                                hash,
+                                if guard.identical_run > 0 {
+                                    format!(" IDENTICAL to previous ({} in a row)", guard.identical_run)
+                                } else {
+                                    String::new()
+                                }
+                            );
+                            guard.note(line);
                             guard.sweep = sweep;
                             let points = guard.sweep.len();
                             let id_hex = guard
@@ -286,11 +385,22 @@ fn worker(rx: Receiver<Cmd>, live: Arc<Mutex<Live>>, ctx: egui::Context) {
                             Ok(())
                         }
                         Err(err) => {
-                            live.lock().expect("nanovna").sweep_errors += 1;
-                            Err(err)
+                            // Re-sync so the next sweep starts on a command boundary.
+                            let synced = resync(port.as_mut()).is_ok();
+                            let mut guard = live.lock().expect("nanovna");
+                            guard.sweep_errors += 1;
+                            guard.last_sweep_error = Some(err.clone());
+                            guard.note(format!(
+                                "sweep failed: {err}; {}",
+                                if synced { "port re-synced" } else { "re-sync failed" }
+                            ));
+                            Err(format!("Sweep failed: {err}. The graph is NOT showing new data."))
                         }
                     }
                 } else {
+                    let mut guard = live.lock().expect("nanovna");
+                    guard.sweeps_done += 1;
+                    guard.last_sweep_error = Some("Not connected.".into());
                     Err("Not connected.".into())
                 }
             }
@@ -445,18 +555,18 @@ pub fn vote_device_id(mut read: impl FnMut() -> Result<[u8; 12], String>) -> IdR
     }
 }
 
-fn read_device_id_once(port: &mut dyn serialport::SerialPort) -> Result<[u8; 12], String> {
+fn read_device_id_once(port: &mut dyn Link) -> Result<[u8; 12], String> {
     // Drop anything stale before and after the resync so the 12 bytes line up.
     resync(port)?;
     std::thread::sleep(Duration::from_millis(20));
-    let _ = port.clear(serialport::ClearBuffer::Input);
+    port.clear_input();
     write_cmd(port, &proto::read_device_id())?;
     let mut raw = [0u8; 12];
     read_exact(port, &mut raw, Duration::from_millis(400))?;
     proto::parse_device_id(&raw)
 }
 
-fn identify(port: &mut dyn serialport::SerialPort) -> Result<(Identity, IdRead), String> {
+fn identify(port: &mut dyn Link) -> Result<(Identity, IdRead), String> {
     resync(port)?;
     write_cmd(port, &proto::indicate())?;
     let mut mark = [0u8; 1];
@@ -473,7 +583,7 @@ fn identify(port: &mut dyn serialport::SerialPort) -> Result<(Identity, IdRead),
 }
 
 fn read_sweep(
-    port: &mut dyn serialport::SerialPort,
+    port: &mut dyn Link,
     identity: Option<Identity>,
     start_hz: u64,
     step_hz: u64,
@@ -519,7 +629,7 @@ fn read_sweep(
 }
 
 fn read_fifo_slots(
-    port: &mut dyn serialport::SerialPort,
+    port: &mut dyn Link,
     prog_start: u64,
     step_hz: u64,
     prog_points: u16,
@@ -552,7 +662,7 @@ fn read_fifo_slots(
     Ok(slots)
 }
 
-fn read_capture(port: &mut dyn serialport::SerialPort) -> Result<Vec<u8>, String> {
+fn read_capture(port: &mut dyn Link) -> Result<Vec<u8>, String> {
     resync(port)?;
     write_cmd(port, &proto::capture())?;
     let mut header = [0u8; 5];
@@ -564,17 +674,17 @@ fn read_capture(port: &mut dyn serialport::SerialPort) -> Result<Vec<u8>, String
     rf::rgb565_png(meta.width, meta.height, &pixels)
 }
 
-fn resync(port: &mut dyn serialport::SerialPort) -> Result<(), String> {
-    let _ = port.clear(serialport::ClearBuffer::Input);
+fn resync(port: &mut dyn Link) -> Result<(), String> {
+    port.clear_input();
     write_cmd(port, &proto::resync())
 }
 
-fn write_cmd(port: &mut dyn serialport::SerialPort, bytes: &[u8]) -> Result<(), String> {
+fn write_cmd(port: &mut dyn Link, bytes: &[u8]) -> Result<(), String> {
     port.write_all(bytes).map_err(|err| err.to_string())
 }
 
 fn read_exact(
-    port: &mut dyn serialport::SerialPort,
+    port: &mut dyn Link,
     buf: &mut [u8],
     budget: Duration,
 ) -> Result<(), String> {
@@ -728,3 +838,226 @@ mod tests {
     }
 }
 
+
+/// In-memory NanoVNA V2 for headless tests: it parses the binary protocol and
+/// answers like the firmware.
+#[cfg(test)]
+pub mod fake {
+    use super::*;
+    use std::collections::VecDeque;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Mode {
+        /// Every sweep has new values.
+        Normal,
+        /// Every sweep returns exactly the same values.
+        Identical,
+        /// FIFO reads return nothing.
+        Silent,
+    }
+
+    pub struct State {
+        pub mode: Mode,
+        pub start: u64,
+        pub step: u64,
+        pub points: u16,
+        pub sweeps: u64,
+        pub resyncs: u64,
+        pub sent: Vec<u8>,
+    }
+
+    pub struct FakeV2 {
+        pub state: Arc<Mutex<State>>,
+        input: Vec<u8>,
+        out: VecDeque<u8>,
+        nops: usize,
+    }
+
+    pub fn new(mode: Mode) -> (FakeV2, Arc<Mutex<State>>) {
+        let state = Arc::new(Mutex::new(State { mode, start: 0, step: 0, points: 0, sweeps: 0, resyncs: 0, sent: Vec::new() }));
+        (FakeV2 { state: Arc::clone(&state), input: Vec::new(), out: VecDeque::new(), nops: 0 }, state)
+    }
+
+    pub fn opener(state: Arc<Mutex<State>>) -> Opener {
+        Box::new(move |_path: &str| {
+            Ok(Box::new(FakeV2 { state: Arc::clone(&state), input: Vec::new(), out: VecDeque::new(), nops: 0 }) as Box<dyn Link>)
+        })
+    }
+
+    impl FakeV2 {
+        fn run(&mut self) {
+            loop {
+                let Some(&op) = self.input.first() else { return };
+                let need = match op {
+                    proto::NOP | proto::INDICATE => 1,
+                    proto::READ1 | proto::READ4 => 2,
+                    proto::WRITE1 | proto::READ_FIFO => 3,
+                    proto::WRITE2 => 4,
+                    proto::WRITE8 => 10,
+                    _ => 1,
+                };
+                if self.input.len() < need {
+                    return;
+                }
+                let cmd: Vec<u8> = self.input.drain(..need).collect();
+                if op == proto::NOP {
+                    self.nops += 1;
+                    if self.nops == 8 {
+                        self.state.lock().unwrap().resyncs += 1;
+                    }
+                    continue;
+                }
+                self.nops = 0;
+                let mut st = self.state.lock().unwrap();
+                match op {
+                    proto::INDICATE => self.out.push_back(b'2'),
+                    proto::READ1 => self.out.push_back(match cmd[1] {
+                        proto::ADDR_VARIANT => 2,
+                        proto::ADDR_PROTOCOL => 1,
+                        proto::ADDR_BOARD => 4,
+                        proto::ADDR_FW_MAJOR => 1,
+                        proto::ADDR_FW_MINOR => 2,
+                        _ => 0,
+                    }),
+                    proto::READ4 => self.out.extend([cmd[1], 0x11, 0x22, 0x33]),
+                    proto::WRITE1 if cmd[1] == proto::ADDR_FIFO => {}
+                    proto::WRITE8 => {
+                        let v = u64::from_le_bytes(cmd[2..10].try_into().unwrap());
+                        if cmd[1] == proto::ADDR_SWEEP_START { st.start = v } else { st.step = v }
+                    }
+                    proto::WRITE2 if cmd[1] == proto::ADDR_SWEEP_POINTS => {
+                        st.points = u16::from_le_bytes([cmd[2], cmd[3]]);
+                        st.sweeps += 1;
+                    }
+                    proto::READ_FIFO => {
+                        if st.mode == Mode::Silent {
+                            continue;
+                        }
+                        let salt = if st.mode == Mode::Identical { 1 } else { st.sweeps as i32 };
+                        for index in 0..u16::from(cmd[2]).min(st.points) {
+                            self.out.extend(proto::encode_record(&proto::RawRecord {
+                                fwd_re: 1_000_000,
+                                fwd_im: 0,
+                                rev0_re: 1000 * salt + i32::from(index),
+                                rev0_im: 100,
+                                rev1_re: 500,
+                                rev1_im: 0,
+                                freq_index: index,
+                            }));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    impl std::io::Write for FakeV2 {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.state.lock().unwrap().sent.extend_from_slice(buf);
+            self.input.extend_from_slice(buf);
+            self.run();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl std::io::Read for FakeV2 {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.out.is_empty() {
+                std::thread::sleep(Duration::from_millis(2));
+                return Err(std::io::ErrorKind::TimedOut.into());
+            }
+            let n = buf.len().min(self.out.len());
+            for b in buf.iter_mut().take(n) {
+                *b = self.out.pop_front().unwrap();
+            }
+            Ok(n)
+        }
+    }
+
+    impl Link for FakeV2 {
+        fn clear_input(&mut self) {
+            self.out.clear();
+        }
+    }
+}
+
+#[cfg(test)]
+mod fake_tests {
+    use super::fake::{self, Mode};
+    use super::*;
+
+    fn wait(session: &Session, f: impl Fn(&Live) -> bool) -> Live {
+        let t = Instant::now();
+        loop {
+            let live = session.snapshot();
+            if f(&live) {
+                return live;
+            }
+            assert!(t.elapsed() < Duration::from_secs(10), "timed out: {:?} {:?}", live.status, live.log);
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn connected(mode: Mode) -> (Session, Arc<Mutex<fake::State>>) {
+        let (_dev, state) = fake::new(mode);
+        let session = Session::start_with(egui::Context::default(), fake::opener(Arc::clone(&state)));
+        session.connect("fake".into());
+        wait(&session, |l| l.connected && !l.busy);
+        (session, state)
+    }
+
+    #[test]
+    fn each_sweep_brings_new_data_and_counts() {
+        let (s, st) = connected(Mode::Normal);
+        let mut hashes = Vec::new();
+        for n in 1..=3u64 {
+            s.sweep(10_000_000, 1_000_000, 11);
+            let live = wait(&s, |l| l.sweeps_done == n && !l.busy);
+            assert_eq!(live.generation, n);
+            assert_eq!(live.sweep.len(), 11);
+            assert_eq!(live.identical_run, 0);
+            assert!(live.sweep_time.is_some());
+            hashes.push(live.sweep_hash);
+        }
+        hashes.dedup();
+        assert_eq!(hashes.len(), 3, "every sweep differs");
+        assert_eq!(st.lock().unwrap().sweeps, 3, "the device was asked to sweep each time");
+        assert!(s.snapshot().log.iter().any(|l| l.contains("sweep #3 ok")));
+    }
+
+    #[test]
+    fn identical_frames_are_counted_and_logged() {
+        let (s, _) = connected(Mode::Identical);
+        for n in 1..=3u64 {
+            s.sweep(10_000_000, 1_000_000, 11);
+            wait(&s, |l| l.sweeps_done == n && !l.busy);
+        }
+        let live = s.snapshot();
+        assert_eq!(live.identical_run, 2);
+        assert!(live.log.last().unwrap().contains("IDENTICAL to previous (2 in a row)"));
+    }
+
+    #[test]
+    fn a_silent_device_reports_an_error_and_resyncs() {
+        let (s, st) = connected(Mode::Silent);
+        let before = st.lock().unwrap().resyncs;
+        s.sweep(10_000_000, 1_000_000, 5);
+        let live = wait(&s, |l| l.sweeps_done == 1 && !l.busy);
+        assert_eq!(live.generation, 0, "no data, no new generation");
+        assert!(live.last_sweep_error.as_deref().unwrap().contains("timed out"));
+        assert!(live.status.contains("NOT showing new data"));
+        assert_eq!(live.sweep_errors, 1);
+        assert!(st.lock().unwrap().resyncs > before);
+        assert!(live.log.iter().any(|l| l.contains("port re-synced")));
+        // The device recovers: the next sweep clears the error.
+        st.lock().unwrap().mode = Mode::Normal;
+        s.sweep(10_000_000, 1_000_000, 5);
+        let live = wait(&s, |l| l.sweeps_done == 2 && !l.busy);
+        assert_eq!(live.generation, 1);
+        assert!(live.last_sweep_error.is_none());
+    }
+}

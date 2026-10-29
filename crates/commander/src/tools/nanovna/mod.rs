@@ -798,6 +798,13 @@ pub struct NanoVna {
     cal_state: cal::CalState,
     details_open: bool,
     last_sweep: Option<std::time::Instant>,
+    /// `Live::sweeps_done` when the last sweep was sent. Run re-arms once the
+    /// worker reports that sweep finished, good or bad.
+    sweeps_mark: u64,
+    /// Zone name of the stored scan on screen, for the source label.
+    shown_zone: String,
+    /// True when the chart drew a memory slot in place of a live trace.
+    memory_as_trace: bool,
     /// A stored calibration standard shown in its own window. Issue 75.
     cal_graph: Option<(CalSet, WizStep)>,
     /// Format, compare set (index into the stored sets) and error-term view of that window.
@@ -886,6 +893,9 @@ impl NanoVna {
             cal_state: cal::CalState::Uncal,
             details_open: false,
             last_sweep: None,
+            sweeps_mark: 0,
+            shown_zone: String::new(),
+            memory_as_trace: false,
             cal_graph_view: View::Smith,
             kbd: Vec::new(),
             kbd_step: 0,
@@ -977,16 +987,7 @@ impl NanoVna {
         let live = self.session.snapshot();
         GD_APERTURE.with(|a| a.set(self.face.gd_aperture.clamp(2, 200) as usize));
         self.read_keys(ui);
-        if live.generation != self.seen && !live.sweep.is_empty() {
-            self.ingest(&live.sweep);
-            self.seen = live.generation;
-            self.sweep_count += 1;
-            let now = std::time::Instant::now();
-            if let (true, Some(was)) = (self.run, self.last_sweep) {
-                self.sweep_ms = Some(now.duration_since(was).as_secs_f64() * 1000.0);
-            }
-            self.last_sweep = Some(now);
-        }
+        self.take_live(&live);
         self.pump(&live);
         if self.arm_connect
             && !self.user_closed
@@ -1015,6 +1016,20 @@ impl NanoVna {
         self.trace_menu_dialog(ui, &theme, shown_trace.as_deref());
         self.setup_dialog(ui, &theme, &live);
         self.wizard_dialog(ui, &theme, &live);
+    }
+
+    /// Take a new device sweep into the chart history, once per generation.
+    fn take_live(&mut self, live: &device::Live) {
+        if live.generation != self.seen && !live.sweep.is_empty() {
+            self.ingest(&live.sweep);
+            self.seen = live.generation;
+            self.sweep_count += 1;
+            let now = std::time::Instant::now();
+            if let (true, Some(was)) = (self.run, self.last_sweep) {
+                self.sweep_ms = Some(now.duration_since(was).as_secs_f64() * 1000.0);
+            }
+            self.last_sweep = Some(now);
+        }
     }
 
     fn setup_dialog(&mut self, ui: &mut Ui, theme: &LcarsTheme, live: &device::Live) {
@@ -1116,6 +1131,12 @@ impl NanoVna {
 
     fn pump(&mut self, live: &device::Live) {
         match self.run_state {
+            // The sweep we sent has finished, with data or with an error. Before
+            // this, a sweep that failed between two frames left Run Queued for
+            // ever: busy went up and down unseen and no new generation came.
+            Run::Queued | Run::Running if !live.busy && live.sweeps_done > self.sweeps_mark => {
+                self.run_state = Run::Idle
+            }
             Run::Queued if live.busy => self.run_state = Run::Running,
             Run::Running if !live.busy => self.run_state = Run::Idle,
             Run::Queued if !live.busy && live.generation != self.seen => self.run_state = Run::Idle,
@@ -1375,8 +1396,12 @@ impl NanoVna {
         };
         // With no live trace, a shown memory (for example an imported file)
         // becomes the trace so markers and readouts work on it. Issue 53.
-        if trace.is_none() && memory.is_some() {
+        // Only when there is no device sweep at all: a live sweep hidden for
+        // want of calibration must not be replaced by a frozen memory trace.
+        self.memory_as_trace = false;
+        if trace.is_none() && memory.is_some() && live.sweep.is_empty() && self.history.is_empty() && self.shown_scan.is_none() {
             trace = memory.take();
+            self.memory_as_trace = true;
         }
         let math = match (&trace, &memory) {
             (Some(t), Some(m)) => traces::trace_math(t, m, self.math),
@@ -1444,6 +1469,23 @@ impl NanoVna {
         show_frame(ui, theme, right, Side::Right, |ui| {
             let table_h = if placed.is_empty() { 0.0 } else { 22.0 * (placed.len() as f32 + 1.0) + 6.0 };
             let status_h = 26.0;
+            let header = self.source_lines(live, trace.as_deref(), cal.as_ref(), state, std::time::Instant::now());
+            let warn_color = LED_WARN;
+            for (line, alarm) in &header {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(line)
+                            .monospace()
+                            .size(theme.data_size * 0.8)
+                            .color(if *alarm { warn_color } else { palette::TEXT_MUTED }),
+                    )
+                    .wrap(),
+                );
+            }
+            if self.run || live.last_sweep_error.is_some() {
+                // Keeps the STALE timer counting while nothing arrives.
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+            }
             let grid_h = (ui.available_height() - table_h - status_h - 8.0).max(160.0);
             let area = Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), grid_h));
             ui.allocate_rect(area, Sense::hover());
@@ -3092,7 +3134,11 @@ impl NanoVna {
         let selected = self.zone_name();
         // A calibration piece is drawn as it arrives. A zone sweep updates the
         // chart only when that zone is the one on screen.
+        // In Run the chart always follows the device. A zone tab clicked while
+        // running used to keep the chart on that tab's stored scan, so every
+        // live sweep was dropped from view and the same picture stayed up.
         let show_this = self.pending.is_some()
+            || self.run
             || match &sweep_for {
                 Some(zone) => selected.as_deref() == Some(zone.as_str()),
                 None => true,
@@ -3101,6 +3147,13 @@ impl NanoVna {
             self.shown_scan = None;
             self.shown_id.clear();
             self.blank_until_sweep = false;
+            self.shown_zone.clear();
+            // Host averaging must not mix frequency grids. With the limits
+            // changed, the old rows were averaged in and their frequency axis
+            // (the oldest row) kept on screen.
+            if self.history.back().is_some_and(|last| !same_axis(last, raw)) {
+                self.history.clear();
+            }
             self.history.push_back(raw.to_vec());
             while self.history.len() > keep {
                 self.history.pop_front();
@@ -3188,6 +3241,10 @@ impl NanoVna {
             .snapshot()
             .device_id
             .map(|bytes| proto::device_id_hex(&bytes));
+        if self.run {
+            self.note = format!("Run is on, so the graph stays LIVE. Press Hold to view the stored scan for {name}.");
+            return;
+        }
         let Some(scan) = self.scan_for(&name, id.as_deref()).cloned() else {
             self.note = format!("No stored scan for {name}. Double-click a band to load its limits, then press Scan.");
             return;
@@ -3196,7 +3253,8 @@ impl NanoVna {
         self.blank_until_sweep = false;
         self.shown_id = scan.id.clone();
         self.shown_scan = Some(samples_of(&scan));
-        self.note = format!("Showing the stored scan for {name}.");
+        self.shown_zone = name.clone();
+        self.note = format!("Showing the STORED scan for {name}, not live data.");
     }
 
     fn store_standard(&mut self, standard: Standard, raw: &[Sample]) {
@@ -4258,6 +4316,7 @@ impl NanoVna {
                 if !same {
                     self.dirty = true;
                 }
+                self.sweeps_mark = self.session.snapshot().sweeps_done;
                 self.session.sweep(start, step, points);
                 self.note.clear();
                 true
@@ -4494,6 +4553,112 @@ impl NanoVna {
                 && set.short.len() == samples.len()
                 && set.load.len() == samples.len()
         })
+    }
+
+    /// Plain-text header for the chart: where the trace came from, the sweep
+    /// counter, staleness, identical frames, errors, calibration, and the
+    /// last device log line. `true` marks a line that is a warning.
+    fn source_lines(
+        &self,
+        live: &device::Live,
+        trace: Option<&[Sample]>,
+        cal: Option<&CalSet>,
+        state: cal::CalState,
+        now: std::time::Instant,
+    ) -> Vec<(String, bool)> {
+        let mut out = Vec::new();
+        let source = if trace.is_none() {
+            if !live.sweep.is_empty() && state == cal::CalState::Uncal {
+                "NO DATA: the device sweep is hidden because this range has no calibration".to_string()
+            } else {
+                "NO DATA".to_string()
+            }
+        } else if self.memory_as_trace {
+            format!("MEMORY {} (imported or frozen, NOT live)", self.mem_sel + 1)
+        } else if self.shown_scan.is_some() && self.history.is_empty() {
+            format!("STORED SCAN {} (saved earlier, NOT live)", self.shown_zone)
+        } else {
+            format!(
+                "LIVE {}  sweep #{}",
+                live.sweep_time.as_deref().unwrap_or("-"),
+                live.generation
+            )
+        };
+        out.push((
+            format!(
+                "SOURCE: {source}  ·  {}  ·  sweeps {} ok / {} errors",
+                if self.run { "RUN" } else { "HOLD" },
+                live.generation,
+                live.sweep_errors
+            ),
+            trace.is_none(),
+        ));
+        if self.run {
+            let since = self.last_sweep.map(|t| now.duration_since(t).as_secs_f64());
+            let limit = self.sweep_ms.map(|ms| (ms / 1000.0 * 3.0).max(3.0)).unwrap_or(3.0);
+            match since {
+                Some(secs) if secs > limit => out.push((format!("STALE: no new sweep for {} s", secs.round()), true)),
+                None if live.sweeps_done > self.sweeps_mark || live.sweep_errors > 0 => {
+                    out.push(("STALE: Run is on but no sweep has arrived".into(), true))
+                }
+                _ => {}
+            }
+        }
+        if live.identical_run > 0 {
+            out.push((
+                format!("DEVICE RETURNED IDENTICAL DATA {} times in a row", live.identical_run + 1),
+                true,
+            ));
+        }
+        if let Some(err) = &live.last_sweep_error {
+            out.push((format!("LAST SWEEP FAILED: {err}"), true));
+        }
+        let (cal_text, cal_warn) = self.cal_header(trace, cal, state);
+        out.push((cal_text, cal_warn));
+        if let Some(line) = live.log.last() {
+            out.push((format!("VNA LOG: {line}"), false));
+        }
+        out
+    }
+
+    /// "CAL: ..." for the header. Never silent about a missing, partial,
+    /// interpolated or other-device calibration.
+    fn cal_header(&self, trace: Option<&[Sample]>, cal: Option<&CalSet>, state: cal::CalState) -> (String, bool) {
+        if state == cal::CalState::Off {
+            return ("CAL: OFF (raw, uncorrected)".into(), true);
+        }
+        let Some(set) = cal else {
+            return ("CAL: NONE for this range (uncalibrated)".into(), true);
+        };
+        let n = set.open.len();
+        let last = set.start_hz + set.step_hz * n.saturating_sub(1) as f64;
+        let name = if !set.name.is_empty() { set.name.clone() } else if !set.zone.is_empty() { set.zone.clone() } else { "unnamed".into() };
+        let mut text = format!(
+            "CAL: {name} {} – {}, saved {}",
+            display::fmt_hz(set.start_hz),
+            display::fmt_hz(last),
+            cal_date_text(set.saved_at.as_deref())
+        );
+        let mut warn = false;
+        if state == cal::CalState::Interp {
+            text.push_str(" (interpolated onto this sweep)");
+        }
+        let points = trace.map(|t| t.len()).unwrap_or(n);
+        if set.thru.len() != points {
+            text.push_str(" · partial: S11 only, no thru");
+        }
+        let live_id = self.session.snapshot().device_id.map(|raw| proto::device_id_hex(&raw));
+        if other_device(set, live_id.as_deref()) {
+            text.push_str(&format!(" · OTHER DEVICE ID {}", set.id));
+            warn = true;
+        }
+        if let Some(t) = trace.filter(|t| !t.is_empty()) {
+            if t[0].hz < set.start_hz - 1.0 || t[t.len() - 1].hz > last + 1.0 {
+                text.push_str(" · DOES NOT COVER THIS SWEEP");
+                warn = true;
+            }
+        }
+        (text, warn)
     }
 
     fn cal_label(&self, live: &device::Live) -> String {
@@ -4772,6 +4937,11 @@ fn same_grid(set: &CalSet, start: f64, step: f64, n: usize) -> bool {
         .into_iter()
         .filter(|len| *len > 0)
         .all(|len| len == n)
+}
+
+/// Same number of points on the same frequencies.
+fn same_axis(a: &[Sample], b: &[Sample]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (x.hz - y.hz).abs() < 1.0)
 }
 
 fn cal_complete(set: &CalSet) -> bool {
@@ -7534,5 +7704,305 @@ pub fn paint_device_wiring(ui: &mut Ui, device: &str, ports: &[String], ch0: &st
     }
     if ch1.is_none() {
         painter.text(Pos2::new(p2.x, p2.y - 14.0), egui::Align2::CENTER_BOTTOM, "empty", egui::FontId::proportional(12.0), palette::TEXT_MUTED);
+    }
+}
+
+/// Issue: graph showed the same data over and over and Run never updated.
+/// Headless, over an in-memory NanoVNA V2 (`device::fake`).
+#[cfg(test)]
+mod stale_tests {
+    use super::device::fake::{self, Mode};
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    fn real_ctx() -> egui::Context {
+        let ctx = egui::Context::default();
+        rustcars::install_lcars_font(&ctx);
+        rustcars::apply_theme(&ctx, &rustcars::LcarsTheme::default());
+        ctx
+    }
+
+    fn with_fake(mode: Mode) -> (NanoVna, Arc<Mutex<fake::State>>) {
+        let ctx = real_ctx();
+        let mut vna = NanoVna::from_face(&ctx, Face::default());
+        let (_d, st) = fake::new(mode);
+        vna.session = device::Session::start_with(ctx, fake::opener(Arc::clone(&st)));
+        vna.session.connect("fake".into());
+        let t = Instant::now();
+        while !(vna.session.snapshot().connected && !vna.session.snapshot().busy) {
+            assert!(t.elapsed() < Duration::from_secs(10));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        vna.start = "10000000".into();
+        vna.stop = "14000000".into();
+        vna.points = "5".into();
+        (vna, st)
+    }
+
+    /// The UI side of one frame: take a sweep, then let Run re-arm.
+    fn frames_until(vna: &mut NanoVna, mut done: impl FnMut(&NanoVna, &device::Live) -> bool) -> device::Live {
+        let t = Instant::now();
+        loop {
+            let live = vna.session.snapshot();
+            vna.take_live(&live);
+            vna.pump(&live);
+            if done(vna, &live) {
+                return live;
+            }
+            assert!(t.elapsed() < Duration::from_secs(15), "stuck: {:?}", live.log);
+            std::thread::sleep(Duration::from_millis(3));
+        }
+    }
+
+    fn texts(vna: &NanoVna, live: &device::Live) -> String {
+        let trace = vna.display_trace(live);
+        let (cal, state) = match trace.as_deref() {
+            Some(t) => vna.cal_for(t, None),
+            None => (None, if vna.cal_off { cal::CalState::Off } else { cal::CalState::Uncal }),
+        };
+        vna.source_lines(live, trace.as_deref(), cal.as_ref(), state, Instant::now())
+            .into_iter()
+            .map(|l| l.0)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn run_mode_resweeps_and_the_graph_follows_every_sweep() {
+        let (mut vna, st) = with_fake(Mode::Normal);
+        vna.cal_off = true;
+        vna.run = true;
+        let mut seen = Vec::new();
+        let live = frames_until(&mut vna, |v, l| {
+            if let Some(t) = v.display_trace(l) {
+                let h = device::sweep_hash(&t);
+                if seen.last() != Some(&h) {
+                    seen.push(h);
+                }
+            }
+            v.sweep_count >= 4
+        });
+        assert!(st.lock().unwrap().sweeps >= 4);
+        assert!(seen.len() >= 3, "the drawn trace changed with each sweep");
+        let head = texts(&vna, &live);
+        assert!(head.contains("SOURCE: LIVE"), "{head}");
+        assert!(head.contains(&format!("sweep #{}", live.generation)));
+        assert!(!head.contains("STALE"));
+    }
+
+    #[test]
+    fn a_failed_sweep_does_not_stall_run_and_is_shown() {
+        let (mut vna, st) = with_fake(Mode::Silent);
+        vna.cal_off = true;
+        vna.run = true;
+        // Run keeps asking the device even though every sweep fails.
+        let live = frames_until(&mut vna, |_, l| l.sweeps_done >= 2 && !l.busy);
+        assert_eq!(live.generation, 0);
+        let head = texts(&vna, &live);
+        assert!(head.contains("SOURCE: NO DATA"), "{head}");
+        assert!(head.contains("LAST SWEEP FAILED"), "{head}");
+        assert!(head.contains("STALE"), "{head}");
+        assert!(head.contains("VNA LOG:"), "{head}");
+        // The device comes back: Run picks it up with no user action.
+        st.lock().unwrap().mode = Mode::Normal;
+        let live = frames_until(&mut vna, |v, _| v.sweep_count >= 2);
+        let head = texts(&vna, &live);
+        assert!(head.contains("SOURCE: LIVE"), "{head}");
+        assert!(!head.contains("LAST SWEEP FAILED"), "{head}");
+    }
+
+    #[test]
+    fn stale_warning_counts_seconds_without_a_sweep() {
+        let (mut vna, _) = with_fake(Mode::Normal);
+        vna.cal_off = true;
+        vna.run = true;
+        let live = frames_until(&mut vna, |v, _| v.sweep_count >= 1);
+        vna.last_sweep = Some(Instant::now() - Duration::from_secs(9));
+        vna.sweep_ms = Some(100.0);
+        let head = texts(&vna, &live);
+        assert!(head.contains("STALE: no new sweep for 9 s"), "{head}");
+    }
+
+    #[test]
+    fn identical_device_data_is_called_out() {
+        let (mut vna, _) = with_fake(Mode::Identical);
+        vna.cal_off = true;
+        vna.run = true;
+        let live = frames_until(&mut vna, |_, l| l.identical_run >= 2);
+        let head = texts(&vna, &live);
+        assert!(head.contains("DEVICE RETURNED IDENTICAL DATA"), "{head}");
+    }
+
+    #[test]
+    fn a_zone_click_in_run_keeps_the_graph_live() {
+        let plan = crate::plan::parse(include_str!("../../../../../bsp/publicsafety.json")).expect("plan");
+        let (mut vna, _) = with_fake(Mode::Normal);
+        vna.set_plan(&plan);
+        vna.cal_off = true;
+        vna.start_run(&vna.session.snapshot());
+        assert!(vna.run);
+        frames_until(&mut vna, |v, _| v.sweep_count >= 1);
+        // A stored scan exists for another zone.
+        let other = (vna.zone_sel + 1) % plan.zones.len();
+        let id = proto::device_id_hex(&vna.session.snapshot().device_id.unwrap());
+        vna.scans.push(StoredScan {
+            id,
+            zone: plan.zones[other].name.clone(),
+            start_hz: 1e6,
+            step_hz: 1e6,
+            s11: vec![[0.5, 0.0]; 5],
+            s21: vec![[0.0, 0.0]; 5],
+        });
+        vna.zone_sel = other;
+        vna.recall_selected();
+        assert!(vna.shown_scan.is_none(), "Run stays live");
+        assert!(vna.note.contains("stays LIVE"));
+        let before = vna.sweep_count;
+        let live = frames_until(&mut vna, |v, _| v.sweep_count >= before + 2);
+        let trace = vna.display_trace(&live).expect("live trace");
+        assert_eq!(trace[0].hz, 10e6, "the live sweep is drawn, not the stored scan");
+        // Hold, then the click shows the stored scan, labelled as such.
+        vna.run = false;
+        vna.recall_selected();
+        let head = texts(&vna, &live);
+        assert!(head.contains("SOURCE: STORED SCAN"), "{head}");
+        assert!(head.contains("NOT live"), "{head}");
+    }
+
+    #[test]
+    fn host_average_restarts_when_the_limits_change() {
+        let (mut vna, _) = with_fake(Mode::Normal);
+        vna.cal_off = true;
+        vna.face.host_average = 4;
+        vna.run = true;
+        frames_until(&mut vna, |v, _| v.sweep_count >= 2);
+        vna.band_click("B", 100e6, 104e6, true);
+        let live = frames_until(&mut vna, |v, l| {
+            v.display_trace(l).is_some_and(|t| t[0].hz == 100e6)
+        });
+        let t = vna.display_trace(&live).unwrap();
+        assert_eq!(t[t.len() - 1].hz, 104e6);
+        assert!(vna.history.iter().all(|row| row[0].hz == 100e6), "no 10 MHz rows averaged in");
+    }
+
+    fn osl(id: &str, zone: &str, start: f64, step: f64, n: usize) -> CalSet {
+        CalSet {
+            id: id.into(),
+            zone: zone.into(),
+            band: String::new(),
+            name: String::new(),
+            start_hz: start,
+            step_hz: step,
+            z0: 50.0,
+            open: vec![[1.0, 0.0]; n],
+            short: vec![[-1.0, 0.0]; n],
+            load: vec![[0.0, 0.0]; n],
+            thru: Vec::new(),
+            isolation: Vec::new(),
+            saved_at: Some("2026-10-28T12:00:00Z".into()),
+            ..one()
+        }
+    }
+
+    fn one() -> CalSet {
+        serde_json::from_str(r#"{"id":"","start_hz":0,"step_hz":0,"z0":50,"open":[],"short":[],"load":[]}"#).expect("calset")
+    }
+
+    #[test]
+    fn switching_limits_loads_the_calibration_for_that_range() {
+        let (mut vna, _) = with_fake(Mode::Normal);
+        let id = proto::device_id_hex(&vna.session.snapshot().device_id.unwrap());
+        vna.face.cals = vec![
+            osl(&id, "HF A", 10e6, 1e6, 5),
+            osl(&id, "VHF B", 100e6, 1e6, 5),
+        ];
+        for (name, lo, hi) in [("HF A", 10e6, 14e6), ("VHF B", 100e6, 104e6), ("HF A", 10e6, 14e6)] {
+            vna.band_click(name, lo, hi, true);
+            vna.points = "5".into();
+            let before = vna.sweep_count;
+            vna.begin_scan(&vna.session.snapshot());
+            assert!(vna.wizard.is_none(), "{name} has a calibration, so Scan sweeps");
+            let live = frames_until(&mut vna, |v, _| v.sweep_count > before && v.run_state == Run::Idle);
+            let trace = vna.display_trace(&live).expect("calibrated trace");
+            assert_eq!(trace[0].hz, lo);
+            let (cal, state) = vna.cal_for(&trace, None);
+            assert_eq!(cal.expect("cal").zone, name);
+            assert!(state == cal::CalState::Exact);
+            let head = texts(&vna, &live);
+            assert!(head.contains(&format!("CAL: {name}")), "{head}");
+            assert!(head.contains("2026-10-28T12:00Z"), "{head}");
+            assert!(head.contains("partial: S11 only"), "{head}");
+        }
+    }
+
+    #[test]
+    fn a_range_without_calibration_says_uncalibrated_and_borrows_nothing() {
+        let (vna, _) = with_fake(Mode::Normal);
+        let mut vna = vna;
+        let id = proto::device_id_hex(&vna.session.snapshot().device_id.unwrap());
+        vna.face.cals = vec![osl(&id, "HF A", 10e6, 1e6, 5)];
+        // A sweep at 200 MHz: the 10 MHz set must not be applied.
+        let samples: Vec<Sample> = (0..5)
+            .map(|i| rf::from_ratio(200e6 + i as f64 * 1e6, 0.1, 0.0, 0.0, 0.0))
+            .collect();
+        let (cal, state) = vna.cal_for(&samples, None);
+        assert!(cal.is_none());
+        assert!(state == cal::CalState::Uncal);
+        let (text, warn) = vna.cal_header(Some(&samples), None, state);
+        assert_eq!(text, "CAL: NONE for this range (uncalibrated)");
+        assert!(warn);
+        // Scan on that range opens the wizard instead of sweeping uncorrected.
+        vna.band_click("UHF", 200e6, 204e6, true);
+        vna.begin_scan(&vna.session.snapshot());
+        assert!(!vna.setup_has_cal(&vna.session.snapshot()));
+        // A set that does not cover the sweep is labelled, never silent.
+        let set = osl(&id, "HF A", 10e6, 1e6, 5);
+        let (text, warn) = vna.cal_header(Some(&samples), Some(&set), cal::CalState::Exact);
+        assert!(text.contains("DOES NOT COVER THIS SWEEP") && warn, "{text}");
+        // Another device's calibration is flagged.
+        let other = osl("0102030405060708090a0b0c", "HF A", 200e6, 1e6, 5);
+        let (text, warn) = vna.cal_header(Some(&samples), Some(&other), cal::CalState::Exact);
+        assert!(text.contains("OTHER DEVICE ID") && warn, "{text}");
+    }
+
+    #[test]
+    fn a_hidden_uncalibrated_sweep_is_not_replaced_by_memory() {
+        let (mut vna, _) = with_fake(Mode::Normal);
+        vna.mems[0] = Some(vec![rf::from_ratio(1e6, 0.2, 0.0, 0.0, 0.0), rf::from_ratio(2e6, 0.2, 0.0, 0.0, 0.0)]);
+        vna.show_memory = true;
+        vna.cal_off = true;
+        vna.run = true;
+        frames_until(&mut vna, |v, _| v.sweep_count >= 1);
+        vna.run = false;
+        vna.cal_off = false; // no calibration for 10-14 MHz
+        let ctx = real_ctx();
+        let live = vna.session.snapshot();
+        let mut shown = Vec::new();
+        for i in 0..2 {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1400.0, 900.0))),
+                time: Some(i as f64),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| {
+                let theme = LcarsTheme::default();
+                vna.chart(ui, &theme, &live);
+            });
+            out.textures_delta.clear();
+            fn flat(s: &egui::Shape, v: &mut Vec<String>) {
+                match s {
+                    egui::Shape::Vec(xs) => xs.iter().for_each(|x| flat(x, v)),
+                    egui::Shape::Text(t) => v.push(t.galley.job.text.clone()),
+                    _ => {}
+                }
+            }
+            shown.clear();
+            out.shapes.iter().for_each(|c| flat(&c.shape, &mut shown));
+        }
+        assert!(!vna.memory_as_trace, "memory must not stand in for the live sweep");
+        let all = shown.join("\n");
+        assert!(all.contains("NO DATA: the device sweep is hidden"), "{all}");
+        assert!(all.contains("CAL: NONE for this range (uncalibrated)"), "{all}");
     }
 }
