@@ -66,7 +66,9 @@ fn cfg_colour(name: &str) -> egui::Color32 {
 /// the E-STOP: the 40 px page bar above already does on every page (#200).
 /// Every group is detachable: its end pill (DETACH/ATTACH) moves the group
 /// and everything in it to its own window.
-fn cfg_group<R>(ui: &mut egui::Ui, name: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+/// `add` is FnMut and the result optional: a detached group's window may draw
+/// twice in a frame, or not at all if the window could not open (rustcars 1f2f06e).
+fn cfg_group<R>(ui: &mut egui::Ui, name: &str, add: impl FnMut(&mut egui::Ui) -> R) -> Option<R> {
     group_box::GroupBox::new(name, cfg_colour(name))
         .detachable(("config-group", name))
         .show(ui, add)
@@ -3124,8 +3126,13 @@ impl App {
             Page::Rec => self.page_rec(ui, snap),
             Page::HfData => self.page_hfdata(ui, snap),
             Page::Config => {
-                if group_box::DetachState::load(ui.ctx(), config_page_detach_id()).detached {
-                    ui.label(group_box::detached_stub_text("Config"));
+                let st = group_box::DetachState::load(ui.ctx(), config_page_detach_id());
+                if st.detached {
+                    ui.label(if st.failed {
+                        group_box::detach_failed_text("Config")
+                    } else {
+                        group_box::detached_stub_text("Config")
+                    });
                 } else {
                     self.page_config(ui, snap);
                 }
