@@ -74,6 +74,12 @@ fn cfg_group<R>(ui: &mut egui::Ui, name: &str, add: impl FnMut(&mut egui::Ui) ->
         .show(ui, add)
 }
 
+/// Where the whole-page Config detach pill goes: the top end cap, or the
+/// bottom one while the "more tabs" key owns the top cap.
+fn config_page_pill_rect(ctx: &egui::Context, frame_rect: egui::Rect) -> egui::Rect {
+    tools::top_end_cap_free(ctx).unwrap_or_else(|| tools::bottom_end_cap(frame_rect))
+}
+
 /// Memory id of the whole Config page's detach state.
 fn config_page_detach_id() -> egui::Id {
     group_box::DetachState::id("config-page")
@@ -3063,11 +3069,14 @@ impl eframe::App for App {
                         },
                     );
                 }
-                // Config's whole page detaches from the bottom elbow's end pill.
+                // Config's whole page detaches from the top elbow's end pill
+                // (top right, right of the E-STOP gap). Only while the tab row
+                // overflows does that cap belong to the "more tabs" key; then
+                // the pill uses the bottom end cap so neither is lost.
                 if self.page == Page::Config {
                     let id = config_page_detach_id();
                     let mut st = group_box::DetachState::load(ui.ctx(), id);
-                    let cap = tools::bottom_end_cap(frame_rect);
+                    let cap = config_page_pill_rect(ui.ctx(), frame_rect);
                     let pill = group_box::detach_pill(ui, cap, id.with("page-pill"), rustcars::palette::TAN, "Config", st.detached);
                     if pill.clicked() {
                         st.toggle();
@@ -12414,6 +12423,55 @@ fn fixed_slider(ui: &mut egui::Ui, label: &str, value: f64) {
 
 #[cfg(test)]
 mod config_order_tests {
+    /// Run one page frame like `ui()` does (real font and theme, E-STOP slot
+    /// in the top bar) and return (frame rect, E-STOP slot, pill rect).
+    fn page_pill(more_tabs: bool) -> (egui::Rect, egui::Rect, egui::Rect) {
+        let ctx = egui::Context::default();
+        rustcars::install_lcars_font(&ctx);
+        rustcars::apply_theme(&ctx, &rustcars::LcarsTheme::default());
+        let mut got = None;
+        for _ in 0..2 {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1280.0, 800.0))),
+                    ..Default::default()
+                },
+                |ui| {
+                    let more_id = crate::tools::more_tabs_id(ui.ctx());
+                    ui.ctx().data_mut(|d| d.insert_temp(more_id, more_tabs));
+                    let estop_w = crate::estop::button_width(ui, false) + 16.0;
+                    let (frame_rect, slot) = crate::tools::frame_with_slot(ui, Some(estop_w), |ui| {
+                        ui.label("config");
+                    });
+                    let pill = crate::config_page_pill_rect(ui.ctx(), frame_rect);
+                    got = Some((frame_rect, slot.expect("E-STOP slot"), pill));
+                },
+            );
+            out.textures_delta.clear();
+        }
+        got.expect("frame ran")
+    }
+
+    #[test]
+    fn config_page_pill_is_the_top_right_end_cap() {
+        let (frame, estop, pill) = page_pill(false);
+        let t = rustcars::LcarsTheme::default();
+        assert_eq!(pill.top(), frame.top(), "pill on the top bar, not the bottom: {pill:?} in {frame:?}");
+        assert!((pill.right() - frame.right()).abs() < 0.5, "pill at the right end: {pill:?}");
+        assert_eq!(pill.height(), t.bar_thin, "pill is the whole end cap");
+        assert!(pill.width() >= 40.0, "hit area: {pill:?}");
+        assert!(pill.left() >= estop.right(), "pill right of the E-STOP gap: {pill:?} vs {estop:?}");
+        assert!(!pill.intersects(estop), "pill does not overlap the E-STOP slot");
+        assert!(pill.bottom() < frame.center().y);
+    }
+
+    #[test]
+    fn config_page_pill_yields_the_top_cap_to_the_more_tabs_key() {
+        let (frame, _, pill) = page_pill(true);
+        assert_eq!(pill.bottom(), frame.bottom(), "bottom end cap while tabs overflow: {pill:?}");
+        assert!((pill.right() - frame.right()).abs() < 0.5);
+    }
+
     /// Every Config group detaches on its own and with the page (real font
     /// and theme). Bodies run once a frame; groups never overlap.
     #[test]

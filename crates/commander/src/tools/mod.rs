@@ -512,6 +512,19 @@ pub(crate) fn no_scroll_fade(ctx: &egui::Context) {
     ctx.global_style_mut(|s| s.spacing.scroll.fade.strength = 0.0);
 }
 
+pub(crate) fn more_tabs_id(ctx: &egui::Context) -> egui::Id {
+    egui::Id::NULL.with(("more-tabs-active", ctx.viewport_id()))
+}
+
+/// The top elbow's end cap (top right of the page frame), as laid out by
+/// [`frame_with_slot`] this frame, unless the "more tabs" key owns it now.
+/// `None` before the frame is drawn or while tabs overflow.
+pub fn top_end_cap_free(ctx: &egui::Context) -> Option<egui::Rect> {
+    let (cap_id, more_id) = (top_cap_id(ctx), more_tabs_id(ctx));
+    let (cap, more) = ctx.data(|d| (d.get_temp::<egui::Rect>(cap_id), d.get_temp::<bool>(more_id)));
+    if more.unwrap_or(false) { None } else { cap }
+}
+
 fn top_cap_id(ctx: &egui::Context) -> egui::Id {
     egui::Id::NULL.with(("elbow-top-cap", ctx.viewport_id()))
 }
@@ -585,7 +598,10 @@ pub fn overflow_tab_row(
             }
         }
     });
-    if hidden.is_empty() {
+    let more_id = more_tabs_id(ui.ctx());
+    let more = !hidden.is_empty();
+    ui.ctx().data_mut(|d| d.insert_temp(more_id, more));
+    if !more {
         return picked;
     }
     let cap_id = top_cap_id(ui.ctx());
