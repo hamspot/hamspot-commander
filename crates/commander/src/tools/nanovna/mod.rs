@@ -801,6 +801,11 @@ pub struct NanoVna {
     /// `Live::sweeps_done` when the last sweep was sent. Run re-arms once the
     /// worker reports that sweep finished, good or bad.
     sweeps_mark: u64,
+    /// STATUS detail window open. Memory only, never saved.
+    status_open: bool,
+    /// Last chart and status-strip rects, for layout tests.
+    last_grid: Rect,
+    last_strip: Rect,
     /// Zone name of the stored scan on screen, for the source label.
     shown_zone: String,
     /// True when the chart drew a memory slot in place of a live trace.
@@ -894,6 +899,9 @@ impl NanoVna {
             details_open: false,
             last_sweep: None,
             sweeps_mark: 0,
+            status_open: false,
+            last_grid: Rect::NOTHING,
+            last_strip: Rect::NOTHING,
             shown_zone: String::new(),
             memory_as_trace: false,
             cal_graph_view: View::Smith,
@@ -1010,6 +1018,7 @@ impl NanoVna {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
         }
         self.chart(ui, &theme, &live);
+        self.status_dialog(ui, &theme, &live);
         self.details_dialog(ui, &theme, &live);
         self.limits_dialog(ui, &theme);
         let shown_trace = self.display_trace(&live);
@@ -1469,27 +1478,19 @@ impl NanoVna {
         show_frame(ui, theme, right, Side::Right, |ui| {
             let table_h = if placed.is_empty() { 0.0 } else { 22.0 * (placed.len() as f32 + 1.0) + 6.0 };
             let status_h = 26.0;
-            let header = self.source_lines(live, trace.as_deref(), cal.as_ref(), state, std::time::Instant::now());
-            let warn_color = LED_WARN;
-            for (line, alarm) in &header {
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(line)
-                            .monospace()
-                            .size(theme.data_size * 0.8)
-                            .color(if *alarm { warn_color } else { palette::TEXT_MUTED }),
-                    )
-                    .wrap(),
-                );
-            }
+            let now = std::time::Instant::now();
             if self.run || live.last_sweep_error.is_some() {
                 // Keeps the STALE timer counting while nothing arrives.
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
             }
-            let grid_h = (ui.available_height() - table_h - status_h - 8.0).max(160.0);
+            // The status strip has a fixed height and always exists, so the
+            // chart rect never depends on what the status says.
+            let grid_h = (ui.available_height() - table_h - status_h - STRIP_H - 8.0).max(160.0);
             let area = Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), grid_h));
             ui.allocate_rect(area, Sense::hover());
+            self.last_grid = area;
             self.draw_panes(ui, theme, area, trace.as_deref(), memory.as_deref(), math.as_deref(), &placed, cal.as_ref());
+            self.status_strip(ui, theme, live, trace.as_deref(), cal.as_ref(), state, now);
             if let Some(samples) = trace.as_deref() {
                 self.marker_table(ui, theme, samples, &placed);
             }
@@ -4633,12 +4634,10 @@ impl NanoVna {
         let n = set.open.len();
         let last = set.start_hz + set.step_hz * n.saturating_sub(1) as f64;
         let name = if !set.name.is_empty() { set.name.clone() } else if !set.zone.is_empty() { set.zone.clone() } else { "unnamed".into() };
-        let mut text = format!(
-            "CAL: {name} {} – {}, saved {}",
-            display::fmt_hz(set.start_hz),
-            display::fmt_hz(last),
-            cal_date_text(set.saved_at.as_deref())
-        );
+        let mut text = format!("CAL: {name} {} – {}", display::fmt_hz(set.start_hz), display::fmt_hz(last));
+        if set.saved_at.is_some() {
+            text.push_str(&format!(", saved {}", cal_date_text(set.saved_at.as_deref())));
+        }
         let mut warn = false;
         if state == cal::CalState::Interp {
             text.push_str(" (interpolated onto this sweep)");
@@ -4647,9 +4646,8 @@ impl NanoVna {
         if set.thru.len() != points {
             text.push_str(" · partial: S11 only, no thru");
         }
-        let live_id = self.session.snapshot().device_id.map(|raw| proto::device_id_hex(&raw));
-        if other_device(set, live_id.as_deref()) {
-            text.push_str(&format!(" · OTHER DEVICE ID {}", set.id));
+        if self.cal_other_device(set) {
+            text.push_str(" · other device");
             warn = true;
         }
         if let Some(t) = trace.filter(|t| !t.is_empty()) {
@@ -4659,6 +4657,151 @@ impl NanoVna {
             }
         }
         (text, warn)
+    }
+
+    fn cal_other_device(&self, set: &CalSet) -> bool {
+        let live_id = self.session.snapshot().device_id.map(|raw| proto::device_id_hex(&raw));
+        other_device(set, live_id.as_deref())
+    }
+
+    /// Short one-line tokens for the status strip, and whether a warning exists.
+    fn compact_status(
+        &self,
+        live: &device::Live,
+        trace: Option<&[Sample]>,
+        cal: Option<&CalSet>,
+        state: cal::CalState,
+        now: std::time::Instant,
+    ) -> (String, bool) {
+        let lines = self.source_lines(live, trace, cal, state, now);
+        let src = if trace.is_none() {
+            "NO DATA"
+        } else if self.memory_as_trace {
+            "MEMORY"
+        } else if self.shown_scan.is_some() && self.history.is_empty() {
+            "STORED"
+        } else {
+            "LIVE"
+        };
+        let cal_tok = match (state, cal) {
+            (cal::CalState::Off, _) => "CAL OFF",
+            (_, None) => "CAL NONE",
+            (_, Some(set)) if self.cal_other_device(set) => "CAL OTHER-DEVICE",
+            (cal::CalState::Interp, _) => "CAL INTERP",
+            _ => "CAL OK",
+        };
+        let mut warns = Vec::new();
+        for (line, _) in &lines {
+            if line.starts_with("STALE") {
+                warns.push("STALE");
+            } else if line.starts_with("LAST SWEEP FAILED") {
+                warns.push("FAILED");
+            } else if line.starts_with("DEVICE RETURNED IDENTICAL") {
+                warns.push("IDENTICAL");
+            }
+        }
+        let mut text = format!(
+            "{src} #{} · {} · {cal_tok}",
+            live.generation,
+            if self.run { "RUN" } else { "HOLD" }
+        );
+        if !warns.is_empty() {
+            text = format!("! {} · {text}", warns.join(" "));
+        }
+        (text, !warns.is_empty())
+    }
+
+    /// Fixed-height one-line status strip below the chart, with a bordered
+    /// STATUS button for the details. Text is truncated, never wrapped.
+    fn status_strip(
+        &mut self,
+        ui: &mut Ui,
+        theme: &LcarsTheme,
+        live: &device::Live,
+        trace: Option<&[Sample]>,
+        cal: Option<&CalSet>,
+        state: cal::CalState,
+        now: std::time::Instant,
+    ) {
+        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), STRIP_H), Sense::hover());
+        self.last_strip = rect;
+        let (text, warn) = self.compact_status(live, trace, cal, state, now);
+        let full = self
+            .source_lines(live, trace, cal, state, now)
+            .into_iter()
+            .map(|l| l.0)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let btn_w = 96.0;
+        let text_rect = Rect::from_min_max(rect.min, egui::pos2(rect.max.x - btn_w - 6.0, rect.max.y));
+        let btn_rect = Rect::from_min_max(egui::pos2(rect.max.x - btn_w, rect.min.y), rect.max);
+        let mut toggle = false;
+        ui.scope_builder(egui::UiBuilder::new().max_rect(text_rect), |ui| {
+            ui.add_sized(
+                text_rect.size(),
+                egui::Label::new(
+                    egui::RichText::new(&text)
+                        .monospace()
+                        .size(theme.data_size * 0.8)
+                        .color(if warn { LED_WARN } else { palette::TEXT_MUTED }),
+                )
+                .truncate(),
+            )
+            .on_hover_text(&full);
+        });
+        ui.scope_builder(egui::UiBuilder::new().max_rect(btn_rect), |ui| {
+            let label = if self.status_open { "STATUS ▾" } else { "STATUS ▸" };
+            if action_button(ui, theme, label, btn_rect.size())
+                .on_hover_text("Open or close the full NanoVNA status")
+                .clicked()
+            {
+                toggle = true;
+            }
+        });
+        if toggle {
+            self.status_open = !self.status_open;
+        }
+    }
+
+    /// The full status as a floating window, so it never moves the chart.
+    fn status_dialog(&mut self, ui: &mut Ui, theme: &LcarsTheme, live: &device::Live) {
+        if !self.status_open {
+            return;
+        }
+        let trace = self.display_trace(live);
+        let (cal, state) = match trace.as_deref() {
+            Some(t) => self.cal_for(t, None),
+            None => (None, if self.cal_off { cal::CalState::Off } else { cal::CalState::Uncal }),
+        };
+        let mut lines = self.source_lines(live, trace.as_deref(), cal.as_ref(), state, std::time::Instant::now());
+        if let Some(set) = cal.as_ref().filter(|set| self.cal_other_device(set)) {
+            let here = live.device_id.map(|raw| proto::device_id_hex(&raw)).unwrap_or_default();
+            lines.push((format!("CAL DEVICE ID {} (this connection reports {here})", set.id), true));
+        }
+        for line in live.log.iter().rev().skip(1).take(8) {
+            lines.push((format!("VNA LOG: {line}"), false));
+        }
+        let mut open = true;
+        egui::Window::new("NanoVNA status")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(560.0)
+            .show(ui.ctx(), |ui| {
+                for (line, warn) in &lines {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(line)
+                                .monospace()
+                                .size(theme.data_size * 0.8)
+                                .color(if *warn { LED_WARN } else { palette::TEXT }),
+                        )
+                        .wrap(),
+                    );
+                }
+            });
+        if !open {
+            self.status_open = false;
+        }
     }
 
     fn cal_label(&self, live: &device::Live) -> String {
@@ -5350,6 +5493,8 @@ struct Led {
 }
 
 const LED_OK: Color32 = Color32::from_rgb(0x5E, 0xC2, 0x5A);
+/// Height of the one-line status strip under the chart.
+const STRIP_H: f32 = 24.0;
 const LED_WARN: Color32 = Color32::from_rgb(0xE8, 0xA8, 0x30);
 const LED_BAD: Color32 = Color32::from_rgb(0xE0, 0x4A, 0x3C);
 const LED_OFF: Color32 = Color32::from_rgb(0x55, 0x55, 0x55);
@@ -7963,7 +8108,7 @@ mod stale_tests {
         // Another device's calibration is flagged.
         let other = osl("0102030405060708090a0b0c", "HF A", 200e6, 1e6, 5);
         let (text, warn) = vna.cal_header(Some(&samples), Some(&other), cal::CalState::Exact);
-        assert!(text.contains("OTHER DEVICE ID") && warn, "{text}");
+        assert!(text.contains("other device") && !text.contains("0102030405") && warn, "{text}");
     }
 
     #[test]
@@ -8002,7 +8147,98 @@ mod stale_tests {
         }
         assert!(!vna.memory_as_trace, "memory must not stand in for the live sweep");
         let all = shown.join("\n");
-        assert!(all.contains("NO DATA: the device sweep is hidden"), "{all}");
-        assert!(all.contains("CAL: NONE for this range (uncalibrated)"), "{all}");
+        assert!(all.contains("NO DATA #"), "{all}");
+        assert!(all.contains("CAL NONE"), "{all}");
+        assert!(!all.contains("CAL: NONE for this range"), "full text only in STATUS");
     }
+
+    /// Render the whole tool (chart, strip and any windows) with real fonts.
+    fn render(vna: &mut NanoVna, ctx: &egui::Context, live: &device::Live, t: f64) -> Vec<(String, Rect, usize)> {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1400.0, 900.0))),
+            time: Some(t),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| {
+            let theme = LcarsTheme::default();
+            vna.chart(ui, &theme, live);
+            vna.status_dialog(ui, &theme, live);
+        });
+        out.textures_delta.clear();
+        fn flat(s: &egui::Shape, v: &mut Vec<(String, Rect, usize)>) {
+            match s {
+                egui::Shape::Vec(xs) => xs.iter().for_each(|x| flat(x, v)),
+                egui::Shape::Text(t) => v.push((t.galley.text().to_string(), t.visual_bounding_rect(), t.galley.rows.len())),
+                _ => {}
+            }
+        }
+        let mut v = Vec::new();
+        out.shapes.iter().for_each(|c| flat(&c.shape, &mut v));
+        v
+    }
+
+    fn noisy_live(base: &device::Live) -> device::Live {
+        let mut l = base.clone();
+        l.last_sweep_error = Some("timed out after 0 of 3264 bytes ".repeat(8));
+        l.identical_run = 7;
+        l.sweep_errors = 99;
+        l.log.push("x".repeat(400));
+        l
+    }
+
+    #[test]
+    fn the_chart_rect_never_depends_on_the_status_text() {
+        let (mut vna, _) = with_fake(Mode::Normal);
+        vna.cal_off = true;
+        vna.run = true;
+        frames_until(&mut vna, |v, _| v.sweep_count >= 1);
+        let ctx = real_ctx();
+        let quiet = vna.session.snapshot();
+        let mut rects = Vec::new();
+        // 1: nothing to warn about.
+        render(&mut vna, &ctx, &quiet, 0.0);
+        render(&mut vna, &ctx, &quiet, 0.1);
+        rects.push(vna.last_grid);
+        // 2: every warning, very long error and log.
+        vna.last_sweep = Some(std::time::Instant::now() - Duration::from_secs(60));
+        let noisy = noisy_live(&quiet);
+        render(&mut vna, &ctx, &noisy, 0.2);
+        let shapes = render(&mut vna, &ctx, &noisy, 0.3);
+        rects.push(vna.last_grid);
+        let strip = vna.last_strip;
+        let in_strip: Vec<_> = shapes.iter().filter(|(_, r, _)| strip.contains(r.center())).collect();
+        assert!(!in_strip.is_empty());
+        for (text, r, rows) in &in_strip {
+            assert_eq!(*rows, 1, "one line: {text}");
+            assert!(r.height() <= strip.height() + 1.0, "{text}");
+        }
+        let all: String = in_strip.iter().map(|s| s.0.clone()).collect::<Vec<_>>().join(" ");
+        assert!(all.contains("! STALE IDENTICAL FAILED"), "warning marker: {all}");
+        // 3: a very long calibration name, interpolated, other device.
+        let id = "50bc16000000000000000000";
+        let mut set = osl(id, &"UHF very long zone name ".repeat(10), 9e6, 1e6, 20);
+        set.saved_at = None;
+        vna.face.cals = vec![set];
+        vna.cal_off = false;
+        render(&mut vna, &ctx, &noisy, 0.4);
+        let shapes = render(&mut vna, &ctx, &noisy, 0.5);
+        rects.push(vna.last_grid);
+        let all: String = shapes.iter().map(|s| s.0.clone()).collect::<Vec<_>>().join("\n");
+        assert!(!all.contains("saved no date"), "{all}");
+        assert!(!all.contains(id), "device id only in STATUS: {all}");
+        // 4: STATUS window open.
+        vna.status_open = true;
+        render(&mut vna, &ctx, &noisy, 0.6);
+        let shapes = render(&mut vna, &ctx, &noisy, 0.7);
+        rects.push(vna.last_grid);
+        let all: String = shapes.iter().map(|s| s.0.clone()).collect::<Vec<_>>().join("\n");
+        assert!(all.contains("LAST SWEEP FAILED"), "{all}");
+        assert!(all.contains("DEVICE RETURNED IDENTICAL DATA"), "{all}");
+        assert!(all.contains("CAL DEVICE ID 50bc16"), "{all}");
+        for r in &rects {
+            assert_eq!(*r, rects[0], "chart rect moved: {rects:?}");
+        }
+        assert!(rects[0].height() > 160.0);
+    }
+
 }
