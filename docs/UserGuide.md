@@ -811,7 +811,9 @@ For a **NanoVNA V2** (V2.2) over USB. When the screen opens and the station name
 
 **Markers and search.** Max, Min and Next pk move the active marker; TARGET with ◀ Tgt / Tgt ▶ finds crossings; Track follows the max or min each sweep; Peaks→M places M1–M8 on the highest peaks. **Filter** on an S21 pane shows centre, loss, 3 dB and 6 dB widths and Q (double-click for notch analysis, triple-click turns both off). **SWR BW** on an S11 pane shows the 2:1 bandwidth.
 
-**Setup.** Port, sweep limits, points (11 to 1023), velocity factor, port extension, **Smooth** and **Host avg** (1 = off). TX power and on-device averaging appear only on firmware 1.0.2 or newer with the sweep at or above 140 MHz.
+**Device and setup.** There is no SETUP key. Click the bordered device name (for example **NANOVNA V2 · ttyACM0**) at the right end of the status bar under the graph; its tooltip says *Device setup*. The **NanoVNA device** window opens with the device details, **Copy** and **Reconnect**, and below them the setup: port list, **Connect**, **Close**, sweep limits, points (11 to 1023), velocity factor, port extension, **Smooth** and **Host avg** (1 = off). TX power and on-device averaging appear only on firmware 1.0.2 or newer with the sweep at or above 140 MHz.
+
+Just above that bar is a one-line status strip of fixed height, so the chart never moves: the trace source (**LIVE**, **STORED**, **MEMORY** or **NO DATA**) with the sweep number, **RUN** or **HOLD**, and the calibration (**CAL OK**, **CAL INTERP**, **CAL NONE**, **CAL OFF**, **CAL OTHER-DEVICE**). A warning puts **!** and its name first: **STALE** (Run is on but no new sweep has come in), **FAILED** (the last sweep got no data) or **IDENTICAL** (the device sent exactly the same data as the sweep before). Hover the strip for the full lines; the bordered **STATUS** button opens them in a window, with the calibration's range and date, the device id it was saved under, and the VNA log of commands sent and data received.
 
 <!-- screenshot: vna-04 — Sweep setup. -->
 <!-- screenshot: vna-06 — Limit lines flag a failing sweep. -->
@@ -1177,7 +1179,7 @@ Save the `.py` file in `modems.d` next to the pipe file. The Pipe editor lists o
 
 ## 14.5 Calibrate and sweep an antenna with a NanoVNA
 
-1. Plug in the NanoVNA V2, open Tools → NanoVNA and pick its port in Setup.
+1. Plug in the NanoVNA V2, open Tools → NanoVNA, click the device name in the status bar under the graph and pick its port in the device window.
 2. Click the zone you want (for example HF). Follow the calibration dialog: open, short, load ([12.1](#ch12)).
 3. Connect the antenna to S11 and press **Scan**.
 4. Choose the SWR or Smith view, and press **SWR BW** for the 2:1 bandwidth, or **Max**/**Min** to place markers.

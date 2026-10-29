@@ -755,7 +755,6 @@ pub struct NanoVna {
     pending: Option<Standard>,
     note: String,
     dirty: bool,
-    setup_open: bool,
     plan: crate::plan::BandPlan,
     zone_sel: usize,
     /// The Cal tab, drawn before the zones so its place does not move.
@@ -806,6 +805,7 @@ pub struct NanoVna {
     /// Last chart and status-strip rects, for layout tests.
     last_grid: Rect,
     last_strip: Rect,
+    last_device_btn: Rect,
     /// Zone name of the stored scan on screen, for the source label.
     shown_zone: String,
     /// True when the chart drew a memory slot in place of a live trace.
@@ -865,7 +865,6 @@ impl NanoVna {
             pending: None,
             note: String::new(),
             dirty: false,
-            setup_open: false,
             plan: crate::plan::BandPlan {
                 version: 1,
                 zones: Vec::new(),
@@ -902,6 +901,7 @@ impl NanoVna {
             status_open: false,
             last_grid: Rect::NOTHING,
             last_strip: Rect::NOTHING,
+            last_device_btn: Rect::NOTHING,
             shown_zone: String::new(),
             memory_as_trace: false,
             cal_graph_view: View::Smith,
@@ -1023,7 +1023,6 @@ impl NanoVna {
         self.limits_dialog(ui, &theme);
         let shown_trace = self.display_trace(&live);
         self.trace_menu_dialog(ui, &theme, shown_trace.as_deref());
-        self.setup_dialog(ui, &theme, &live);
         self.wizard_dialog(ui, &theme, &live);
     }
 
@@ -1041,28 +1040,6 @@ impl NanoVna {
         }
     }
 
-    fn setup_dialog(&mut self, ui: &mut Ui, theme: &LcarsTheme, live: &device::Live) {
-        if !self.setup_open {
-            return;
-        }
-        let mut open = true;
-        egui::Window::new("NanoVNA setup")
-            .open(&mut open)
-            .resizable(true)
-            .default_width(440.0)
-            .show(ui.ctx(), |ui| {
-                ui.set_min_width(400.0);
-                ui.set_max_width(520.0);
-                egui::ScrollArea::vertical()
-                    .id_salt("nanovna-setup")
-                    .max_height(560.0)
-                    .show(ui, |ui| {
-                        self.controls(ui, theme, live);
-                    });
-            });
-        self.setup_open = open;
-    }
-
     /// Device details read from the identity and device-id registers. Issue 72.
     fn details_dialog(&mut self, ui: &mut Ui, theme: &LcarsTheme, live: &device::Live) {
         if !self.details_open {
@@ -1072,7 +1049,8 @@ impl NanoVna {
         let text = self.device_details(live);
         egui::Window::new("NanoVNA device")
             .open(&mut open)
-            .resizable(false)
+            .resizable(true)
+            .default_width(440.0)
             .show(ui.ctx(), |ui| {
                 ui.label(egui::RichText::new(&text).monospace().size(theme.data_size * 0.85));
                 ui.horizontal(|ui| {
@@ -1083,6 +1061,16 @@ impl NanoVna {
                         self.reconnect();
                     }
                 });
+                // What the old SETUP key opened: port choice, Connect/Close and
+                // the sweep, averaging and power settings.
+                ui.separator();
+                ui.label(egui::RichText::new("SETUP").strong());
+                egui::ScrollArea::vertical()
+                    .id_salt("nanovna-setup")
+                    .max_height(420.0)
+                    .show(ui, |ui| {
+                        self.controls(ui, theme, live);
+                    });
             });
         self.details_open = open;
     }
@@ -1126,7 +1114,7 @@ impl NanoVna {
 
     fn reconnect(&mut self) {
         if self.face.port.is_empty() {
-            self.note = "Choose a USB port in Setup first.".into();
+            self.note = "Choose a USB port: click NANOVNA in the status bar under the graph.".into();
             return;
         }
         self.user_closed = false;
@@ -1330,7 +1318,7 @@ impl NanoVna {
                 return live.status.clone();
             }
             return if self.face.port.is_empty() {
-                "Not connected. Setup chooses the USB port.".into()
+                "Not connected. Click NANOVNA in the status bar under the graph to choose the USB port.".into()
             } else {
                 format!("Not connected to {}.", self.face.port)
             };
@@ -2157,6 +2145,28 @@ impl NanoVna {
         let right_galley = painter.layout_no_wrap(device.clone(), font.clone(), right_color);
         let char_w = painter.layout_no_wrap("0".into(), font.clone(), palette::TEXT).size().x.max(1.0);
         let text_x = rect.right() - 8.0 - right_galley.size().x;
+        // The device name is a bordered button: it opens the device window,
+        // which holds the setup (port, connect, sweep settings).
+        let dev_rect = Rect::from_min_max(
+            Pos2::new(text_x - 5.0, rect.top() + 2.0),
+            Pos2::new(rect.right() - 3.0, rect.bottom() - 2.0),
+        );
+        let dev_resp = ui
+            .interact(dev_rect, egui::Id::new("nanovna-device-setup"), Sense::click())
+            .on_hover_text("Device setup");
+        painter.rect_stroke(
+            dev_rect,
+            2.0,
+            Stroke::new(if dev_resp.hovered() { 2.0 } else { 1.0 }, palette::TAN),
+            egui::StrokeKind::Inside,
+        );
+        if dev_resp.clicked() {
+            if !self.details_open {
+                self.ports = device::list_ports();
+            }
+            self.details_open = !self.details_open;
+        }
+        self.last_device_btn = dev_rect;
         painter.galley(Pos2::new(text_x, rect.center().y - right_galley.size().y / 2.0), right_galley, right_color);
         // LEDs just left of the device text.
         let led_r = 4.0;
@@ -2203,7 +2213,6 @@ impl NanoVna {
         key_caption(ui, theme, "SWEEP · CAL", width);
         let mut scan = false;
         let mut mode: Option<u8> = None;
-        let mut setup = false;
         ui.horizontal(|ui| {
             scan = softkey(ui, theme, "Scan", false, col4);
             // RUN: single = continuous, double = single sweep, triple = hold.
@@ -2243,13 +2252,6 @@ impl NanoVna {
             None => {}
         }
         self.sweep_panel(ui, theme, live, width, col4);
-        ui.horizontal(|ui| {
-            setup = softkey(ui, theme, "Setup", self.setup_open, col4);
-        });
-        if setup {
-            self.ports = device::list_ports();
-            self.setup_open = true;
-        }
 
         key_caption(ui, theme, "LAYOUT · TRACE", width);
         let mut lay: Option<(u8, u8)> = None;
@@ -3513,7 +3515,7 @@ impl NanoVna {
             self.wizard = None;
             if self.face.port.is_empty() {
                 self.await_scan = None;
-                self.note = "Choose the NanoVNA port in Setup, then click the zone.".into();
+                self.note = "Choose the NanoVNA port (click NANOVNA in the status bar under the graph), then click the zone.".into();
                 return;
             }
             // A double-click is a request to use the saved port, including
@@ -8235,6 +8237,32 @@ mod stale_tests {
         assert!(all.contains("LAST SWEEP FAILED"), "{all}");
         assert!(all.contains("DEVICE RETURNED IDENTICAL DATA"), "{all}");
         assert!(all.contains("CAL DEVICE ID 50bc16"), "{all}");
+        // The device setup button sits in the fixed bottom bar, below the chart.
+        assert!(vna.last_device_btn.min.y >= rects[0].max.y);
+        assert!(!all.lines().any(|l| l.trim() == "Setup" || l.trim() == "SETUP ▸"), "no Setup key");
+        // Click the device button: the device window with the setup opens, chart stays.
+        vna.status_open = false;
+        vna.details_open = false;
+        let c = vna.last_device_btn.center();
+        for (i, pressed) in [(0.8, true), (0.9, false)] {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1400.0, 900.0))),
+                time: Some(i),
+                events: vec![
+                    egui::Event::PointerMoved(c),
+                    egui::Event::PointerButton { pos: c, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() },
+                ],
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| {
+                let theme = LcarsTheme::default();
+                vna.chart(ui, &theme, &noisy);
+                vna.details_dialog(ui, &theme, &noisy);
+            });
+            out.textures_delta.clear();
+        }
+        assert!(vna.details_open, "device button opens the device window");
+        rects.push(vna.last_grid);
         for r in &rects {
             assert_eq!(*r, rects[0], "chart rect moved: {rects:?}");
         }
