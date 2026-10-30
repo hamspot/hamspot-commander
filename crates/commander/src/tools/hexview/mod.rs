@@ -137,7 +137,9 @@ impl HexView {
         super::screen_header(ui, "hex_header", &t, |ui| {
                 ui.horizontal(|ui| {
                     super::title_block(ui, &t, "Hex", palette::TAN, egui::vec2(110.0, t.bar_thin));
-                    if super::header_key(ui, &t, "Open", egui::vec2(96.0, t.bar_thin)).clicked() {
+                    // A square action key in its own hue (rustcars P1c), not the dark
+                    // inactive mode fill.
+                    if rustcars::lcars_button(ui, &t, "Open", palette::TEAL, egui::vec2(96.0, t.bar_thin), rustcars::Cap::None, true).clicked() {
                         self.open_request = true;
                     }
                 });

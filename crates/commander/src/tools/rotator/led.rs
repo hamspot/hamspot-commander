@@ -91,7 +91,7 @@ const WINDOW: egui::Color32 = egui::Color32::from_rgb(0x0A, 0x04, 0x04);
 
 /// Paint `text` as seven-segment digits in `rect`, slanted a little.
 pub fn paint(painter: &egui::Painter, rect: egui::Rect, text: &str, color: egui::Color32) {
-    painter.rect_filled(rect, egui::CornerRadius::same(3), WINDOW);
+    painter.rect_filled(rect, egui::CornerRadius::ZERO, WINDOW);
     let cells = cells(text);
     if cells.is_empty() {
         return;

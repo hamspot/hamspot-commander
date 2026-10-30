@@ -714,19 +714,18 @@ mod tests {
 
     #[test]
     fn every_main_page_has_exactly_one_estop() {
-        // main.rs draws the E-STOP in the 40 px page-bar slot shared by
-        // every page (Config included), and once more at the right of a
-        // detached page window's top row (not Tools: its window body draws
-        // its own, in tools/mod.rs); group bars never.
+        // main.rs draws the E-STOP once, in the 40 px page-bar slot of the
+        // shared page frame (`framed_page`), which docked pages and detached
+        // page windows both use (David, pt368u); Tools' own frame
+        // (`Tools::framed`, for the tests) draws its own; group bars never.
         let call = ["estop::", "button(ui)"].concat();
         let main = include_str!("main.rs");
-        assert_eq!(main.matches(&call).count(), 2, "page bar + detached page window");
+        assert_eq!(main.matches(&call).count(), 1, "page frame only");
         let at = main.find(&call).unwrap();
         assert!(main[..at].rfind("id_salt(\"estop-page-bar\")").is_some());
         let body = &main[main.find("fn detached_page_body(").unwrap()..];
         let body = &body[..body.find("\n    fn ").unwrap()];
-        assert_eq!(body.matches(&call).count(), 1, "detached page windows carry it once");
-        assert!(body.contains("if page != Page::Tools"), "Tools draws its own");
+        assert!(body.contains("self.framed_page("), "detached windows use the page frame");
         assert_eq!(include_str!("tools/mod.rs").matches(&call).count(), 1);
         assert_eq!(include_str!("group_box.rs").matches(&call).count(), 0);
     }

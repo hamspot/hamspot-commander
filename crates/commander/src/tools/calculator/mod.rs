@@ -317,28 +317,15 @@ impl Calc {
         super::screen_header(ui, "calc_header", &t, |ui| {
                 ui.horizontal(|ui| {
                     super::title_block(ui, &t, "Calc", palette::TAN, egui::vec2(110.0, t.bar_thin));
-                    let label = if self.env.angle == Angle::Deg {
-                        "Deg"
-                    } else {
-                        "Rad"
-                    };
-                    if lcars_button(
-                        ui,
-                        &t,
-                        label,
-                        palette::TEAL,
-                        egui::vec2(90.0, t.bar_thin),
-                        Cap::None,
-                        true,
-                    )
-                    .on_hover_text("Toggle degrees / radians")
-                    .clicked()
-                    {
-                        self.env.angle = if self.env.angle == Angle::Deg {
-                            Angle::Rad
-                        } else {
-                            Angle::Deg
-                        };
+                    // Deg / Rad: two square folder keys, the open one marked.
+                    for (i, (label, angle)) in [("Deg", Angle::Deg), ("Rad", Angle::Rad)].into_iter().enumerate() {
+                        let on = self.env.angle == angle;
+                        let resp = crate::folder_tab(ui, on, 4 + i, label, false).on_hover_text("Degrees / radians");
+                        let name = label.to_uppercase();
+                        resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::RadioButton, true, on, &name));
+                        if resp.clicked() {
+                            self.env.angle = angle;
+                        }
                     }
                 });
         });

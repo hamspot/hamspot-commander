@@ -2,7 +2,7 @@
 //! One screen at a time. The whole tab can tear off into its own window.
 
 mod calculator;
-mod ham_rf;
+pub(crate) mod ham_rf;
 mod hexview;
 mod rotator;
 pub mod nanovna;
@@ -148,21 +148,34 @@ impl Tools {
     /// page. The window has its own keyboard focus, so it polls the chord.
     pub fn window_body(&mut self, ui: &mut egui::Ui) {
         self.estop_chord.poll(ui.ctx());
-        let h = self.theme.bar_thin;
-        let row = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), egui::Sense::hover()).0;
-        let estop_w = crate::estop::button_width(ui, crate::estop::engaged()) + 8.0;
-        let tabs = egui::Rect::from_min_max(row.min, egui::pos2(row.right() - estop_w, row.bottom()));
-        self.bar_tabs(ui, tabs);
+        self.framed(ui);
+    }
+
+    /// The Tools page in the shared page frame, exactly as main.rs draws it
+    /// docked and in its detached window (David, pt368u): the tool tabs, the
+    /// open tool's keys (Rotator: the AZ/EL LEDs) and E-STOP in the top
+    /// elbow bar's slot, the screen in the frame. Returns (frame, tabs gap,
+    /// E-STOP rect).
+    pub fn framed(&mut self, ui: &mut egui::Ui) -> (egui::Rect, egui::Rect, egui::Rect) {
+        let estop_w = crate::estop::button_width(ui, crate::estop::engaged()) + 16.0;
+        let half = ((ui.available_width() - BAR_TABS_RESERVE - estop_w) * 0.5).max(0.0);
+        let kw = self.header_width().min(half);
+        request_bar_keys(ui.ctx(), kw, estop_w + BAR_TAB_GAP);
+        let keys_w = if kw > 0.0 { kw + BAR_TAB_GAP } else { 0.0 };
+        let room = (ui.available_width() - BAR_TABS_RESERVE - estop_w - keys_w).max(more_key_w() + 80.0);
+        let tabs_w = bar_tabs_width(ui, &Self::tab_labels()).min(room) + 2.0 * BAR_TAB_GAP;
+        let (frame, slot) = frame_with_slot(ui, Some(tabs_w + keys_w + estop_w), |ui| self.draw_in(ui));
+        let r = slot.expect("slot");
+        let tabs_r = egui::Rect::from_min_max(r.min, egui::pos2(r.right() - estop_w - BAR_TAB_GAP - keys_w, r.bottom()));
+        let stop_r = egui::Rect::from_min_max(egui::pos2(r.right() - estop_w, r.top()), r.max);
+        self.bar_tabs(ui, tabs_r);
         ui.scope_builder(
-            egui::UiBuilder::new()
-                .max_rect(egui::Rect::from_min_max(egui::pos2(tabs.right(), row.top()), row.max))
-                .layout(egui::Layout::right_to_left(egui::Align::Center)),
+            egui::UiBuilder::new().max_rect(stop_r).id_salt("estop-tools-frame").layout(egui::Layout::right_to_left(egui::Align::Center)),
             |ui| {
                 crate::estop::button(ui);
             },
         );
-        ui.add_space(self.theme.frame_gap);
-        self.draw_in(ui);
+        (frame, tabs_r, stop_r)
     }
 
     /// The Tools page body inside the shared page frame, REC style: the
@@ -209,8 +222,8 @@ impl Tools {
         let g = BAR_TAB_GAP;
         match self.screen {
             Screen::Log => 90.0 * 2.0 + g,
-            Screen::HamRf => ham_rf::TOOL_COUNT as f32 * (96.0 + g) - g,
-            Screen::Calculator => 90.0,
+            Screen::HamRf => plain_tabs_width(&ham_rf::tool_labels()),
+            Screen::Calculator => plain_tabs_width(&["Deg".to_owned(), "Rad".to_owned()]),
             Screen::Hex => 96.0,
             Screen::Rotator => 2.0 * rotator::BAR_LED_W + g,
             _ => 0.0,
@@ -668,6 +681,12 @@ pub fn more_key_w() -> f32 {
 }
 
 /// Width all `labels` take as sub-tabs in the top bar, with gaps.
+/// [`bar_tabs_width`] without a `Ui` (plain tabs need none).
+pub fn plain_tabs_width(labels: &[String]) -> f32 {
+    let w: f32 = labels.iter().map(|l| crate::plain_tab_width(l)).sum();
+    w + BAR_TAB_GAP * labels.len().saturating_sub(1) as f32
+}
+
 pub fn bar_tabs_width(ui: &egui::Ui, labels: &[String]) -> f32 {
     let w: f32 = labels.iter().map(|l| crate::folder_tab_width(ui, l, false)).sum();
     w + BAR_TAB_GAP * labels.len().saturating_sub(1) as f32
@@ -684,6 +703,19 @@ pub fn bar_tab_row(
     id_salt: &str,
     labels: &[String],
     selected: Option<usize>,
+) -> Option<usize> {
+    bar_tab_row_from(ui, rect, id_salt, labels, selected, 0)
+}
+
+/// [`bar_tab_row`] whose hues start at `hue0` in the tab palette (so a tool's
+/// own key row does not repeat the tool tabs' colours one for one).
+pub fn bar_tab_row_from(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    id_salt: &str,
+    labels: &[String],
+    selected: Option<usize>,
+    hue0: usize,
 ) -> Option<usize> {
     let widths: Vec<f32> = labels.iter().map(|l| crate::folder_tab_width(ui, l, false)).collect();
     let all = bar_tabs_width(ui, labels);
@@ -702,7 +734,7 @@ pub fn bar_tab_row(
             for (n, &i) in shown.iter().enumerate() {
                 // In the bar every tab is a plain segment: no left end cap.
                 let _ = n;
-                let resp = crate::folder_tab(ui, selected == Some(i), i, &labels[i], false);
+                let resp = crate::folder_tab(ui, selected == Some(i), hue0 + i, &labels[i], false);
                 // The open tab is the light tint, as on the page tab strip
                 // (rustcars IMG2 tabs); screen readers get it as selected.
                 let (sel, name) = (selected == Some(i), labels[i].to_uppercase());
@@ -1199,19 +1231,7 @@ mod page_frame_tests {
                     ..Default::default()
                 },
                 |ui| {
-                    let estop_w = crate::estop::button_width(ui, false) + 16.0;
-                    let half = ((ui.available_width() - BAR_TABS_RESERVE - estop_w) * 0.5).max(0.0);
-                    let kw = tools.header_width().min(half);
-                    request_bar_keys(ui.ctx(), kw, estop_w + BAR_TAB_GAP);
-                    let keys_w = if kw > 0.0 { kw + BAR_TAB_GAP } else { 0.0 };
-                    let room = (ui.available_width() - BAR_TABS_RESERVE - estop_w - keys_w).max(more_key_w() + 80.0);
-                    let tabs_w = bar_tabs_width(ui, &Tools::tab_labels()).min(room) + 2.0 * BAR_TAB_GAP;
-                    let (f, slot) = frame_with_slot(ui, Some(tabs_w + keys_w + estop_w), |ui| tools.draw_in(ui));
-                    let r = slot.expect("slot");
-                    tabs_r = egui::Rect::from_min_max(r.min, egui::pos2(r.right() - estop_w - BAR_TAB_GAP - keys_w, r.bottom()));
-                    stop_r = egui::Rect::from_min_max(egui::pos2(r.right() - estop_w, r.top()), r.max);
-                    tools.bar_tabs(ui, tabs_r);
-                    frame = f;
+                    (frame, tabs_r, stop_r) = tools.framed(ui);
                 },
             );
             out.textures_delta.clear();
@@ -1242,7 +1262,7 @@ mod page_frame_tests {
                     let keys = bar_keys_rect(&ctx).unwrap_or(egui::Rect::NOTHING);
                     assert!(keys.right() <= stop_r.left() + 0.5, "keys left of the E-STOP");
                     assert!(
-                        tabs_r.expand(1.0).contains_rect(*r) || keys.expand(1.0).contains_rect(*r),
+                        tabs_r.expand(1.0).contains_rect(*r) || keys.expand(1.0).contains_rect(*r) || stop_r.expand(1.0).contains_rect(*r),
                         "{label} at {w}: {s:?} {r:?} in the bar outside the tab gap {tabs_r:?} and keys {keys:?}"
                     );
                 }

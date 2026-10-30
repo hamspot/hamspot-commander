@@ -3123,7 +3123,7 @@ dependencies = [
 [[package]]
 name = "rustcars"
 version = "0.2.0"
-source = "git+https://github.com/webaugur/rustcars?rev=b9f1506cae8172f3298f63bd4c5ab8e6eed336cf#b9f1506cae8172f3298f63bd4c5ab8e6eed336cf"
+source = "git+https://github.com/webaugur/rustcars?rev=ae9a4004242b9cde3c207754188c0c929d001770#ae9a4004242b9cde3c207754188c0c929d001770"
 dependencies = [
  "eframe",
  "egui",

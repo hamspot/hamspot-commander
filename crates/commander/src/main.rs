@@ -114,6 +114,8 @@ fn detach_opts(page: Page) -> group_box::DetachOpts {
         default_size: egui::vec2(default.0, default.1),
         min_size: egui::vec2(min.0, min.1),
         scroll: false,
+        // The page draws its own frame and pill, as in the main window.
+        chrome: false,
     }
 }
 
@@ -1437,7 +1439,17 @@ pub(crate) fn tab_color(index: usize) -> egui::Color32 {
         rustcars::palette::TEAL,
         rustcars::palette::PLUM,
     ];
-    COLORS[index % COLORS.len()]
+    // Past six, the same hues a shade darker, so each key keeps its own.
+    let base = COLORS[index % COLORS.len()];
+    if (index / COLORS.len()) % 2 == 1 { rustcars::tint(base, -0.3) } else { base }
+}
+
+/// Marks the selected folder tab without relying on its lighter tint: a
+/// light bar along the tab's bottom edge (never black; David, #221).
+pub(crate) const TAB_MARK_H: f32 = 3.0;
+pub(crate) fn paint_tab_mark(ui: &egui::Ui, rect: egui::Rect) {
+    let mark = egui::Rect::from_min_max(egui::pos2(rect.left() + 4.0, rect.bottom() - 2.0 - TAB_MARK_H), egui::pos2(rect.right() - 4.0, rect.bottom() - 2.0));
+    ui.painter().rect_filled(mark, 0.0, rustcars::palette::TEXT);
 }
 
 /// Caution text. This is the theme alert, which is also the Meters bar.
@@ -1485,6 +1497,11 @@ pub(crate) fn folder_tab(
 }
 
 /// The width a [`folder_tab_colored`] tab takes in the row.
+/// [`folder_tab_width`] of a plain (no speaker) tab; needs no `Ui`.
+pub(crate) fn plain_tab_width(label: &str) -> f32 {
+    (label.chars().map(|ch| if (ch as u32) >= 0x1F000 { 22.0 } else { 11.0 }).sum::<f32>() + 28.0).max(72.0)
+}
+
 pub(crate) fn folder_tab_width(ui: &egui::Ui, label: &str, speaker: bool) -> f32 {
     let theme = rustcars::LcarsTheme::default();
     let width = if speaker {
@@ -1537,6 +1554,9 @@ pub(crate) fn folder_tab_colored(
     );
     if let Some(alpha) = speaker {
         paint_voice_caption(ui.painter(), resp.rect, &theme, label, fill, alpha);
+    }
+    if selected {
+        paint_tab_mark(ui, resp.rect);
     }
     resp
 }
@@ -1934,13 +1954,16 @@ fn bar_key_hue(label: &str, lamp: KeyLamp) -> egui::Color32 {
         return radio_key_hue(lamp);
     }
     match label.to_ascii_uppercase().as_str() {
-        "LOAD" | "SAVE" => SLATE,
+        // Each key its own hue (David, #221), never all one colour.
+        "LOAD" => TAN,
+        "SAVE" => OLIVE,
         "ADD" => TEAL,
         "REC" => BRICK,
         "SCAN" => OLIVE,
         "DWELL" => TEAL,
         "FOLLOW" => PLUM,
-        _ => SLATE,
+        // Any other key: a hue from its name, so neighbours differ.
+        other => tab_color(other.bytes().fold(0usize, |h, b| h.wrapping_mul(31).wrapping_add(b as usize)) % 12),
     }
 }
 
@@ -2016,6 +2039,22 @@ mod radio_key_tests {
                         assert!(!k.intersects(o.shrink(0.5)), "keys overlap");
                     }
                 }
+                // rustcars P1c style: square, per-key hues, no dark strokes.
+                let rects: Vec<egui::epaint::RectShape> = out.shapes.iter().filter_map(|c| match &c.shape {
+                    egui::Shape::Rect(r) if keys.iter().any(|k| k.expand(0.5).contains_rect(r.rect)) && r.fill.a() > 0 => Some(r.clone()),
+                    _ => None,
+                }).collect();
+                for r in &rects {
+                    assert_eq!(r.corner_radius, egui::CornerRadius::ZERO, "{labels:?}: square bar key {:?}", r.rect);
+                    if r.stroke.width > 0.0 {
+                        let c = r.stroke.color;
+                        assert!(c.r() as u32 + c.g() as u32 + c.b() as u32 > 150, "{labels:?}: dark stroke {c:?}");
+                    }
+                }
+                let mut hues: Vec<_> = rects.iter().map(|r| r.fill.to_array()).collect();
+                hues.sort();
+                hues.dedup();
+                assert!(hues.len() >= shown.min(2), "{labels:?}: per-key hues {hues:?}");
                 if w >= 1400.0 {
                     assert_eq!(shown, n, "all keys fit at {w}");
                 }
@@ -3291,143 +3330,7 @@ impl eframe::App for App {
                 .show(ui, |ui| {
                 // Tune owns the wheel. Plan and Channels own a bandspread click.
                 // A scroll area would take those pointers and move the page.
-                let in_frame = match rec_place {
-                    Some(rec_ui::BarPlace::InFrame { compact }) if self.page == Page::Rec => Some(compact),
-                    _ => None,
-                };
-                // Every main page carries the E-STOP at the right end of its
-                // tan top bar (issue #198; Tune is the reference placement).
-                // REC's in-frame view controls share the same gap, to its left.
-                let estop_w = estop::button_width(ui, estop::engaged()) + 16.0;
-                // Timers' COPY TIME / ID 10:00 share the gap too, while attached.
-                let timers_bar = self.page == Page::Timers && !page_detached(ui.ctx(), Page::Timers);
-                let timers_w = if timers_bar { tools::timers::BAR_SLOT_W } else { 0.0 };
-                // Tools' and Timers' sub-tabs sit in the bar too, directly left
-                // of the E-STOP (David, #221): as wide as they need, never more
-                // than the bar has; the rest go into the more-tabs key.
-                let tab_page = matches!(self.page, Page::Tools | Page::Timers) && !page_detached(ui.ctx(), self.page);
-                // The open tool's own header keys (Logbook Today/All, RF Calc
-                // picker, Calc Deg/Rad, Hex Open) sit in the bar between the
-                // tool tabs and E-STOP (David, #221). At most half the bar.
-                let tool_keys_w = if self.page == Page::Tools && tab_page {
-                    let want = self.tools.lock().expect("tools").header_width();
-                    let half = ((ui.available_width() - tools::BAR_TABS_RESERVE - estop_w) * 0.5).max(0.0);
-                    let w = want.min(half);
-                    // Asked even at 0: the tool then draws no header row.
-                    tools::request_bar_keys(ui.ctx(), w, estop_w + tools::BAR_TAB_GAP);
-                    if w > 0.0 { w + tools::BAR_TAB_GAP } else { 0.0 }
-                } else {
-                    0.0
-                };
-                let tabs_w = if tab_page {
-                    let labels = if self.page == Page::Tools { tools::Tools::tab_labels() } else { tools::timers::tab_labels() };
-                    let room = (ui.available_width() - tools::BAR_TABS_RESERVE - timers_w - estop_w - tool_keys_w).max(tools::more_key_w() + 80.0);
-                    tools::bar_tabs_width(ui, &labels).min(room) + 2.0 * tools::BAR_TAB_GAP
-                } else {
-                    0.0
-                };
-                // Plan, Channels and HackRF TG keys sit in the bar too,
-                // directly left of the E-STOP (David, #222).
-                let keys_n = page_bar_keys(self.page);
-                let keys_w = if keys_n > 0 {
-                    let room = ui.available_width() - tools::BAR_TABS_RESERVE - estop_w;
-                    let w = bar_keys_width(keys_n, room);
-                    tools::request_bar_keys(ui.ctx(), w, estop_w + tools::BAR_TAB_GAP);
-                    w + 2.0 * tools::BAR_TAB_GAP
-                } else {
-                    0.0
-                };
-                let slot_w = Some(in_frame.map(rec_ui::bar_slot_width).unwrap_or(0.0) + timers_w + tabs_w + tool_keys_w + keys_w + estop_w);
-                let (frame_rect, slot) = tools::frame_with_slot(ui, slot_w, |ui| {
-                    if page_detached(ui.ctx(), self.page) {
-                        page_stub(ui, self.page);
-                    } else if self.page == Page::Tune {
-                        self.page_tune(ui, &mut snap);
-                    } else if self.page == Page::Plan {
-                        self.page_plan(ui, &mut snap);
-                    } else if self.page == Page::Channels {
-                        self.page_channels(ui, &mut snap);
-                    } else if let Page::Talkgroups(id) = self.page {
-                        self.page_talkgroups(ui, id, &snap);
-                    } else if let Page::RadioIds(id) = self.page {
-                        self.page_radio_ids(ui, id, &snap);
-                    } else if self.page == Page::Rec {
-                        self.page_rec(ui, &snap);
-                    } else if self.page == Page::Timers {
-                        // Timers scrolls its own body under the sub-tabs.
-                        self.page_timers(ui);
-                    } else if self.page == Page::Tools {
-                        // Each tool screen lays out its own panels in the frame.
-                        self.page_tools(ui);
-                    } else {
-                        egui::ScrollArea::vertical()
-                            .id_salt("body")
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| self.page_body(ui, &mut snap));
-                    }
-                });
-                // REC's view controls and the E-STOP sit in the gap opened in the top bar.
-                if let Some(r) = slot {
-                    let (rec_r, stop_r) = (
-                        egui::Rect::from_min_max(r.min, egui::pos2(r.right() - estop_w, r.bottom())),
-                        egui::Rect::from_min_max(egui::pos2(r.right() - estop_w, r.top()), r.max),
-                    );
-                    if timers_bar {
-                        ui.scope_builder(egui::UiBuilder::new().max_rect(rec_r).id_salt("timers-bar-in-frame"), |ui| {
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 4.0;
-                                self.tools.lock().expect("tools").timers_mut().bar(ui);
-                            });
-                        });
-                    }
-                    if tab_page {
-                        // [COPY TIME · ID 10:00] [tabs … more] [E-STOP]
-                        let tabs_r = egui::Rect::from_min_max(
-                            egui::pos2(rec_r.left() + timers_w, rec_r.top()),
-                            egui::pos2(rec_r.right() - tools::BAR_TAB_GAP - tool_keys_w, rec_r.bottom()),
-                        );
-                        let mut t = self.tools.lock().expect("tools");
-                        if self.page == Page::Tools {
-                            t.bar_tabs(ui, tabs_r);
-                        } else {
-                            t.timers_mut().bar_tabs(ui, tabs_r);
-                        }
-                    }
-                    if let Some(compact) = in_frame {
-                        ui.scope_builder(egui::UiBuilder::new().max_rect(rec_r).id_salt("rec-bar-in-frame"), |ui| {
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = rec_ui::BAR_GAP;
-                                self.rec_bar(ui, compact);
-                            });
-                        });
-                    }
-                    ui.scope_builder(
-                        egui::UiBuilder::new()
-                            .max_rect(stop_r)
-                            .id_salt("estop-page-bar")
-                            .layout(egui::Layout::right_to_left(egui::Align::Center)),
-                        |ui| {
-                            estop::button(ui);
-                        },
-                    );
-                }
-                // A detachable page's frame detaches from the top elbow's
-                // end pill (top right, right of the E-STOP gap).
-                if page_detachable(self.page) {
-                    let id = page_detach_id(self.page);
-                    let mut st = group_box::DetachState::load(ui.ctx(), id);
-                    let cap = config_page_pill_rect(ui.ctx(), frame_rect);
-                    let name = page_name(self.page);
-                    let pill = group_box::detach_pill(ui, cap, id.with("page-pill"), rustcars::palette::TAN, &name, st.detached);
-                    if pill.clicked() {
-                        st.toggle();
-                        st.store(ui.ctx(), id);
-                    }
-                }
-                // REC's legal note rides the bottom elbow's bar, REC page only.
-                if self.page == Page::Rec {
-                    tools::bottom_bar_watermark(ui, frame_rect, rec_ui::PRIVACY);
-                }
+                self.framed_page(ui, self.page, &mut snap, rec_place, false);
             });
         }
 
@@ -3459,6 +3362,177 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// A page in the shared page frame: the elbow bar with the page's keys,
+    /// tabs and E-STOP in its slot, the page in the frame, the detach pill on
+    /// the top-right cap. The main window and a detached page window both draw
+    /// pages through here, so they look the same (David, pt368u). `window`:
+    /// drawing in the page's own detached window. Returns whether the pill
+    /// was clicked in a detached window (the caller attaches it).
+    fn framed_page(
+        &mut self,
+        ui: &mut egui::Ui,
+        page: Page,
+        snap: &mut Snapshot,
+        rec_place: Option<rec_ui::BarPlace>,
+        window: bool,
+    ) -> bool {
+        let mut pill_clicked = false;
+                let in_frame = match rec_place {
+                    Some(rec_ui::BarPlace::InFrame { compact }) if page == Page::Rec => Some(compact),
+                    _ => None,
+                };
+                // Every main page carries the E-STOP at the right end of its
+                // tan top bar (issue #198; Tune is the reference placement).
+                // REC's in-frame view controls share the same gap, to its left.
+                let estop_w = estop::button_width(ui, estop::engaged()) + 16.0;
+                // Timers' COPY TIME / ID 10:00 share the gap too, while attached.
+                let timers_bar = page == Page::Timers && (window || !page_detached(ui.ctx(), Page::Timers));
+                let timers_w = if timers_bar { tools::timers::BAR_SLOT_W } else { 0.0 };
+                // Tools' and Timers' sub-tabs sit in the bar too, directly left
+                // of the E-STOP (David, #221): as wide as they need, never more
+                // than the bar has; the rest go into the more-tabs key.
+                let tab_page = matches!(page, Page::Tools | Page::Timers) && (window || !page_detached(ui.ctx(), page));
+                // The open tool's own header keys (Logbook Today/All, RF Calc
+                // picker, Calc Deg/Rad, Hex Open) sit in the bar between the
+                // tool tabs and E-STOP (David, #221). At most half the bar.
+                let tool_keys_w = if page == Page::Tools && tab_page {
+                    let want = self.tools.lock().expect("tools").header_width();
+                    let half = ((ui.available_width() - tools::BAR_TABS_RESERVE - estop_w) * 0.5).max(0.0);
+                    let w = want.min(half);
+                    // Asked even at 0: the tool then draws no header row.
+                    tools::request_bar_keys(ui.ctx(), w, estop_w + tools::BAR_TAB_GAP);
+                    if w > 0.0 { w + tools::BAR_TAB_GAP } else { 0.0 }
+                } else {
+                    0.0
+                };
+                let tabs_w = if tab_page {
+                    let labels = if page == Page::Tools { tools::Tools::tab_labels() } else { tools::timers::tab_labels() };
+                    let room = (ui.available_width() - tools::BAR_TABS_RESERVE - timers_w - estop_w - tool_keys_w).max(tools::more_key_w() + 80.0);
+                    tools::bar_tabs_width(ui, &labels).min(room) + 2.0 * tools::BAR_TAB_GAP
+                } else {
+                    0.0
+                };
+                // Plan, Channels and HackRF TG keys sit in the bar too,
+                // directly left of the E-STOP (David, #222).
+                let keys_n = page_bar_keys(page);
+                let keys_w = if keys_n > 0 {
+                    let room = ui.available_width() - tools::BAR_TABS_RESERVE - estop_w;
+                    let w = bar_keys_width(keys_n, room);
+                    tools::request_bar_keys(ui.ctx(), w, estop_w + tools::BAR_TAB_GAP);
+                    w + 2.0 * tools::BAR_TAB_GAP
+                } else {
+                    0.0
+                };
+                let slot_w = Some(in_frame.map(rec_ui::bar_slot_width).unwrap_or(0.0) + timers_w + tabs_w + tool_keys_w + keys_w + estop_w);
+                let (frame_rect, slot) = tools::frame_with_slot(ui, slot_w, |ui| {
+                    if !window && page_detached(ui.ctx(), page) {
+                        page_stub(ui, page);
+                    } else if page == Page::Tune {
+                        self.page_tune(ui, snap);
+                    } else if page == Page::Plan {
+                        self.page_plan(ui, snap);
+                    } else if page == Page::Channels {
+                        self.page_channels(ui, snap);
+                    } else if let Page::Talkgroups(id) = self.page {
+                        self.page_talkgroups(ui, id, snap);
+                    } else if let Page::RadioIds(id) = self.page {
+                        self.page_radio_ids(ui, id, snap);
+                    } else if page == Page::Rec {
+                        self.page_rec(ui, snap);
+                    } else if page == Page::Timers {
+                        // Timers scrolls its own body under the sub-tabs.
+                        self.page_timers(ui);
+                    } else if page == Page::Tools {
+                        // Each tool screen lays out its own panels in the frame.
+                        self.page_tools(ui);
+                    } else {
+                        egui::ScrollArea::vertical()
+                            .id_salt(("body", page_name(page)))
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| self.page_body_of(page, window, ui, snap));
+                    }
+                });
+                // REC's view controls and the E-STOP sit in the gap opened in the top bar.
+                if let Some(r) = slot {
+                    let (rec_r, stop_r) = (
+                        egui::Rect::from_min_max(r.min, egui::pos2(r.right() - estop_w, r.bottom())),
+                        egui::Rect::from_min_max(egui::pos2(r.right() - estop_w, r.top()), r.max),
+                    );
+                    if timers_bar {
+                        ui.scope_builder(egui::UiBuilder::new().max_rect(rec_r).id_salt("timers-bar-in-frame"), |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                self.tools.lock().expect("tools").timers_mut().bar(ui);
+                            });
+                        });
+                    }
+                    if tab_page {
+                        // [COPY TIME · ID 10:00] [tabs … more] [E-STOP]
+                        let tabs_r = egui::Rect::from_min_max(
+                            egui::pos2(rec_r.left() + timers_w, rec_r.top()),
+                            egui::pos2(rec_r.right() - tools::BAR_TAB_GAP - tool_keys_w, rec_r.bottom()),
+                        );
+                        let mut t = self.tools.lock().expect("tools");
+                        if page == Page::Tools {
+                            t.bar_tabs(ui, tabs_r);
+                        } else {
+                            t.timers_mut().bar_tabs(ui, tabs_r);
+                        }
+                    }
+                    if let Some(compact) = in_frame {
+                        ui.scope_builder(egui::UiBuilder::new().max_rect(rec_r).id_salt("rec-bar-in-frame"), |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = rec_ui::BAR_GAP;
+                                self.rec_bar(ui, compact);
+                            });
+                        });
+                    }
+                    ui.scope_builder(
+                        egui::UiBuilder::new()
+                            .max_rect(stop_r)
+                            .id_salt("estop-page-bar")
+                            .layout(egui::Layout::right_to_left(egui::Align::Center)),
+                        |ui| {
+                            estop::button(ui);
+                        },
+                    );
+                }
+                // A detachable page's frame detaches from the top elbow's
+                // end pill (top right, right of the E-STOP gap).
+                if page_detachable(page) {
+                    let id = page_detach_id(page);
+                    let mut st = group_box::DetachState::load(ui.ctx(), id);
+                    let cap = config_page_pill_rect(ui.ctx(), frame_rect);
+                    let name = page_name(page);
+                    let pill = group_box::detach_pill(ui, cap, id.with("page-pill"), rustcars::palette::TAN, &name, st.detached);
+                    if pill.clicked() {
+                        if window {
+                            // The window's caller attaches it (it owns the state).
+                            pill_clicked = true;
+                        } else {
+                            st.toggle();
+                            st.store(ui.ctx(), id);
+                        }
+                    }
+                }
+                // REC's legal note rides the bottom elbow's bar, REC page only.
+                if page == Page::Rec {
+                    tools::bottom_bar_watermark(ui, frame_rect, rec_ui::PRIVACY);
+                }
+        pill_clicked
+    }
+
+    fn page_body_of(&mut self, page: Page, window: bool, ui: &mut egui::Ui, snap: &mut Snapshot) {
+        if window && page == Page::Config {
+            self.page_config(ui, snap);
+            return;
+        }
+        let keep = self.page;
+        self.page = page;
+        self.page_body(ui, snap);
+        self.page = keep;
+    }
+
     fn page_body(&mut self, ui: &mut egui::Ui, snap: &mut Snapshot) {
         match self.page {
             Page::Tune => self.page_tune(ui, snap),
@@ -8870,99 +8944,44 @@ impl App {
             }
             let m = group_box::Metrics::default();
             let name = page_name(page);
-            group_box::detached_window_with(ctx, id, &m, &name, rustcars::palette::TAN, &mut st, detach_opts(page), |ui| {
-                self.detached_page_body(ui, page, snap);
+            let attach = group_box::detached_window_with(ctx, id, &m, &name, rustcars::palette::TAN, &mut st, detach_opts(page), |ui| {
+                self.detached_page_body(ui, page, snap)
             });
+            if attach == Some(true) {
+                st.detached = false;
+                st.failed = false;
+                st.open = false;
+            }
             st.store(ctx, id);
         }
     }
 
-    /// A detached page's contents. REC's view controls ride the main page
-    /// bar when attached; detached they head the window instead (drawn once:
-    /// the main bar leaves them out while REC is detached).
-    fn detached_page_body(&mut self, ui: &mut egui::Ui, page: Page, snap: &mut Snapshot) {
-        // Every page carries E-STOP / RELEASE in its main page bar; its
-        // window carries them at the right of its top row (Tools draws its
-        // own). The window has its own keyboard focus, so it polls the chord.
-        if page != Page::Tools {
-            self.estop_chord.poll(ui.ctx());
-            let h = rustcars::LcarsTheme::default().bar_thin;
-            ui.horizontal(|ui| {
-                ui.set_min_height(h);
-                match page {
-                    Page::Timers => {
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        let mut t = self.tools.lock().expect("tools");
-                        t.timers_mut().bar(ui);
-                        let estop_w = estop::button_width(ui, estop::engaged()) + 8.0;
-                        let left = ui.cursor().left();
-                        let r = ui.max_rect();
-                        let tabs_r = egui::Rect::from_min_max(
-                            egui::pos2(left, r.top()),
-                            egui::pos2((r.right() - estop_w).max(left), r.top() + h),
-                        );
-                        t.timers_mut().bar_tabs(ui, tabs_r);
-                    }
-                    Page::Rec => {
-                        ui.spacing_mut().item_spacing.x = rec_ui::BAR_GAP;
-                        self.rec_bar(ui, false);
-                    }
-                    _ => {}
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    estop::button(ui);
-                });
-            });
-            ui.add_space(4.0);
-        }
-        // The window gives exactly its visible height (no outer scroll):
-        // flowing pages scroll here; Tools, Meters and the scrolling pages
-        // below fill it and scroll inside.
-        let flow = |ui: &mut egui::Ui, add: &mut dyn FnMut(&mut egui::Ui)| {
-            egui::ScrollArea::vertical()
-                .id_salt(("detached-flow", page_name(page)))
-                .auto_shrink([false, false])
-                .show(ui, |ui| add(ui));
-        };
-        match page {
-            Page::Config => flow(ui, &mut |ui| self.page_config(ui, snap)),
-            Page::Timers => flow(ui, &mut |ui| self.page_timers(ui)),
-            Page::Rec => flow(ui, &mut |ui| {
-                self.page_rec(ui, snap);
-                ui.add_space(4.0);
-                ui.label(egui::RichText::new(rec_ui::PRIVACY).weak().small());
-            }),
-            Page::Tools => self.tools.lock().expect("tools").window_body(ui),
-            Page::Meters => {
-                // The station file keeps the window's monitor and scale too.
-                let info = ui.input(|input| input.viewport().clone());
-                let radio = self.hub.view().rows.iter().find(|row| row.selected).map(|row| row.spec.name.clone());
-                let mut meters = self.meters.lock().expect("meters");
-                if let Some(monitor) = info.monitor_size.filter(|m| m.x > 1.0 && m.y > 1.0) {
-                    meters.saved_monitor = Some(monitor);
-                }
-                if let Some(ppp) = info.native_pixels_per_point.filter(|p| p.is_finite() && *p > 0.0) {
-                    meters.saved_ppp = Some(ppp);
-                }
-                egui::ScrollArea::vertical()
-                    .id_salt("meter-window")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| paint_meter_page(ui, snap, radio.as_deref(), &mut meters, &self.system_clock));
+    /// A detached page's contents: the same page frame as in the main
+    /// window (elbow bar, keys, tabs, E-STOP, pill), not a separate header
+    /// row (David, pt368u). Returns whether its pill was clicked (attach).
+    fn detached_page_body(&mut self, ui: &mut egui::Ui, page: Page, snap: &mut Snapshot) -> bool {
+        // The window has its own keyboard focus, so it polls the chord.
+        self.estop_chord.poll(ui.ctx());
+        if page == Page::Meters {
+            // The station file keeps the window's monitor and scale too.
+            let info = ui.input(|input| input.viewport().clone());
+            let mut meters = self.meters.lock().expect("meters");
+            if let Some(monitor) = info.monitor_size.filter(|m| m.x > 1.0 && m.y > 1.0) {
+                meters.saved_monitor = Some(monitor);
             }
-            Page::HfData | Page::Levels | Page::Keys => {
-                egui::ScrollArea::vertical()
-                    .id_salt(("detached-body", page_name(page)))
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| match page {
-                        Page::HfData => self.page_hfdata(ui, snap),
-                        Page::Levels => self.page_levels(ui, snap),
-                        _ => self.page_keys(ui),
-                    });
+            if let Some(ppp) = info.native_pixels_per_point.filter(|p| p.is_finite() && *p > 0.0) {
+                meters.saved_ppp = Some(ppp);
             }
-            // Only DETACHABLE_PAGES open a window; draw the asked page, never
-            // whichever page the main window shows.
-            _ => debug_assert!(false, "{} is not detachable", page_name(page)),
         }
+        // No page-tab row here: REC's view controls always ride the frame.
+        let rec_place = (page == Page::Rec).then(|| {
+            let w = ui.available_width();
+            let compact = match rec_ui::bar_place(w - rec_ui::FRAME_MARGIN_X, 0.0) {
+                rec_ui::BarPlace::TabRow { compact } | rec_ui::BarPlace::InFrame { compact } => compact,
+            };
+            rec_ui::BarPlace::InFrame { compact }
+        });
+        self.framed_page(ui, page, snap, rec_place, true)
     }
 
     /// Config groups detached on their own keep their windows on every page:
@@ -12785,9 +12804,12 @@ mod config_order_tests {
         // and the detached window heads REC with it (drawn once).
         let src = include_str!("main.rs");
         assert!(src.contains("&& !page_detached(ui.ctx(), Page::Rec);"));
+        // Detached, REC goes through the same page frame, with its view
+        // controls always in the frame's bar.
         let body = &src[src.find("fn detached_page_body(").unwrap()..];
         let body = &body[..body.find("\n    fn ").unwrap()];
-        assert_eq!(body.matches("self.rec_bar(ui, false)").count(), 1);
+        assert!(body.contains("self.framed_page(ui, page, snap, rec_place, true)"));
+        assert!(body.contains("rec_ui::BarPlace::InFrame { compact }"));
     }
 
     struct Bar {
@@ -13134,4 +13156,146 @@ mod detached_fit_tests {
             }
         }
     }
+
+    /// Bar content of one Tools frame: (label, x offset from the frame's
+    /// left) for every text in the top bar, and the bar's rect shapes.
+    fn bar_of(out: &egui::FullOutput, frame: egui::Rect) -> (Vec<(String, i32)>, Vec<egui::epaint::RectShape>) {
+        let th = rustcars::LcarsTheme::default();
+        let bar = egui::Rect::from_min_max(frame.min, egui::pos2(frame.right(), frame.top() + th.bar_thin));
+        let mut texts: Vec<(String, i32)> = out.shapes.iter().filter_map(|c| match &c.shape {
+            egui::Shape::Text(t) => {
+                let r = t.visual_bounding_rect().intersect(c.clip_rect);
+                (r.is_positive() && bar.contains_rect(r)).then(|| (t.galley.text().to_owned(), (r.left() - frame.left()).round() as i32))
+            }
+            _ => None,
+        }).collect();
+        texts.sort();
+        let rects = out.shapes.iter().filter_map(|c| match &c.shape {
+            egui::Shape::Rect(r) if bar.contains_rect(r.rect) && r.rect.height() >= th.bar_thin - 12.0 => Some(r.clone()),
+            _ => None,
+        }).collect();
+        (texts, rects)
+    }
+
+    /// Docked and detached Tools draw the same elbow bar for every screen:
+    /// the same tabs, tool keys (Rotator: AZ/EL LEDs), E-STOP, same places
+    /// (David, pt368u). Detached runs through rustcars' bare detached window
+    /// as eframe runs an immediate viewport.
+    #[test]
+    fn docked_and_detached_tools_bars_match() {
+        let ctx = ctx();
+        let mut tools = tools::Tools::new(&ctx);
+        let size = egui::vec2(1400.0, 900.0);
+        for (screen, label) in tools::SCREENS {
+            tools.screen = screen;
+            let mut docked = (egui::FullOutput::default(), egui::Rect::NOTHING);
+            for _ in 0..3 {
+                let mut f = egui::Rect::NOTHING;
+                let mut out = ctx.run_ui(
+                    egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), ..Default::default() },
+                    |ui| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin { left: 8, right: 8, top: 8, bottom: 0 }))
+                            .show_inside(ui, |ui| f = tools.framed(ui).0);
+                    },
+                );
+                out.textures_delta.clear();
+                docked = (out, f);
+            }
+            let mut det_frame = egui::Rect::NOTHING;
+            let det = frame(&ctx, Page::Tools, size, &mut |ui| det_frame = tools.framed(ui).0);
+            let (a, ar) = bar_of(&docked.0, docked.1);
+            let (b, br) = bar_of(&det, det_frame);
+            assert!(!a.is_empty(), "{label}: docked bar has content");
+            assert_eq!(a, b, "{label}: docked vs detached bar texts");
+            assert_eq!(ar.len(), br.len(), "{label}: docked vs detached bar shapes");
+            if screen == tools::Screen::Rotator {
+                let glass = egui::Color32::from_rgb(8, 8, 6);
+                assert_eq!(br.iter().filter(|r| r.fill == glass).count(), 2, "Rotator: AZ/EL LEDs in the detached bar");
+            }
+        }
+        tools.conceal_nanovna();
+    }
+
+    /// Every bar key moved into the bar follows rustcars P1c: square
+    /// (radius 0), per-key hues (not all one colour), no black or dark
+    /// strokes. Docked and detached, real fonts/theme, every Tools screen.
+    #[test]
+    fn tools_bar_keys_are_square_varied_and_unstroked() {
+        let ctx = ctx();
+        let mut tools = tools::Tools::new(&ctx);
+        let size = egui::vec2(1600.0, 900.0);
+        for (screen, label) in tools::SCREENS {
+            tools.screen = screen;
+            let mut f = egui::Rect::NOTHING;
+            let out = frame(&ctx, Page::Tools, size, &mut |ui| f = tools.framed(ui).0);
+            let keys = tools::bar_keys_rect(&ctx).unwrap_or(egui::Rect::NOTHING);
+            let (_, rects) = bar_of(&out, f);
+            let bg = rustcars::LcarsTheme::default().bg;
+            let cap_left = f.right() - rustcars::LcarsTheme::default().bar_thick * 2.0;
+            // The LED's own digit cell inside a bezel is display, not a key.
+            let glass = egui::Color32::from_rgb(8, 8, 6);
+            let bezels: Vec<egui::Rect> = rects.iter().filter(|r| r.fill == glass).map(|r| r.rect.expand(3.5)).collect();
+            let keyish: Vec<_> = rects.iter().filter(|r| r.fill != bg && r.fill.a() > 0 && r.rect.right() < cap_left
+                && !bezels.iter().any(|b| b.contains_rect(r.rect))).collect();
+            for r in &keyish {
+                assert_eq!(r.corner_radius.nw, 0, "{label}: rounded bar key {:?}", r.rect);
+                assert_eq!(r.corner_radius.se, 0, "{label}: rounded bar key {:?}", r.rect);
+                if r.stroke.width > 0.0 {
+                    let c = r.stroke.color;
+                    let lum = c.r() as u32 + c.g() as u32 + c.b() as u32;
+                    assert!(lum > 150 || c.a() == 0, "{label}: dark stroke {c:?} on {:?}", r.rect);
+                }
+            }
+            let mut hues: Vec<egui::Color32> = keyish.iter().map(|r| r.fill).collect();
+            hues.sort_by_key(|c| c.to_array());
+            hues.dedup();
+            assert!(hues.len() >= 3, "{label}: bar hues {hues:?}");
+            // Tool keys sit in their rect: in the bar, left of E-STOP.
+            if keys.width() > 0.0 {
+                let th = rustcars::LcarsTheme::default();
+                assert!(keys.top() >= f.top() - 0.5 && keys.bottom() <= f.top() + th.bar_thin + 0.5, "{label}: keys in the bar");
+            }
+        }
+        tools.conceal_nanovna();
+    }
+
+    /// RF Calc's ten function keys: folder tabs, never clipped at the right
+    /// (the extras go behind the more key), each its own hue, the open one
+    /// marked by a light bar (not colour alone, not black).
+    #[test]
+    fn rf_calc_function_keys_are_folder_tabs_that_fit() {
+        let ctx = ctx();
+        let mut tools = tools::Tools::new(&ctx);
+        tools.screen = tools::Screen::HamRf;
+        for w in [1600.0, 1100.0, 900.0] {
+            let size = egui::vec2(w, 800.0);
+            let out = frame(&ctx, Page::Tools, size, &mut |ui| { tools.framed(ui); });
+            let keys = tools::bar_keys_rect(&ctx).expect("keys rect");
+            let labels = tools::ham_rf::tool_labels();
+            let shown: Vec<egui::Rect> = out.shapes.iter().filter_map(|c| match &c.shape {
+                egui::Shape::Text(t) if labels.iter().any(|l| l.eq_ignore_ascii_case(t.galley.text())) => {
+                    Some(t.visual_bounding_rect())
+                }
+                _ => None,
+            }).collect();
+            assert!(!shown.is_empty(), "at {w}: function keys shown");
+            for r in &shown {
+                assert!(keys.expand(1.0).contains_rect(*r), "at {w}: key {r:?} clipped outside {keys:?}");
+            }
+            let fills: Vec<egui::Color32> = out.shapes.iter().filter_map(|c| match &c.shape {
+                egui::Shape::Rect(r) if keys.contains_rect(r.rect) && r.rect.height() > 20.0 => Some(r.fill),
+                _ => None,
+            }).collect();
+            let mut u = fills.clone();
+            u.sort_by_key(|c| c.to_array());
+            u.dedup();
+            assert!(u.len() >= shown.len().min(3), "at {w}: hues {u:?}");
+            let mark = out.shapes.iter().any(|c| matches!(&c.shape, egui::Shape::Rect(r)
+                if keys.contains_rect(r.rect) && (r.rect.height() - TAB_MARK_H).abs() < 0.5 && r.fill == rustcars::palette::TEXT));
+            assert!(mark, "at {w}: the open function key is marked");
+        }
+        tools.conceal_nanovna();
+    }
+
 }
