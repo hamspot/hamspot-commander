@@ -630,6 +630,8 @@ Hamlib and GQRX radios give only demodulated audio, and REC does not record them
 
 # 10. Meters, Levels, Timers and HF Data
 
+**Detaching a page.** HF Data, Levels, Keys and Timers carry the same rounded pill at the top right as Config and REC: click it to move the whole page into its own window, click it again (in either place) to bring it back, drag it to move the window. The main window shows a line saying where the page went. Tune, Plan, Channels and the TG / ID pages have no page pill. Meters keeps its own detach for now.
+
 ## 10.1 Meters
 
 The Meters page shows the S-meter for the current VFO, then ALC, SWR and power.
@@ -653,7 +655,7 @@ Station clocks at fixed offsets (no daylight saving time), a 10-minute **ID time
 
 The page is laid out like REC. Sub-tabs under the page bar pick **Clocks** (UTC, date, local time, day of year, top of hour), **World** (the world clocks), **Stopwatch** or **Countdown**; when the window is too narrow, the extra tabs move into the three-dot more-tabs button. A status line under the tabs always shows UTC, the countdown (or COUNTDOWN OFF), a running stopwatch and the last action, so the ID timer is visible from every tab. **Copy time** (click UTC log, double-click local with offset, triple-click ISO 8601) and **ID 10:00** sit in the page bar, left of E-STOP.
 
-Like Config and REC, Timers can be detached with the pill at the top right of the page. The detached window carries Copy time and ID 10:00 in its top row; the main window shows a stub until you reattach it.
+Like Config, REC, HF Data, Levels and Keys, Timers can be detached with the pill at the top right of the page. The detached window carries Copy time and ID 10:00 in its top row; the main window shows a stub until you reattach it.
 
 <!-- screenshot: timers-01 — Station clocks and timers. -->
 

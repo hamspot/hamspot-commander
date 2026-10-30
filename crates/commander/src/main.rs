@@ -90,7 +90,12 @@ fn config_page_detach_id() -> egui::Id {
 /// Pages whose whole frame detaches from the top-right end pill. One shared
 /// path: the pill in the page bar, a stub in the page while it is out, and
 /// the page drawn in its own window every frame (`show_page_windows`).
-const DETACHABLE_PAGES: [Page; 3] = [Page::Config, Page::Rec, Page::Timers];
+/// Pages that carry the page detach pill. Tune, Plan, Channels and the
+/// HackRF TG / ID pages stay out: they hold the Tune and scanner widgets,
+/// which are not wrapped. Meters and Tools keep their own detach until their
+/// settings migrate.
+const DETACHABLE_PAGES: [Page; 6] =
+    [Page::Config, Page::Rec, Page::Timers, Page::HfData, Page::Levels, Page::Keys];
 
 fn page_detachable(page: Page) -> bool {
     DETACHABLE_PAGES.contains(&page)
@@ -8721,7 +8726,19 @@ impl App {
                 ui.add_space(4.0);
                 ui.label(egui::RichText::new(rec_ui::PRIVACY).weak().small());
             }
-            _ => self.page_body(ui, snap),
+            Page::HfData | Page::Levels | Page::Keys => {
+                egui::ScrollArea::vertical()
+                    .id_salt(("detached-body", page_name(page)))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| match page {
+                        Page::HfData => self.page_hfdata(ui, snap),
+                        Page::Levels => self.page_levels(ui, snap),
+                        _ => self.page_keys(ui),
+                    });
+            }
+            // Only DETACHABLE_PAGES open a window; draw the asked page, never
+            // whichever page the main window shows.
+            _ => debug_assert!(false, "{} is not detachable", page_name(page)),
         }
     }
 
@@ -12595,6 +12612,12 @@ mod config_order_tests {
         use crate::{Page, page_detachable, page_detach_id, page_detached, page_stub};
         assert!(page_detachable(Page::Config) && page_detachable(Page::Rec));
         assert!(!page_detachable(Page::Tune), "Tune is not wrapped");
+        for p in [Page::Timers, Page::HfData, Page::Levels, Page::Keys] {
+            assert!(page_detachable(p), "{} carries the page pill", crate::page_name(p));
+        }
+        for p in [Page::Plan, Page::Channels, Page::Talkgroups(0), Page::RadioIds(0), Page::Meters, Page::Tools] {
+            assert!(!page_detachable(p), "{} stays out (scanner widgets / own detach)", crate::page_name(p));
+        }
         assert_ne!(page_detach_id(Page::Config), page_detach_id(Page::Rec));
         assert_eq!(crate::config_page_detach_id(), page_detach_id(Page::Config));
         let ctx = egui::Context::default();
