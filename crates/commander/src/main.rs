@@ -118,6 +118,16 @@ fn migrate_tool_detach(detach: Option<&str>, pos: Option<&str>, size: Option<&st
     }
 }
 
+/// How many side keys a page puts in its top bar (David, #222).
+fn page_bar_keys(page: Page) -> usize {
+    match page {
+        Page::Plan => 3,
+        Page::Channels => 5,
+        Page::Talkgroups(_) => 4,
+        _ => 0,
+    }
+}
+
 fn page_detachable(page: Page) -> bool {
     DETACHABLE_PAGES.contains(&page)
 }
@@ -1771,7 +1781,14 @@ enum KeyLamp {
 ///   green is Follow or a one-zone scan, amber the all-zone scan (and REC
 ///   all), purple a scan limited to marked zones, red REC marked.
 fn radio_key(ui: &mut egui::Ui, label: &str, lamp: KeyLamp, enabled: bool) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(RADIO_KEY_SIZE, egui::Sense::click());
+    if in_bar_row(ui) {
+        // In the elbow bar: the one bar style (#222).
+        let size = radio_key_size(ui);
+        let on = (!radio_key_is_momentary(label)).then(|| !matches!(lamp, KeyLamp::Dark));
+        let base = if radio_key_is_momentary(label) { rustcars::palette::TAN } else { radio_key_hue(lamp) };
+        return tools::bar_button(ui, label, base, size, on, enabled);
+    }
+    let (rect, response) = ui.allocate_exact_size(radio_key_size(ui), egui::Sense::click());
     if !ui.is_rect_visible(rect) {
         return response;
     }
@@ -1805,6 +1822,85 @@ fn radio_key(ui: &mut egui::Ui, label: &str, lamp: KeyLamp, enabled: bool) -> eg
 /// The scanner / Plan / Channels key size (unchanged from the old keys).
 const RADIO_KEY_SIZE: egui::Vec2 = egui::vec2(72.0, 46.0);
 
+/// A key in a bar row is as tall as the row (never taller than a column key).
+fn in_bar_row(ui: &egui::Ui) -> bool {
+    ui.data(|d| d.get_temp::<bool>(bar_keys_row_id(ui.layer_id()))).unwrap_or(false)
+}
+
+fn radio_key_size(ui: &egui::Ui) -> egui::Vec2 {
+    if in_bar_row(ui) {
+        egui::vec2(RADIO_KEY_SIZE.x, RADIO_KEY_SIZE.y.min(ui.available_height()).max(20.0))
+    } else {
+        RADIO_KEY_SIZE
+    }
+}
+
+fn bar_keys_row_id(layer: egui::LayerId) -> egui::Id {
+    egui::Id::NULL.with(("bar-keys-row", layer))
+}
+
+/// Width the top bar gives `n` page keys, as wide as they need and never
+/// more than `room`; the rest go behind more-tabs.
+fn bar_keys_width(n: usize, room: f32) -> f32 {
+    let all = n as f32 * RADIO_KEY_SIZE.x + n.saturating_sub(1) as f32 * tools::BAR_TAB_GAP;
+    all.min(room.max(tools::more_key_w() + RADIO_KEY_SIZE.x + tools::BAR_TAB_GAP))
+}
+
+/// How many of `n` keys fit in `w`; on overflow the more key takes the right end.
+fn bar_keys_shown(n: usize, w: f32) -> usize {
+    let gap = tools::BAR_TAB_GAP;
+    let step = RADIO_KEY_SIZE.x + gap;
+    if n as f32 * step - gap <= w + 0.5 {
+        return n;
+    }
+    (((w - tools::more_key_w() - gap + gap) / step).floor().max(0.0) as usize).min(n)
+}
+
+/// Page side keys (Plan, Channels, HackRF TG) in the top bar, directly left
+/// of E-STOP, as one row of rustcars keys (David, #222). `key(ui, k)` draws
+/// key `k`. Keys that do not fit go behind the more-tabs key at the right
+/// end of the gap; a page drawn without a bar gap keeps the old column.
+fn bar_keys(ui: &mut egui::Ui, salt: &str, n: usize, mut key: impl FnMut(&mut egui::Ui, usize)) {
+    let Some(rect) = tools::bar_keys_rect(ui.ctx()) else {
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 6.0;
+            ui.set_width(RADIO_KEY_SIZE.x);
+            for k in 0..n {
+                key(ui, k);
+            }
+        });
+        return;
+    };
+    let shown = bar_keys_shown(n, rect.width());
+    // Above the page so the bar's black slot cover (painted after the page)
+    // does not hide the keys; below popups and tooltips.
+    let layer = egui::LayerId::new(egui::Order::Middle, egui::Id::new(("bar-keys-layer", salt)));
+    let row_id = bar_keys_row_id(layer);
+    ui.ctx().data_mut(|d| d.insert_temp(row_id, true));
+    let mut row = ui.new_child(
+        egui::UiBuilder::new()
+            .layer_id(layer)
+            .max_rect(rect)
+            .id_salt(("bar-keys", salt))
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    row.set_clip_rect(rect);
+    row.spacing_mut().item_spacing.x = tools::BAR_TAB_GAP;
+    for k in 0..shown {
+        key(&mut row, k);
+    }
+    if shown < n {
+        let more = egui::Rect::from_min_max(egui::pos2(rect.right() - tools::more_key_w(), rect.top()), rect.max);
+        let resp = tools::more_key(&mut row, more, ("bar-keys-more", salt), n - shown);
+        egui::Popup::menu(&resp).show(|ui| {
+            ui.spacing_mut().item_spacing.y = 6.0;
+            for k in shown..n {
+                key(ui, k);
+            }
+        });
+    }
+}
+
 /// Keys that act once on the click and hold no state.
 fn radio_key_is_momentary(label: &str) -> bool {
     matches!(label.to_ascii_uppercase().as_str(), "LOAD" | "SAVE" | "ADD")
@@ -1824,6 +1920,85 @@ fn radio_key_hue(lamp: KeyLamp) -> egui::Color32 {
 #[cfg(test)]
 mod radio_key_tests {
     use super::*;
+
+    /// Real LCARS fonts and theme, laid out like the main window: Plan,
+    /// Channels and HackRF TG keys sit in the top-bar gap directly left of
+    /// the E-STOP, at the bar height, never overlapping each other or the
+    /// E-STOP (which keeps its full width); a narrow bar puts the rest
+    /// behind more-tabs at the gap's right end; the LCD panel to their
+    /// right moves left and fills the width.
+    #[test]
+    fn side_keys_sit_in_the_bar_left_of_the_estop() {
+        let ctx = egui::Context::default();
+        let th = rustcars::LcarsTheme::default();
+        let pages: [&[&str]; 3] = [&["LOAD", "SAVE", "ADD"], &["REC", "LOAD", "SAVE", "SCAN", "DWELL"], &["REC", "LOAD", "SAVE", "FOLLOW"]];
+        for w in [1400.0, 760.0, 560.0] {
+            for labels in pages {
+                let n = labels.len();
+                let mut keys: Vec<egui::Rect> = Vec::new();
+                let (mut frame, mut stop_r, mut gap, mut panel, mut estop_w) =
+                    (egui::Rect::NOTHING, egui::Rect::NOTHING, None, egui::Rect::NOTHING, 0.0);
+                let mut out = egui::FullOutput::default();
+                for _ in 0..3 {
+                    keys.clear();
+                    out = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, 800.0))),
+                            ..Default::default()
+                        },
+                        |ui| {
+                            estop_w = estop::button_width(ui, false) + 16.0;
+                            let room = ui.available_width() - tools::BAR_TABS_RESERVE - estop_w;
+                            let kw = bar_keys_width(n, room);
+                            tools::request_bar_keys(ui.ctx(), kw, estop_w + tools::BAR_TAB_GAP);
+                            let (f, slot) = tools::frame_with_slot(ui, Some(kw + 2.0 * tools::BAR_TAB_GAP + estop_w), |ui| {
+                                gap = tools::bar_keys_rect(ui.ctx());
+                                ui.horizontal(|ui| {
+                                    bar_keys(ui, "test", n, |ui, k| keys.push(radio_key(ui, labels[k], KeyLamp::Dark, true).rect));
+                                    lcd_panel(ui, |ui| panel = ui.max_rect());
+                                });
+                            });
+                            let r = slot.unwrap();
+                            stop_r = egui::Rect::from_min_max(egui::pos2(r.right() - estop_w, r.top()), r.max);
+                            frame = f;
+                        },
+                    );
+                    out.textures_delta.clear();
+                }
+                let gap = gap.expect("the bar gap is set aside");
+                assert!(gap.right() <= stop_r.left(), "keys end left of the E-STOP");
+                assert!(stop_r.width() >= estop_w - 0.5, "E-STOP keeps its width");
+                assert!(gap.top() >= frame.top() - 0.5 && gap.bottom() <= frame.top() + th.bar_thin + 0.5, "gap is in the top bar");
+                let shown = bar_keys_shown(n, gap.width());
+                assert_eq!(keys.len(), shown, "{labels:?} at {w}: shown keys drawn in the bar");
+                for (i, k) in keys.iter().enumerate() {
+                    assert!(gap.expand(0.5).contains_rect(*k), "{labels:?} at {w}: key {i} {k:?} outside gap {gap:?}");
+                    assert!((k.height() - th.bar_thin).abs() < 1.0, "key at the bar height: {k:?}");
+                    for o in &keys[i + 1..] {
+                        assert!(!k.intersects(o.shrink(0.5)), "keys overlap");
+                    }
+                }
+                if w >= 1400.0 {
+                    assert_eq!(shown, n, "all keys fit at {w}");
+                }
+                if shown < n {
+                    let more = gap.right() - tools::more_key_w();
+                    assert!(keys.iter().all(|k| k.right() <= more + 0.5), "keys left of more-tabs");
+                }
+                // The panel took the freed width: it starts at the side bar.
+                assert!(panel.left() < frame.left() + th.bar_thick + 40.0, "{labels:?} at {w}: panel moved left: {panel:?}");
+                assert!(panel.right() > frame.right() - 40.0, "{labels:?} at {w}: panel fills the width: {panel:?}");
+                // Labels in the bar (painted text).
+                let texts: Vec<String> = out.shapes.iter().filter_map(|c| match &c.shape {
+                    egui::Shape::Text(t) if t.pos.y < frame.top() + th.bar_thin => Some(t.galley.text().to_owned()),
+                    _ => None,
+                }).collect();
+                for l in &labels[..shown] {
+                    assert!(texts.iter().any(|t| t.contains(l)), "{l} in the bar at {w}: {texts:?}");
+                }
+            }
+        }
+    }
 
     fn draw(label: &str, lamp: KeyLamp, enabled: bool) -> (egui::Rect, Vec<egui::epaint::ClippedShape>) {
         let ctx = egui::Context::default();
@@ -3100,7 +3275,18 @@ impl eframe::App for App {
                 } else {
                     0.0
                 };
-                let slot_w = Some(in_frame.map(rec_ui::bar_slot_width).unwrap_or(0.0) + timers_w + tabs_w + estop_w);
+                // Plan, Channels and HackRF TG keys sit in the bar too,
+                // directly left of the E-STOP (David, #222).
+                let keys_n = page_bar_keys(self.page);
+                let keys_w = if keys_n > 0 {
+                    let room = ui.available_width() - tools::BAR_TABS_RESERVE - estop_w;
+                    let w = bar_keys_width(keys_n, room);
+                    tools::request_bar_keys(ui.ctx(), w, estop_w + tools::BAR_TAB_GAP);
+                    w + 2.0 * tools::BAR_TAB_GAP
+                } else {
+                    0.0
+                };
+                let slot_w = Some(in_frame.map(rec_ui::bar_slot_width).unwrap_or(0.0) + timers_w + tabs_w + keys_w + estop_w);
                 let (frame_rect, slot) = tools::frame_with_slot(ui, slot_w, |ui| {
                     if page_detached(ui.ctx(), self.page) {
                         page_stub(ui, self.page);
@@ -3536,15 +3722,19 @@ impl App {
         let mut clicked = None;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 6.0;
-                ui.set_width(72.0);
+            // LOAD · SAVE · ADD ride the top bar, left of E-STOP (David, #222).
+            bar_keys(ui, "plan", 3, |ui, k| match k {
+                0 => {
                 if radio_key(ui, "LOAD", KeyLamp::Dark, true).clicked() {
                     self.browse_plan(false);
                 }
+                }
+                1 => {
                 if radio_key(ui, "SAVE", KeyLamp::Dark, true).clicked() {
                     self.browse_plan(true);
                 }
+                }
+                _ => {
                 if radio_key(ui, "ADD", KeyLamp::Dark, true).clicked() {
                     let color = self
                         .plan
@@ -3556,6 +3746,7 @@ impl App {
                     self.zone_sel = plan::push_zone(&mut self.plan, color, home, &snap.mode);
                     self.band_sel = 0;
                     self.zone_rename = None;
+                }
                 }
             });
             lcd_panel(ui, |ui| {
@@ -3801,16 +3992,22 @@ impl App {
         let mut clicked = None;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 6.0;
-                ui.set_width(72.0);
+            // REC · LOAD · SAVE · SCAN · DWELL ride the top bar, left of E-STOP (#222).
+            bar_keys(ui, "channels", 5, |ui, k| match k {
+                0 => {
                 self.rec_key(ui, false);
+                }
+                1 => {
                 if radio_key(ui, "LOAD", KeyLamp::Dark, true).clicked() {
                     self.browse_channels(false);
                 }
+                }
+                2 => {
                 if radio_key(ui, "SAVE", KeyLamp::Dark, true).clicked() {
                     self.browse_channels(true);
                 }
+                }
+                3 => {
                 let scan_on = self.memory_scan.is_on();
                 let all_zones = self.memory_scan.all_zones();
                 let listed_on = !self.scan_zones.is_empty();
@@ -3875,6 +4072,8 @@ impl App {
                         self.start_memory_scan(snap);
                     }
                 }
+                }
+                _ => {
                 let dwell = radio_key(
                     ui,
                     "DWELL",
@@ -3887,6 +4086,7 @@ impl App {
                 );
                 if dwell.clicked() {
                     self.memory_scan.toggle_dwell();
+                }
                 }
             });
             lcd_panel(ui, |ui| {
@@ -10604,27 +10804,24 @@ impl App {
             self.followers.get(&id).and_then(|follower| follower.active_tg())
         };
         ui.horizontal_top(|ui| {
-            // The face is 204 px. Three 46 px keys with 6 px between them
-            // sit on the vertical middle of that bezel, 4 px from its edge.
             ui.spacing_mut().item_spacing.x = 4.0;
-            let face_h = 204.0_f32;
-            let key_h = 46.0;
-            let key_gap = 6.0;
-            let stack = key_h * 4.0 + key_gap * 3.0;
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 0.0;
-                ui.set_width(72.0);
-                ui.add_space(((face_h - stack) * 0.5).max(0.0));
+            // REC · LOAD · SAVE · FOLLOW ride the top bar, left of E-STOP (#222);
+            // the scanner face moves left into the freed width.
+            bar_keys(ui, "talkgroups", 4, |ui, k| match k {
+                0 => {
                 self.rec_key(ui, true);
-                ui.add_space(key_gap);
+                }
+                1 => {
                 if radio_key(ui, "LOAD", KeyLamp::Dark, true).clicked() {
                     self.browse_talkgroups(false);
                 }
-                ui.add_space(key_gap);
+                }
+                2 => {
                 if radio_key(ui, "SAVE", KeyLamp::Dark, true).clicked() {
                     self.browse_talkgroups(true);
                 }
-                ui.add_space(key_gap);
+                }
+                _ => {
                 let toggle = radio_key(
                     ui,
                     "FOLLOW",
@@ -10638,6 +10835,7 @@ impl App {
                     toggle.on_hover_text("The trunking receive pipe is off.");
                 } else if gpredict {
                     toggle.on_hover_text("Gpredict is moving this radio.");
+                }
                 }
             });
             self.scanner_face(ui, id, selected, &radio_name, follow, direct, snap);

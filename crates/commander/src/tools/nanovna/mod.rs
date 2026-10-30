@@ -4963,10 +4963,11 @@ impl NanoVna {
                         ui.add(egui::DragValue::new(&mut seg.start_v).speed(0.05));
                         ui.add(egui::DragValue::new(&mut seg.stop_v).speed(0.05));
                         let label = if seg.upper { "UPPER" } else { "LOWER" };
-                        if ui.button(label).clicked() {
+                        // Panel buttons in the rustcars panel style (#222).
+                        if action_button(ui, theme, label, vec2(90.0, 26.0)).clicked() {
                             seg.upper = !seg.upper;
                         }
-                        if ui.button("Delete").clicked() {
+                        if action_button(ui, theme, "Delete", vec2(90.0, 26.0)).clicked() {
                             remove = Some(i);
                         }
                         ui.end_row();
@@ -6061,8 +6062,17 @@ fn key_cap(ui: &mut Ui, theme: &LcarsTheme, label: &str, lit: bool, width: f32, 
         size -= 1.0;
         galley = painter.layout_no_wrap(text.clone(), egui::FontId::proportional(size), ink);
     }
-    let at = rect.center() - galley.size() * 0.5;
-    painter.galley(at, galley, ink);
+    if lit {
+        // A lit key is an on state: thin border and the ● marker, so the
+        // state is never shown by colour alone (#222).
+        painter.rect_stroke(rect, 4.0, Stroke::new(rustcars::TOGGLE_BORDER, rustcars::tint(base, 0.6)), egui::StrokeKind::Inside);
+        rustcars::paint_toggle_marker_label(painter, rect, label, true, egui::FontId::proportional(size), ink);
+    } else {
+        let at = rect.center() - galley.size() * 0.5;
+        painter.galley(at, galley, ink);
+    }
+    let name = if lit { rustcars::toggle_label(label, true) } else { text.clone() };
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, &name));
     resp
 }
 

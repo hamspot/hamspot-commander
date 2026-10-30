@@ -117,7 +117,10 @@ impl Timers {
         let t = self.theme;
         let now = self.now(ui);
         let mut m = Mode::Inactive; // momentary: the gesture picks the format
-        mode_button(ui, &t, "Copy time", &mut m, egui::vec2(COPY_W, t.bar_thin)).on_hover_text(
+        let copy = mode_button(ui, &t, "Copy time", &mut m, egui::vec2(COPY_W, t.bar_thin));
+        // Same gestures; painted in the one bar style (#222).
+        crate::tools::paint_bar_button(ui, copy.rect, &copy, "Copy time", rustcars::palette::TAN, None, true);
+        copy.on_hover_text(
             "click: 2026-10-23 1948Z · double: local with offset · triple: ISO 8601",
         );
         match m {
@@ -126,7 +129,7 @@ impl Timers {
             Mode::Alt2 => self.copy(ui, Stamp::Iso),
             Mode::Inactive => {}
         }
-        if action_button(ui, &t, "ID 10:00", egui::vec2(ID_W, t.bar_thin))
+        if crate::tools::bar_button(ui, "ID 10:00", rustcars::palette::TAN, egui::vec2(ID_W, t.bar_thin), None, true)
             .on_hover_text("Start a 10 minute station identification countdown")
             .clicked()
         {

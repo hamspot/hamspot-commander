@@ -171,6 +171,15 @@ impl Tools {
     /// add their panels inside `ui`, so they stay within the frame.
     pub fn draw_in(&mut self, ui: &mut egui::Ui) {
         // The tool sub-tabs are in the top elbow bar (`bar_tabs`), not here.
+        // NanoVNA has its own status bar under the chart (device key,
+        // STATUS), so it gets no top line (David, #222): the chart starts
+        // right under the bar.
+        if self.screen == Screen::NanoVna {
+            crate::status_note::clear(ui.ctx());
+            self.screen(ui);
+            crate::status_note::clear(ui.ctx());
+            return;
+        }
         let status = crate::status_note::reserve(ui);
         ui.add_space(self.theme.frame_gap);
         crate::status_note::clear(ui.ctx());
@@ -440,6 +449,19 @@ pub fn frame_with_slot(
     let id = top_cap_id(ui.ctx());
     ui.ctx().data_mut(|d| d.insert_temp(id, cap));
     let slot = slot_w.map(|w| top_slot(outer, frame.cap_len, frame.thin, w));
+    // Page keys asked for this frame (see `request_bar_keys`) get their part
+    // of the slot now, before the page draws them.
+    let keys_req = bar_keys_req_id(ui.ctx());
+    let req = ui.ctx().data_mut(|d| d.remove_temp::<(f32, f32)>(keys_req));
+    let keys = match (slot, req) {
+        (Some((_, inner)), Some((w, reserve))) => Some(egui::Rect::from_min_max(
+            egui::pos2(inner.right() - reserve - w, inner.top()),
+            egui::pos2(inner.right() - reserve, inner.bottom()),
+        )),
+        _ => None,
+    };
+    let keys_id = bar_keys_rect_id(ui.ctx());
+    ui.ctx().data_mut(|d| d.insert_temp(keys_id, keys));
     let cover_id = top_slot_cover_id(ui.ctx());
     let cover = slot.map(|(c, _)| c);
     ui.ctx().data_mut(|d| d.insert_temp(cover_id, cover));
@@ -458,6 +480,38 @@ pub fn frame_with_slot(
 /// it off everywhere.
 pub(crate) fn no_scroll_fade(ctx: &egui::Context) {
     ctx.global_style_mut(|s| s.spacing.scroll.fade.strength = 0.0);
+}
+
+fn bar_keys_req_id(ctx: &egui::Context) -> egui::Id {
+    egui::Id::NULL.with(("bar-keys-req", ctx.viewport_id()))
+}
+
+fn bar_keys_rect_id(ctx: &egui::Context) -> egui::Id {
+    egui::Id::NULL.with(("bar-keys-rect", ctx.viewport_id()))
+}
+
+/// Ask the next [`frame_with_slot`] to set aside `w` of its slot for page
+/// keys, ending `reserve` from the slot's right edge (the E-STOP).
+pub fn request_bar_keys(ctx: &egui::Context, w: f32, reserve: f32) {
+    let id = bar_keys_req_id(ctx);
+    ctx.data_mut(|d| d.insert_temp(id, (w, reserve)));
+}
+
+/// The page-key part of the top-bar slot for the frame being drawn.
+pub fn bar_keys_rect(ctx: &egui::Context) -> Option<egui::Rect> {
+    let id = bar_keys_rect_id(ctx);
+    ctx.data(|d| d.get_temp::<Option<egui::Rect>>(id)).flatten()
+}
+
+/// The three-dot more key at `rect` with `hidden` items behind it.
+pub fn more_key(ui: &mut egui::Ui, rect: egui::Rect, salt: impl std::hash::Hash + std::fmt::Debug, hidden: usize) -> egui::Response {
+    let id = ui.id().with(salt);
+    let resp = ui.interact(rect, id, egui::Sense::click());
+    paint_more_key(ui, rect, &resp);
+    let resp = resp.on_hover_text(format!("More keys ({hidden} hidden)"));
+    let l = format!("More keys, {hidden} hidden");
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &l));
+    resp
 }
 
 fn top_slot_cover_id(ctx: &egui::Context) -> egui::Id {
@@ -665,6 +719,68 @@ pub fn overflow_tab_row(
 /// The "more tabs" button: a pill (round both ends) in the bar colour with a
 /// highlight outline, like the detach pill, and three painted dots. No text;
 /// the tooltip and accessibility label say "More tabs".
+/// Corner radius of every elbow-bar button (the app's button rule).
+pub const BAR_BUTTON_RADIUS: u8 = 4;
+
+/// Colours of a bar button `(fill, border)`: a momentary key is a solid
+/// pill with no border; a toggle has a thin border and is solid when on,
+/// a dimmed fill of its hue when off (state is also the ●/○ marker).
+pub fn bar_button_colors(base: egui::Color32, on: Option<bool>, enabled: bool, hovered: bool) -> (egui::Color32, Option<egui::Color32>) {
+    let mut fill = match on {
+        Some(false) => rustcars::tint(base, -0.55),
+        _ => base,
+    };
+    if !enabled {
+        fill = rustcars::tint(fill, -0.5);
+    } else if hovered {
+        fill = rustcars::tint(fill, 0.2);
+    }
+    let border = on.map(|_| rustcars::tint(base, 0.6));
+    (fill, border)
+}
+
+/// Paint one elbow-bar button at `rect` (see [`bar_button`]).
+pub fn paint_bar_button(ui: &egui::Ui, rect: egui::Rect, resp: &egui::Response, label: &str, base: egui::Color32, on: Option<bool>, enabled: bool) {
+    let theme = LcarsTheme::default();
+    let painter = ui.painter();
+    let r = egui::CornerRadius::same(BAR_BUTTON_RADIUS);
+    let (fill, border) = bar_button_colors(base, on, enabled, enabled && resp.hovered());
+    // Black gap on both sides so neighbours read as separate keys.
+    painter.rect_filled(rect, r, fill);
+    if let Some(b) = border {
+        painter.rect_stroke(rect, r, egui::Stroke::new(rustcars::TOGGLE_BORDER, b), egui::StrokeKind::Inside);
+    }
+    let ink = rustcars::ink_on(fill);
+    let font = egui::FontId::proportional(theme.data_size);
+    match on {
+        Some(state) => rustcars::paint_toggle_marker_label(painter, rect, label, state, font, ink),
+        None => {
+            painter.text(rect.center(), egui::Align2::CENTER_CENTER, label.to_uppercase(), font, ink);
+        }
+    }
+    if resp.has_focus() {
+        painter.rect_stroke(rect.shrink(3.0), r, egui::Stroke::new(1.0, ink), egui::StrokeKind::Inside);
+    }
+}
+
+/// The one elbow-bar button style (David, #222): a filled pill at the bar
+/// height, radius 4, label in the ink for its fill; toggles add a thin
+/// border and the ●/○ marker. E-STOP / RELEASE keep their own square keys.
+pub fn bar_button(ui: &mut egui::Ui, label: &str, base: egui::Color32, size: egui::Vec2, on: Option<bool>, enabled: bool) -> egui::Response {
+    let sense = if enabled { egui::Sense::click() } else { egui::Sense::hover() };
+    let (rect, resp) = ui.allocate_exact_size(size, sense);
+    paint_bar_button(ui, rect, &resp, label, base, on, enabled);
+    let text = match on {
+        Some(state) => rustcars::toggle_label(label, state),
+        None => label.to_uppercase(),
+    };
+    match on {
+        Some(state) => resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, enabled, state, &text)),
+        None => resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, &text)),
+    }
+    resp
+}
+
 fn paint_more_key(ui: &egui::Ui, rect: egui::Rect, resp: &egui::Response) {
     let theme = LcarsTheme::default();
     let painter = ui.painter();
@@ -673,7 +789,7 @@ fn paint_more_key(ui: &egui::Ui, rect: egui::Rect, resp: &egui::Response) {
     let gap = theme.frame_gap;
     // Black gap on both sides so it reads as its own button on the bar.
     painter.rect_filled(rect.expand2(egui::vec2(gap, 0.0)), 0.0, theme.bg);
-    let r = rustcars::cap_radius(Cap::Both, rect.height());
+    let r = egui::CornerRadius::same(BAR_BUTTON_RADIUS);
     painter.rect_filled(rect, r, fill);
     let w = if resp.hovered() { rustcars::group::PILL_BORDER + 0.5 } else { rustcars::group::PILL_BORDER };
     painter.rect_stroke(rect, r, egui::Stroke::new(w, outline), egui::StrokeKind::Inside);
@@ -947,6 +1063,21 @@ mod top_cap_deadlock_tests {
 mod page_frame_tests {
     use super::*;
 
+    /// One bar style: momentary keys solid with no border; toggles have a
+    /// thin border both ways and differ on/off by fill and the ●/○ marker.
+    #[test]
+    fn bar_buttons_share_one_style() {
+        let tan = rustcars::palette::TAN;
+        let (m, mb) = bar_button_colors(tan, None, true, false);
+        assert_eq!((m, mb), (tan, None));
+        let (on, onb) = bar_button_colors(tan, Some(true), true, false);
+        let (off, offb) = bar_button_colors(tan, Some(false), true, false);
+        assert!(onb.is_some() && offb.is_some(), "toggles are thin-bordered");
+        assert_ne!(on, off);
+        assert_eq!(rustcars::toggle_label("FOLLOW", true), "\u{25cf} FOLLOW");
+        assert_eq!(BAR_BUTTON_RADIUS, 4);
+    }
+
     fn texts(out: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
         out.shapes
             .iter()
@@ -1029,6 +1160,13 @@ mod page_frame_tests {
                 let first: Vec<_> = body.iter().filter(|(_, r)| (r.top() - top).abs() < 1.0).collect();
                 let base = tools.status_line();
                 let head: String = base.chars().take(8).collect();
+                if screen == Screen::NanoVna {
+                    // NanoVNA: no top line; its status bar under the chart says it once.
+                    assert!(!first.iter().any(|(s, _)| s.starts_with(&head)), "NanoVNA: no top status line, got {first:?}");
+                    let n = t.iter().filter(|(s, _)| s.contains("NOT CONNECTED")).count();
+                    assert!(n <= 1, "NanoVNA: connection state shown once, got {n}");
+                    continue;
+                }
                 assert!(first.iter().any(|(s, _)| s.starts_with(&head)), "{label}: status line first, got {first:?}");
                 let line_h = 30.0;
                 assert!(first.iter().all(|(_, r)| r.height() < line_h), "{label}: status is one row");
