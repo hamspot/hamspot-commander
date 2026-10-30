@@ -9,6 +9,7 @@
 pub mod geom;
 mod horizon;
 mod led;
+pub mod map;
 
 use std::sync::Arc;
 
@@ -66,6 +67,8 @@ pub struct Settings {
     pub preset_el: f64,
     pub az_rate: Rate,
     pub el_rate: Rate,
+    /// Azimuthal-equidistant map behind the rose (versioned, off by default).
+    pub map: map::MapSettings,
 }
 
 impl Default for Settings {
@@ -78,6 +81,7 @@ impl Default for Settings {
             preset_el: 0.0,
             az_rate: Rate { value: 15.0, per_minute: true, dir: Dir::Plus },
             el_rate: Rate { value: 5.0, per_minute: true, dir: Dir::Plus },
+            map: map::MapSettings::default(),
         }
     }
 }
@@ -93,6 +97,7 @@ pub struct Rotator {
     /// How many LED readouts (AZ, then EL) the elbow bar showed this frame;
     /// the rest are drawn on the page.
     leds_in_bar: u8,
+    map_cache: map::MapCache,
 }
 
 fn hamlib_limits(row: &rot::RotatorRow) -> Option<Limits> {
@@ -110,6 +115,7 @@ impl Rotator {
             jog: None,
             note: String::new(),
             leds_in_bar: 0,
+            map_cache: map::MapCache::default(),
         }
     }
 
@@ -131,6 +137,16 @@ impl Rotator {
 
     /// One status line for the Tools page: the selected rotator and its state.
     pub fn status_line(&self) -> String {
+        let base = self.rotator_status();
+        if self.settings.map.show {
+            if let Err(why) = map::resolve(&self.settings.map).and_then(|_| map::coastlines().map(|_| ())) {
+                return format!("{base}   MAP OFF: {why}");
+            }
+        }
+        base
+    }
+
+    fn rotator_status(&self) -> String {
         let rows = self.hub.as_ref().map(|hub| hub.view().rows).unwrap_or_default();
         match rows.iter().find(|row| row.selected).or_else(|| rows.first()) {
             Some(row) => {
@@ -183,6 +199,12 @@ impl Rotator {
                 let preset_az = az.map(|az| geom::az_for_bearing(s.preset_az, az, lim));
                 paint_dial(ui.painter(), dial_rect);
                 paint_globe(ui.painter(), dial_rect, el, Some(s.preset_el), lim.el_hi);
+                if s.map.show {
+                    // Failures go to the status line (status_line).
+                    if let Ok(lines) = self.map_cache.get(&s.map) {
+                        map::paint(ui.painter(), dial_rect.center(), dial_radius(dial_rect) * MAP_R, lines);
+                    }
+                }
                 // The azimuth scale, needle and lamp go back on top of the globe.
                 paint_dial_top(ui.painter(), dial_rect, az, Some(s.preset_az), lim, preset_az);
                 ui.scope_builder(egui::UiBuilder::new().max_rect(panel), |ui| {
@@ -458,6 +480,23 @@ impl Rotator {
         });
         ui.add_space(t.main_gap);
 
+        heading(ui, "WORLD MAP");
+        ui.horizontal_wrapped(|ui| {
+            let mut on = self.settings.map.show;
+            if rustcars::toggle_button(ui, &t, "MAP", &mut on, palette::TEAL, egui::vec2(96.0, t.bar_thin)).clicked() {
+                self.settings.map.show = on;
+            }
+            let m = &mut self.settings.map;
+            ui.label("Lat");
+            ui.add(egui::TextEdit::singleline(&mut m.lat).desired_width(70.0).hint_text("39.77"));
+            ui.label("Lon");
+            ui.add(egui::TextEdit::singleline(&mut m.lon).desired_width(70.0).hint_text("-86.16"));
+            ui.label("Range km");
+            ui.add(egui::TextEdit::singleline(&mut m.range_km).desired_width(70.0).hint_text("world"));
+        });
+        ui.label(egui::RichText::new("Decimal degrees, north and east positive. Problems show on the status line.").color(t.text).size(t.header_size * 0.5));
+        ui.add_space(t.main_gap);
+
         heading(ui, "MANUAL TRACKING");
         let preset_az = az.map(|az| geom::az_for_bearing(self.settings.preset_az, az, lim));
         self.track_row(ui, false, id, az, lim, preset_az);
@@ -705,6 +744,8 @@ fn paint_globe(
 /// Globe radius as a share of the dial radius. The 30-degree labels sit at
 /// 0.63 with their inner edge near 0.58, so 0.52 leaves a dark gap.
 const GLOBE: f32 = 0.52;
+/// Map edge as a share of the dial radius: inside the tick ring.
+const MAP_R: f32 = 0.86;
 
 fn dial_radius(rect: egui::Rect) -> f32 {
     (rect.width().min(rect.height()) * 0.5 - 8.0).max(40.0)
@@ -837,6 +878,54 @@ fn paint_dial_top(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn draw_rot(rot: &mut Rotator, w: f32, h: f32) -> egui::FullOutput {
+        let ctx = egui::Context::default();
+        rustcars::install_lcars_font(&ctx);
+        rustcars::apply_theme(&ctx, &LcarsTheme::default());
+        let mut out = egui::FullOutput::default();
+        for _ in 0..2 {
+            out = ctx.run_ui(
+                egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, h))), ..Default::default() },
+                |ui| rot.draw(ui),
+            );
+            out.textures_delta.clear();
+        }
+        out
+    }
+
+    fn map_shapes(out: &egui::FullOutput) -> Vec<(usize, egui::Rect)> {
+        out.shapes.iter().enumerate().filter_map(|(i, c)| match &c.shape {
+            egui::Shape::Path(p) if p.stroke.color == egui::epaint::ColorMode::Solid(map::MAP_COLOR) => Some((i, c.shape.visual_bounding_rect())),
+            _ => None,
+        }).collect()
+    }
+
+    #[test]
+    fn map_draws_faint_behind_the_rose_docked_and_small() {
+        for (w, h) in [(1400.0, 900.0), (500.0, 700.0), (360.0, 300.0)] {
+            let mut rot = Rotator::new();
+            assert!(map_shapes(&draw_rot(&mut rot, w, h)).is_empty(), "map off by default");
+            rot.settings.map = map::MapSettings { show: true, lat: "39.77".into(), lon: "-86.16".into(), ..Default::default() };
+            let out = draw_rot(&mut rot, w, h);
+            let lines = map_shapes(&out);
+            assert!(lines.len() > 20, "coastlines drawn at {w}x{h}");
+            let first_amber = out.shapes.iter().position(|c| matches!(&c.shape, egui::Shape::LineSegment { stroke, .. } if stroke.color == AMBER && stroke.width == 2.5)).unwrap();
+            assert!(lines.iter().all(|(i, _)| *i < first_amber), "map under the rose scale");
+            assert!(lines.iter().all(|(_, r)| r.is_finite()));
+            assert!(!rot.status_line().contains("MAP OFF"));
+        }
+    }
+
+    #[test]
+    fn bad_map_input_is_reported_not_silent() {
+        let mut rot = Rotator::new();
+        rot.settings.map = map::MapSettings { show: true, lat: "95".into(), lon: "0".into(), ..Default::default() };
+        let out = draw_rot(&mut rot, 900.0, 700.0);
+        assert!(map_shapes(&out).is_empty());
+        let line = rot.status_line();
+        assert!(line.contains("MAP OFF") && line.contains("latitude"), "{line}");
+    }
 
     #[test]
     fn settings_round_trip_and_bad_json_keeps_defaults() {

@@ -61,3 +61,12 @@ David: Keys and Levels become sections of Config; Rotator leaves Tools and becom
 - **Rotator** is `Page::Rotator` (after Channels in `PAGES`; TG / ID tabs still insert after Channels), detachable, drawn by `Tools::draw_rotator_in` in the shared page frame; its bar asks only for the AZ / EL LEDs (`tools::rotator_bar_width`), no tool tabs. `Screen::Rotator` stays internal; it is not in `SCREENS`.
 - **Migration:** the station file has `page_layout` (`PAGE_LAYOUT` = 2, written always; absent reads 0). Loading a layout-0 file maps `page` Keys / Levels to Config (`migrate_page_name`), drops Keys / Levels from `tabs` and places Rotator after Channels (`migrate_tabs`), and puts a line in the Config note saying so (never silent). An older Commander refuses a layout-2 file (`deny_unknown_fields`); staging builds only.
 - Tests: `config_sections_tests::*`, `page_layout_round_trips_and_defaults_to_zero`.
+
+## Rotator world map (2026-10-30)
+
+David: optional azimuthal-equidistant map behind the Rotator rose.
+- Projection written directly in `tools/rotator/map.rs` (great-circle bearing -> rose angle via `geom::dial_xy`, angular distance -> radius); no projection crate, no native deps. Edge = antipode (π) or a range of 100…20015 km.
+- Data: Natural Earth 1:110m coastline, public domain, as `crates/commander/data/coastline-110m.txt` (header `# hamspot coastline v1`), `include_str!` so the binary is portable (no paths), parsed once (`OnceLock`), re-projected only when centre/range change (`MapCache`). Lines split where they leave the edge or jump > 0.35 disc units (antipode wrap).
+- Setting: `Settings.map` (`MapSettings { version: 1, show: false, lat, lon, range_km }`) inside the existing eframe-storage `rotator_settings` JSON, `serde(default)` so old JSON loads with the map off, and older builds ignore the field. Text is kept as typed; a bad value or data error is appended to the Rotator status line as `MAP OFF: …` (never silent).
+- No station location exists in Commander yet, so there is no default centre; lat/lon must be typed. When a station location is added it should seed blank fields.
+- Tests: `tools::rotator::map::tests::*`, `tools::rotator::tests::map_draws_faint_behind_the_rose_docked_and_small`, `bad_map_input_is_reported_not_silent`.
