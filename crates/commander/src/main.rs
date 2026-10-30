@@ -3284,9 +3284,22 @@ impl eframe::App for App {
                 // of the E-STOP (David, #221): as wide as they need, never more
                 // than the bar has; the rest go into the more-tabs key.
                 let tab_page = matches!(self.page, Page::Tools | Page::Timers) && !page_detached(ui.ctx(), self.page);
+                // The open tool's own header keys (Logbook Today/All, RF Calc
+                // picker, Calc Deg/Rad, Hex Open) sit in the bar between the
+                // tool tabs and E-STOP (David, #221). At most half the bar.
+                let tool_keys_w = if self.page == Page::Tools && tab_page {
+                    let want = self.tools.lock().expect("tools").header_width();
+                    let half = ((ui.available_width() - tools::BAR_TABS_RESERVE - estop_w) * 0.5).max(0.0);
+                    let w = want.min(half);
+                    // Asked even at 0: the tool then draws no header row.
+                    tools::request_bar_keys(ui.ctx(), w, estop_w + tools::BAR_TAB_GAP);
+                    if w > 0.0 { w + tools::BAR_TAB_GAP } else { 0.0 }
+                } else {
+                    0.0
+                };
                 let tabs_w = if tab_page {
                     let labels = if self.page == Page::Tools { tools::Tools::tab_labels() } else { tools::timers::tab_labels() };
-                    let room = (ui.available_width() - tools::BAR_TABS_RESERVE - timers_w - estop_w).max(tools::more_key_w() + 80.0);
+                    let room = (ui.available_width() - tools::BAR_TABS_RESERVE - timers_w - estop_w - tool_keys_w).max(tools::more_key_w() + 80.0);
                     tools::bar_tabs_width(ui, &labels).min(room) + 2.0 * tools::BAR_TAB_GAP
                 } else {
                     0.0
@@ -3302,7 +3315,7 @@ impl eframe::App for App {
                 } else {
                     0.0
                 };
-                let slot_w = Some(in_frame.map(rec_ui::bar_slot_width).unwrap_or(0.0) + timers_w + tabs_w + keys_w + estop_w);
+                let slot_w = Some(in_frame.map(rec_ui::bar_slot_width).unwrap_or(0.0) + timers_w + tabs_w + tool_keys_w + keys_w + estop_w);
                 let (frame_rect, slot) = tools::frame_with_slot(ui, slot_w, |ui| {
                     if page_detached(ui.ctx(), self.page) {
                         page_stub(ui, self.page);
@@ -3349,7 +3362,7 @@ impl eframe::App for App {
                         // [COPY TIME · ID 10:00] [tabs … more] [E-STOP]
                         let tabs_r = egui::Rect::from_min_max(
                             egui::pos2(rec_r.left() + timers_w, rec_r.top()),
-                            egui::pos2(rec_r.right() - tools::BAR_TAB_GAP, rec_r.bottom()),
+                            egui::pos2(rec_r.right() - tools::BAR_TAB_GAP - tool_keys_w, rec_r.bottom()),
                         );
                         let mut t = self.tools.lock().expect("tools");
                         if self.page == Page::Tools {

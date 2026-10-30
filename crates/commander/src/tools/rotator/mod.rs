@@ -13,7 +13,7 @@ mod led;
 use std::sync::Arc;
 
 use geom::{Dir, Limits, Model, Source, Tick, TrackEnd};
-use rustcars::{Cap, LcarsTheme, lcars_button, palette};
+use rustcars::{Cap, LcarsTheme, palette};
 use serde::{Deserialize, Serialize};
 
 use crate::rot::{self, Spin};
@@ -90,6 +90,9 @@ pub struct Rotator {
     el_track: Option<Track>,
     jog: Option<Spin>,
     note: String,
+    /// How many LED readouts (AZ, then EL) the elbow bar showed this frame;
+    /// the rest are drawn on the page.
+    leds_in_bar: u8,
 }
 
 fn hamlib_limits(row: &rot::RotatorRow) -> Option<Limits> {
@@ -106,6 +109,7 @@ impl Rotator {
             el_track: None,
             jog: None,
             note: String::new(),
+            leds_in_bar: 0,
         }
     }
 
@@ -148,37 +152,33 @@ impl Rotator {
             .cloned();
         let (lim, source) =
             geom::effective(row.as_ref().and_then(hamlib_limits), self.settings.model.limits());
+        let az = row.as_ref().and_then(|row| row.azimuth);
+        let el = row.as_ref().and_then(|row| row.elevation);
+        // AZ / EL LEDs ride the elbow bar, each in a recessed bezel, as many
+        // as fit (AZ first); the rest stay on the page (David, #221).
+        let bar_w = super::bar_keys_rect(ui.ctx()).map(|r| r.width());
+        let fit = bar_w.map_or(0, leds_fit);
+        self.leds_in_bar = fit;
         super::screen_header(ui, "rotator_header", &t, |ui| {
             ui.horizontal(|ui| {
-                lcars_button(
-                    ui,
-                    &t,
-                    "Rotator",
-                    palette::TAN,
-                    egui::vec2(120.0, t.bar_thin),
-                    Cap::Left,
-                    true,
-                );
+                super::title_block(ui, &t, "Rotator", palette::TAN, egui::vec2(120.0, t.bar_thin));
+                if fit > 0 {
+                    self.bar_leds(ui, az, el, lim, fit);
+                }
                 // The rotator, model and state are on the Tools status line.
             });
         });
-        let az = row.as_ref().and_then(|row| row.azimuth);
-        let el = row.as_ref().and_then(|row| row.elevation);
         let id = row.as_ref().filter(|row| row.port.is_some()).map(|row| row.id);
         self.step_track(ui, id, az, el, lim);
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(t.bg))
             .show(ui, |ui| {
                 let full = ui.available_rect_before_wrap();
-                let panel_w = 320.0_f32.min(full.width() * 0.45);
-                let dial_rect = egui::Rect::from_min_max(
-                    full.min,
-                    egui::pos2(full.right() - panel_w - t.main_gap, full.bottom()),
-                );
-                let panel = egui::Rect::from_min_max(
-                    egui::pos2(full.right() - panel_w, full.top()),
-                    full.max,
-                );
+                // The dial is the main feature: beside the controls when the
+                // area is wide enough, otherwise on top with the controls as
+                // a block below it (David, #221).
+                let (dial_rect, panel) = rotator_layout(full, t.main_gap);
+                ui.allocate_rect(full, egui::Sense::hover());
                 let s = &self.settings;
                 let preset_az = az.map(|az| geom::az_for_bearing(s.preset_az, az, lim));
                 paint_dial(ui.painter(), dial_rect);
@@ -191,6 +191,11 @@ impl Rotator {
                     });
                 });
             });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn layout_for(full: egui::Rect) -> (egui::Rect, egui::Rect) {
+        rotator_layout(full, rustcars::LcarsTheme::default().main_gap)
     }
 
     fn step_track(
@@ -353,7 +358,7 @@ impl Rotator {
             ui.label(egui::RichText::new(text).color(AMBER).size(t.header_size * 0.6));
         };
 
-        self.readouts(ui, az, el, lim);
+        self.readouts(ui, az, el, lim, self.leds_in_bar);
         ui.checkbox(&mut self.settings.show_travel, "AZ shows travel past 360 (off: bearing + OVL)");
         if let Some(az) = az {
             if geom::out_of_range(az, lim) {
@@ -542,7 +547,7 @@ impl Rotator {
     /// Red LED readouts. AZ shows travel past 360 or the bearing (checkbox),
     /// with OVL in the overlap. EL shows up to 180.0, and FLIP past 90 with the
     /// equivalent az/el.
-    fn readouts(&self, ui: &mut egui::Ui, az: Option<f64>, el: Option<f64>, lim: Limits) {
+    fn readouts(&self, ui: &mut egui::Ui, az: Option<f64>, el: Option<f64>, lim: Limits, in_bar: u8) {
         let t = self.theme;
         let show_travel = self.settings.show_travel;
         let overlap = az.is_some_and(|az| geom::in_overlap(az, lim));
@@ -552,10 +557,16 @@ impl Rotator {
         let digit_h = 34.0;
         let small = egui::FontId::proportional(11.0);
         let dim = egui::Color32::from_rgb(0x90, 0x30, 0x28);
-        for (name, text, cells, flag_on, flag) in [
+        for (k, (name, text, cells, flag_on, flag)) in [
             ("AZ", az_text, 4.0, overlap, "OVL"),
             ("EL", el_text, 4.0, flipped, "FLIP"),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if (k as u8) < in_bar {
+                continue; // shown in the elbow bar
+            }
             let width = 250.0_f32.min(ui.available_width());
             let (rect, _) = ui.allocate_exact_size(egui::vec2(width, digit_h + 6.0), egui::Sense::hover());
             let painter = ui.painter();
@@ -610,6 +621,72 @@ impl Rotator {
                 .color(t.text)
                 .size(12.0),
             );
+        }
+    }
+}
+
+/// Width of one LED readout in the elbow bar.
+pub const BAR_LED_W: f32 = 150.0;
+
+/// How many bar LED readouts (0, 1 = AZ, 2 = AZ + EL) fit in `w`.
+pub fn leds_fit(w: f32) -> u8 {
+    let g = super::BAR_TAB_GAP;
+    if w + 0.5 >= 2.0 * BAR_LED_W + g {
+        2
+    } else if w + 0.5 >= BAR_LED_W {
+        1
+    } else {
+        0
+    }
+}
+
+/// A recessed LCD bezel cut into the bar (Commander's LCD panel colours):
+/// dark rim, darker glass, a shadow line along the top and left inner edge
+/// and a faint light line along the bottom and right. Square, as every
+/// bar element (rustcars P1c).
+fn paint_inset(painter: &egui::Painter, rect: egui::Rect) -> egui::Rect {
+    painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(42, 42, 46));
+    let glass = rect.shrink(3.0);
+    painter.rect_filled(glass, 0.0, egui::Color32::from_rgb(8, 8, 6));
+    let shadow = egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 0, 0));
+    painter.line_segment([glass.left_top(), glass.right_top()], shadow);
+    painter.line_segment([glass.left_top(), glass.left_bottom()], shadow);
+    let light = egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 70, 76));
+    painter.line_segment([glass.left_bottom(), glass.right_bottom()], light);
+    painter.line_segment([glass.right_top(), glass.right_bottom()], light);
+    glass
+}
+
+impl Rotator {
+    /// The AZ (and EL) LEDs at the bar height, each in an inset bezel. Same
+    /// text and flags as on the page (OVL, FLIP).
+    fn bar_leds(&self, ui: &mut egui::Ui, az: Option<f64>, el: Option<f64>, lim: Limits, n: u8) {
+        let t = self.theme;
+        let show_travel = self.settings.show_travel;
+        let overlap = az.is_some_and(|az| geom::in_overlap(az, lim));
+        let az_text = led::format_az(az.map(|az| geom::display_az(az, lim, show_travel)), !show_travel);
+        let el_text = led::format_el(el);
+        let flipped = el.is_some_and(led::el_flipped);
+        let items = [("AZ", az_text, overlap, "OVL"), ("EL", el_text, flipped, "FLIP")];
+        for (name, text, flag_on, flag) in items.into_iter().take(n as usize) {
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(BAR_LED_W, t.bar_thin), egui::Sense::hover());
+            let painter = ui.painter();
+            let glass = paint_inset(painter, rect);
+            painter.text(glass.left_center() + egui::vec2(6.0, 0.0), egui::Align2::LEFT_CENTER, name, egui::FontId::proportional(13.0), AMBER);
+            let digit_h = glass.height() - 6.0;
+            let led_w = digit_h * 0.62 * 4.0 + 10.0;
+            let led_rect = egui::Rect::from_min_size(glass.left_top() + egui::vec2(26.0, 3.0), egui::vec2(led_w.min(glass.width() - 60.0), digit_h));
+            led::paint(painter, led_rect, &text, led::LIT);
+            painter.text(
+                egui::pos2(glass.right() - 4.0, glass.center().y),
+                egui::Align2::RIGHT_CENTER,
+                flag,
+                egui::FontId::proportional(10.0),
+                if flag_on { led::LIT } else { led::GHOST },
+            );
+            let state = if flag_on { format!(" {flag}") } else { String::new() };
+            let l = format!("{name} {}{state}", text.trim());
+            resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &l));
         }
     }
 }
@@ -790,4 +867,27 @@ mod tests {
         assert_eq!(label_area(rect, Cap::Left).left(), 30.0);
         assert_eq!(label_area(rect, Cap::Right).right(), 90.0);
     }
+}
+
+
+/// Width of the controls block beside the dial.
+const PANEL_W: f32 = 320.0;
+/// Smallest dial worth putting beside the controls.
+const SIDE_DIAL_MIN: f32 = 320.0;
+
+/// `(dial, controls)` for the rotator area `full`: side by side when the
+/// dial still gets `SIDE_DIAL_MIN` beside a `PANEL_W` block, else the dial
+/// on top (from the width, at most 60% of the height, at least 160 px) and
+/// the controls below it.
+fn rotator_layout(full: egui::Rect, gap: f32) -> (egui::Rect, egui::Rect) {
+    let side = full.width() - PANEL_W - gap;
+    if side >= SIDE_DIAL_MIN {
+        let dial = egui::Rect::from_min_max(full.min, egui::pos2(full.left() + side, full.bottom()));
+        let panel = egui::Rect::from_min_max(egui::pos2(full.right() - PANEL_W, full.top()), full.max);
+        return (dial, panel);
+    }
+    let h = full.width().min(full.height() * 0.6).max(160.0_f32.min(full.height()));
+    let dial = egui::Rect::from_min_size(full.min, egui::vec2(full.width(), h));
+    let panel = egui::Rect::from_min_max(egui::pos2(full.left(), (dial.bottom() + gap).min(full.bottom())), full.max);
+    (dial, panel)
 }

@@ -37,7 +37,10 @@ pub enum Tool {
     Bands,
 }
 
-const TOOLS: [(Tool, &str, &str); 10] = [
+/// How many calculators the picker has.
+pub const TOOL_COUNT: usize = 10;
+
+const TOOLS: [(Tool, &str, &str); TOOL_COUNT] = [
     (Tool::Wave, "Wave", "FREQUENCY AND WAVELENGTH"),
     (Tool::Antenna, "Antenna", "ANTENNA ELEMENT LENGTHS"),
     (Tool::Coax, "Coax", "COAX LOSS (APPROXIMATE)"),
@@ -338,7 +341,7 @@ impl HamRf {
             .frame(egui::Frame::new().fill(t.bg))
             .show(ui, |ui| {
                 let full = ui.available_rect_before_wrap();
-                let split = full.left() + 360.0;
+                let split = full.left() + 360.0_f32.min(full.width() * 0.55); // narrow windows: both panels stay usable
                 let left = egui::Rect::from_min_max(full.min, egui::pos2(split, full.bottom()));
                 let right =
                     egui::Rect::from_min_max(egui::pos2(split + t.main_gap, full.top()), full.max);
@@ -347,12 +350,15 @@ impl HamRf {
                     f.top_color = palette::TAN;
                     f.bottom_color = palette::TEAL;
                     f.min_height = left.height();
-                    f.show(ui, &t, |ui| self.shared_panel(ui));
+                    f.show(ui, &t, |ui| {
+                        egui::ScrollArea::both().id_salt("rf-left").auto_shrink([false, false]).show(ui, |ui| self.shared_panel(ui));
+                    });
                 });
                 ui.scope_builder(egui::UiBuilder::new().max_rect(right), |ui| {
                     // No right-hand elbow (as NanoVNA): the panel uses the whole rect.
                     ui.set_min_height(right.height());
                     (|ui: &mut egui::Ui| {
+                        egui::ScrollArea::both().id_salt("rf-right").auto_shrink([false, false]).show(ui, |ui| {
                         let title = TOOLS.iter().find(|x| x.0 == self.tool).unwrap().2;
                         heading(ui, &t, title);
                         if self.status != "READY" && !self.status.is_empty() {
@@ -373,6 +379,7 @@ impl HamRf {
                                 Tool::Path => self.tool_path(ui),
                                 Tool::Bands => self.tool_bands(ui),
                             });
+                        });
                     })(ui);
                 });
             });

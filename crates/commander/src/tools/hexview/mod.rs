@@ -146,7 +146,7 @@ impl HexView {
             .frame(egui::Frame::new().fill(t.bg))
             .show(ui, |ui| {
                 let full = ui.available_rect_before_wrap();
-                let split = full.left() + 830.0;
+                let split = full.left() + 830.0_f32.min(full.width() * 0.55); // narrow windows: both panels stay usable
                 let left = egui::Rect::from_min_max(full.min, egui::pos2(split, full.bottom()));
                 let right =
                     egui::Rect::from_min_max(egui::pos2(split + t.main_gap, full.top()), full.max);

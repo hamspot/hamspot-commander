@@ -346,7 +346,7 @@ impl Calc {
             .frame(egui::Frame::new().fill(t.bg))
             .show(ui, |ui| {
                 let full = ui.available_rect_before_wrap();
-                let split = full.left() + 590.0;
+                let split = full.left() + 590.0_f32.min(full.width() * 0.55); // narrow windows: both panels stay usable
                 let left = egui::Rect::from_min_max(full.min, egui::pos2(split, full.bottom()));
                 let right =
                     egui::Rect::from_min_max(egui::pos2(split + t.main_gap, full.top()), full.max);
@@ -354,6 +354,8 @@ impl Calc {
                     let mut f = LcarsFrame::new(&t, Side::Left, 0.6);
                     f.min_height = left.height();
                     f.show(ui, &t, |ui| {
+                        // Scrolls in a small window instead of being cut off.
+                        egui::ScrollArea::both().id_salt("calc-left").auto_shrink([false, false]).show(ui, |ui| {
                         ui.label(egui::RichText::new("EXPRESSION").size(t.header_size));
                         let shown = if self.input.is_empty() {
                             "_".to_owned()
@@ -378,17 +380,20 @@ impl Calc {
                             .size(t.data_size),
                         );
                         self.keypad(ui);
+                        });
                     });
                 });
                 ui.scope_builder(egui::UiBuilder::new().max_rect(right), |ui| {
                     // No right-hand elbow (as NanoVNA): the panel uses the whole rect.
                     ui.set_min_height(right.height());
                     (|ui: &mut egui::Ui| {
+                        egui::ScrollArea::vertical().id_salt("calc-right").auto_shrink([false, false]).show(ui, |ui| {
                         ui.label(egui::RichText::new("GRAPH  Y = F(X)").size(t.header_size));
                         let w = ui.available_width();
                         self.graph_ui(ui, egui::vec2(w, 300.0));
                         ui.label(egui::RichText::new("HISTORY").size(t.header_size));
                         self.history_ui(ui);
+                        });
                     })(ui);
                 });
             });

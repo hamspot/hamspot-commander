@@ -183,7 +183,14 @@ impl Tools {
         // Every other tool: the screen fills the frame, and one status strip
         // in NanoVNA's style sits at the bottom, always in the same place
         // (David, #221): hints, notes and warnings as plain text.
-        let full = ui.available_rect_before_wrap();
+        // In a detached window the page sits in a scroll area, whose height
+        // is unbounded: bound it by what is visible, or the strip and any
+        // screen sized from the height (the rotator dial) land far below.
+        let mut full = ui.available_rect_before_wrap();
+        let vis = ui.clip_rect();
+        if !full.bottom().is_finite() || full.bottom() > vis.bottom() {
+            full.max.y = vis.bottom().max(full.top() + 120.0);
+        }
         let strip = egui::Rect::from_min_max(egui::pos2(full.left(), full.bottom() - crate::status_note::STRIP_H), full.max);
         let body = egui::Rect::from_min_max(full.min, egui::pos2(full.right(), strip.top() - self.theme.frame_gap));
         crate::status_note::clear(ui.ctx());
@@ -195,6 +202,19 @@ impl Tools {
         let base = self.status_line();
         crate::status_note::paint_strip(ui, strip, &base);
         ui.allocate_rect(full, egui::Sense::hover());
+    }
+
+    /// Width the open tool's header keys want in the elbow bar.
+    pub fn header_width(&self) -> f32 {
+        let g = BAR_TAB_GAP;
+        match self.screen {
+            Screen::Log => 90.0 * 2.0 + g,
+            Screen::HamRf => ham_rf::TOOL_COUNT as f32 * (96.0 + g) - g,
+            Screen::Calculator => 90.0,
+            Screen::Hex => 96.0,
+            Screen::Rotator => 2.0 * rotator::BAR_LED_W + g,
+            _ => 0.0,
+        }
     }
 
     pub fn tab_labels() -> Vec<String> {
@@ -220,16 +240,15 @@ impl Tools {
             }
             Screen::Calculator => {
                 let angle = self.calc.angle_label();
-                let res = match &self.calc.result {
-                    Ok(v) => format!("ANS {v}"),
-                    Err(e) => format!("ERROR {e}"),
-                };
-                format!("CALC {angle}   {res}   HISTORY {}", self.calc.history.len())
+                // The answer is on the calculator's own display; only an
+                // error is repeated here, in words.
+                match &self.calc.result {
+                    Ok(_) => format!("CALC {angle}   HISTORY {}", self.calc.history.len()),
+                    Err(e) => format!("CALC {angle}   ERROR {e}   HISTORY {}", self.calc.history.len()),
+                }
             }
-            Screen::Smith => format!(
-                "SMITH Z = {} + j{} Ω   Z0 {} Ω   F {} MHz",
-                or_dash(&self.smith.r), or_dash(&self.smith.x), or_dash(&self.smith.z0), or_dash(&self.smith.f)
-            ),
+            // R, X, Z0 and F are in the Smith fields on screen.
+            Screen::Smith => "SMITH CHART".to_owned(),
             Screen::Hex => {
                 let mut l = if self.hex.data.is_empty() {
                     "HEX NO FILE: OPEN ONE WITH OPEN".to_owned()
@@ -333,11 +352,40 @@ pub(crate) fn screen_header(
     theme: &LcarsTheme,
     add: impl FnOnce(&mut egui::Ui),
 ) {
+    // In the main window the tool's header keys go into the page's elbow
+    // bar, between the tool tabs and E-STOP (David, #221), as square bar
+    // keys; too many scroll sideways there. The name block is left out (the
+    // open tab names the tool). A detached Tools window keeps the row.
+    if let Some(rect) = bar_keys_rect(ui.ctx()) {
+        let layer = egui::LayerId::new(egui::Order::Middle, egui::Id::new(("tool-bar-keys", id)));
+        let flag = in_bar_id(layer);
+        ui.ctx().data_mut(|d| d.insert_temp(flag, true));
+        let mut row = ui.new_child(egui::UiBuilder::new().layer_id(layer).max_rect(rect).id_salt(("tool-bar-keys", id)));
+        row.set_clip_rect(rect);
+        egui::ScrollArea::horizontal()
+            .id_salt(("tool-bar-keys-scroll", id))
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+            .auto_shrink([false, false])
+            .show(&mut row, |ui| {
+                ui.spacing_mut().item_spacing.x = BAR_TAB_GAP;
+                add(ui);
+            });
+        return;
+    }
     egui::Panel::top(id)
         .exact_size(tab_row_height(theme))
         .show_separator_line(false)
         .frame(tab_row(theme.bg))
         .show(ui, add);
+}
+
+fn in_bar_id(layer: egui::LayerId) -> egui::Id {
+    egui::Id::NULL.with(("tool-keys-in-bar", layer))
+}
+
+/// True while drawing a tool's header keys in the elbow bar.
+pub(crate) fn in_bar(ui: &egui::Ui) -> bool {
+    ui.data(|d| d.get_temp::<bool>(in_bar_id(ui.layer_id()))).unwrap_or(false)
 }
 
 /// Name block at the left of a screen's header: the same tan cap as a tab,
@@ -349,6 +397,9 @@ pub(crate) fn title_block(
     base: egui::Color32,
     size: egui::Vec2,
 ) {
+    if in_bar(ui) {
+        return; // the open tab already names the tool
+    }
     let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
     let painter = ui.painter();
     painter.rect_filled(rect, rustcars::cap_radius(Cap::Left, rect.height()), base);
@@ -1149,11 +1200,15 @@ mod page_frame_tests {
                 },
                 |ui| {
                     let estop_w = crate::estop::button_width(ui, false) + 16.0;
-                    let room = (ui.available_width() - BAR_TABS_RESERVE - estop_w).max(more_key_w() + 80.0);
+                    let half = ((ui.available_width() - BAR_TABS_RESERVE - estop_w) * 0.5).max(0.0);
+                    let kw = tools.header_width().min(half);
+                    request_bar_keys(ui.ctx(), kw, estop_w + BAR_TAB_GAP);
+                    let keys_w = if kw > 0.0 { kw + BAR_TAB_GAP } else { 0.0 };
+                    let room = (ui.available_width() - BAR_TABS_RESERVE - estop_w - keys_w).max(more_key_w() + 80.0);
                     let tabs_w = bar_tabs_width(ui, &Tools::tab_labels()).min(room) + 2.0 * BAR_TAB_GAP;
-                    let (f, slot) = frame_with_slot(ui, Some(tabs_w + estop_w), |ui| tools.draw_in(ui));
+                    let (f, slot) = frame_with_slot(ui, Some(tabs_w + keys_w + estop_w), |ui| tools.draw_in(ui));
                     let r = slot.expect("slot");
-                    tabs_r = egui::Rect::from_min_max(r.min, egui::pos2(r.right() - estop_w - BAR_TAB_GAP, r.bottom()));
+                    tabs_r = egui::Rect::from_min_max(r.min, egui::pos2(r.right() - estop_w - BAR_TAB_GAP - keys_w, r.bottom()));
                     stop_r = egui::Rect::from_min_max(egui::pos2(r.right() - estop_w, r.top()), r.max);
                     tools.bar_tabs(ui, tabs_r);
                     frame = f;
@@ -1182,14 +1237,21 @@ mod page_frame_tests {
                 assert!(tabs_r.right() <= stop_r.left(), "tabs end left of the E-STOP");
                 let in_bar: Vec<_> = t.iter().filter(|(_, r)| r.top() < frame.top() + th.bar_thin).collect();
                 for (s, r) in &in_bar {
-                    assert!(tabs_r.expand(1.0).contains_rect(*r), "{label} at {w}: {s:?} {r:?} in the bar outside the tab gap {tabs_r:?}");
+                    // Tool keys (and Rotator LEDs) sit in their own rect
+                    // between the tabs and the E-STOP.
+                    let keys = bar_keys_rect(&ctx).unwrap_or(egui::Rect::NOTHING);
+                    assert!(keys.right() <= stop_r.left() + 0.5, "keys left of the E-STOP");
+                    assert!(
+                        tabs_r.expand(1.0).contains_rect(*r) || keys.expand(1.0).contains_rect(*r),
+                        "{label} at {w}: {s:?} {r:?} in the bar outside the tab gap {tabs_r:?} and keys {keys:?}"
+                    );
                 }
                 assert!(in_bar.iter().any(|(s, _)| s.eq_ignore_ascii_case(label)), "{label} at {w}: open tab shown in the bar");
-                if w >= 1400.0 {
+                if w >= 1400.0 && tools.header_width() == 0.0 {
                     for (_, l) in SCREENS {
                         assert!(in_bar.iter().any(|(s, _)| s.eq_ignore_ascii_case(l)), "tab {l} in the bar at {w}");
                     }
-                } else {
+                } else if w < 1400.0 {
                     assert!(SCREENS.iter().any(|(_, l)| !in_bar.iter().any(|(s, _)| s.eq_ignore_ascii_case(l))), "narrow: some tabs hidden");
                 }
                 // Below the bar: the page content, inside the frame.
@@ -1217,6 +1279,89 @@ mod page_frame_tests {
             }
         }
         tools.conceal_nanovna();
+    }
+
+    /// A detached Tools window puts the page in a vertical scroll area
+    /// (unbounded height). Every screen, the rotator dial included, still
+    /// draws inside the visible window, and the status strip is visible.
+    /// Real fonts/theme, window sizes 720x480 and 1200x800.
+    #[test]
+    fn detached_window_screens_draw_in_view() {
+        let ctx = egui::Context::default();
+        let mut tools = Tools::new(&ctx);
+        for size in [egui::vec2(720.0, 480.0), egui::vec2(1200.0, 800.0), egui::vec2(500.0, 700.0)] {
+            for (screen, label) in SCREENS {
+                tools.screen = screen;
+                let mut out = egui::FullOutput::default();
+                for _ in 0..3 {
+                    out = ctx.run_ui(
+                        egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), ..Default::default() },
+                        |ui| {
+                            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| tools.window_body(ui));
+                        },
+                    );
+                    out.textures_delta.clear();
+                }
+                let view = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+                let painted: Vec<egui::Rect> = out.shapes.iter().filter_map(|c| {
+                    let r = c.shape.visual_bounding_rect().intersect(c.clip_rect);
+                    r.is_positive().then_some(r)
+                }).collect();
+                assert!(!painted.is_empty(), "{label} at {size:?}: nothing drawn");
+                if screen == Screen::Rotator {
+                    // The dial: large shapes in the visible window.
+                    let big = painted.iter().filter(|r| view.contains_rect(**r) && r.width() > size.x.min(size.y) * 0.3).count();
+                    assert!(big > 0, "{label} at {size:?}: no dial in view");
+                }
+                if screen != Screen::NanoVna {
+                    let strip = out.shapes.iter().any(|c| matches!(&c.shape, egui::Shape::Rect(r)
+                        if r.fill == rustcars::palette::STRIP && view.contains_rect(r.rect) && (r.rect.height() - crate::status_note::STRIP_H).abs() < 0.5));
+                    assert!(strip, "{label} at {size:?}: status strip not in view");
+                }
+            }
+        }
+        tools.conceal_nanovna();
+    }
+
+    /// Rotator LEDs in the elbow bar: at the bar height, inside the bar gap
+    /// left of E-STOP, both when wide, AZ only or none (then on the page)
+    /// when the bar is short. Real fonts/theme, through the main layout.
+    #[test]
+    fn rotator_leds_sit_in_the_bar() {
+        assert_eq!(rotator::leds_fit(2.0 * rotator::BAR_LED_W + BAR_TAB_GAP), 2);
+        assert_eq!(rotator::leds_fit(rotator::BAR_LED_W + 10.0), 1);
+        assert_eq!(rotator::leds_fit(60.0), 0);
+        let ctx = egui::Context::default();
+        let mut tools = Tools::new(&ctx);
+        tools.screen = Screen::Rotator;
+        let th = LcarsTheme::default();
+        let (out, frame, _, stop_r) = tools_frame(&ctx, &mut tools, 1600.0);
+        let glass = egui::Color32::from_rgb(8, 8, 6);
+        let insets: Vec<egui::Rect> = out.shapes.iter().filter_map(|c| match &c.shape {
+            egui::Shape::Rect(r) if r.fill == glass && r.rect.top() < frame.top() + th.bar_thin => Some(r.rect),
+            _ => None,
+        }).collect();
+        assert_eq!(insets.len(), 2, "AZ and EL in the bar at 1600: {insets:?}");
+        for r in &insets {
+            assert!(r.bottom() <= frame.top() + th.bar_thin + 0.5 && r.right() <= stop_r.left(), "{r:?}");
+            assert!(r.height() >= th.bar_thin - 8.0, "bar height");
+        }
+        tools.conceal_nanovna();
+    }
+
+    /// Rotator: the dial beside the controls when wide, on top with the
+    /// controls below when narrow; the dial is never squeezed away.
+    #[test]
+    fn rotator_dial_beside_when_wide_and_on_top_when_narrow() {
+        let wide = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 700.0));
+        let (d, p) = rotator::Rotator::layout_for(wide);
+        assert!(p.left() > d.right() && d.width() >= 320.0 && d.height() == 700.0);
+        for w in [600.0, 420.0] {
+            let narrow = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, 700.0));
+            let (d, p) = rotator::Rotator::layout_for(narrow);
+            assert!(p.top() >= d.bottom() && d.width() == w && d.height() >= 160.0, "{w}: {d:?} {p:?}");
+            assert!(p.height() > 100.0, "controls get room below");
+        }
     }
 
     /// Every tool screen (real fonts/theme): no right-hand elbow (no PLUM
@@ -1289,7 +1434,7 @@ mod page_frame_tests {
             (Screen::NanoVna, "NANOVNA NOT CONNECTED"),
             (Screen::HamRf, "RF CALC"),
             (Screen::Calculator, "CALC RAD"),
-            (Screen::Smith, "SMITH Z ="),
+            (Screen::Smith, "SMITH CHART"),
             (Screen::Hex, "HEX"),
             (Screen::Log, "NO LOG OPEN"),
             (Screen::Rotator, "NO ROTATOR"),
