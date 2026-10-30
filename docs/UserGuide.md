@@ -210,7 +210,7 @@ A frequency the radio refuses doesn't move the readout.
 
 ## 4.4 E-STOP
 
-The red **E-STOP** button with a black stop-sign octagon sits at the right end of the tan top bar of every main page (Tune, Plan, Channels, Talkgroups, Radio IDs, Keys, Meters, Levels, REC and Config). It is also at the right end of the Tools tab row when Rotator or NanoVNA is open (in the torn-off Tools window too), and in the bar of the Config groups Radio, Rotator, Amplifier, Automation patch and RF patch. Every copy is the same switch.
+The red **E-STOP** button with a black stop-sign octagon sits at the right end of the tan top bar of every main page (Tune, Plan, Channels, Talkgroups, Radio IDs, Keys, Meters, Levels, Timers, REC, Tools and Config); on Tools it is there for every tool screen, and in the torn-off Tools window it sits at the right of the top row. It is also and in the bar of the Config groups Radio, Rotator, Amplifier, Automation patch and RF patch. Every copy is the same switch.
 
 Press it and it latches. Every copy then reads **E-STOP ENGAGED**, and Commander:
 
@@ -809,7 +809,7 @@ Any box with coax jacks on the RF patch can be measured with the NanoVNA, and ev
 
 # 12. Tools
 
-The Tools page has seven screens: **NanoVNA**, **RF Calc**, **Calc**, **Smith**, **Hex**, **Logbook** and **Rotator**. One is shown at a time. Tear them off into their own window with the square at the right of the tab row.
+The Tools page has seven screens: **NanoVNA**, **RF Calc**, **Calc**, **Smith**, **Hex**, **Logbook** and **Rotator**. One is shown at a time. The page is laid out like REC: the tools are sub-tabs under the page bar (extra tabs move into the three-dot more-tabs button when the window is narrow), a status line under the tabs sums up the open tool (NanoVNA connection and sweep, the RF calculator in use, the calculator's angle mode and answer, the Smith chart impedance, the open hex file, the open logbook and its filter, the selected rotator and its bearing), and the tool screen fills the rest of the frame. E-STOP and RELEASE sit in the page bar like every page. Tear the tools off into their own window with the square at the right of the page row.
 
 ## 12.1 NanoVNA
 

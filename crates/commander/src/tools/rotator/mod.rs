@@ -125,6 +125,19 @@ impl Rotator {
         }
     }
 
+    /// One status line for the Tools page: the selected rotator and its state.
+    pub fn status_line(&self) -> String {
+        let rows = self.hub.as_ref().map(|hub| hub.view().rows).unwrap_or_default();
+        match rows.iter().find(|row| row.selected).or_else(|| rows.first()) {
+            Some(row) => {
+                let az = row.azimuth.map(|a| format!("   AZ {a:.0}°")).unwrap_or_default();
+                let el = row.elevation.map(|e| format!("   EL {e:.0}°")).unwrap_or_default();
+                format!("ROTATOR {}  {}  {}{az}{el}", row.spec.name, row.model_label, row.status)
+            }
+            None => "NO ROTATOR: ADD ONE IN CONFIG AUTOMATION (DUMMY IS MODEL 1)".to_owned(),
+        }
+    }
+
     pub fn draw(&mut self, ui: &mut egui::Ui) {
         let t = self.theme;
         let rows = self.hub.as_ref().map(|hub| hub.view().rows).unwrap_or_default();

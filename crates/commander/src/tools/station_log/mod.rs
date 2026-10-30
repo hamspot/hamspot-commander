@@ -329,6 +329,32 @@ impl StationLog {
         }
     }
 
+    /// One status line for the Tools page: which log is open, the filter, the last note.
+    pub fn status_line(&self) -> String {
+        let mut line = match (&self.open_path, &self.diary) {
+            (Some(p), Some(d)) => {
+                let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let mut l = format!("LOG {name}");
+                if !d.date.is_empty() {
+                    l.push_str(&format!("   DATE {}", d.date));
+                }
+                if !d.search.is_empty() {
+                    l.push_str(&format!("   SEARCH \"{}\"", d.search));
+                }
+                if !d.status.is_empty() {
+                    l.push_str(&format!("   {}", d.status));
+                }
+                l
+            }
+            _ => "NO LOG OPEN: SAVE THE STATION FILE TO START ITS LOGBOOK".to_owned(),
+        };
+        if !self.note.is_empty() {
+            line.push_str("   ");
+            line.push_str(&self.note);
+        }
+        line
+    }
+
     pub fn set_dial(&mut self, hz: f64, mode: &str, radio: &str) {
         self.dial_hz = hz;
         self.dial_mode = mode.to_string();

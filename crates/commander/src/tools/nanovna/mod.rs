@@ -990,6 +990,20 @@ impl NanoVna {
         self.archive_dirty = true;
     }
 
+    /// One status line for the Tools page (the full status bar stays under the graph).
+    pub fn status_line(&self) -> String {
+        let live = self.session.snapshot();
+        let state = if live.connected {
+            format!("CONNECTED {}", self.face.port)
+        } else if live.lost {
+            "DISCONNECTED (LOST)".to_owned()
+        } else {
+            "NOT CONNECTED".to_owned()
+        };
+        let run = if self.run && live.connected { "   SWEEPING" } else { "" };
+        format!("NANOVNA {state}{run}   {}", live.status)
+    }
+
     pub fn draw(&mut self, ui: &mut Ui) {
         let theme = LcarsTheme::default();
         let live = self.session.snapshot();

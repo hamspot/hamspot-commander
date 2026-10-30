@@ -147,25 +147,97 @@ impl Tools {
     /// `in_window` is the torn-off viewport. Closing that window docks the
     /// tools. The main window's tab row owns the tear-off square.
     ///
-    /// Panels are added before any other widget. egui ignores a panel that
-    /// follows ordinary content in the same ui.
+    /// The torn-off Tools window: E-STOP / RELEASE at the right of the top
+    /// row (as in the page-bar slot), then the same body as the page.
     pub fn ui(&mut self, ui: &mut egui::Ui, in_window: bool) {
         if in_window && ui.input(|input| input.viewport().close_requested()) {
             self.dock = true;
             self.detached = false;
         }
-        egui::Panel::top("tool_nav")
-            .show_separator_line(false)
-            .frame(tab_row(self.theme.bg))
-            .show(ui, |ui| {
-                self.nav(ui);
-            });
         if in_window {
             self.remember_window(ui);
             // The torn-off window has its own keyboard focus.
             self.estop_chord.poll(ui.ctx());
+            let h = self.theme.bar_thin;
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), h),
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    crate::estop::button(ui);
+                },
+            );
+            ui.add_space(self.theme.frame_gap);
         }
-        self.screen(ui);
+        self.draw_in(ui);
+    }
+
+    /// The Tools page body inside the shared page frame, REC style: the
+    /// tool sub-tabs (more-tabs overflow), one status line for the open
+    /// tool, then the tool screen in the remaining area. The tool screens
+    /// add their panels inside `ui`, so they stay within the frame.
+    pub fn draw_in(&mut self, ui: &mut egui::Ui) {
+        let labels: Vec<String> = SCREENS.iter().map(|(_, l)| (*l).to_owned()).collect();
+        let sel = SCREENS.iter().position(|(s, _)| *s == self.screen);
+        let picked = overflow_tab_row(
+            ui,
+            "tool-tabs",
+            &labels,
+            sel,
+            |ui, i| crate::folder_tab_width(ui, &labels[i], false),
+            |ui, i, lead| crate::folder_tab(ui, Some(i) == sel, i, &labels[i], lead),
+        );
+        if let Some(i) = picked {
+            self.screen = SCREENS[i].0;
+        }
+        ui.add_space(4.0);
+        ui.label(self.status_line());
+        ui.add_space(self.theme.frame_gap);
+        let rect = ui.available_rect_before_wrap();
+        ui.scope_builder(egui::UiBuilder::new().max_rect(rect).id_salt("tool-screen"), |ui| {
+            self.screen(ui);
+        });
+    }
+
+    /// One status line per tool, under the sub-tabs. Plain text.
+    pub fn status_line(&self) -> String {
+        let mut line = match self.screen {
+            Screen::NanoVna => self.nanovna.status_line(),
+            Screen::HamRf => {
+                let name = self.ham.tool_name().to_uppercase();
+                if self.ham.status.is_empty() { format!("RF CALC {name}") } else { format!("RF CALC {name}   {}", self.ham.status) }
+            }
+            Screen::Calculator => {
+                let angle = self.calc.angle_label();
+                let res = match &self.calc.result {
+                    Ok(v) => format!("ANS {v}"),
+                    Err(e) => format!("ERROR {e}"),
+                };
+                format!("CALC {angle}   {res}   HISTORY {}", self.calc.history.len())
+            }
+            Screen::Smith => format!(
+                "SMITH Z = {} + j{} Ω   Z0 {} Ω   F {} MHz",
+                or_dash(&self.smith.r), or_dash(&self.smith.x), or_dash(&self.smith.z0), or_dash(&self.smith.f)
+            ),
+            Screen::Hex => {
+                let mut l = if self.hex.data.is_empty() {
+                    "HEX NO FILE: OPEN ONE WITH OPEN".to_owned()
+                } else {
+                    format!("HEX {}   {} BYTES{}", self.hex.name, self.hex.data.len(), if self.hex.truncated { " (TRUNCATED)" } else { "" })
+                };
+                if !self.hex.status.is_empty() {
+                    l.push_str("   ");
+                    l.push_str(&self.hex.status);
+                }
+                l
+            }
+            Screen::Log => self.log.status_line(),
+            Screen::Rotator => self.rotator.status_line(),
+        };
+        if !self.open_note.is_empty() {
+            line.push_str("   ");
+            line.push_str(&self.open_note);
+        }
+        line
     }
 
     /// Station clocks and timers. The Timers page draws them inside the
@@ -192,56 +264,6 @@ impl Tools {
             if size.x >= 64.0 && size.y >= 64.0 {
                 self.saved_size = Some(size);
             }
-        }
-    }
-
-    fn nav(&mut self, ui: &mut egui::Ui) {
-        let theme = self.theme;
-        // Rotator: the E-STOP sits at the right end of this row (issue #198).
-        // Hardware screens (Rotator moves a motor, NanoVNA emits RF stimulus)
-        // carry the E-STOP at the right end of this row (issue #198).
-        let estop = matches!(self.screen, Screen::Rotator | Screen::NanoVna);
-        let estop_w = crate::estop::button_width(ui, crate::estop::engaged()) + 8.0;
-        ui.horizontal(|ui| {
-        let max_w = if estop { (ui.available_width() - estop_w).max(0.0) } else { ui.available_width() };
-        egui::ScrollArea::horizontal()
-            .id_salt("tool-nav")
-            .max_width(max_w)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-            for (index, (screen, label)) in SCREENS.iter().enumerate() {
-                let color = if *screen == self.screen {
-                    palette::TAN
-                } else {
-                    screen_color(index)
-                };
-                let cap = if index == 0 { Cap::Left } else { Cap::None };
-                let width = (label.len() as f32) * 12.0 + 36.0;
-                if lcars_button(
-                    ui,
-                    &theme,
-                    label,
-                    color,
-                    egui::vec2(width, theme.bar_thin),
-                    cap,
-                    true,
-                )
-                .clicked()
-                {
-                    self.screen = *screen;
-                }
-            }
-                });
-            });
-        if estop {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.set_min_height(theme.bar_thin);
-                crate::estop::button(ui);
-            });
-        }
-        });
-        if !self.open_note.is_empty() {
-            readout(ui, &theme, &self.open_note, false);
         }
     }
 
@@ -281,6 +303,10 @@ impl Tools {
             Screen::Rotator => self.rotator.draw(ui),
         }
     }
+}
+
+fn or_dash(s: &str) -> &str {
+    if s.trim().is_empty() { "-" } else { s }
 }
 
 /// One tab row. The bottom gap is `frame_gap`. A row with no gap shares its
@@ -921,5 +947,90 @@ mod top_cap_deadlock_tests {
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("headless frame_with_slot did not finish in 10 s (deadlock?)");
         assert!(slot.is_some());
+    }
+}
+
+#[cfg(test)]
+mod page_frame_tests {
+    use super::*;
+
+    fn texts(out: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
+        out.shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                // What is painted: the text clipped to its clip rect.
+                egui::Shape::Text(t) => {
+                    let r = t.visual_bounding_rect().intersect(c.clip_rect);
+                    r.is_positive().then(|| (t.galley.text().to_owned(), r))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Real LCARS fonts and theme: every tool screen draws inside the page
+    /// frame it is given (sub-tabs, status line and screen), the sub-tabs
+    /// label each tool, and a narrow window moves tabs into more-tabs.
+    #[test]
+    fn every_tool_screen_draws_inside_the_page_frame() {
+        let ctx = egui::Context::default();
+        let mut tools = Tools::new(&ctx);
+        for (w, all_tabs) in [(1400.0, true), (640.0, false)] {
+            for (screen, label) in SCREENS {
+                tools.screen = screen;
+                let mut frame = egui::Rect::NOTHING;
+                let mut out = egui::FullOutput::default();
+                for _ in 0..3 {
+                    out = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, 800.0))),
+                            ..Default::default()
+                        },
+                        |ui| {
+                            frame = frame_with_slot(ui, Some(200.0), |ui| tools.draw_in(ui)).0;
+                        },
+                    );
+                    out.textures_delta.clear();
+                }
+                let t = texts(&out);
+                let status = tools.status_line();
+                assert!(t.iter().any(|(s, _)| *s == status), "{label}: status line {status:?} missing");
+                assert!(t.iter().any(|(s, _)| s.eq_ignore_ascii_case(label)), "{label}: its sub-tab is missing");
+                if all_tabs {
+                    for (_, l) in SCREENS {
+                        assert!(t.iter().any(|(s, _)| s.eq_ignore_ascii_case(l)), "{label}: tab {l} missing at {w}");
+                    }
+                }
+                // Inside the frame: right of the side bar, under the top bar.
+                let th = LcarsTheme::default();
+                let inner = egui::Rect::from_min_max(
+                    frame.min + egui::vec2(th.bar_thick, th.bar_thin),
+                    frame.max,
+                );
+                for (s, r) in &t {
+                    assert!(inner.expand(1.0).contains_rect(*r), "{label} at {w}: {s:?} {r:?} outside frame {inner:?}");
+                }
+            }
+        }
+        tools.conceal_nanovna();
+    }
+
+    #[test]
+    fn status_lines_name_each_tool() {
+        let ctx = egui::Context::default();
+        let mut tools = Tools::new(&ctx);
+        for (screen, want) in [
+            (Screen::NanoVna, "NANOVNA NOT CONNECTED"),
+            (Screen::HamRf, "RF CALC"),
+            (Screen::Calculator, "CALC RAD"),
+            (Screen::Smith, "SMITH Z ="),
+            (Screen::Hex, "HEX"),
+            (Screen::Log, "NO LOG OPEN"),
+            (Screen::Rotator, "NO ROTATOR"),
+        ] {
+            tools.screen = screen;
+            let line = tools.status_line();
+            assert!(line.starts_with(want), "{line:?} should start with {want:?}");
+        }
     }
 }

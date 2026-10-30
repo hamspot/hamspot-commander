@@ -307,6 +307,10 @@ impl Calc {
 }
 
 impl Calc {
+    pub fn angle_label(&self) -> &'static str {
+        if self.env.angle == Angle::Deg { "DEG" } else { "RAD" }
+    }
+
     pub fn draw(&mut self, ui: &mut egui::Ui) {
         let t = self.theme;
         self.keyboard(ui);

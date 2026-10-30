@@ -3110,9 +3110,7 @@ impl eframe::App for App {
         // Every page frame runs to the window edge. A status strip would
         // leave text under the elbows.
         self.refresh_tools(ui.ctx(), &snap);
-        if self.page == Page::Tools {
-            self.page_tools(ui);
-        } else {
+        {
             // The stock central panel keeps an 8px margin on every side.
             // The bottom one would lift the elbows off the window.
             egui::CentralPanel::default()
@@ -3155,6 +3153,9 @@ impl eframe::App for App {
                     } else if self.page == Page::Timers {
                         // Timers scrolls its own body under the sub-tabs.
                         self.page_timers(ui);
+                    } else if self.page == Page::Tools {
+                        // Each tool screen lays out its own panels in the frame.
+                        self.page_tools(ui);
                     } else {
                         egui::ScrollArea::vertical()
                             .id_salt("body")
@@ -8610,13 +8611,15 @@ impl App {
         }
     }
 
+    /// Tools inside the shared page frame: sub-tabs, a status line, then the
+    /// tool screen. E-STOP / RELEASE ride the page-bar slot like every page.
     fn page_tools(&mut self, ui: &mut egui::Ui) {
-        if self.tools.lock().expect("tools").detached {
+        let mut tools = self.tools.lock().expect("tools");
+        if tools.detached {
+            ui.label("Tools: torn off into their own window. Close that window to bring them back.");
             return;
         }
-        // The example screens create their own top and central panels, so this
-        // call stays on the root ui.
-        self.tools.lock().expect("tools").ui(ui, false);
+        tools.draw_in(ui);
     }
 
     /// Timers inside the shared page frame, REC style: sub-tabs, a status

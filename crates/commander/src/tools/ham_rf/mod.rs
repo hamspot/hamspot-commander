@@ -318,6 +318,11 @@ impl HamRf {
         self.status = format!("COPIED: {text}");
     }
 
+    /// The open calculator's tab label, for the Tools status line.
+    pub fn tool_name(&self) -> &'static str {
+        TOOLS.iter().find(|x| x.0 == self.tool).map(|x| x.1).unwrap_or("")
+    }
+
     pub fn draw(&mut self, ui: &mut Ui) {
         let t = self.theme;
         super::screen_header(ui, "ham_header", &t, |ui| {
