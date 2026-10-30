@@ -350,11 +350,9 @@ impl HamRf {
                     f.show(ui, &t, |ui| self.shared_panel(ui));
                 });
                 ui.scope_builder(egui::UiBuilder::new().max_rect(right), |ui| {
-                    let mut f = LcarsFrame::new(&t, Side::Right, 0.6);
-                    f.top_color = palette::PLUM;
-                    f.bottom_color = palette::SLATE;
-                    f.min_height = right.height();
-                    f.show(ui, &t, |ui| {
+                    // No right-hand elbow (as NanoVNA): the panel uses the whole rect.
+                    ui.set_min_height(right.height());
+                    (|ui: &mut egui::Ui| {
                         let title = TOOLS.iter().find(|x| x.0 == self.tool).unwrap().2;
                         heading(ui, &t, title);
                         if self.status != "READY" && !self.status.is_empty() {
@@ -375,7 +373,7 @@ impl HamRf {
                                 Tool::Path => self.tool_path(ui),
                                 Tool::Bands => self.tool_bands(ui),
                             });
-                    });
+                    })(ui);
                 });
             });
     }

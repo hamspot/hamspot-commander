@@ -381,17 +381,15 @@ impl Calc {
                     });
                 });
                 ui.scope_builder(egui::UiBuilder::new().max_rect(right), |ui| {
-                    let mut f = LcarsFrame::new(&t, Side::Right, 0.6);
-                    f.top_color = palette::PLUM;
-                    f.bottom_color = palette::SLATE;
-                    f.min_height = right.height();
-                    f.show(ui, &t, |ui| {
+                    // No right-hand elbow (as NanoVNA): the panel uses the whole rect.
+                    ui.set_min_height(right.height());
+                    (|ui: &mut egui::Ui| {
                         ui.label(egui::RichText::new("GRAPH  Y = F(X)").size(t.header_size));
                         let w = ui.available_width();
                         self.graph_ui(ui, egui::vec2(w, 300.0));
                         ui.label(egui::RichText::new("HISTORY").size(t.header_size));
                         self.history_ui(ui);
-                    });
+                    })(ui);
                 });
             });
     }

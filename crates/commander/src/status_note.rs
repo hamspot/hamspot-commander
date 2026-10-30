@@ -81,3 +81,29 @@ mod tests {
         assert_eq!(got, vec!["A".to_owned(), "B".to_owned()]);
     }
 }
+
+/// Height of the status strip under a tool screen (as NanoVNA's).
+pub const STRIP_H: f32 = 24.0;
+
+/// NanoVNA-style status strip at `rect` (fixed place, one row): a dark
+/// strip with `base` and this frame's notes as plain text, truncated.
+/// Returns the full line (also the hover text).
+pub fn paint_strip(ui: &mut egui::Ui, rect: egui::Rect, base: &str) -> String {
+    let mut line = base.to_owned();
+    for n in take(ui.ctx()) {
+        if !line.is_empty() {
+            line.push_str("   ");
+        }
+        line.push_str(&n);
+    }
+    ui.painter().rect_filled(rect, 0.0, rustcars::palette::STRIP);
+    let inner = rect.shrink2(egui::vec2(8.0, 0.0));
+    ui.scope_builder(
+        egui::UiBuilder::new().max_rect(inner).id_salt("status-strip").layout(egui::Layout::left_to_right(egui::Align::Center)),
+        |ui| {
+            let text = egui::RichText::new(line.clone()).size(14.0).color(rustcars::LcarsTheme::default().text);
+            ui.add(egui::Label::new(text).truncate()).on_hover_text(line.clone());
+        },
+    );
+    line
+}

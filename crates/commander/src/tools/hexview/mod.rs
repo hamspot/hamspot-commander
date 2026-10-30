@@ -156,11 +156,9 @@ impl HexView {
                     f.show(ui, &t, |ui| self.rows_panel(ui));
                 });
                 ui.scope_builder(egui::UiBuilder::new().max_rect(right), |ui| {
-                    let mut f = LcarsFrame::new(&t, Side::Right, 0.6);
-                    f.top_color = palette::PLUM;
-                    f.bottom_color = palette::SLATE;
-                    f.min_height = right.height();
-                    f.show(ui, &t, |ui| self.side_panel(ui));
+                    // No right-hand elbow (as NanoVNA): the panel uses the whole rect.
+                    ui.set_min_height(right.height());
+                    (|ui: &mut egui::Ui| self.side_panel(ui))(ui);
                 });
             });
     }

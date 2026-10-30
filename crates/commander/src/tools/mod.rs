@@ -180,15 +180,21 @@ impl Tools {
             crate::status_note::clear(ui.ctx());
             return;
         }
-        let status = crate::status_note::reserve(ui);
-        ui.add_space(self.theme.frame_gap);
+        // Every other tool: the screen fills the frame, and one status strip
+        // in NanoVNA's style sits at the bottom, always in the same place
+        // (David, #221): hints, notes and warnings as plain text.
+        let full = ui.available_rect_before_wrap();
+        let strip = egui::Rect::from_min_max(egui::pos2(full.left(), full.bottom() - crate::status_note::STRIP_H), full.max);
+        let body = egui::Rect::from_min_max(full.min, egui::pos2(full.right(), strip.top() - self.theme.frame_gap));
         crate::status_note::clear(ui.ctx());
-        let rect = ui.available_rect_before_wrap();
-        ui.scope_builder(egui::UiBuilder::new().max_rect(rect).id_salt("tool-screen"), |ui| {
-            self.screen(ui);
-        });
+        // A child that does not grow the frame: a screen taller than the
+        // window is clipped above the strip, never pushes it down.
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(body).id_salt("tool-screen"));
+        child.set_clip_rect(body.intersect(ui.clip_rect()));
+        self.screen(&mut child);
         let base = self.status_line();
-        crate::status_note::paint(ui, status, &base);
+        crate::status_note::paint_strip(ui, strip, &base);
+        ui.allocate_rect(full, egui::Sense::hover());
     }
 
     pub fn tab_labels() -> Vec<String> {
@@ -1192,21 +1198,53 @@ mod page_frame_tests {
                 for (s, r) in &body {
                     assert!(inner.expand(1.0).contains_rect(*r), "{label} at {w}: {s:?} {r:?} outside frame {inner:?}");
                 }
-                // The status line: the first body row, a single row.
-                let top = body.iter().map(|(_, r)| r.top()).fold(f32::INFINITY, f32::min);
-                let first: Vec<_> = body.iter().filter(|(_, r)| (r.top() - top).abs() < 1.0).collect();
+                // The status strip: the last body row, one row, at the
+                // frame's bottom (NanoVNA style).
+                let bottom = body.iter().map(|(_, r)| r.bottom()).fold(f32::NEG_INFINITY, f32::max);
+                let last: Vec<_> = body.iter().filter(|(_, r)| (r.bottom() - bottom).abs() < 1.0).collect();
                 let base = tools.status_line();
                 let head: String = base.chars().take(8).collect();
                 if screen == Screen::NanoVna {
-                    // NanoVNA: no top line; its status bar under the chart says it once.
-                    assert!(!first.iter().any(|(s, _)| s.starts_with(&head)), "NanoVNA: no top status line, got {first:?}");
                     let n = t.iter().filter(|(s, _)| s.contains("NOT CONNECTED")).count();
                     assert!(n <= 1, "NanoVNA: connection state shown once, got {n}");
+                    assert!(!t.iter().any(|(s, _)| s.starts_with(&head) && s.len() >= base.len().min(20)), "NanoVNA: no extra status line");
                     continue;
                 }
-                assert!(first.iter().any(|(s, _)| s.starts_with(&head)), "{label}: status line first, got {first:?}");
-                let line_h = 30.0;
-                assert!(first.iter().all(|(_, r)| r.height() < line_h), "{label}: status is one row");
+                assert!(last.iter().any(|(s, _)| s.starts_with(&head)), "{label}: status strip last, got {last:?}");
+                // Just above the bottom elbow (bar plus its gap).
+                assert!(frame.bottom() - bottom < LcarsTheme::default().bar_thin + 24.0 + crate::status_note::STRIP_H, "{label} at {w}: strip at the frame bottom ({bottom}) frame {frame:?} last {last:?}");
+                assert!(last.iter().all(|(_, r)| r.height() < crate::status_note::STRIP_H), "{label}: one row");
+            }
+        }
+        tools.conceal_nanovna();
+    }
+
+    /// Every tool screen (real fonts/theme): no right-hand elbow (no PLUM
+    /// chrome on the frame's right edge below the bar), and the content
+    /// reaches the right edge; the status strip is NanoVNA's (STRIP fill at
+    /// the bottom) on every tool but NanoVNA, which has its own.
+    #[test]
+    fn no_tool_screen_has_a_right_elbow() {
+        let ctx = egui::Context::default();
+        let mut tools = Tools::new(&ctx);
+        let th = LcarsTheme::default();
+        for (screen, label) in SCREENS {
+            tools.screen = screen;
+            let (out, frame, _, _) = tools_frame(&ctx, &mut tools, 1400.0);
+            let edge = frame.right() - 2.0;
+            let below = frame.top() + th.bar_thin + 1.0;
+            let elbow = out.shapes.iter().any(|c| match &c.shape {
+                egui::Shape::Rect(r) => r.fill == rustcars::palette::PLUM && r.rect.right() >= edge && r.rect.top() > below,
+                egui::Shape::Path(p) => p.fill == rustcars::palette::PLUM && p.points.iter().any(|q| q.x >= edge && q.y > below),
+                _ => false,
+            });
+            assert!(!elbow, "{label}: right-hand elbow drawn");
+            if screen != Screen::NanoVna {
+                let strip = out.shapes.iter().any(|c| matches!(&c.shape, egui::Shape::Rect(r)
+                    if r.fill == rustcars::palette::STRIP && r.rect.bottom() >= frame.bottom() - th.bar_thin - 24.0
+                        && (r.rect.height() - crate::status_note::STRIP_H).abs() < 0.5));
+                let strips: Vec<_> = out.shapes.iter().filter_map(|c| match &c.shape { egui::Shape::Rect(r) if r.fill == rustcars::palette::STRIP => Some(r.rect), _ => None }).collect();
+                assert!(strip, "{label}: status strip at the bottom; frame {frame:?} strips {strips:?}");
             }
         }
         tools.conceal_nanovna();
