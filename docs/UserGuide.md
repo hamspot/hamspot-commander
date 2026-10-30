@@ -209,7 +209,7 @@ A frequency the radio refuses doesn't move the readout.
 
 ## 4.4 E-STOP
 
-The red **E-STOP** button with a black stop-sign octagon sits at the right end of the tan top bar of every main page (Tune, Plan, Channels, Talkgroups, Radio IDs, Keys, Meters, Levels, Timers, REC, Tools and Config); on Tools it is there for every tool screen, and in the detached Tools window it sits at the right of the top row. It is also in the bar of the Config groups Radio, Rotator, Amplifier, Automation patch and RF patch. Every copy is the same switch.
+The red **E-STOP** button with a black stop-sign octagon sits at the right end of the tan top bar of every main page (Tune, Plan, Channels, Talkgroups, Radio IDs, Keys, Meters, Levels, Timers, REC, Tools and Config); on Tools it is there for every tool screen, and in every detached page window (REC, Timers, Config, HF Data, Levels, Keys, Meters, Tools) it sits at the right of the window's top row, with RELEASE; the E-STOP keyboard chord works in those windows too. It is also in the bar of the Config groups Radio, Rotator, Amplifier, Automation patch and RF patch. Every copy is the same switch.
 
 Press it and it latches. Every copy then reads **E-STOP ENGAGED**, and Commander:
 

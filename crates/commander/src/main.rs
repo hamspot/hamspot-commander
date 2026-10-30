@@ -105,7 +105,7 @@ const DETACHABLE_PAGES: [Page; 8] = [
 /// `meter_win_size` (and the station file's `meters.detached` / window).
 /// They now seed the Meters page pill.
 fn seed_meter_pill(detached: bool, pos: Option<egui::Pos2>, size: Option<egui::Vec2>) -> group_box::DetachState {
-    group_box::DetachState { detached, pos, size, failed: false }
+    group_box::DetachState { detached, pos, size, ..Default::default() }
 }
 
 fn migrate_tool_detach(detach: Option<&str>, pos: Option<&str>, size: Option<&str>) -> group_box::DetachState {
@@ -113,7 +113,7 @@ fn migrate_tool_detach(detach: Option<&str>, pos: Option<&str>, size: Option<&st
         detached: detach == Some("1"),
         pos: pos.and_then(parse_point),
         size: size.and_then(parse_size),
-        failed: false,
+        ..Default::default()
     }
 }
 
@@ -8616,22 +8616,35 @@ impl App {
     /// bar when attached; detached they head the window instead (drawn once:
     /// the main bar leaves them out while REC is detached).
     fn detached_page_body(&mut self, ui: &mut egui::Ui, page: Page, snap: &mut Snapshot) {
+        // Every page carries E-STOP / RELEASE in its main page bar; its
+        // window carries them at the right of its top row (Tools draws its
+        // own). The window has its own keyboard focus, so it polls the chord.
+        if page != Page::Tools {
+            self.estop_chord.poll(ui.ctx());
+            let h = rustcars::LcarsTheme::default().bar_thin;
+            ui.horizontal(|ui| {
+                ui.set_min_height(h);
+                match page {
+                    Page::Timers => {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        self.tools.lock().expect("tools").timers_mut().bar(ui);
+                    }
+                    Page::Rec => {
+                        ui.spacing_mut().item_spacing.x = rec_ui::BAR_GAP;
+                        self.rec_bar(ui, false);
+                    }
+                    _ => {}
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    estop::button(ui);
+                });
+            });
+            ui.add_space(4.0);
+        }
         match page {
             Page::Config => self.page_config(ui, snap),
-            Page::Timers => {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    self.tools.lock().expect("tools").timers_mut().bar(ui);
-                });
-                ui.add_space(4.0);
-                self.page_timers(ui);
-            }
+            Page::Timers => self.page_timers(ui),
             Page::Rec => {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = rec_ui::BAR_GAP;
-                    self.rec_bar(ui, false);
-                });
-                ui.add_space(4.0);
                 self.page_rec(ui, snap);
                 ui.add_space(4.0);
                 ui.label(egui::RichText::new(rec_ui::PRIVACY).weak().small());
