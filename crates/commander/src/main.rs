@@ -1726,58 +1726,136 @@ enum KeyLamp {
     Purple,
 }
 
-/// One key beside the scanner face. Green is Follow or a one-zone scan.
-/// Amber is the all-zone scan. Purple is a scan limited to marked zones.
-/// Load and Save stay dark; they act on the click.
+/// One key beside the scanner face (and the Plan / Channels key columns),
+/// in the rustcars button style (#221 follow-up). Size and behaviour are
+/// unchanged; only the look.
+/// - Momentary keys (LOAD, SAVE, ADD): dark surface with a 1 px border,
+///   like `rustcars::action_button`.
+/// - State keys (SCAN, DWELL, FOLLOW, REC): rustcars toggles, a 1.5 px border
+///   and a painted ● (on) / ○ (off) marker before the label, so state is in
+///   the text and not colour alone. The lamp colour still tells which mode:
+///   green is Follow or a one-zone scan, amber the all-zone scan (and REC
+///   all), purple a scan limited to marked zones, red REC marked.
 fn radio_key(ui: &mut egui::Ui, label: &str, lamp: KeyLamp, enabled: bool) -> egui::Response {
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(72.0, 46.0), egui::Sense::click());
+    let (rect, response) = ui.allocate_exact_size(RADIO_KEY_SIZE, egui::Sense::click());
     if !ui.is_rect_visible(rect) {
         return response;
     }
+    let theme = rustcars::LcarsTheme::default();
     let hover = enabled && response.hovered();
-    let fill = match lamp {
-        KeyLamp::Green => egui::Color32::from_rgb(18, 58, 28),
-        KeyLamp::Amber => egui::Color32::from_rgb(72, 48, 10),
-        KeyLamp::Purple => egui::Color32::from_rgb(42, 16, 64),
-        KeyLamp::Red => egui::Color32::from_rgb(70, 12, 10),
-        KeyLamp::Dark if hover => egui::Color32::from_rgb(48, 48, 52),
-        KeyLamp::Dark => egui::Color32::from_rgb(28, 28, 32),
-    };
-    let edge = match lamp {
+    let r = egui::CornerRadius::same(4);
+    let font = egui::FontId::proportional(theme.data_size);
+    let dim = |c: egui::Color32| if enabled { c } else { c.gamma_multiply(0.45) };
+    let painter = ui.painter();
+    if radio_key_is_momentary(label) {
+        let c = rustcars::Mode::Inactive.colors();
+        let fill = if hover { rustcars::tint(c.fill, 0.08) } else { c.fill };
+        painter.rect(rect, r, fill, egui::Stroke::new(1.0, dim(if hover { theme.text } else { c.border })), egui::StrokeKind::Inside);
+        painter.text(rect.center(), egui::Align2::CENTER_CENTER, label.to_uppercase(), font, dim(theme.text));
+    } else {
+        let on = !matches!(lamp, KeyLamp::Dark);
+        let (fill, border, ink) = rustcars::toggle_colors(radio_key_hue(lamp), on);
+        let fill = if hover { rustcars::tint(fill, 0.08) } else { fill };
+        painter.rect(rect, r, fill, egui::Stroke::new(rustcars::TOGGLE_BORDER, dim(border)), egui::StrokeKind::Inside);
+        rustcars::paint_toggle_marker_label(painter, rect, label, on, font, dim(ink));
+    }
+    if response.has_focus() {
+        painter.rect_stroke(rect.expand(2.0), egui::CornerRadius::same(5), egui::Stroke::new(1.0, theme.text), egui::StrokeKind::Outside);
+    }
+    let on = !matches!(lamp, KeyLamp::Dark);
+    let text = if radio_key_is_momentary(label) { label.to_uppercase() } else { rustcars::toggle_label(label, on) };
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, &text));
+    response
+}
+
+/// The scanner / Plan / Channels key size (unchanged from the old keys).
+const RADIO_KEY_SIZE: egui::Vec2 = egui::vec2(72.0, 46.0);
+
+/// Keys that act once on the click and hold no state.
+fn radio_key_is_momentary(label: &str) -> bool {
+    matches!(label.to_ascii_uppercase().as_str(), "LOAD" | "SAVE" | "ADD")
+}
+
+/// Hue of a state key's lamp. Off keys use slate, the app's neutral hue.
+fn radio_key_hue(lamp: KeyLamp) -> egui::Color32 {
+    match lamp {
         KeyLamp::Green => egui::Color32::from_rgb(46, 176, 78),
         KeyLamp::Amber => egui::Color32::from_rgb(214, 148, 32),
         KeyLamp::Purple => egui::Color32::from_rgb(168, 96, 214),
         KeyLamp::Red => egui::Color32::from_rgb(214, 44, 32),
-        KeyLamp::Dark if hover => egui::Color32::from_rgb(120, 120, 126),
-        KeyLamp::Dark => egui::Color32::from_rgb(78, 78, 84),
-    };
-    ui.painter().rect(
-        rect,
-        egui::CornerRadius::same(3),
-        fill,
-        egui::Stroke::new(1.0, edge),
-        egui::StrokeKind::Inside,
-    );
-    let text = if !enabled {
-        egui::Color32::from_rgb(110, 108, 100)
-    } else {
-        match lamp {
-            KeyLamp::Green => egui::Color32::from_rgb(150, 230, 140),
-            KeyLamp::Amber => egui::Color32::from_rgb(255, 196, 96),
-            KeyLamp::Purple => egui::Color32::from_rgb(220, 170, 255),
-            KeyLamp::Red => egui::Color32::from_rgb(255, 150, 140),
-            KeyLamp::Dark => egui::Color32::from_rgb(232, 228, 216),
+        KeyLamp::Dark => rustcars::palette::SLATE,
+    }
+}
+
+#[cfg(test)]
+mod radio_key_tests {
+    use super::*;
+
+    fn draw(label: &str, lamp: KeyLamp, enabled: bool) -> (egui::Rect, Vec<egui::epaint::ClippedShape>) {
+        let ctx = egui::Context::default();
+        rustcars::install_lcars_font(&ctx);
+        rustcars::apply_theme(&ctx, &rustcars::LcarsTheme::default());
+        let mut rect = egui::Rect::NOTHING;
+        let mut shapes = Vec::new();
+        for _ in 0..2 {
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                rect = radio_key(ui, label, lamp, enabled).rect;
+            });
+            out.textures_delta.clear();
+            shapes = out.shapes;
         }
-    };
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        label,
-        egui::FontId::monospace(13.0),
-        text,
-    );
-    response
+        (rect, shapes)
+    }
+
+    fn frame_stroke(shapes: &[egui::epaint::ClippedShape], rect: egui::Rect) -> Option<(f32, u8)> {
+        shapes.iter().find_map(|c| match &c.shape {
+            egui::Shape::Rect(r) if r.rect == rect && r.stroke.width > 0.0 => Some((r.stroke.width, r.corner_radius.nw)),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn keys_keep_their_size_and_get_a_visible_border() {
+        for (label, lamp) in [("LOAD", KeyLamp::Dark), ("SAVE", KeyLamp::Dark), ("ADD", KeyLamp::Dark)] {
+            let (rect, shapes) = draw(label, lamp, true);
+            assert_eq!(rect.size(), RADIO_KEY_SIZE);
+            assert_eq!(frame_stroke(&shapes, rect), Some((1.0, 4)), "{label}: 1 px border, radius 4");
+        }
+        for (label, lamp) in [
+            ("SCAN", KeyLamp::Dark), ("SCAN", KeyLamp::Green), ("SCAN", KeyLamp::Amber), ("SCAN", KeyLamp::Purple),
+            ("DWELL", KeyLamp::Green), ("FOLLOW", KeyLamp::Dark), ("FOLLOW", KeyLamp::Green), ("REC", KeyLamp::Red), ("REC", KeyLamp::Amber),
+        ] {
+            let (rect, shapes) = draw(label, lamp, true);
+            assert_eq!(rect.size(), RADIO_KEY_SIZE);
+            assert_eq!(frame_stroke(&shapes, rect), Some((rustcars::TOGGLE_BORDER, 4)), "{label}: toggle border");
+        }
+    }
+
+    #[test]
+    fn state_keys_show_state_by_marker_not_colour_alone() {
+        let filled = |shapes: &[egui::epaint::ClippedShape]| {
+            shapes.iter().filter(|c| matches!(&c.shape, egui::Shape::Circle(ci) if ci.fill != egui::Color32::TRANSPARENT)).count()
+        };
+        let (_, off) = draw("FOLLOW", KeyLamp::Dark, true);
+        let (_, on) = draw("FOLLOW", KeyLamp::Green, true);
+        assert_eq!(filled(&off), 0, "off: hollow ○");
+        assert_eq!(filled(&on), 1, "on: filled ●");
+        let (_, load) = draw("LOAD", KeyLamp::Dark, true);
+        assert!(!load.iter().any(|c| matches!(c.shape, egui::Shape::Circle(_))), "momentary keys have no marker");
+    }
+
+    #[test]
+    fn labels_fit_inside_the_key_in_the_real_font() {
+        for label in ["LOAD", "SAVE", "ADD", "SCAN", "DWELL", "FOLLOW", "REC"] {
+            let (rect, shapes) = draw(label, KeyLamp::Green, true);
+            for c in &shapes {
+                if let egui::Shape::Text(t) = &c.shape {
+                    let r = egui::Rect::from_min_size(t.pos, t.galley.size());
+                    assert!(rect.shrink(2.0).contains_rect(r), "{label}: text {r:?} outside {rect:?}");
+                }
+            }
+        }
+    }
 }
 
 /// Column titles above the key list. They stay put while the rows scroll.
