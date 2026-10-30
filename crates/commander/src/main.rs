@@ -95,6 +95,28 @@ fn config_page_detach_id() -> egui::Id {
 /// HackRF TG / ID pages stay out: they hold the Tune and scanner widgets,
 /// which are not wrapped. Meters and Tools keep their own detach until their
 /// settings migrate.
+/// How each detached page window opens: a default size for a first open
+/// (big pages large, up to the 80% monitor cap rustcars applies), a minimum
+/// inner size the page needs to render fully (a saved size is raised to it),
+/// and no outer scroll: the window gives the page exactly its visible
+/// height, so a chart or dial sized from the height fills the window, and
+/// each page scrolls inside itself (David, pt365u).
+fn detach_opts(page: Page) -> group_box::DetachOpts {
+    let (default, min) = match page {
+        Page::Tools => ((1600.0, 1000.0), (900.0, 620.0)),
+        Page::Rec => ((1400.0, 900.0), (760.0, 520.0)),
+        Page::Config => ((1100.0, 850.0), (640.0, 480.0)),
+        Page::HfData => ((1200.0, 800.0), (640.0, 480.0)),
+        Page::Meters => ((900.0, 640.0), (480.0, 360.0)),
+        _ => ((900.0, 650.0), (520.0, 400.0)),
+    };
+    group_box::DetachOpts {
+        default_size: egui::vec2(default.0, default.1),
+        min_size: egui::vec2(min.0, min.1),
+        scroll: false,
+    }
+}
+
 const DETACHABLE_PAGES: [Page; 8] = [
     Page::Config, Page::Rec, Page::Timers, Page::HfData, Page::Levels, Page::Keys, Page::Tools, Page::Meters,
 ];
@@ -8848,7 +8870,7 @@ impl App {
             }
             let m = group_box::Metrics::default();
             let name = page_name(page);
-            group_box::detached_window(ctx, id, &m, &name, rustcars::palette::TAN, &mut st, |ui| {
+            group_box::detached_window_with(ctx, id, &m, &name, rustcars::palette::TAN, &mut st, detach_opts(page), |ui| {
                 self.detached_page_body(ui, page, snap);
             });
             st.store(ctx, id);
@@ -8893,14 +8915,23 @@ impl App {
             });
             ui.add_space(4.0);
         }
+        // The window gives exactly its visible height (no outer scroll):
+        // flowing pages scroll here; Tools, Meters and the scrolling pages
+        // below fill it and scroll inside.
+        let flow = |ui: &mut egui::Ui, add: &mut dyn FnMut(&mut egui::Ui)| {
+            egui::ScrollArea::vertical()
+                .id_salt(("detached-flow", page_name(page)))
+                .auto_shrink([false, false])
+                .show(ui, |ui| add(ui));
+        };
         match page {
-            Page::Config => self.page_config(ui, snap),
-            Page::Timers => self.page_timers(ui),
-            Page::Rec => {
+            Page::Config => flow(ui, &mut |ui| self.page_config(ui, snap)),
+            Page::Timers => flow(ui, &mut |ui| self.page_timers(ui)),
+            Page::Rec => flow(ui, &mut |ui| {
                 self.page_rec(ui, snap);
                 ui.add_space(4.0);
                 ui.label(egui::RichText::new(rec_ui::PRIVACY).weak().small());
-            }
+            }),
             Page::Tools => self.tools.lock().expect("tools").window_body(ui),
             Page::Meters => {
                 // The station file keeps the window's monitor and scale too.
@@ -12948,5 +12979,159 @@ mod config_order_tests {
             pos("self.automation_frame(ui, snap)"), pos("cfg_group(ui, \"RF patch\""),
         ];
         assert!(seq.windows(2).all(|w| w[0] < w[1]), "{seq:?}");
+    }
+}
+
+/// Detached page windows (David, pt365u): the page gets exactly the visible
+/// window, so the key display (NanoVNA chart, rotator dial, tool screens,
+/// meters) and the status line are in view at every size, and each page
+/// opens at a sensible size no smaller than it needs. Real LCARS fonts and
+/// theme, through rustcars' real detached-window frame with the viewport
+/// callback run like eframe's immediate viewport.
+#[cfg(test)]
+mod detached_fit_tests {
+    use super::*;
+
+    fn sizes(min: egui::Vec2) -> Vec<egui::Vec2> {
+        let mut v: Vec<egui::Vec2> = [egui::vec2(720.0, 480.0), egui::vec2(1200.0, 800.0), egui::vec2(500.0, 700.0)]
+            .into_iter()
+            .map(|s| s.max(min))
+            .collect();
+        v.push(min);
+        v
+    }
+
+    /// One frame of a detached window `size` big with `body`.
+    fn frame(ctx: &egui::Context, page: Page, size: egui::Vec2, body: &mut dyn FnMut(&mut egui::Ui)) -> egui::FullOutput {
+        let mut out = egui::FullOutput::default();
+        for _ in 0..3 {
+            out = ctx.run_ui(
+                egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), ..Default::default() },
+                |ui| {
+                    let mut st = group_box::DetachState { detached: true, ..Default::default() };
+                    let c = ui.ctx().clone();
+                    let id = group_box::DetachState::id(("page", page_name(page)));
+                    rustcars::group::detached_window_in_opts(
+                        &c, id, &group_box::Metrics::default(), &page_name(page), rustcars::palette::TAN, &mut st,
+                        detach_opts(page), |ui| body(ui),
+                        |_, _, cb| cb(ui, true),
+                    );
+                },
+            );
+            out.textures_delta.clear();
+        }
+        out
+    }
+
+    fn ctx() -> egui::Context {
+        let ctx = egui::Context::default();
+        rustcars::install_lcars_font(&ctx);
+        rustcars::apply_theme(&ctx, &rustcars::LcarsTheme::default());
+        ctx
+    }
+
+    /// Nothing drawn below the window (the bug: content laid out in an
+    /// unbounded scroll area lands off-screen), and a large element in view.
+    fn check_fill(out: &egui::FullOutput, view: egui::Rect, what: &str) {
+        // Shapes inside a page's own scroll area may lie below, clipped away;
+        // none may be laid out to show past the window.
+        let below = out.shapes.iter().filter(|c| {
+            let r = c.shape.visual_bounding_rect().intersect(c.clip_rect);
+            r.is_positive() && r.bottom() > view.bottom() + 1.0
+        }).count();
+        assert_eq!(below, 0, "{what}: {below} shapes shown past the window");
+        let big = out.shapes.iter().any(|c| {
+            let r = c.shape.visual_bounding_rect().intersect(c.clip_rect);
+            r.is_positive() && view.expand(1.0).contains_rect(r) && r.width() * r.height() >= view.area() * 0.15
+                && !matches!(&c.shape, egui::Shape::Rect(s) if s.rect.size() == view.size())
+        });
+        assert!(big, "{what}: no key display element in view");
+    }
+
+    #[test]
+    fn every_page_opens_at_least_its_minimum_under_the_monitor_cap() {
+        let monitor = egui::vec2(1920.0, 1080.0);
+        for page in DETACHABLE_PAGES {
+            let o = detach_opts(page);
+            assert!(o.default_size.x >= o.min_size.x && o.default_size.y >= o.min_size.y, "{}", page_name(page));
+            assert!(!o.scroll, "{}: bounded, not an outer scroll", page_name(page));
+            let open = o.open_size(None, Some(monitor));
+            assert!(open.x <= monitor.x * 0.8 + 0.5 && open.y <= monitor.y * 0.8 + 0.5, "80% cap");
+            assert!(open.x >= o.min_size.x.min(monitor.x * 0.8) && open.y >= o.min_size.y.min(monitor.y * 0.8));
+            let saved_small = o.open_size(Some(egui::vec2(300.0, 200.0)), Some(monitor));
+            assert!(saved_small.x >= o.min_size.x && saved_small.y >= o.min_size.y, "saved raised to min");
+        }
+        let tools = detach_opts(Page::Tools).default_size;
+        assert!(tools.x >= 1500.0 && tools.y >= 900.0, "NanoVNA / Tools open large");
+    }
+
+    /// Tools, every screen (NanoVNA chart, calibration via its own screen,
+    /// Smith, Calc, Hex, Logbook, RF Calc, Rotator): the screen fills the
+    /// window, status line at the bottom in view.
+    #[test]
+    fn detached_tools_screens_fill_the_window() {
+        let ctx = ctx();
+        let mut tools = tools::Tools::new(&ctx);
+        for size in sizes(detach_opts(Page::Tools).min_size) {
+            for (screen, label) in tools::SCREENS {
+                tools.screen = screen;
+                let out = frame(&ctx, Page::Tools, size, &mut |ui| tools.window_body(ui));
+                let view = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+                let what = format!("{label} at {size:?}");
+                check_fill(&out, view, &what);
+                // Status: some text in the bottom 80 px, in view.
+                let status = out.shapes.iter().any(|c| matches!(&c.shape, egui::Shape::Text(t)
+                    if { let r = t.visual_bounding_rect().intersect(c.clip_rect); r.is_positive() && view.contains_rect(r) && r.bottom() > view.bottom() - 80.0 }));
+                assert!(status, "{what}: no status line at the bottom");
+            }
+        }
+        tools.conceal_nanovna();
+    }
+
+    /// Meters: the grid is in view, nothing drawn below the window.
+    #[test]
+    fn detached_meters_fill_the_window() {
+        let ctx = ctx();
+        let snap = empty_snap();
+        let clock = clock::SystemClock::default();
+        let mut meters = MeterState {
+            locked: false, order: Vec::new(), drag: None, needles: HashMap::new(), detached: true, seed_pill: false,
+            saved_pos: None, saved_size: None, saved_monitor: None, saved_ppp: None,
+        };
+        for size in sizes(detach_opts(Page::Meters).min_size) {
+            let out = frame(&ctx, Page::Meters, size, &mut |ui| {
+                egui::ScrollArea::vertical().id_salt("meter-window").auto_shrink([false, false])
+                    .show(ui, |ui| paint_meter_page(ui, &snap, None, &mut meters, &clock));
+            });
+            let view = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+            let below = out.shapes.iter().filter(|c| {
+                let r = c.shape.visual_bounding_rect().intersect(c.clip_rect);
+                r.is_positive() && r.top() > view.bottom() + 1.0
+            }).count();
+            assert_eq!(below, 0, "meters at {size:?}");
+        }
+    }
+
+    /// Flowing pages (Config, REC, Timers, HF DATA, Levels, Keys) scroll
+    /// inside the bounded window: the frame ends at the window bottom and the
+    /// page's own scroll area reaches its last row.
+    #[test]
+    fn detached_flow_pages_scroll_inside_the_window() {
+        let ctx = ctx();
+        for page in [Page::Config, Page::Rec, Page::Timers, Page::HfData, Page::Levels, Page::Keys] {
+            for size in sizes(detach_opts(page).min_size) {
+                let mut inner_bottom = f32::INFINITY;
+                let out = frame(&ctx, page, size, &mut |ui| {
+                    inner_bottom = ui.max_rect().bottom();
+                    egui::ScrollArea::vertical().id_salt(("detached-flow", page_name(page))).auto_shrink([false, false])
+                        .show(ui, |ui| for i in 0..200 { ui.label(format!("row {i}")); });
+                });
+                let what = format!("{} at {size:?}", page_name(page));
+                assert!(inner_bottom.is_finite() && inner_bottom <= size.y, "{what}: page height bounded ({inner_bottom})");
+                let shown = out.shapes.iter().any(|c| matches!(&c.shape, egui::Shape::Text(t) if t.galley.text() == "row 0"
+                    && c.clip_rect.intersects(t.visual_bounding_rect())));
+                assert!(shown, "{what}: first row in view");
+            }
+        }
     }
 }

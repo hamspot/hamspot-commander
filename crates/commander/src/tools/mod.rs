@@ -23,7 +23,7 @@ pub enum Screen {
     Rotator,
 }
 
-const SCREENS: [(Screen, &str); 7] = [
+pub(crate) const SCREENS: [(Screen, &str); 7] = [
     (Screen::NanoVna, "NanoVNA"),
     (Screen::HamRf, "RF Calc"),
     (Screen::Calculator, "Calc"),

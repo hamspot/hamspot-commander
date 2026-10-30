@@ -5,7 +5,7 @@
 
 #[allow(unused_imports)]
 pub use rustcars::group::{
-    DetachState, GroupBox, Layout, Metrics, chrome_shapes, detached_stub_text, detached_window, detach_failed_text,
+    DetachState, GroupBox, Layout, Metrics, chrome_shapes, detached_stub_text, detached_window, detached_window_with, DetachOpts, detach_failed_text,
     detach_pill, group_box, group_box_slot, group_box_with, layout, layout_with_slot,
 };
 
