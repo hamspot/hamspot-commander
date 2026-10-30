@@ -1336,7 +1336,8 @@ Buttons in a page's top elbow bar follow the rustcars rules, the same as REC's b
 - A key that does one thing (LOAD, SAVE, ADD, ID 10:00, REC's day and zoom keys) is a solid, square segment of the bar in its own colour, with no outline.
 - A key that switches something on and off (REC, SCAN, DWELL, FOLLOW, REC's LIVE / DATA / PLAY NEXT) has a thin border and shows its state as ● (on) or ○ (off) before the label, so the state never depends on colour alone. A lit key keeps its lamp colour.
 - **Copy time** has click modes, so it is a rustcars mode button (click, double-click, triple-click).
-- Tool and Timers tabs in the bar are square segments (no rounded end); the open tab has a frame round it.
+- Every button in an elbow bar has square corners: tabs, keys, toggles, Copy time and the more-tabs key. Only the pills (an elbow's rounded end, the detach pill) are rounded. Buttons away from the elbows keep their slightly rounded corners.
+- Tool and Timers tabs in the bar are square segments (no rounded end); the open tab is the lighter shade, as on the page tabs.
 - E-STOP and RELEASE are square keys at the right end of the bar and never shrink.
 
 Key colours: LOAD and SAVE slate, ADD teal, REC brick, SCAN olive, DWELL teal, FOLLOW plum, ID 10:00 brick.

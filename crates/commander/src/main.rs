@@ -1497,11 +1497,9 @@ pub(crate) fn folder_tab_colored(
         }
     });
     let width = folder_tab_width(ui, label, speaker.is_some());
-    let cap = if lead {
-        rustcars::Cap::Left
-    } else {
-        rustcars::Cap::None
-    };
+    // Tabs sit in the elbow bar: square, no end cap (rustcars P1c).
+    let _ = lead;
+    let cap = rustcars::Cap::None;
     // The speaker is painted on the left of the name, with the button's
     // own right inset removed. An empty label keeps that inset from drawing
     // a second copy of the name.
@@ -1541,7 +1539,8 @@ pub(crate) fn folder_tab_rec(
         }
     });
     let width = voice_tab_width(ui.painter(), &theme, label).max(72.0);
-    let cap = if lead { rustcars::Cap::Left } else { rustcars::Cap::None };
+    let _ = lead;
+    let cap = rustcars::Cap::None; // square in the bar (rustcars P1c)
     let resp = rustcars::lcars_button(
         ui,
         &theme,
@@ -1643,11 +1642,8 @@ fn paint_floating_tab(
     } else {
         tab_color(index)
     };
-    let cap = if index == 0 {
-        rustcars::Cap::Left
-    } else {
-        rustcars::Cap::None
-    };
+    let _ = index;
+    let cap = rustcars::Cap::None; // square in the bar (rustcars P1c)
     let painter = ui.ctx().layer_painter(egui::LayerId::new(
         egui::Order::Tooltip,
         egui::Id::unique("tab-tear"),

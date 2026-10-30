@@ -1248,7 +1248,7 @@ impl App {
                 // is discarded here.
                 Some(state) => {
                     let mut local = state;
-                    let resp = rustcars::toggle_button(ui, &theme, seg.label, &mut local, base, size);
+                    let resp = rustcars::bar_toggle_button(ui, &theme, seg.label, &mut local, base, size); // square in the bar (P1c)
                     let name = bar_label(seg, on);
                     resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, true, state, &name));
                     resp

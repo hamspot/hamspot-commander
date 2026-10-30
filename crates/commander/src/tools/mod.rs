@@ -646,11 +646,10 @@ pub fn bar_tab_row(
                 // In the bar every tab is a plain segment: no left end cap.
                 let _ = n;
                 let resp = crate::folder_tab(ui, selected == Some(i), i, &labels[i], false);
-                if selected == Some(i) {
-                    // The open tab: a frame in the ink, so it is not shown by colour alone.
-                    let ink = rustcars::ink_on(rustcars::tint(crate::tab_color(i), 0.35));
-                    ui.painter().rect_stroke(resp.rect.shrink(1.0), 0.0, egui::Stroke::new(2.0, ink), egui::StrokeKind::Inside);
-                }
+                // The open tab is the light tint, as on the page tab strip
+                // (rustcars IMG2 tabs); screen readers get it as selected.
+                let (sel, name) = (selected == Some(i), labels[i].to_uppercase());
+                resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Tab, true, sel, &name));
                 if resp.clicked() {
                     picked = Some(i);
                 }
@@ -740,7 +739,8 @@ pub fn bar_button(ui: &mut egui::Ui, label: &str, base: egui::Color32, size: egu
         Some(state) => {
             ui.add_enabled_ui(enabled, |ui| {
                 let mut local = state;
-                rustcars::toggle_button(ui, &t, label, &mut local, base, size)
+                // Square in the bar (rustcars P1c).
+                rustcars::bar_toggle_button(ui, &t, label, &mut local, base, size)
             })
             .inner
         }
@@ -1029,6 +1029,38 @@ mod top_cap_deadlock_tests {
 #[cfg(test)]
 mod page_frame_tests {
     use super::*;
+
+    /// Real LCARS fonts and theme: the Timers bar (COPY TIME, ID 10:00, the
+    /// CLOCKS / WORLD / STOPWATCH / COUNTDOWN tabs, each one open in turn)
+    /// and the Tools tabs paint no dark outline: momentary keys and tabs
+    /// have no stroke; the mode button's border is its state colour.
+    #[test]
+    fn bar_buttons_have_no_black_borders() {
+        let ctx = egui::Context::default();
+        let mut tools = Tools::new(&ctx);
+        let dark = |c: egui::Color32| c.a() > 0 && (c.r() as u16 + c.g() as u16 + c.b() as u16) < 3 * 48;
+        let tl = timers::tab_labels();
+        for sel in 0..tl.len() {
+            let mut out = egui::FullOutput::default();
+            for _ in 0..2 {
+                out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    ui.horizontal(|ui| tools.timers_mut().bar(ui));
+                    let r = egui::Rect::from_min_size(egui::pos2(300.0, 0.0), egui::vec2(700.0, 40.0));
+                    bar_tab_row(ui, r, "timers", &tl, Some(sel));
+                    let r = egui::Rect::from_min_size(egui::pos2(0.0, 100.0), egui::vec2(900.0, 40.0));
+                    bar_tab_row(ui, r, "tools", &Tools::tab_labels(), Some(sel));
+                });
+                out.textures_delta.clear();
+            }
+            for c in &out.shapes {
+                if let egui::Shape::Rect(r) = &c.shape {
+                    assert!(!(r.stroke.width > 0.0 && dark(r.stroke.color)), "tab {sel}: dark border {r:?}");
+                    // rustcars P1c: every bar button is square.
+                    assert_eq!(r.corner_radius, egui::CornerRadius::ZERO, "tab {sel}: rounded bar button {r:?}");
+                }
+            }
+        }
+    }
 
     /// In the bar the tool tabs are plain segments: no end cap on the
     /// first (NANOVNA) or any tab, at wide and narrow widths.

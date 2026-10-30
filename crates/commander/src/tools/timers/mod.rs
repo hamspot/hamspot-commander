@@ -119,7 +119,8 @@ impl Timers {
         let mut m = Mode::Inactive; // momentary: the gesture picks the format
         // Click modes: a rustcars mode button (AGENTS.md P1; P1b "a toggle
         // with click modes stays a mode_button").
-        mode_button(ui, &t, "Copy time", &mut m, egui::vec2(COPY_W, t.bar_thin)).on_hover_text(
+        // Square in the bar (rustcars P1c).
+        rustcars::bar_mode_button(ui, &t, "Copy time", &mut m, egui::vec2(COPY_W, t.bar_thin)).on_hover_text(
             "click: 2026-10-23 1948Z · double: local with offset · triple: ISO 8601",
         );
         match m {
