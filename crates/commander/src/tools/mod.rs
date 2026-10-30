@@ -221,10 +221,9 @@ impl Tools {
     pub fn header_width(&self) -> f32 {
         let g = BAR_TAB_GAP;
         match self.screen {
-            Screen::Log => 90.0 * 2.0 + g,
-            Screen::HamRf => plain_tabs_width(&ham_rf::tool_labels()),
-            Screen::Calculator => plain_tabs_width(&["Deg".to_owned(), "Rad".to_owned()]),
-            Screen::Hex => 96.0,
+            // Logbook, RF Calc, Calc and Hex keys are a folder-tab row on
+            // the page under the bar, as NanoVNA's band row; only the
+            // Rotator LEDs ride the bar.
             Screen::Rotator => 2.0 * rotator::BAR_LED_W + g,
             _ => 0.0,
         }
@@ -350,6 +349,34 @@ pub(crate) fn tab_row(bg: egui::Color32) -> egui::Frame {
         top: 0,
         bottom: gap,
     })
+}
+
+/// A tool's function keys as NanoVNA's band row: folder tabs (same helper,
+/// size, spacing and selected style), wrapping when too narrow, then the
+/// frame gap. Hues start at `hue0`. Returns the clicked key.
+pub(crate) fn key_row(ui: &mut egui::Ui, labels: &[String], selected: Option<usize>, hue0: usize) -> Option<usize> {
+    let mut picked = None;
+    ui.horizontal_wrapped(|ui| {
+        for (i, label) in labels.iter().enumerate() {
+            let on = selected == Some(i);
+            let resp = crate::folder_tab_colored(ui, on, hue0 + i, label, false, None, None);
+            let name = label.to_uppercase();
+            resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Tab, true, on, &name));
+            if resp.clicked() {
+                picked = Some(i);
+            }
+        }
+    });
+    ui.add_space(LcarsTheme::default().frame_gap);
+    picked
+}
+
+/// The top panel a tool's [`key_row`] sits in, at the top of its screen.
+pub(crate) fn key_row_panel(ui: &mut egui::Ui, id: &str, add: impl FnOnce(&mut egui::Ui)) {
+    egui::Panel::top(id)
+        .show_separator_line(false)
+        .frame(egui::Frame::new().fill(LcarsTheme::default().bg))
+        .show(ui, add);
 }
 
 /// Outer height of a tab row: the buttons stay `bar_thin`, then the gap.
@@ -1267,7 +1294,7 @@ mod page_frame_tests {
                     );
                 }
                 assert!(in_bar.iter().any(|(s, _)| s.eq_ignore_ascii_case(label)), "{label} at {w}: open tab shown in the bar");
-                if w >= 1400.0 && tools.header_width() == 0.0 {
+                if w >= 1400.0 && screen != Screen::Rotator {
                     for (_, l) in SCREENS {
                         assert!(in_bar.iter().any(|(s, _)| s.eq_ignore_ascii_case(l)), "tab {l} in the bar at {w}");
                     }

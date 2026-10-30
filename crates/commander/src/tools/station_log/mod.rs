@@ -109,19 +109,15 @@ impl Diary {
 
     pub fn draw(&mut self, ui: &mut egui::Ui) {
         let t = self.theme;
-        super::screen_header(ui, "diary_header", &t, |ui| {
-                ui.horizontal(|ui| {
-                    super::title_block(ui, &t, "Logbook", palette::TAN, egui::vec2(110.0, t.bar_thin));
-                    let seg = egui::vec2(90.0, t.bar_thin);
-                    if lcars_button(ui, &t, "Today", palette::TEAL, seg, Cap::None, true).clicked()
-                    {
-                        self.date = chrono::Local::now().format("%Y-%m-%d").to_string();
-                    }
-                    if lcars_button(ui, &t, "All", palette::SLATE, seg, Cap::None, true).clicked() {
-                        self.date.clear();
-                        self.search.clear();
-                    }
-                });
+        super::key_row_panel(ui, "diary_header", |ui| {
+            match super::key_row(ui, &["Today".to_owned(), "All".to_owned()], None, 4) {
+                Some(0) => self.date = chrono::Local::now().format("%Y-%m-%d").to_string(),
+                Some(_) => {
+                    self.date.clear();
+                    self.search.clear();
+                }
+                None => {}
+            }
         });
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(t.bg))

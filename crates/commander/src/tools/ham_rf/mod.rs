@@ -322,21 +322,14 @@ impl HamRf {
 
     pub fn draw(&mut self, ui: &mut Ui) {
         let t = self.theme;
-        super::screen_header(ui, "ham_header", &t, |ui| {
-                ui.horizontal(|ui| {
-                    super::title_block(ui, &t, "RF Calc", palette::TAN, vec2(110.0, t.bar_thin));
-                    // Function keys: folder tabs as the NanoVNA band row, each
-                    // its own hue, the open one lighter with a light bottom
-                    // mark; what does not fit goes behind the more key.
-                    let labels = tool_labels();
-                    let sel = TOOLS.iter().position(|(tool, _, _)| *tool == self.tool);
-                    let rect = super::bar_keys_rect(ui.ctx())
-                        .filter(|r| r.width() > 0.0)
-                        .unwrap_or_else(|| egui::Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), t.bar_thin)));
-                    if let Some(i) = super::bar_tab_row_from(ui, rect, "rf-tools", &labels, sel, 3) {
-                        self.tool = TOOLS[i].0;
-                    }
-                });
+        super::key_row_panel(ui, "ham_header", |ui| {
+            // Function keys: a folder-tab row on the page under the bar, as
+            // the NanoVNA band row (David, pt368u follow-up).
+            let labels = tool_labels();
+            let sel = TOOLS.iter().position(|(tool, _, _)| *tool == self.tool);
+            if let Some(i) = super::key_row(ui, &labels, sel, 3) {
+                self.tool = TOOLS[i].0;
+            }
         });
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(t.bg))

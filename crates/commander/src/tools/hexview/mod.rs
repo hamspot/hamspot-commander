@@ -134,15 +134,10 @@ impl HexView {
 
     pub fn draw(&mut self, ui: &mut egui::Ui) {
         let t = self.theme;
-        super::screen_header(ui, "hex_header", &t, |ui| {
-                ui.horizontal(|ui| {
-                    super::title_block(ui, &t, "Hex", palette::TAN, egui::vec2(110.0, t.bar_thin));
-                    // A square action key in its own hue (rustcars P1c), not the dark
-                    // inactive mode fill.
-                    if rustcars::lcars_button(ui, &t, "Open", palette::TEAL, egui::vec2(96.0, t.bar_thin), rustcars::Cap::None, true).clicked() {
-                        self.open_request = true;
-                    }
-                });
+        super::key_row_panel(ui, "hex_header", |ui| {
+            if super::key_row(ui, &["Open".to_owned()], None, 4).is_some() {
+                self.open_request = true;
+            }
         });
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(t.bg))

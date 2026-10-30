@@ -314,20 +314,14 @@ impl Calc {
     pub fn draw(&mut self, ui: &mut egui::Ui) {
         let t = self.theme;
         self.keyboard(ui);
-        super::screen_header(ui, "calc_header", &t, |ui| {
-                ui.horizontal(|ui| {
-                    super::title_block(ui, &t, "Calc", palette::TAN, egui::vec2(110.0, t.bar_thin));
-                    // Deg / Rad: two square folder keys, the open one marked.
-                    for (i, (label, angle)) in [("Deg", Angle::Deg), ("Rad", Angle::Rad)].into_iter().enumerate() {
-                        let on = self.env.angle == angle;
-                        let resp = crate::folder_tab(ui, on, 4 + i, label, false).on_hover_text("Degrees / radians");
-                        let name = label.to_uppercase();
-                        resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::RadioButton, true, on, &name));
-                        if resp.clicked() {
-                            self.env.angle = angle;
-                        }
-                    }
-                });
+        super::key_row_panel(ui, "calc_header", |ui| {
+            let labels = vec!["Deg".to_owned(), "Rad".to_owned()];
+            let sel = Some(if self.env.angle == Angle::Deg { 0 } else { 1 });
+            match super::key_row(ui, &labels, sel, 4) {
+                Some(0) => self.env.angle = Angle::Deg,
+                Some(_) => self.env.angle = Angle::Rad,
+                None => {}
+            }
         });
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(t.bg))

@@ -13260,40 +13260,96 @@ mod detached_fit_tests {
         tools.conceal_nanovna();
     }
 
-    /// RF Calc's ten function keys: folder tabs, never clipped at the right
-    /// (the extras go behind the more key), each its own hue, the open one
-    /// marked by a light bar (not colour alone, not black).
+    /// The folder tab (bar-height rect) behind the text `label`.
+    fn tab_rect(out: &egui::FullOutput, label: &str) -> Option<egui::Rect> {
+        let th = rustcars::LcarsTheme::default();
+        let texts: Vec<egui::Rect> = out.shapes.iter().filter_map(|c| match &c.shape {
+            egui::Shape::Text(t) if t.galley.text().eq_ignore_ascii_case(label) => Some(t.visual_bounding_rect()),
+            _ => None,
+        }).collect();
+        texts.iter().find_map(|text| out.shapes.iter().find_map(|c| match &c.shape {
+            egui::Shape::Rect(r) if r.rect.contains_rect(*text) && (r.rect.height() - th.bar_thin).abs() < 1.0 => Some(r.rect),
+            _ => None,
+        }))
+    }
+
+    /// Tool function keys (RF Calc, Calc, Hex, Logbook) sit as NanoVNA's
+    /// band row: a folder-tab row on the page directly under the bar, same
+    /// place, size and spacing; not in the bar, so every tool tab shows in
+    /// the bar at 1400 px with no more key. Docked and detached.
     #[test]
-    fn rf_calc_function_keys_are_folder_tabs_that_fit() {
+    fn tool_key_rows_sit_where_the_nanovna_band_row_is() {
         let ctx = ctx();
         let mut tools = tools::Tools::new(&ctx);
-        tools.screen = tools::Screen::HamRf;
-        for w in [1600.0, 1100.0, 900.0] {
-            let size = egui::vec2(w, 800.0);
-            let out = frame(&ctx, Page::Tools, size, &mut |ui| { tools.framed(ui); });
-            let keys = tools::bar_keys_rect(&ctx).expect("keys rect");
-            let labels = tools::ham_rf::tool_labels();
-            let shown: Vec<egui::Rect> = out.shapes.iter().filter_map(|c| match &c.shape {
-                egui::Shape::Text(t) if labels.iter().any(|l| l.eq_ignore_ascii_case(t.galley.text())) => {
-                    Some(t.visual_bounding_rect())
+        let th = rustcars::LcarsTheme::default();
+        for detached in [false, true] {
+            for w in [1400.0, 1100.0] {
+                let size = egui::vec2(w, 900.0);
+                let run = |tools: &mut tools::Tools| -> (egui::FullOutput, egui::Rect) {
+                    let mut f = egui::Rect::NOTHING;
+                    let out = if detached {
+                        frame(&ctx, Page::Tools, size, &mut |ui| f = tools.framed(ui).0)
+                    } else {
+                        let mut out = egui::FullOutput::default();
+                        for _ in 0..3 {
+                            out = ctx.run_ui(
+                                egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), ..Default::default() },
+                                |ui| f = tools.framed(ui).0,
+                            );
+                            out.textures_delta.clear();
+                        }
+                        out
+                    };
+                    (out, f)
+                };
+                tools.screen = tools::Screen::NanoVna;
+                let (out, f) = run(&mut tools);
+                let cal = tab_rect(&out, "Cal").expect("NanoVNA Cal tab");
+                assert!(cal.top() >= f.top() + th.bar_thin, "band row under the bar");
+                let (dy, dx) = (cal.top() - f.top(), cal.left() - f.left());
+                for (screen, first, n) in [
+                    (tools::Screen::HamRf, "Wave", 10),
+                    (tools::Screen::Calculator, "Deg", 2),
+                    (tools::Screen::Hex, "Open", 1),
+                    // Logbook draws its Today / All row through the same
+                    // key_row; with no station file saved it shows only the
+                    // "no log open" note, so it is not measured here.
+                ] {
+                    tools.screen = screen;
+                    let (out, f) = run(&mut tools);
+                    let what = format!("{first} row at {w} (detached {detached})");
+                    let r = tab_rect(&out, first).unwrap_or_else(|| {
+                        let t: Vec<String> = out.shapes.iter().filter_map(|c| match &c.shape { egui::Shape::Text(t) => Some(t.galley.text().to_owned()), _ => None }).take(40).collect();
+                        panic!("{what}: no {first} tab; texts {t:?}")
+                    });
+                    assert!((r.top() - f.top() - dy).abs() < 1.0, "{what}: top {} vs NanoVNA {dy}", r.top() - f.top());
+                    assert!((r.left() - f.left() - dx).abs() < 1.0, "{what}: left {} vs NanoVNA {dx}", r.left() - f.left());
+                    assert!((r.height() - cal.height()).abs() < 0.5, "{what}: same height");
+                    // Not in the bar.
+                    assert!(r.top() >= f.top() + th.bar_thin, "{what}: on the page");
+                    // All keys shown (wrapping, not clipped), the open one marked.
+                    if screen == tools::Screen::HamRf {
+                        let labels = tools::ham_rf::tool_labels();
+                        let mut fills = Vec::new();
+                        for l in &labels {
+                            let k = tab_rect(&out, l).unwrap_or_else(|| panic!("{what}: {l} missing"));
+                            assert!(k.right() <= f.right() + 0.5, "{what}: {l} clipped");
+                            fills.push(k);
+                        }
+                        assert_eq!(fills.len(), n);
+                        let mark = out.shapes.iter().any(|c| matches!(&c.shape, egui::Shape::Rect(m)
+                            if (m.rect.height() - TAB_MARK_H).abs() < 0.5 && m.fill == rustcars::palette::TEXT && m.rect.top() > f.top() + th.bar_thin));
+                        assert!(mark, "{what}: open key marked");
+                    }
+                    // Tool tabs: all in the bar at 1400, no more key.
+                    if w >= 1400.0 {
+                        for (_, l) in tools::SCREENS {
+                            let t = tab_rect(&out, l).unwrap_or_else(|| panic!("{what}: tab {l} hidden"));
+                            assert!(t.top() < f.top() + th.bar_thin, "{what}: tab {l} in the bar");
+                        }
+                    }
                 }
-                _ => None,
-            }).collect();
-            assert!(!shown.is_empty(), "at {w}: function keys shown");
-            for r in &shown {
-                assert!(keys.expand(1.0).contains_rect(*r), "at {w}: key {r:?} clipped outside {keys:?}");
             }
-            let fills: Vec<egui::Color32> = out.shapes.iter().filter_map(|c| match &c.shape {
-                egui::Shape::Rect(r) if keys.contains_rect(r.rect) && r.rect.height() > 20.0 => Some(r.fill),
-                _ => None,
-            }).collect();
-            let mut u = fills.clone();
-            u.sort_by_key(|c| c.to_array());
-            u.dedup();
-            assert!(u.len() >= shown.len().min(3), "at {w}: hues {u:?}");
-            let mark = out.shapes.iter().any(|c| matches!(&c.shape, egui::Shape::Rect(r)
-                if keys.contains_rect(r.rect) && (r.rect.height() - TAB_MARK_H).abs() < 0.5 && r.fill == rustcars::palette::TEXT));
-            assert!(mark, "at {w}: the open function key is marked");
         }
         tools.conceal_nanovna();
     }
