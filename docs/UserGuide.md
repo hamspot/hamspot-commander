@@ -184,8 +184,7 @@ The top of the window is one row of page tabs. The default order is **Tune**, **
 
 ## 4.2 Separate windows
 
-- **Config, REC, Timers, HF Data, Levels, Keys and Tools** detach with the rounded pill at the top right of the page: click it to open the page in its own window, click it again (on the window or the main page) to put it back.
-- **Meters** has a **Detach** button that opens it in its own window, and **Dock** puts it back.
+- **Config, REC, Timers, HF Data, Levels, Keys, Meters and Tools** detach with the rounded pill at the top right of the page: click it to open the page in its own window, click it again (on the window or the main page) to put it back.
 
 <!-- screenshot: main-03 — Any page can be torn off into its own window. -->
 
@@ -210,7 +209,7 @@ A frequency the radio refuses doesn't move the readout.
 
 ## 4.4 E-STOP
 
-The red **E-STOP** button with a black stop-sign octagon sits at the right end of the tan top bar of every main page (Tune, Plan, Channels, Talkgroups, Radio IDs, Keys, Meters, Levels, Timers, REC, Tools and Config); on Tools it is there for every tool screen, and in the detached Tools window it sits at the right of the top row. It is also and in the bar of the Config groups Radio, Rotator, Amplifier, Automation patch and RF patch. Every copy is the same switch.
+The red **E-STOP** button with a black stop-sign octagon sits at the right end of the tan top bar of every main page (Tune, Plan, Channels, Talkgroups, Radio IDs, Keys, Meters, Levels, Timers, REC, Tools and Config); on Tools it is there for every tool screen, and in the detached Tools window it sits at the right of the top row. It is also in the bar of the Config groups Radio, Rotator, Amplifier, Automation patch and RF patch. Every copy is the same switch.
 
 Press it and it latches. Every copy then reads **E-STOP ENGAGED**, and Commander:
 
@@ -630,7 +629,7 @@ Hamlib and GQRX radios give only demodulated audio, and REC does not record them
 
 # 10. Meters, Levels, Timers and HF Data
 
-**Detaching a page.** HF Data, Levels, Keys and Timers carry the same rounded pill at the top right as Config and REC: click it to move the whole page into its own window, click it again (in either place) to bring it back, drag it to move the window. The main window shows a line saying where the page went. Tune, Plan, Channels and the TG / ID pages have no page pill. Tools detach the same way (see Tools). Meters keeps its own detach for now.
+**Detaching a page.** HF Data, Levels, Keys and Timers carry the same rounded pill at the top right as Config and REC: click it to move the whole page into its own window, click it again (in either place) to bring it back, drag it to move the window. The main window shows a line saying where the page went. Tune, Plan, Channels and the TG / ID pages have no page pill. Tools and Meters detach the same way; whether they are detached, and their window's place and size, are remembered (for Meters also in the station file).
 
 ## 10.1 Meters
 
@@ -639,7 +638,7 @@ The Meters page shows the S-meter for the current VFO, then ALC, SWR and power.
 - The S-meter reads S0 to S9 in about 6 dB steps, then `S9+` dB.
 - SWR reads 1.0 (empty) to 5.0 (full). **High SWR** lights at 3.0 or more.
 - `Busy`, `Mic Eq` and `PLL unlock` are drawn but not yet connected to the radio.
-- **Detach** opens the meters in their own window, and the lock button stops them being rearranged.
+- The pill at the top right of the page opens the meters in their own window (click it again to bring them back), and the lock button stops them being rearranged.
 
 <!-- screenshot: meter-01 — The Meters page. -->
 

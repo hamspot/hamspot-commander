@@ -94,12 +94,20 @@ fn config_page_detach_id() -> egui::Id {
 /// HackRF TG / ID pages stay out: they hold the Tune and scanner widgets,
 /// which are not wrapped. Meters and Tools keep their own detach until their
 /// settings migrate.
-const DETACHABLE_PAGES: [Page; 7] =
-    [Page::Config, Page::Rec, Page::Timers, Page::HfData, Page::Levels, Page::Keys, Page::Tools];
+const DETACHABLE_PAGES: [Page; 8] = [
+    Page::Config, Page::Rec, Page::Timers, Page::HfData, Page::Levels, Page::Keys, Page::Tools, Page::Meters,
+];
 
 /// The old Tools tear-off saved `tool_detach` ("1"), `tool_win_pos` and
 /// `tool_win_size` ("x,y"). They now seed the Tools page pill, and the same
 /// keys keep being written from it, so an older build reads them back too.
+/// Meters' old Detach button saved `meter_detach`, `meter_win_pos` and
+/// `meter_win_size` (and the station file's `meters.detached` / window).
+/// They now seed the Meters page pill.
+fn seed_meter_pill(detached: bool, pos: Option<egui::Pos2>, size: Option<egui::Vec2>) -> group_box::DetachState {
+    group_box::DetachState { detached, pos, size, failed: false }
+}
+
 fn migrate_tool_detach(detach: Option<&str>, pos: Option<&str>, size: Option<&str>) -> group_box::DetachState {
     group_box::DetachState {
         detached: detach == Some("1"),
@@ -576,18 +584,13 @@ struct App {
     gpredict_wires: Vec<gpredict_hw::OwnedWire>,
     /// Meter order, lock, needles, and whether the page is in its own window.
     meters: Arc<Mutex<MeterState>>,
-    /// Latest radio reading for the detached window. The root writes it.
-    meter_feed: Arc<Mutex<MeterFeed>>,
     /// Window icon, shared so a new viewport does not rebuild the PNG.
+    // Unused since the Meters/Tools windows became page-pill windows:
+    // rustcars detached_window takes no icon yet (follow-up).
+    #[allow(dead_code)]
     icon: Arc<egui::IconData>,
-    /// Position and size handed to the meter window when it opens.
-    /// Left alone while the window is open, so a drag is not pulled back.
-    meter_place: Option<egui::Pos2>,
-    meter_size: Option<egui::Vec2>,
-    meter_placed: bool,
     /// Calculator, station log, and the other rustcars screens.
     tools: Arc<Mutex<tools::Tools>>,
-    /// Position and size handed to the tools window when it opens.
     /// REC recorder state (#119).
     rec: rec_ui::RecUi,
 }
@@ -598,10 +601,11 @@ struct MeterState {
     order: Vec<String>,
     drag: Option<MeterDrag>,
     needles: HashMap<String, Needle>,
-    /// The meters are a separate native window.
+    /// Mirror of the Meters page pill's detach state (show_page_windows).
     detached: bool,
-    /// The detached window asked to come back into the main window.
-    dock: bool,
+    /// The fields above were just loaded (storage or station file): copy
+    /// them into the page pill's state on the next frame (decisions.md).
+    seed_pill: bool,
     /// Last known outer position and inner size. Absent on Wayland.
     saved_pos: Option<egui::Pos2>,
     saved_size: Option<egui::Vec2>,
@@ -609,16 +613,6 @@ struct MeterState {
     saved_monitor: Option<egui::Vec2>,
     /// OS pixels per point, when the window system reports it.
     saved_ppp: Option<f32>,
-}
-
-struct MeterFeed {
-    snap: Snapshot,
-    radio: Option<String>,
-    clock: clock::SystemClock,
-}
-
-fn meter_viewport() -> egui::ViewportId {
-    egui::ViewportId::from_hash_of("hamspot-meters")
 }
 
 fn parse_point(text: &str) -> Option<egui::Pos2> {
@@ -2312,7 +2306,7 @@ impl App {
                     .storage
                     .and_then(|storage| storage.get_string("meter_detach"))
                     .is_some_and(|value| value == "1"),
-                dock: false,
+                seed_pill: true,
                 saved_pos: cc
                     .storage
                     .and_then(|storage| storage.get_string("meter_win_pos"))
@@ -2326,15 +2320,7 @@ impl App {
                 saved_monitor: None,
                 saved_ppp: None,
             })),
-            meter_feed: Arc::new(Mutex::new(MeterFeed {
-                snap: empty_snap(),
-                radio: None,
-                clock: clock::SystemClock::default(),
-            })),
             icon: Arc::new(hamspot_icon()),
-            meter_place: None,
-            meter_size: None,
-            meter_placed: false,
             tools: Arc::new(Mutex::new(tools::Tools::new(&cc.egui_ctx))),
         };
         {
@@ -2778,14 +2764,6 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // E-STOP chord: read once, act after the input closure.
         self.estop_chord.poll(ui.ctx());
-        {
-            let mut meters = self.meters.lock().expect("meters");
-            if meters.dock {
-                meters.detached = false;
-                meters.dock = false;
-                meters.drag = None;
-            }
-        }
         let (mut snap, live_gen, poll_gen) = self.snap_gen();
         self.overlay_hackrf(&mut snap);
         self.clear_stale_channel_note(&snap);
@@ -3209,7 +3187,6 @@ impl eframe::App for App {
             self.amplifier_window(&ctx);
         }
         self.show_page_windows(&ctx, &mut snap);
-        self.show_meter_window(&ctx, &snap);
         self.show_vna_wizard(&ctx);
         // Clicks in this frame already ran. A channel or zone pick stops
         // the scan before this hop, and service_cc has already stored any
@@ -7386,15 +7363,12 @@ impl App {
             meters.detached = face.detached;
             meters.order = face.order.clone();
             meters.drag = None;
-            meters.dock = false;
+            meters.seed_pill = true;
             meters.saved_pos = pos;
             meters.saved_size = size;
             meters.saved_monitor = monitor;
             meters.saved_ppp = face.window.pixels_per_point;
         }
-        self.meter_place = pos;
-        self.meter_size = size;
-        self.meter_placed = false;
     }
 
     fn clamp_plan_selection(&mut self) {
@@ -8523,24 +8497,8 @@ impl App {
             .find(|row| row.selected)
             .map(|row| row.spec.name.clone());
         let mut meters = self.meters.lock().expect("meters");
-        if meters.detached {
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.label("Meters are in their own window.");
-                if ui.button("Dock").clicked() {
-                    meters.detached = false;
-                    meters.drag = None;
-                }
-            });
-            return;
-        }
-        paint_meter_page(
-            ui,
-            snap,
-            radio.as_deref(),
-            &mut meters,
-            &self.system_clock,
-            false,
-        );
+        // Detached: the page frame shows the stub; the window draws this.
+        paint_meter_page(ui, snap, radio.as_deref(), &mut meters, &self.system_clock);
     }
 
     fn refresh_tools(&mut self, ctx: &egui::Context, snap: &Snapshot) {
@@ -8612,6 +8570,25 @@ impl App {
         for page in DETACHABLE_PAGES {
             let id = page_detach_id(page);
             let mut st = group_box::DetachState::load(ctx, id);
+            if page == Page::Meters {
+                // Migration (decisions.md, "Meters detach is the page pill"):
+                // freshly loaded meter_detach / window place seed the pill;
+                // otherwise the pill is mirrored back so the same keys and
+                // the station file's meters.detached keep being written.
+                let mut meters = self.meters.lock().expect("meters");
+                if meters.seed_pill {
+                    meters.seed_pill = false;
+                    st = seed_meter_pill(meters.detached, meters.saved_pos, meters.saved_size);
+                    st.store(ctx, id);
+                } else {
+                    if meters.detached != st.detached {
+                        meters.drag = None;
+                    }
+                    meters.detached = st.detached;
+                    meters.saved_pos = st.pos.or(meters.saved_pos);
+                    meters.saved_size = st.size.or(meters.saved_size);
+                }
+            }
             if page == Page::Tools {
                 // Mirror for NanoVNA visibility and the saved tool_* keys,
                 // attached or not (a docked pill must save tool_detach=0).
@@ -8660,6 +8637,22 @@ impl App {
                 ui.label(egui::RichText::new(rec_ui::PRIVACY).weak().small());
             }
             Page::Tools => self.tools.lock().expect("tools").window_body(ui),
+            Page::Meters => {
+                // The station file keeps the window's monitor and scale too.
+                let info = ui.input(|input| input.viewport().clone());
+                let radio = self.hub.view().rows.iter().find(|row| row.selected).map(|row| row.spec.name.clone());
+                let mut meters = self.meters.lock().expect("meters");
+                if let Some(monitor) = info.monitor_size.filter(|m| m.x > 1.0 && m.y > 1.0) {
+                    meters.saved_monitor = Some(monitor);
+                }
+                if let Some(ppp) = info.native_pixels_per_point.filter(|p| p.is_finite() && *p > 0.0) {
+                    meters.saved_ppp = Some(ppp);
+                }
+                egui::ScrollArea::vertical()
+                    .id_salt("meter-window")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| paint_meter_page(ui, snap, radio.as_deref(), &mut meters, &self.system_clock));
+            }
             Page::HfData | Page::Levels | Page::Keys => {
                 egui::ScrollArea::vertical()
                     .id_salt(("detached-body", page_name(page)))
@@ -8692,51 +8685,6 @@ impl App {
                     self.page_config(ui, snap);
                 });
         }
-    }
-
-    /// Open the meters as a native window when they are detached.
-    /// The builder's position is fixed for the life of that window.
-    fn show_meter_window(&mut self, ctx: &egui::Context, snap: &Snapshot) {
-        let detached = self.meters.lock().expect("meters").detached;
-        if !detached {
-            self.meter_placed = false;
-            return;
-        }
-        {
-            let mut feed = self.meter_feed.lock().expect("meters");
-            feed.snap = snap.clone();
-            feed.clock = self.system_clock.clone();
-            feed.radio = self
-                .hub
-                .view()
-                .rows
-                .iter()
-                .find(|row| row.selected)
-                .map(|row| row.spec.name.clone());
-        }
-        if !self.meter_placed {
-            let meters = self.meters.lock().expect("meters");
-            self.meter_place = meters.saved_pos;
-            self.meter_size = meters.saved_size;
-            self.meter_placed = true;
-        }
-        let mut builder = egui::ViewportBuilder::default()
-            .with_title("Meters")
-            .with_app_id("hamspotcommander")
-            .with_inner_size(self.meter_size.unwrap_or(egui::vec2(1000.0, 560.0)))
-            .with_min_inner_size([480.0, 280.0])
-            .with_icon(Arc::clone(&self.icon));
-        if let Some(pos) = self.meter_place {
-            builder = builder.with_position(pos);
-        }
-        let state = Arc::clone(&self.meters);
-        let feed = Arc::clone(&self.meter_feed);
-        let viewport = meter_viewport();
-        ctx.show_viewport_deferred(viewport, builder, move |ui, _class| {
-            meter_window_ui(ui, &state, &feed);
-        });
-        // The radio poll wakes the main window. The meter window needs its own.
-        ctx.request_repaint_of(viewport);
     }
 
     /// Point every follower at a control the operator just picked. The radio
@@ -11098,7 +11046,6 @@ fn paint_meter_page(
     radio: Option<&str>,
     meters: &mut MeterState,
     clock: &clock::SystemClock,
-    own_window: bool,
 ) {
     let offers: Vec<(&str, f64, f64)> = snap
         .caps
@@ -11133,17 +11080,6 @@ fn paint_meter_page(
                     meters.locked = !meters.locked;
                     meters.drag = None;
                 }
-                if own_window {
-                    if ui.button("Dock").clicked() {
-                        meters.dock = true;
-                        meters.detached = false;
-                        meters.drag = None;
-                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                } else if ui.button("Detach").clicked() {
-                    meters.detached = true;
-                    meters.drag = None;
-                }
             });
         });
         status_column(ui, snap);
@@ -11159,51 +11095,6 @@ fn paint_meter_page(
             order = paint_meter_grid(ui, &faces, order, meters, readout.as_ref());
             meters.order = merge_meter_order(&meters.order, &order);
         }
-    });
-}
-
-fn meter_window_ui(
-    ui: &mut egui::Ui,
-    state: &Arc<Mutex<MeterState>>,
-    feed: &Arc<Mutex<MeterFeed>>,
-) {
-    let (snap, radio, clock) = {
-        let feed = feed.lock().expect("meters");
-        (feed.snap.clone(), feed.radio.clone(), feed.clock.clone())
-    };
-    let mut meters = state.lock().expect("meters");
-    if ui.input(|input| input.viewport().close_requested()) {
-        meters.dock = true;
-        meters.detached = false;
-        meters.drag = None;
-    }
-    let info = ui.input(|input| input.viewport().clone());
-    if let Some(outer) = info.outer_rect {
-        meters.saved_pos = Some(outer.min);
-    }
-    if let Some(inner) = info.inner_rect {
-        let size = inner.size();
-        if size.x >= 64.0 && size.y >= 64.0 {
-            meters.saved_size = Some(size);
-        }
-    }
-    if let Some(monitor) = info.monitor_size {
-        if monitor.x > 1.0 && monitor.y > 1.0 {
-            meters.saved_monitor = Some(monitor);
-        }
-    }
-    if let Some(ppp) = info.native_pixels_per_point {
-        if ppp.is_finite() && ppp > 0.0 {
-            meters.saved_ppp = Some(ppp);
-        }
-    }
-    egui::CentralPanel::default().show(ui, |ui| {
-        egui::ScrollArea::vertical()
-            .id_salt("meter-window")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                paint_meter_page(ui, &snap, radio.as_deref(), &mut meters, &clock, true);
-            });
     });
 }
 
@@ -12541,6 +12432,22 @@ fn fixed_slider(ui: &mut egui::Ui, label: &str, value: f64) {
 
 #[cfg(test)]
 mod config_order_tests {
+    /// Meters' old detach state seeds the Meters page pill (decisions.md),
+    /// and the old Detach / Dock buttons are gone.
+    #[test]
+    fn meter_detach_seeds_the_page_pill() {
+        let st = crate::seed_meter_pill(true, Some(egui::pos2(10.0, 20.0)), Some(egui::vec2(1000.0, 560.0)));
+        assert!(st.detached && !st.failed);
+        assert_eq!((st.pos, st.size), (Some(egui::pos2(10.0, 20.0)), Some(egui::vec2(1000.0, 560.0))));
+        assert!(!crate::seed_meter_pill(false, None, None).detached);
+        assert!(crate::page_detachable(crate::Page::Meters));
+        let src = include_str!("main.rs");
+        let body = &src[src.find(&["fn paint_meter_", "page("].concat()).unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        assert!(!body.contains("\"Detach\"") && !body.contains("\"Dock\""), "Detach/Dock buttons are gone");
+        assert!(src.contains(&["meters.seed_pill", " = true;"].concat()), "station load re-seeds the pill");
+    }
+
     /// The old Tools tear-off keys seed the Tools page pill (decisions.md).
     #[test]
     fn tool_detach_migrates_to_the_page_pill() {
@@ -12563,7 +12470,7 @@ mod config_order_tests {
         for p in [Page::Timers, Page::HfData, Page::Levels, Page::Keys, Page::Tools] {
             assert!(page_detachable(p), "{} carries the page pill", crate::page_name(p));
         }
-        for p in [Page::Plan, Page::Channels, Page::Talkgroups(0), Page::RadioIds(0), Page::Meters] {
+        for p in [Page::Plan, Page::Channels, Page::Talkgroups(0), Page::RadioIds(0)] {
             assert!(!page_detachable(p), "{} stays out (scanner widgets / own detach)", crate::page_name(p));
         }
         assert_ne!(page_detach_id(Page::Config), page_detach_id(Page::Rec));
