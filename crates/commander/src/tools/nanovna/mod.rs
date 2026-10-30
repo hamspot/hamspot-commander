@@ -5477,9 +5477,9 @@ const MARKER_COLORS: [Color32; markers::SLOTS] = [
     Color32::from_rgb(0xF0, 0xF0, 0xF0),
 ];
 /// Major grid: 3:1 on the pane (WCAG 1.4.11). Issue 73.
-const GRID: Color32 = Color32::from_rgb(0x58, 0x64, 0x76);
-const GRID_FAINT: Color32 = Color32::from_rgb(0x2C, 0x33, 0x3D);
-const TRACE1: Color32 = Color32::from_rgb(0xF2, 0xC2, 0x6B);
+pub(crate) const GRID: Color32 = Color32::from_rgb(0x58, 0x64, 0x76);
+pub(crate) const GRID_FAINT: Color32 = Color32::from_rgb(0x2C, 0x33, 0x3D);
+pub(crate) const TRACE1: Color32 = Color32::from_rgb(0xF2, 0xC2, 0x6B);
 const TRACE2: Color32 = Color32::from_rgb(0x78, 0xAA, 0xD2);
 /// TRC1..TRC4 colours for extra traces sharing a pane and their header chips.
 const TRACE_COLORS: [Color32; 4] = [
@@ -5608,7 +5608,7 @@ const MATH_TEXT: Color32 = Color32::from_rgb(0xFF, 0x99, 0x88);
 const MEM_COLOR: Color32 = palette::TEAL;
 /// Ideal reference behind a calibration standard: light grey, above 3:1 on the pane. Issue 75.
 const IDEAL_COLOR: Color32 = Color32::from_rgb(0x9A, 0x9C, 0xA8);
-const PANE_BG: Color32 = Color32::from_rgb(12, 16, 22);
+pub(crate) const PANE_BG: Color32 = Color32::from_rgb(12, 16, 22);
 
 /// Graticule, labelled ticks, reference line, and traces on one Cartesian pane.
 fn paint_cartesian(
@@ -5964,7 +5964,7 @@ fn show_frame(ui: &mut Ui, theme: &LcarsTheme, rect: Rect, side: Side, add: impl
 }
 
 /// A small group caption over a block of keys, with a rule like a front-panel silkscreen.
-fn key_caption(ui: &mut Ui, theme: &LcarsTheme, text: &str, width: f32) {
+pub(crate) fn key_caption(ui: &mut Ui, theme: &LcarsTheme, text: &str, width: f32) {
     ui.add_space(4.0);
     let (rect, _) = ui.allocate_exact_size(vec2(width, 16.0), Sense::hover());
     let painter = ui.painter_at(rect);
@@ -6028,7 +6028,7 @@ fn softkey_response(ui: &mut Ui, theme: &LcarsTheme, label: &str, lit: bool, wid
     resp
 }
 
-fn key_cap(ui: &mut Ui, theme: &LcarsTheme, label: &str, lit: bool, width: f32, enabled: bool) -> egui::Response {
+pub(crate) fn key_cap(ui: &mut Ui, theme: &LcarsTheme, label: &str, lit: bool, width: f32, enabled: bool) -> egui::Response {
     // A key cap: centered label with padding on every side. The label steps
     // down in size before it is allowed to touch the edge of the cap.
     const PAD: f32 = 8.0;
@@ -6077,7 +6077,7 @@ fn key_cap(ui: &mut Ui, theme: &LcarsTheme, label: &str, lit: bool, width: f32, 
 }
 
 /// Height of one key cap in the left key panel.
-const KEY_H: f32 = 32.0;
+pub(crate) const KEY_H: f32 = 32.0;
 
 fn paint_chart(
     ui: &mut Ui,

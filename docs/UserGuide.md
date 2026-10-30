@@ -309,6 +309,10 @@ A key lights only when the radio reports it can do that operation.
 
 A key is dark when the radio is offline or doesn't support that function. `Dimmer`, `NR sub`, `CW Spot`, `Keyer`, `Nar`, `Ant Rx`, `Chan +`, `Chan -`, `QMR`, `BC`, `PWR`, `QMS`, `Contour`, `Scan` and `Scan Dn` are always dark in this version.
 
+Below the tuning display the page uses the NanoVNA look. Each group has a caption with a thin rule: **VFO · BAND** (ALT, BSP, LOAD, band chips), **MODE · RECEIVER**, **FUNCTIONS**, and on a HackRF **SPECTRUM · GAIN**. Momentary keys are solid key caps. Latching keys (BSP, the band chips, the functions, Ant, Pre, MOX, Avg/Peak) show ● when on and ○ when off with a thin border, so the state never depends on colour. Rows wrap, so every key stays whole in a narrow or detached window.
+
+**HackRF spectrum.** `Avg` and `Peak` pick the trace; the LNA and VGA sliders sit in inset fields. The chart is a dark NanoVNA pane: a header line above it shows the trace, centre, span and the applied LNA/VGA gain; the graticule is labelled in dB (left) and MHz (bottom); a status strip below shows the VFO or "NO CAPTURE" when no samples have arrived. Click or drag in the pane to tune. The chart grows to fill the window, up to a limit, and keeps a minimum height when the window is small.
+
 ## 5.6 Transmit and the band plan
 
 > **Important.** `MOX` keys the transmitter.

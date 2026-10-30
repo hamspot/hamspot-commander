@@ -1,0 +1,289 @@
+//! NanoVNA look for the Tune page below the tuning widget: captions with a
+//! rule, solid key caps (radius 4), ●/○ toggles, and a dark chart pane with a
+//! header line and one status strip. Reuses the NanoVNA helpers so the two
+//! pages stay one style. Layout and styling only; callers keep behaviour.
+
+use crate::tools::nanovna::{key_cap, key_caption, GRID, GRID_FAINT, KEY_H, PANE_BG, TRACE1};
+use egui::{vec2, Color32, Pos2, Rect, Sense, Stroke};
+use rustcars::{palette, LcarsTheme};
+
+/// Header line above and status strip below the spectrum pane.
+pub const STRIP_H: f32 = 18.0;
+/// The pane never grows past this, so a tall detached window stays sane.
+pub const SPECTRUM_MAX_H: f32 = 420.0;
+
+fn theme() -> LcarsTheme {
+    LcarsTheme::default()
+}
+
+fn key_font(t: &LcarsTheme) -> egui::FontId {
+    egui::FontId::proportional((t.header_size * 0.85).min(17.0))
+}
+
+/// Width that fits a label with padding plus room for the ●/○ marker.
+pub fn key_width(ui: &mut egui::Ui, label: &str) -> f32 {
+    let t = theme();
+    let w = ui.fonts_mut(|f| f.layout_no_wrap(format!("● {}", label.to_uppercase()), key_font(&t), Color32::WHITE).size().x);
+    (w + 22.0).max(56.0)
+}
+
+/// Section caption with a thin rule, as NanoVNA's "SWEEP · CAL".
+pub fn caption(ui: &mut egui::Ui, text: &str) {
+    let w = ui.available_width().max(60.0);
+    key_caption(ui, &theme(), text, w);
+}
+
+/// Momentary solid key cap (NanoVNA key_cap, idle slate).
+pub fn action(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response {
+    let w = key_width(ui, label);
+    key_cap(ui, &theme(), label, false, w, enabled)
+}
+
+/// Latching key: hue fill, thin border and the ●/○ marker (never colour alone).
+/// Painted here (not in a child Ui) so it wraps with its row.
+pub fn toggle(ui: &mut egui::Ui, label: &str, enabled: bool, on: bool, hue: Color32) -> egui::Response {
+    let w = key_width(ui, label);
+    let t = theme();
+    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let (rect, resp) = ui.allocate_exact_size(vec2(w, KEY_H), sense);
+    let (fill, border, ink) = rustcars::toggle_colors(hue, on);
+    let fade = |c: Color32| if enabled { c } else { c.gamma_multiply(0.45) };
+    let fill = if enabled && resp.hovered() { rustcars::tint(fill, 0.08) } else { fill };
+    let p = ui.painter();
+    p.rect_filled(rect, 4.0, fade(fill));
+    p.rect_stroke(rect, 4.0, Stroke::new(rustcars::TOGGLE_BORDER, fade(border)), egui::StrokeKind::Inside);
+    rustcars::paint_toggle_marker_label(p, rect, label, on, key_font(&t), fade(ink));
+    if resp.has_focus() {
+        p.rect_stroke(rect.expand(2.0), 5.0, Stroke::new(1.0, t.text), egui::StrokeKind::Outside);
+    }
+    let name = rustcars::toggle_label(label, on);
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, enabled, on, &name));
+    resp
+}
+
+/// Inset field frame (dark glass, thin grid border, radius 4) around a control.
+pub fn inset<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    egui::Frame::new()
+        .fill(PANE_BG)
+        .stroke(Stroke::new(1.0, GRID))
+        .corner_radius(4.0)
+        .inner_margin(egui::Margin::symmetric(6, 4))
+        .show(ui, |ui| {
+            ui.set_min_height(KEY_H - 8.0);
+            add(ui)
+        })
+        .inner
+}
+
+/// Height for the spectrum pane: fill what is left, bounded, never NaN.
+pub fn spectrum_height(ui: &egui::Ui, reserve: f32) -> f32 {
+    let room = ui.available_height().min(ui.clip_rect().bottom() - ui.cursor().top());
+    let h = room - reserve - 2.0 * STRIP_H;
+    if h.is_finite() { h.clamp(crate::dial::SPECTRUM_H, SPECTRUM_MAX_H) } else { crate::dial::SPECTRUM_H }
+}
+
+fn strip(ui: &mut egui::Ui, left: &str, right: &str, ink: Color32) -> Rect {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), STRIP_H), Sense::hover());
+    let p = ui.painter_at(rect);
+    p.rect_filled(rect, 0.0, PANE_BG);
+    let font = egui::FontId::monospace(12.0);
+    p.text(Pos2::new(rect.left() + 6.0, rect.center().y), egui::Align2::LEFT_CENTER, left, font.clone(), ink);
+    p.text(Pos2::new(rect.right() - 6.0, rect.center().y), egui::Align2::RIGHT_CENTER, right, font, palette::TEXT_MUTED);
+    rect
+}
+
+pub struct Chart<'a> {
+    pub header: &'a str,
+    pub header_right: &'a str,
+    pub center_hz: f64,
+    pub rate_hz: f64,
+    pub usable_hz: f64,
+    pub db: &'a [f32],
+    pub needle_hz: f64,
+    pub height: f32,
+    pub status: &'a str,
+}
+
+/// NanoVNA chart: header line, dark pane with labelled graticule, status strip.
+/// A click or drag in the pane returns a frequency.
+pub fn spectrum_chart(ui: &mut egui::Ui, c: Chart) -> (Option<f64>, Rect) {
+    let item = ui.spacing().item_spacing.y;
+    ui.spacing_mut().item_spacing.y = 0.0;
+    strip(ui, c.header, c.header_right, palette::TEXT);
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), c.height), Sense::click_and_drag());
+    let p = ui.painter_at(rect);
+    p.rect_filled(rect, 0.0, PANE_BG);
+    let font = egui::FontId::monospace(10.0);
+    let band = Rect::from_min_max(Pos2::new(rect.left() + 40.0, rect.top() + 6.0), Pos2::new(rect.right() - 8.0, rect.bottom() - 16.0));
+    let rate = if c.rate_hz.is_finite() && c.rate_hz > 0.0 { c.rate_hz } else { 1.0 };
+    let center = if c.center_hz.is_finite() { c.center_hz } else { 0.0 };
+    let (lo, hi) = (center - rate / 2.0, center + rate / 2.0);
+    let top = c.db.iter().copied().filter(|v| v.is_finite()).fold(f32::MIN, f32::max);
+    let (floor, span) = (if top > f32::MIN / 2.0 { top - 70.0 } else { -70.0 }, 70.0f32);
+    for i in 0..=10 {
+        let x = band.left() + band.width() * i as f32 / 10.0;
+        p.line_segment([Pos2::new(x, band.top()), Pos2::new(x, band.bottom())], Stroke::new(1.0, if i % 5 == 0 { GRID } else { GRID_FAINT }));
+        if i % 5 == 0 {
+            let hz = lo + rate * i as f64 / 10.0;
+            let align = match i { 0 => egui::Align2::LEFT_TOP, 10 => egui::Align2::RIGHT_TOP, _ => egui::Align2::CENTER_TOP };
+            p.text(Pos2::new(x, band.bottom() + 2.0), align, format!("{:.3}", hz / 1e6), font.clone(), palette::TEXT_MUTED);
+        }
+    }
+    for i in 0..=7 {
+        let y = band.bottom() - band.height() * i as f32 / 7.0;
+        p.line_segment([Pos2::new(band.left(), y), Pos2::new(band.right(), y)], Stroke::new(1.0, if i == 0 || i == 7 { GRID } else { GRID_FAINT }));
+        if i % 2 == 1 || i == 7 {
+            p.text(Pos2::new(band.left() - 4.0, y), egui::Align2::RIGHT_CENTER, format!("{:.0}", floor + span * i as f32 / 7.0), font.clone(), palette::TEXT_MUTED);
+        }
+    }
+    if c.usable_hz.is_finite() && c.usable_hz > 0.0 && c.usable_hz < rate {
+        let inset = ((rate - c.usable_hz) / 2.0 / rate).clamp(0.0, 0.5) as f32 * band.width();
+        let shade = Color32::from_rgba_unmultiplied(40, 46, 56, 120);
+        p.rect_filled(Rect::from_min_max(band.left_top(), Pos2::new(band.left() + inset, band.bottom())), 0.0, shade);
+        p.rect_filled(Rect::from_min_max(Pos2::new(band.right() - inset, band.top()), band.right_bottom()), 0.0, shade);
+    }
+    if c.db.len() >= 2 {
+        let pts: Vec<Pos2> = c.db.iter().enumerate().map(|(i, v)| {
+            let s = if v.is_finite() { *v } else { floor };
+            let t = ((s - floor) / span).clamp(0.0, 1.0);
+            Pos2::new(band.left() + (i as f32 + 0.5) / c.db.len() as f32 * band.width(), band.bottom() - t * band.height())
+        }).collect();
+        p.add(egui::Shape::line(pts, Stroke::new(1.5, TRACE1)));
+    }
+    if c.needle_hz.is_finite() && c.needle_hz >= lo && c.needle_hz <= hi {
+        let x = band.left() + ((c.needle_hz - lo) / rate) as f32 * band.width();
+        p.line_segment([Pos2::new(x, band.top()), Pos2::new(x, band.bottom())], Stroke::new(1.5, palette::TEXT));
+        p.text(Pos2::new(x + 3.0, band.top()), egui::Align2::LEFT_TOP, "▼ VFO", font.clone(), palette::TEXT);
+    }
+    p.rect_stroke(band, 0.0, Stroke::new(1.0, GRID), egui::StrokeKind::Inside);
+    let resp = if let Some(pos) = response.hover_pos().filter(|p| band.contains(*p)) {
+        let f = lo + ((pos.x - band.left()) / band.width()).clamp(0.0, 1.0) as f64 * rate;
+        response.on_hover_text(format!("{:.6} MHz", f / 1e6))
+    } else {
+        response
+    };
+    let hz = if resp.clicked() || resp.dragged() {
+        resp.interact_pointer_pos().filter(|p| band.contains(*p)).map(|pos| lo + ((pos.x - band.left()) / band.width()).clamp(0.0, 1.0) as f64 * rate)
+    } else {
+        None
+    };
+    strip(ui, c.status, "dB / MHz", palette::TEXT);
+    ui.spacing_mut().item_spacing.y = item;
+    (hz, rect)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every key on the Tune page below the tuning widget, in page order.
+    const KEYS: [&str; 33] = [
+        "ALT", "BSP", "LOAD", "ATU", "Band -", "Band +", "Dimmer", "NR", "Pre 1", "Pre 2", "Ant 1", "Ant 2",
+        "Bk-in", "Fast", "NR sub", "CW Spot", "Keyer", "Nar", "Proc", "Ant Rx", "Chan +", "Chan -", "Lock",
+        "Notch", "QMR", "BC", "TX blocked: E-STOP", "PWR", "QMS", "Contour", "Moni", "Scan", "Scan Dn",
+    ];
+
+    fn ctx() -> egui::Context {
+        let ctx = egui::Context::default();
+        rustcars::install_lcars_font(&ctx);
+        rustcars::apply_theme(&ctx, &LcarsTheme::default());
+        ctx
+    }
+
+    fn run(ctx: &egui::Context, w: f32, h: f32, f: &mut dyn FnMut(&mut egui::Ui)) -> egui::FullOutput {
+        let mut out = egui::FullOutput::default();
+        for _ in 0..3 {
+            out = ctx.run_ui(
+                egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(w, h))), ..Default::default() },
+                |ui| f(ui),
+            );
+            out.textures_delta.clear();
+        }
+        out
+    }
+
+    fn dark(c: Color32) -> bool {
+        c.a() > 0 && (c.r() as u32 + c.g() as u32 + c.b() as u32) < 60
+    }
+
+    #[test]
+    fn keys_fit_unclipped_and_no_black_strokes() {
+        for w in [1400.0, 900.0] {
+            let ctx = ctx();
+            let mut rects = Vec::new();
+            let out = run(&ctx, w, 900.0, &mut |ui| {
+                rects.clear();
+                caption(ui, "FUNCTIONS");
+                ui.horizontal_wrapped(|ui| {
+                    for (i, k) in KEYS.iter().enumerate() {
+                        let r = match i % 3 {
+                            0 => action(ui, k, i % 2 == 0),
+                            1 => toggle(ui, k, true, true, palette::TEAL),
+                            _ => toggle(ui, k, i % 2 == 0, false, palette::PLUM),
+                        };
+                        rects.push((*k, r.rect));
+                    }
+                });
+            });
+            let screen = Rect::from_min_size(Pos2::ZERO, vec2(w, 900.0));
+            assert_eq!(rects.len(), KEYS.len());
+            for (k, r) in &rects {
+                assert!(screen.contains_rect(*r), "{k} clipped at {w}: {r:?}");
+            }
+            for c in &out.shapes {
+                match &c.shape {
+                    egui::Shape::Rect(r) => assert!(!dark(r.stroke.color) || r.stroke.width == 0.0, "dark stroke {:?}", r.stroke),
+                    egui::Shape::LineSegment { stroke, .. } => assert!(!dark(stroke.color)),
+                    egui::Shape::Text(t) => {
+                        let s = t.galley.text();
+                        if let Some((_, r)) = rects.iter().find(|(k, _)| s == k.to_uppercase()) {
+                            assert!(r.expand(1.0).contains_rect(t.visual_bounding_rect()), "label {s} spills its key at {w}");
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn toggles_carry_a_marker_not_colour_alone() {
+        let ctx = ctx();
+        let out = run(&ctx, 600.0, 200.0, &mut |ui| {
+            toggle(ui, "NR", true, true, palette::TEAL);
+            toggle(ui, "Lock", true, false, palette::TEAL);
+        });
+        let (mut filled, mut ring) = (0, 0);
+        for c in &out.shapes {
+            if let egui::Shape::Circle(k) = &c.shape {
+                if k.fill.a() > 0 { filled += 1 } else if k.stroke.width > 0.0 { ring += 1 }
+            }
+        }
+        assert!(filled >= 1 && ring >= 1, "● on / ○ off markers missing: {filled} {ring}");
+    }
+
+    #[test]
+    fn spectrum_stays_in_view_and_bounded() {
+        let db: Vec<f32> = (0..256).map(|i| -80.0 + (i % 17) as f32).collect();
+        for (w, h) in [(1400.0, 900.0), (900.0, 700.0), (500.0, 360.0)] {
+            let ctx = ctx();
+            let mut got = Rect::NOTHING;
+            run(&ctx, w, h, &mut |ui| {
+                ui.add_space(120.0);
+                let height = spectrum_height(ui, 0.0);
+                let c = Chart { header: "SPEC AVG", header_right: "LNA 16 dB", center_hz: 146e6, rate_hz: 2e6, usable_hz: 1.75e6, db: &db, needle_hz: 146.1e6, height, status: "ok" };
+                got = spectrum_chart(ui, c).1;
+            });
+            let screen = Rect::from_min_size(Pos2::ZERO, vec2(w, h));
+            assert!(got.is_finite() && got.height() >= crate::dial::SPECTRUM_H && got.height() <= SPECTRUM_MAX_H, "{got:?}");
+            assert!(screen.contains_rect(got) || h < 120.0 + 2.0 * STRIP_H + crate::dial::SPECTRUM_H, "spectrum out of view at {w}x{h}: {got:?}");
+        }
+        // Unbounded parent (a scroll area): height falls back, never NaN.
+        let ctx = ctx();
+        let mut hh = 0.0;
+        run(&ctx, 800.0, 600.0, &mut |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| hh = spectrum_height(ui, 0.0));
+        });
+        assert!(hh.is_finite() && hh >= crate::dial::SPECTRUM_H && hh <= SPECTRUM_MAX_H);
+    }
+}

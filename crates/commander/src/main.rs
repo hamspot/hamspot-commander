@@ -36,6 +36,7 @@ mod group_box;
 mod estop;
 mod hfdata;
 mod toggle;
+mod tune_style;
 mod tx_lockout;
 mod vna_devices;
 
@@ -190,9 +191,9 @@ use dial::{
     channel_dial, channel_window, digit_steps, format_hz, lock_toggle,
     merge_meter_order, meter, meter_columns, meter_faces, meter_hit, meter_origin, move_meter,
     order_with_clock, SYSTEM_CLOCK,
-    gqrx_dbfs_to_s9, needle_settled, paint_analog_meter, parse_freq, scale, spectrum_plot,
+    gqrx_dbfs_to_s9, needle_settled, paint_analog_meter, parse_freq, scale,
     step_needle, strength_frac, strength_label, swatch, vfo_label, wheel_notches, zone_scale,
-    MeterFace, Needle, PaintSpan, SubBand, HAM, METER_GAP, METER_H, METER_W, SPECTRUM_H,
+    MeterFace, Needle, PaintSpan, SubBand, HAM, METER_GAP, METER_H, METER_W,
 };
 use plan::{BandPlan, Use};
 
@@ -3670,17 +3671,19 @@ impl App {
                 }
             }
         });
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-                let alt = ui.button("ALT");
+        ui.add_space(4.0);
+        tune_style::caption(ui, "VFO · BAND");
+        ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                let alt = tune_style::action(ui, "ALT", true);
                 if alt.clicked() && snap.caps.vfo_ops.contains("XCHG") {
                     self.send(Command::VfoOp("XCHG".into()));
                 }
-                let bsp = crate::toggle::add_toggle(ui, true, self.show_spread, "BSP");
+                let bsp = tune_style::toggle(ui, "BSP", true, self.show_spread, bar_key_hue("BSP", KeyLamp::Dark));
                 if bsp.clicked() {
                     self.show_spread = !self.show_spread;
                 }
-                if ui.button("LOAD").clicked() {
+                if tune_style::action(ui, "LOAD", true).clicked() {
                     self.browse_plan(false);
                 }
                 let mut chip_pick = None;
@@ -3727,7 +3730,7 @@ impl App {
                     .collect();
                 for (idx, chip, name, hz) in &chips {
                     let on = self.band_sel == *idx;
-                    if ui.selectable_label(on, chip).clicked() && !self.following() {
+                    if tune_style::toggle(ui, chip, true, on, tab_color(*idx)).clicked() && !self.following() {
                         self.band_sel = *idx;
                         if snap.caps.can_set_freq {
                             let tuned = self.band_mem.get(name).copied().unwrap_or(*hz);
@@ -3738,19 +3741,17 @@ impl App {
                 if let Some(hz) = chip_pick {
                     self.tune(snap, hz);
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    self.receiver_box(ui, snap);
-                    ui.add_space(8.0);
-                    self.mode_box(ui, snap, "Sub", false);
-                    ui.add_space(8.0);
-                    self.mode_box(ui, snap, "Mode", true);
-                });
             });
-        ui.add_space(8.0);
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.take_available_width();
-            self.buttons(ui, snap);
+        tune_style::caption(ui, "MODE · RECEIVER");
+        ui.horizontal_wrapped(|ui| {
+            self.mode_box(ui, snap, "Mode", true);
+            ui.add_space(8.0);
+            self.mode_box(ui, snap, "Sub", false);
+            ui.add_space(8.0);
+            self.receiver_box(ui, snap);
         });
+        tune_style::caption(ui, "FUNCTIONS");
+        self.buttons(ui, snap);
         if self.selected_hackrf() {
             ui.add_space(8.0);
             self.hackrf_spectrum(ui, snap, freq);
@@ -11928,8 +11929,7 @@ impl App {
     /// Spectrum under the tuner buttons, the height of the bandspread block.
     /// Avg and Peak use the same buttons as the row above the glass.
     fn hackrf_spectrum(&mut self, ui: &mut egui::Ui, snap: &Snapshot, freq: f64) {
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.take_available_width();
+        ui.scope(|ui| {
             let radio = self.hub.view().rows.into_iter().find(|row| {
                 row.selected && row.spec.driver == cat::RadioDriver::Hackrf
             });
@@ -11943,28 +11943,25 @@ impl App {
                     self.hackrf_gain_hold = None;
                 }
             }
+            tune_style::caption(ui, "SPECTRUM · GAIN");
             ui.horizontal_wrapped(|ui| {
-                if ui
-                    .add(egui::Button::new("Avg").selected(!self.spectrum_peak))
-                    .clicked()
-                {
+                ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                if tune_style::toggle(ui, "Avg", true, !self.spectrum_peak, bar_key_hue("Avg", KeyLamp::Dark)).clicked() {
                     self.spectrum_peak = false;
                 }
-                if ui
-                    .add(egui::Button::new("Peak").selected(self.spectrum_peak))
-                    .clicked()
-                {
+                if tune_style::toggle(ui, "Peak", true, self.spectrum_peak, bar_key_hue("Peak", KeyLamp::Dark)).clicked() {
                     self.spectrum_peak = true;
                 }
-                if let Some(row) = radio {
+                if let Some(row) = radio.as_ref() {
                     ui.add_space(8.0);
                     let id = row.id;
-                    let spec = row.spec;
+                    let spec = row.spec.clone();
                     self.hackrf_gain_slider(ui, snap, id, &spec, true);
                     ui.add_space(8.0);
                     self.hackrf_gain_slider(ui, snap, id, &spec, false);
                 }
             });
+            ui.add_space(4.0);
             let frame = self.hub.spectrum();
             self.fold_spectrum(&frame);
             let center = if frame.center_hz > 0.0 {
@@ -11979,16 +11976,43 @@ impl App {
             } else {
                 &self.spectrum_avg
             };
-            if let Some(hz) = spectrum_plot(
+            let rate = crate::hackrf::SAMPLE_RATE as f64;
+            let header = format!(
+                "SPEC  {}  CTR {:.4} MHz  SPAN {:.1} MHz",
+                if self.spectrum_peak { "PEAK" } else { "AVG" },
+                center / 1e6,
+                rate / 1e6
+            );
+            let gain = radio
+                .as_ref()
+                .map(|row| {
+                    let (l, v) = self.applied_hackrf_gain(row.id, &row.spec);
+                    format!("LNA {l} dB  VGA {v} dB")
+                })
+                .unwrap_or_default();
+            let status = if trace.is_empty() {
+                "NO CAPTURE: waiting for HackRF samples".to_string()
+            } else {
+                format!("VFO {:.6} MHz  click or drag to tune", freq / 1e6)
+            };
+            // Fill the room left, bounded; the BSP below keeps its share.
+            let reserve = if self.show_spread { 160.0 } else { 0.0 };
+            let height = tune_style::spectrum_height(ui, reserve);
+            let (pick, _) = tune_style::spectrum_chart(
                 ui,
-                "Spec",
-                center,
-                crate::hackrf::SAMPLE_RATE as f64,
-                crate::hackrf::FILTER_HZ,
-                trace,
-                freq,
-                SPECTRUM_H,
-            ) {
+                tune_style::Chart {
+                    header: &header,
+                    header_right: &gain,
+                    center_hz: center,
+                    rate_hz: rate,
+                    usable_hz: crate::hackrf::FILTER_HZ,
+                    db: trace,
+                    needle_hz: freq,
+                    height,
+                    status: &status,
+                },
+            );
+            if let Some(hz) = pick {
                 if self.can_tune_freq(snap, true) {
                     self.tune(snap, hz);
                 }
@@ -12054,14 +12078,17 @@ impl App {
             self.gain_drag_vga.unwrap_or(base)
         };
         ui.spacing_mut().slider_width = 112.0;
-        let response = ui.add(
-            egui::Slider::new(&mut value, 0u32..=max)
-                .integer()
-                .step_by(f64::from(step))
-                .suffix(" dB")
-                .text(if lna { "LNA" } else { "VGA" })
-                .trailing_fill(true),
-        );
+        // Inset labelled field, as NanoVNA's sweep fields.
+        let response = tune_style::inset(ui, |ui| {
+            ui.add(
+                egui::Slider::new(&mut value, 0u32..=max)
+                    .integer()
+                    .step_by(f64::from(step))
+                    .suffix(" dB")
+                    .text(if lna { "LNA" } else { "VGA" })
+                    .trailing_fill(true),
+            )
+        });
         let notch = if lna { "8 dB" } else { "2 dB" };
         let stage = if lna { "LNA" } else { "VGA" };
         let response = response.on_hover_text(format!(
@@ -12108,6 +12135,7 @@ impl App {
 
     fn buttons(&mut self, ui: &mut egui::Ui, snap: &Snapshot) {
         ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
             self.func_btn(ui, snap, "ATU", "TUNER");
             self.band_step(ui, snap, "Band -", -1);
             self.band_step(ui, snap, "Band +", 1);
@@ -12144,7 +12172,7 @@ impl App {
     fn func_btn(&self, ui: &mut egui::Ui, snap: &Snapshot, label: &str, name: &str) {
         let on = snap.funcs.get(name).copied().unwrap_or(false);
         let enabled = snap.online() && snap.caps.has_func(name);
-        if crate::toggle::add_toggle(ui, enabled, on, label).clicked() {
+        if tune_style::toggle(ui, label, enabled, on, bar_key_hue(label, KeyLamp::Dark)).clicked() {
             self.send(Command::SetFunc {
                 name: name.into(),
                 on: !on,
@@ -12153,15 +12181,12 @@ impl App {
     }
 
     fn dead(&self, ui: &mut egui::Ui, label: &str) {
-        ui.add_enabled(false, egui::Button::new(label));
+        tune_style::action(ui, label, false).on_disabled_hover_text("Not wired for this radio yet");
     }
 
     fn ant(&self, ui: &mut egui::Ui, snap: &Snapshot, label: &str, n: i32) {
         let enabled = snap.online() && snap.caps.can_set_ant;
-        if ui
-            .add_enabled(enabled, egui::Button::new(label).selected(snap.ant == n))
-            .clicked()
-        {
+        if tune_style::toggle(ui, label, enabled, snap.ant == n, bar_key_hue(label, KeyLamp::Dark)).clicked() {
             self.send(Command::SetAnt(n));
         }
     }
@@ -12172,7 +12197,7 @@ impl App {
             .levels
             .get("PREAMP")
             .is_some_and(|v| (*v - db).abs() < 0.5);
-        if crate::toggle::add_toggle(ui, enabled, on, label).clicked() {
+        if tune_style::toggle(ui, label, enabled, on, bar_key_hue(label, KeyLamp::Dark)).clicked() {
             self.send(Command::SetLevel {
                 name: "PREAMP".into(),
                 value: db,
@@ -12183,7 +12208,7 @@ impl App {
     fn ptt(&mut self, ui: &mut egui::Ui, snap: &Snapshot, label: &str) {
         let enabled = snap.online() && snap.caps.can_set_ptt && !estop::engaged();
         let label = if estop::engaged() { "TX blocked: E-STOP" } else { label };
-        if crate::toggle::add_toggle(ui, enabled, snap.ptt, label).clicked() {
+        if tune_style::toggle(ui, label, enabled, snap.ptt, rustcars::palette::BRICK).clicked() {
             let next = !snap.ptt;
             if next {
                 if let Err(why) = tx_lockout::refuse_transmit(&self.tx_lockout, estop::engaged(), "PTT/MOX") {
@@ -12210,7 +12235,7 @@ impl App {
 
     fn band_step(&mut self, ui: &mut egui::Ui, snap: &Snapshot, label: &str, dir: isize) {
         let enabled = self.can_tune_freq(snap, true);
-        if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+        if tune_style::action(ui, label, enabled).clicked() {
             let freq = self.shown_freq(snap);
             let bands = plan::tunable_bands(&self.plan, &rx_pairs(snap));
             let Some(idx) = plan::adjacent_band(&bands, freq, dir as i32) else {
