@@ -40,7 +40,7 @@ mod tx_lockout;
 mod vna_devices;
 
 /// Config page groups, in page order, with their elbow colours.
-pub(crate) const CONFIG_GROUPS: [(&str, egui::Color32); 9] = {
+pub(crate) const CONFIG_GROUPS: [(&str, egui::Color32); 11] = {
     use rustcars::palette::*;
     [
         ("Station", TAN),
@@ -52,6 +52,9 @@ pub(crate) const CONFIG_GROUPS: [(&str, egui::Color32); 9] = {
         ("Audio patch", TEAL),
         ("Automation patch", PLUM),
         ("RF patch", TAN),
+        // Pages until page layout 2 (David, 2026-10-30).
+        ("Keys", OLIVE),
+        ("Levels", SLATE),
     ]
 };
 
@@ -108,6 +111,7 @@ fn detach_opts(page: Page) -> group_box::DetachOpts {
         Page::Config => ((1100.0, 850.0), (640.0, 480.0)),
         Page::HfData => ((1200.0, 800.0), (640.0, 480.0)),
         Page::Meters => ((900.0, 640.0), (480.0, 360.0)),
+        Page::Rotator => ((1200.0, 850.0), (700.0, 520.0)),
         _ => ((900.0, 650.0), (520.0, 400.0)),
     };
     group_box::DetachOpts {
@@ -119,8 +123,8 @@ fn detach_opts(page: Page) -> group_box::DetachOpts {
     }
 }
 
-const DETACHABLE_PAGES: [Page; 8] = [
-    Page::Config, Page::Rec, Page::Timers, Page::HfData, Page::Levels, Page::Keys, Page::Tools, Page::Meters,
+const DETACHABLE_PAGES: [Page; 7] = [
+    Page::Config, Page::Rec, Page::Timers, Page::HfData, Page::Rotator, Page::Tools, Page::Meters,
 ];
 
 /// The old Tools tear-off saved `tool_detach` ("1"), `tool_win_pos` and
@@ -1022,10 +1026,9 @@ mod talkgroup_tab_tests {
             .position(|(page, _)| *page == Page::Timers)
             .expect("timers");
         assert_eq!(meters_at + 1, timers_at);
-        let keys_at = both
-            .iter()
-            .position(|(page, _)| *page == Page::Keys)
-            .expect("keys");
+        // Keys and Levels are Config groups (page layout 2), not tabs.
+        assert!(!both.iter().any(|(page, _)| matches!(page, Page::Keys | Page::Levels)));
+        let timers_at2 = timers_at;
         let tools_at = both
             .iter()
             .position(|(page, _)| *page == Page::Tools)
@@ -1034,7 +1037,7 @@ mod talkgroup_tab_tests {
             .iter()
             .position(|(page, _)| *page == Page::Config)
             .expect("config");
-        assert_eq!(keys_at + 1, tools_at);
+        assert_eq!(timers_at2 + 1, tools_at);
         assert_eq!(tools_at + 1, config_at);
         let piped = [
             row(1, crate::cat::RadioDriver::Hamlib, "Dummy", "", false),
@@ -1267,7 +1270,8 @@ enum Page {
     Tune,
     Plan,
     Channels,
-    /// Station key list. The bytes are not in the station JSON.
+    /// Station key list (the "Keys" group of Config since page layout 2).
+    /// The bytes are not in the station JSON.
     Keys,
     /// rustcars screens: NanoVNA, RF Calc, Calc, Smith, Hex, and Logbook.
     Tools,
@@ -1278,8 +1282,11 @@ enum Page {
     /// Radios named on that control channel.
     RadioIds(u64),
     Meters,
+    /// Was a page; now the "Levels" group of Config (page layout 2).
     Levels,
     Config,
+    /// Rotator control: its own page since page layout 2 (was a Tools screen).
+    Rotator,
     /// Recordings (#119): source tabs and the timeline.
     Rec,
     /// HF data decode window (#217): slot clock, presets, decode list.
@@ -1290,12 +1297,11 @@ const PAGES: &[(Page, &str)] = &[
     (Page::Tune, "Tune"),
     (Page::Plan, "Plan"),
     (Page::Channels, "Channels"),
+    (Page::Rotator, "Rotator"),
     (Page::Rec, "REC"),
     (Page::HfData, "HF Data"),
     (Page::Meters, "Meters"),
     (Page::Timers, "Timers"),
-    (Page::Levels, "Levels"),
-    (Page::Keys, "Keys"),
     (Page::Tools, "Tools"),
     (Page::Config, "Config"),
 ];
@@ -1311,6 +1317,38 @@ fn page_name(page: Page) -> String {
         .find(|(id, _)| *id == page)
         .map(|(_, name)| (*name).to_string())
         .unwrap_or_else(|| "Tune".to_string())
+}
+
+/// Page layout of station files: 2 since Keys and Levels became Config
+/// groups and Rotator its own page (decisions.md, "Config sections").
+pub(crate) const PAGE_LAYOUT: u32 = 2;
+
+/// A page name from a station written with an older page layout, mapped to
+/// today's page, with a note when it changed (shown on Config; never
+/// silent).
+fn migrate_page_name(name: &str, layout: u32) -> (String, Option<String>) {
+    if layout >= PAGE_LAYOUT {
+        return (name.to_owned(), None);
+    }
+    match name {
+        "Keys" | "Levels" => ("Config".to_owned(), Some(format!("{name} is now a section of Config."))),
+        _ => (name.to_owned(), None),
+    }
+}
+
+/// A saved tab order from an older page layout: Keys and Levels dropped
+/// (they are Config groups), Rotator placed after Channels (it was a Tools
+/// screen).
+fn migrate_tabs(tabs: &[String], layout: u32) -> Vec<String> {
+    if layout >= PAGE_LAYOUT || tabs.is_empty() {
+        return tabs.to_vec();
+    }
+    let mut out: Vec<String> = tabs.iter().filter(|t| *t != "Keys" && *t != "Levels").cloned().collect();
+    if !out.iter().any(|t| t == "Rotator") {
+        let at = out.iter().position(|t| t == "Channels").map_or(out.len(), |i| i + 1);
+        out.insert(at, "Rotator".to_owned());
+    }
+    out
 }
 
 fn page_from_name(name: &str) -> Page {
@@ -3395,7 +3433,13 @@ impl App {
                 // The open tool's own header keys (Logbook Today/All, RF Calc
                 // picker, Calc Deg/Rad, Hex Open) sit in the bar between the
                 // tool tabs and E-STOP (David, #221). At most half the bar.
-                let tool_keys_w = if page == Page::Tools && tab_page {
+                let tool_keys_w = if page == Page::Rotator {
+                    // Rotator page: only its AZ / EL LEDs in the bar.
+                    let want = tools::rotator_bar_width();
+                    let w = want.min((ui.available_width() - estop_w - tools::BAR_TAB_GAP).max(0.0));
+                    tools::request_bar_keys(ui.ctx(), w, estop_w + tools::BAR_TAB_GAP);
+                    if w > 0.0 { w + tools::BAR_TAB_GAP } else { 0.0 }
+                } else if page == Page::Tools && tab_page {
                     let want = self.tools.lock().expect("tools").header_width();
                     let half = ((ui.available_width() - tools::BAR_TABS_RESERVE - estop_w) * 0.5).max(0.0);
                     let w = want.min(half);
@@ -3445,6 +3489,8 @@ impl App {
                     } else if page == Page::Tools {
                         // Each tool screen lays out its own panels in the frame.
                         self.page_tools(ui);
+                    } else if page == Page::Rotator {
+                        self.tools.lock().expect("tools").draw_rotator_in(ui);
                     } else {
                         egui::ScrollArea::vertical()
                             .id_salt(("body", page_name(page)))
@@ -3540,6 +3586,7 @@ impl App {
             Page::Channels => self.page_channels(ui, snap),
             Page::Keys => self.page_keys(ui),
             Page::Tools => {}
+            Page::Rotator => {}
             Page::Timers => {}
             Page::Talkgroups(id) => self.page_talkgroups(ui, id, snap),
             Page::RadioIds(id) => self.page_radio_ids(ui, id, snap),
@@ -4843,6 +4890,10 @@ impl App {
         cfg_group(ui, "RF patch", |ui| {
             patchbay::show(ui, &mut self.patchbay, &mut self.patchbay_ui, &radios, &link);
         });
+        // Keys and Levels were pages; they are Config groups now, contents
+        // unchanged (page layout 2, decisions.md).
+        cfg_group(ui, "Keys", |ui| self.page_keys(ui));
+        cfg_group(ui, "Levels", |ui| self.page_levels(ui, snap));
         let mut open_vna = false;
         for action in self.patchbay_ui.take_actions() {
             match action {
@@ -7455,6 +7506,7 @@ impl App {
                 .position(|row| row.selected)
                 .unwrap_or(0),
             page: page_name(self.page),
+            page_layout: PAGE_LAYOUT,
             tabs: self.tab_order.clone(),
             channel_zone: self.channel_zone,
             channel_sel: self.channel_sel,
@@ -7541,6 +7593,7 @@ impl App {
             mut amplifiers,
             selected,
             page,
+            page_layout,
             tabs,
             channel_zone,
             channel_sel,
@@ -7615,6 +7668,16 @@ impl App {
         self.rotators.replace(rotators);
         // The daemons start and are polled. No power command is sent.
         self.amplifiers.replace(amplifiers);
+        let (page, moved) = migrate_page_name(&page, page_layout);
+        let tabs = migrate_tabs(&tabs, page_layout);
+        if page_layout < PAGE_LAYOUT {
+            let mut note = String::from("Station from an older Commander: Keys and Levels are now sections of Config; Rotator is its own page.");
+            if let Some(m) = moved {
+                note.push(' ');
+                note.push_str(&m);
+            }
+            self.config_note = note;
+        }
         self.page = page_from_name(&page);
         if self.page != Page::Tools {
             self.page_return = self.page;
@@ -12780,7 +12843,7 @@ mod config_order_tests {
         use crate::{Page, page_detachable, page_detach_id, page_detached, page_stub};
         assert!(page_detachable(Page::Config) && page_detachable(Page::Rec));
         assert!(!page_detachable(Page::Tune), "Tune is not wrapped");
-        for p in [Page::Timers, Page::HfData, Page::Levels, Page::Keys, Page::Tools] {
+        for p in [Page::Timers, Page::HfData, Page::Rotator, Page::Tools] {
             assert!(page_detachable(p), "{} carries the page pill", crate::page_name(p));
         }
         for p in [Page::Plan, Page::Channels, Page::Talkgroups(0), Page::RadioIds(0)] {
@@ -12986,7 +13049,7 @@ mod config_order_tests {
         let names: Vec<&str> = crate::CONFIG_GROUPS.iter().map(|(n, _)| *n).collect();
         let want = [
             "Station", "Display", "Radio", "Rotator", "Amplifier",
-            "Trunking", "Audio patch", "Automation patch", "RF patch",
+            "Trunking", "Audio patch", "Automation patch", "RF patch", "Keys", "Levels",
         ];
         assert_eq!(names, want);
         // page_config must call the groups in the same order.
@@ -12999,6 +13062,7 @@ mod config_order_tests {
             pos("self.cat_frame(ui)"), pos("self.rotator_amp_frame(ui)"),
             pos("cfg_group(ui, \"Trunking\""), pos("self.audio_frame(ui)"),
             pos("self.automation_frame(ui, snap)"), pos("cfg_group(ui, \"RF patch\""),
+            pos("cfg_group(ui, \"Keys\""), pos("cfg_group(ui, \"Levels\""),
         ];
         assert!(seq.windows(2).all(|w| w[0] < w[1]), "{seq:?}");
     }
@@ -13140,7 +13204,7 @@ mod detached_fit_tests {
     #[test]
     fn detached_flow_pages_scroll_inside_the_window() {
         let ctx = ctx();
-        for page in [Page::Config, Page::Rec, Page::Timers, Page::HfData, Page::Levels, Page::Keys] {
+        for page in [Page::Config, Page::Rec, Page::Timers, Page::HfData] {
             for size in sizes(detach_opts(page).min_size) {
                 let mut inner_bottom = f32::INFINITY;
                 let out = frame(&ctx, page, size, &mut |ui| {
@@ -13405,5 +13469,90 @@ mod batched_input_tests {
         run(vec![egui::Event::PointerMoved(pos), press(true), press(false)], &mut clicks);
         run(vec![], &mut clicks);
         assert_eq!(clicks, 1, "a click batched into one pass");
+    }
+}
+
+
+/// Page layout 2 (David, 2026-10-30): Keys and Levels are Config groups,
+/// Rotator is its own top page with only its LEDs in the bar.
+#[cfg(test)]
+mod config_sections_tests {
+    use super::*;
+
+    #[test]
+    fn rotator_is_a_top_tab_and_keys_levels_are_config_groups() {
+        let names: Vec<&str> = PAGES.iter().map(|(_, n)| *n).collect();
+        assert!(names.contains(&"Rotator"), "{names:?}");
+        assert!(!names.contains(&"Keys") && !names.contains(&"Levels"), "{names:?}");
+        let ch = names.iter().position(|n| *n == "Channels").unwrap();
+        assert_eq!(names[ch + 1], "Rotator", "Rotator beside Tune / Channels / TG");
+        assert!(!tools::SCREENS.iter().any(|(_, l)| *l == "Rotator"), "not under Tools");
+        let groups: Vec<&str> = CONFIG_GROUPS.iter().map(|(n, _)| *n).collect();
+        assert!(groups.contains(&"Keys") && groups.contains(&"Levels"));
+        assert!(page_detachable(Page::Rotator));
+        assert!(!page_detachable(Page::Keys) && !page_detachable(Page::Levels));
+    }
+
+    /// The page tabs (plus a TG and an ID tab) fit a 1400 px window: no more
+    /// key there.
+    #[test]
+    fn page_tabs_all_fit_at_1400() {
+        let mut labels: Vec<String> = PAGES.iter().map(|(_, n)| (*n).to_owned()).collect();
+        labels.push("TG Radio".to_owned());
+        labels.push("ID Radio".to_owned());
+        let need = tools::plain_tabs_width(&labels);
+        let room = 1400.0 - 16.0 - rustcars::LcarsTheme::default().bar_thick;
+        assert!(need <= room, "tabs need {need} of {room}");
+    }
+
+    #[test]
+    fn old_stations_migrate_keys_levels_and_rotator() {
+        let (p, note) = migrate_page_name("Keys", 0);
+        assert_eq!(p, "Config");
+        assert!(note.is_some(), "never silent");
+        assert_eq!(migrate_page_name("Levels", 0).0, "Config");
+        assert_eq!(migrate_page_name("Tune", 0), ("Tune".to_owned(), None));
+        assert_eq!(migrate_page_name("Keys", PAGE_LAYOUT).0, "Keys", "current files unchanged");
+        let old: Vec<String> = ["Tune", "Plan", "Channels", "Levels", "Keys", "Tools", "Config"].iter().map(|s| s.to_string()).collect();
+        let new = migrate_tabs(&old, 0);
+        assert_eq!(new, ["Tune", "Plan", "Channels", "Rotator", "Tools", "Config"].map(String::from));
+        assert_eq!(migrate_tabs(&new, PAGE_LAYOUT), new);
+        assert!(migrate_tabs(&[], 0).is_empty(), "built-in order stays built-in");
+    }
+
+    /// The Rotator page bar: its AZ / EL LEDs and E-STOP, no tool tabs.
+    #[test]
+    fn rotator_page_bar_has_only_its_leds() {
+        let ctx = egui::Context::default();
+        rustcars::install_lcars_font(&ctx);
+        rustcars::apply_theme(&ctx, &rustcars::LcarsTheme::default());
+        let mut tools = tools::Tools::new(&ctx);
+        let th = rustcars::LcarsTheme::default();
+        let mut out = egui::FullOutput::default();
+        let (mut f, mut stop) = (egui::Rect::NOTHING, egui::Rect::NOTHING);
+        for _ in 0..3 {
+            out = ctx.run_ui(
+                egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))), ..Default::default() },
+                |ui| (f, stop) = tools.framed_rotator(ui),
+            );
+            out.textures_delta.clear();
+        }
+        let bar = egui::Rect::from_min_max(f.min, egui::pos2(f.right(), f.top() + th.bar_thin));
+        let texts: Vec<String> = out.shapes.iter().filter_map(|c| match &c.shape {
+            egui::Shape::Text(t) if bar.contains_rect(t.visual_bounding_rect()) => Some(t.galley.text().to_uppercase()),
+            _ => None,
+        }).collect();
+        for (_, l) in tools::SCREENS {
+            assert!(!texts.contains(&l.to_uppercase()), "tool tab {l} in the Rotator bar: {texts:?}");
+        }
+        let glass = egui::Color32::from_rgb(8, 8, 6);
+        let leds: Vec<egui::Rect> = out.shapes.iter().filter_map(|c| match &c.shape {
+            egui::Shape::Rect(r) if r.fill == glass && bar.contains_rect(r.rect) => Some(r.rect),
+            _ => None,
+        }).collect();
+        assert_eq!(leds.len(), 2, "AZ and EL in the bar");
+        assert!(leds.iter().all(|r| r.right() <= stop.left()));
+        assert!(texts.iter().any(|t| t.contains("E-STOP")));
+        tools.conceal_nanovna();
     }
 }

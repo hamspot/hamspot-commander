@@ -726,7 +726,8 @@ mod tests {
         let body = &main[main.find("fn detached_page_body(").unwrap()..];
         let body = &body[..body.find("\n    fn ").unwrap()];
         assert!(body.contains("self.framed_page("), "detached windows use the page frame");
-        assert_eq!(include_str!("tools/mod.rs").matches(&call).count(), 1);
+        // Tools' own frames (Tools::framed, Tools::framed_rotator).
+        assert_eq!(include_str!("tools/mod.rs").matches(&call).count(), 2);
         assert_eq!(include_str!("group_box.rs").matches(&call).count(), 0);
     }
 }

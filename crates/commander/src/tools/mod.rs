@@ -23,14 +23,13 @@ pub enum Screen {
     Rotator,
 }
 
-pub(crate) const SCREENS: [(Screen, &str); 7] = [
+pub(crate) const SCREENS: [(Screen, &str); 6] = [
     (Screen::NanoVna, "NanoVNA"),
     (Screen::HamRf, "RF Calc"),
     (Screen::Calculator, "Calc"),
     (Screen::Smith, "Smith"),
     (Screen::Hex, "Hex"),
     (Screen::Log, "Logbook"),
-    (Screen::Rotator, "Rotator"),
 ];
 
 pub struct Tools {
@@ -146,6 +145,35 @@ impl Tools {
     /// The detached Tools window (page pill): E-STOP / RELEASE at the right
     /// of the top row, as in the page-bar slot, then the same body as the
     /// page. The window has its own keyboard focus, so it polls the chord.
+    /// The Rotator page's screen (its own page since page layout 2): the
+    /// rotator screen with its status strip, as a Tools screen was drawn.
+    pub fn draw_rotator_in(&mut self, ui: &mut egui::Ui) {
+        let keep = self.screen;
+        self.screen = Screen::Rotator;
+        self.draw_in(ui);
+        self.screen = keep;
+    }
+
+    /// The Rotator page in the shared page frame as main.rs draws it: only
+    /// its AZ / EL LEDs and E-STOP in the bar, no tool tabs. For tests and
+    /// the same layout docked or detached. Returns (frame, E-STOP rect).
+    pub fn framed_rotator(&mut self, ui: &mut egui::Ui) -> (egui::Rect, egui::Rect) {
+        let estop_w = crate::estop::button_width(ui, crate::estop::engaged()) + 16.0;
+        let w = rotator_bar_width().min((ui.available_width() - estop_w - BAR_TAB_GAP).max(0.0));
+        request_bar_keys(ui.ctx(), w, estop_w + BAR_TAB_GAP);
+        let keys_w = if w > 0.0 { w + BAR_TAB_GAP } else { 0.0 };
+        let (frame, slot) = frame_with_slot(ui, Some(keys_w + estop_w), |ui| self.draw_rotator_in(ui));
+        let r = slot.expect("slot");
+        let stop_r = egui::Rect::from_min_max(egui::pos2(r.right() - estop_w, r.top()), r.max);
+        ui.scope_builder(
+            egui::UiBuilder::new().max_rect(stop_r).id_salt("estop-rotator-frame").layout(egui::Layout::right_to_left(egui::Align::Center)),
+            |ui| {
+                crate::estop::button(ui);
+            },
+        );
+        (frame, stop_r)
+    }
+
     pub fn window_body(&mut self, ui: &mut egui::Ui) {
         self.estop_chord.poll(ui.ctx());
         self.framed(ui);
@@ -714,6 +742,11 @@ pub fn plain_tabs_width(labels: &[String]) -> f32 {
     w + BAR_TAB_GAP * labels.len().saturating_sub(1) as f32
 }
 
+/// Bar width the Rotator page asks for: its AZ and EL LEDs.
+pub fn rotator_bar_width() -> f32 {
+    2.0 * rotator::BAR_LED_W + BAR_TAB_GAP
+}
+
 pub fn bar_tabs_width(ui: &egui::Ui, labels: &[String]) -> f32 {
     let w: f32 = labels.iter().map(|l| crate::folder_tab_width(ui, l, false)).sum();
     w + BAR_TAB_GAP * labels.len().saturating_sub(1) as f32
@@ -1028,7 +1061,7 @@ mod tests {
         let labels: Vec<_> = SCREENS.iter().map(|(_, label)| *label).collect();
         assert_eq!(
             labels,
-            vec!["NanoVNA", "RF Calc", "Calc", "Smith", "Hex", "Logbook", "Rotator"]
+            vec!["NanoVNA", "RF Calc", "Calc", "Smith", "Hex", "Logbook"]
         );
     }
 }

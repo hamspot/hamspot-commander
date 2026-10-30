@@ -57,6 +57,11 @@ pub struct ConfigFile {
     /// Page that was open. Absent means Tune.
     #[serde(default, skip_serializing_if = "is_tune")]
     pub page: String,
+    /// Page layout the file was written with (`crate::PAGE_LAYOUT`). Absent
+    /// (0) is the layout before Keys and Levels became Config groups and
+    /// Rotator its own page; loading migrates `page` and `tabs`.
+    #[serde(default)]
+    pub page_layout: u32,
     /// Page-tab order. Each entry is a page name (`Tune`, `Talkgroups:3`,
     /// `RadioIds:3`). Absent means the built-in order. A tab that is not
     /// open yet stays in the list and is skipped until that radio exists.
@@ -724,6 +729,20 @@ pub fn install_new_bsp(
 mod tests {
     use super::*;
 
+    /// The station file carries its page layout; a file written before it
+    /// existed reads as layout 0, which loading migrates (main.rs).
+    #[test]
+    fn page_layout_round_trips_and_defaults_to_zero() {
+        let mut c = sample();
+        c.page_layout = 2;
+        let json = serde_json::to_value(&c).unwrap();
+        assert_eq!(json["page_layout"], 2);
+        let mut old = json.clone();
+        old.as_object_mut().unwrap().remove("page_layout");
+        let back: ConfigFile = serde_json::from_value(old).unwrap();
+        assert_eq!(back.page_layout, 0);
+    }
+
     fn sample() -> ConfigFile {
         let mut bsp = plan::embedded();
         bsp.zones[0].bands[0].tx_hz = Some(1_900_000.0);
@@ -759,6 +778,7 @@ mod tests {
             amplifiers: Vec::new(),
             selected: 0,
             page: String::new(),
+            page_layout: 0,
             tabs: Vec::new(),
             channel_zone: 0,
             channel_sel: 0,
