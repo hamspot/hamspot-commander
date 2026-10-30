@@ -655,6 +655,7 @@ impl GlowWinitRunning<'_> {
             if is_immediate && viewport_id != ViewportId::ROOT {
                 // This will only happen if this is an immediate viewport.
                 // That means that the viewport cannot be rendered by itself and needs his parent to be rendered.
+                crate::hs_trace!("detached {viewport_id:?}: needs its parent's pass");
                 if let Some(parent_viewport) = glutin.viewports.get(&viewport.ids.parent)
                     && let Some(window) = parent_viewport.window.as_ref()
                 {
@@ -701,6 +702,7 @@ impl GlowWinitRunning<'_> {
                 child_visible,
             );
             let is_visible = is_visible && paint_parent;
+            crate::hs_trace!("pass {viewport_id:?} mode {mode:?}: ui {show_ui}, paint {is_visible}, detached child visible {child_visible}, events {}", raw_input.events.len());
 
             self.integration.pre_update();
 
@@ -1815,6 +1817,12 @@ fn render_immediate_viewport(
         egui_winit::update_viewport_info(&mut viewport.info, egui_ctx, window, false);
 
         let mut raw_input = egui_winit.take_egui_input(window);
+        crate::hs_trace!(
+            "detached {viewport_id:?}: pass with {} events ({} pointer buttons), visible {:?}",
+            raw_input.events.len(),
+            raw_input.events.iter().filter(|e| matches!(e, egui::Event::PointerButton { .. })).count(),
+            viewport.info.visible()
+        );
         raw_input.viewports = glutin
             .viewports
             .iter()

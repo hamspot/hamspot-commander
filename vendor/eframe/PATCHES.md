@@ -13,3 +13,9 @@ Upstream: crates.io eframe 0.37.0, copied unchanged except:
    passes come at about 25 fps instead of 4.
 
 Remove when upstream draws immediate children of an unseen parent.
+3. Diagnostics: `HAMSPOT_VP_TRACE=1` prints the viewport event flow to
+   stderr (`hs_trace!`, `winit_integration::hs_trace_on`): window events per
+   window id (not cursor motion), `request_redraw`, overdue logic-only
+   passes, each pass's mode / ui / paint / detached-child-visible / event
+   count, and each detached (immediate) pass with its event and pointer
+   button counts. No effect when unset.

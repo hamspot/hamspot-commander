@@ -232,6 +232,7 @@ impl<T: WinitApp> WinitAppWrapper<T> {
                         // compositor sends a frame callback. Polling in the meantime
                         // busy-loops a whole CPU core.
                         // See https://github.com/emilk/egui/issues/8326.
+                        crate::hs_trace!("window {window_id:?}: request_redraw");
                         window.request_redraw();
                         self.windows_redraw_deadlines
                             .entry(*window_id)
@@ -279,6 +280,7 @@ impl<T: WinitApp> WinitAppWrapper<T> {
             // have handled this window, so only run it if the deadline is still there:
             if self.windows_redraw_deadlines.remove(&window_id).is_some() {
                 log::trace!("RedrawRequested is overdue for {window_id:?}: running logic only");
+                crate::hs_trace!("window {window_id:?}: RedrawRequested overdue -> logic-only pass");
                 let event_result =
                     self.winit_app
                         .run_ui_and_paint(event_loop, window_id, PassMode::LogicOnly);
@@ -419,6 +421,9 @@ impl<T: WinitApp> ApplicationHandler<UserEvent> for WinitAppWrapper<T> {
 
         // Nb: Make sure this guard is dropped after this function returns.
         event_loop_context::with_event_loop_context(event_loop, move || {
+            if !matches!(event, winit::event::WindowEvent::CursorMoved { .. } | winit::event::WindowEvent::AxisMotion { .. }) {
+                crate::hs_trace!("window {window_id:?}: {}", egui_winit::short_window_event_description(&event));
+            }
             let event_result = match event {
                 winit::event::WindowEvent::RedrawRequested => {
                     self.windows_redraw_deadlines.remove(&window_id);

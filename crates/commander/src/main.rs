@@ -13371,5 +13371,39 @@ mod eframe_patch_tests {
         assert!(glow.contains("let is_visible = is_visible && paint_parent;"));
         let run = include_str!("../../../vendor/eframe/src/native/run.rs");
         assert!(run.contains("MISSED_REDRAW_TIMEOUT: Duration = Duration::from_millis(40)"));
+        // The HAMSPOT_VP_TRACE diagnostics stay wired in.
+        assert!(include_str!("../../../vendor/eframe/src/native/winit_integration.rs").contains("HAMSPOT_VP_TRACE"));
+        assert!(run.contains("RedrawRequested overdue -> logic-only pass"));
+        assert!(glow.contains("pass with {} events ({} pointer buttons)"));
+    }
+}
+
+#[cfg(test)]
+mod batched_input_tests {
+    /// While the main window is minimized, a detached window only runs a pass
+    /// every MISSED_REDRAW_TIMEOUT, so a whole click (move, press, release)
+    /// can arrive in one pass. Does egui still see the click?
+    #[test]
+    fn a_click_batched_into_one_pass_still_clicks() {
+        let ctx = egui::Context::default();
+        let mut clicks = 0;
+        let pos = egui::pos2(30.0, 20.0);
+        let mut run = |events: Vec<egui::Event>, clicks: &mut i32| {
+            let mut out = ctx.run_ui(
+                egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(300.0, 200.0))), events, ..Default::default() },
+                |ui| {
+                    if ui.add_sized([100.0, 40.0], egui::Button::new("KEY")).clicked() {
+                        *clicks += 1;
+                    }
+                },
+            );
+            out.textures_delta.clear();
+        };
+        run(vec![], &mut clicks);
+        let press = |pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        // Pointer had never hovered: move, press and release in one pass.
+        run(vec![egui::Event::PointerMoved(pos), press(true), press(false)], &mut clicks);
+        run(vec![], &mut clicks);
+        assert_eq!(clicks, 1, "a click batched into one pass");
     }
 }

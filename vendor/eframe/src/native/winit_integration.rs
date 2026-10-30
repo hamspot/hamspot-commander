@@ -215,3 +215,25 @@ pub(crate) fn on_accesskit_window_event(
         }
     }
 }
+
+
+/// HamSpot patch: set `HAMSPOT_VP_TRACE=1` to print the viewport event flow
+/// (window events, redraw requests, overdue passes, detached-window passes
+/// and their input) to stderr. Diagnoses detached windows with the main
+/// window minimized; costs nothing when unset.
+pub fn hs_trace_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("HAMSPOT_VP_TRACE").is_some_and(|v| v != "0"))
+}
+
+#[macro_export]
+#[doc(hidden)]
+macro_rules! hs_trace {
+    ($($arg:tt)*) => {
+        if $crate::native::winit_integration::hs_trace_on() {
+            static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let t = T0.get_or_init(std::time::Instant::now).elapsed().as_secs_f64();
+            eprintln!("[hs-vp {t:9.3}] {}", format!($($arg)*));
+        }
+    };
+}
