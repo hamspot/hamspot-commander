@@ -233,19 +233,6 @@ fn main() -> eframe::Result {
             // what puts the icon in the window list and on the dock.
             .with_app_id("hamspotcommander")
             .with_icon(hamspot_icon()),
-        // Detached pages are immediate viewports: they only run inside the
-        // main window's frame. On Wayland, GNOME withholds frame callbacks
-        // from a window that is fully covered (e.g. by a maximized detached
-        // page), eframe then runs logic only (eframe run.rs
-        // MISSED_REDRAW_TIMEOUT), the detached page's pass never runs and
-        // its clicks are lost. X11 (XWayland) keeps redrawing a covered
-        // window, and lets us place windows. HAMSPOT_WAYLAND=1 opts back in.
-        event_loop_builder: Some(Box::new(|builder| {
-            if use_x11(std::env::var_os("DISPLAY").is_some(), std::env::var("HAMSPOT_WAYLAND").ok().as_deref()) {
-                use winit::platform::x11::EventLoopBuilderExtX11 as _;
-                builder.with_x11();
-            }
-        })),
         ..Default::default()
     };
     eframe::run_native(
@@ -253,23 +240,6 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| Ok(Box::new(App::new(cc)))),
     )
-}
-
-/// Run on X11 (XWayland) when an X display is there, unless
-/// `HAMSPOT_WAYLAND=1` asks for native Wayland. See `main`.
-fn use_x11(has_display: bool, wayland_opt_in: Option<&str>) -> bool {
-    has_display && wayland_opt_in != Some("1")
-}
-
-#[cfg(test)]
-mod backend_tests {
-    #[test]
-    fn x11_when_a_display_is_there_unless_wayland_is_asked_for() {
-        assert!(super::use_x11(true, None));
-        assert!(!super::use_x11(true, Some("1")));
-        assert!(!super::use_x11(false, None));
-        assert!(super::use_x11(true, Some("0")));
-    }
 }
 
 struct Favorite {

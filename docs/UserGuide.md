@@ -1345,8 +1345,6 @@ The **Plan** keys (**LOAD**, **SAVE**, **ADD**), the **Channels** keys (**REC**,
 
 On the NanoVNA screen, panel keys are filled keys of radius 4; a lit key (an on state) also has a thin border and the ● marker.
 
-## Detached windows: maximize, snap and move
+## Detached windows: snap and move
 
-A detached page window can be maximized, snapped to half or a quarter of the screen, and restored; it keeps taking clicks in every case. Dragging its end pill moves it; a maximized or full-screen window is restored first, then moves with the pointer. A detached window always opens restored (never maximized), and its size is remembered only while it is not maximized, capped at 80% of the screen so the desktop does not maximize it again on its own.
-
-On Linux, Commander runs through X11 (XWayland on a Wayland desktop) so a detached window keeps working when it covers the main window. To use native Wayland instead, start it with `HAMSPOT_WAYLAND=1`; then a detached window that completely covers the main window stops responding until the main window is visible again.
+A detached page window can be snapped to half or a quarter of the screen with the desktop's own tiling, moved by dragging its end pill, and resized from its bottom-right grip. It cannot be maximized or made full screen: if the desktop maximizes it (for example Super+Up), it is restored at once. A window that covers the whole main window would stop responding, because the detached pages are drawn as part of the main window. Keep part of the main window visible. A detached window always opens restored, and its size is remembered only while it is not maximized, capped at 80% of the screen.
