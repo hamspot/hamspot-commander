@@ -1,4 +1,5 @@
 HamSpot Commander third-party notices (details in licenses/):
 - Antonio font: SIL Open Font License (licenses/Antonio-OFL.txt)
 - rustcars: MIT (licenses/rustcars-MIT.txt)
-- Natural Earth 1:110m coastlines: public domain, Made with Natural Earth (licenses/NaturalEarth.md)
+- Natural Earth 1:110m land polygons: public domain, Made with Natural Earth (licenses/NaturalEarth.md)
+- earcut (Rust crate 0.4.11, polygon triangulation): MIT OR Apache-2.0

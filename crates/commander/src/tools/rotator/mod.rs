@@ -139,7 +139,7 @@ impl Rotator {
     pub fn status_line(&self) -> String {
         let base = self.rotator_status();
         if self.settings.map.show {
-            if let Err(why) = map::resolve(&self.settings.map).and_then(|_| map::coastlines().map(|_| ())) {
+            if let Err(why) = map::resolve(&self.settings.map).and_then(|_| map::land().map(|_| ())) {
                 return format!("{base}   MAP OFF: {why}");
             }
         }
@@ -198,12 +198,17 @@ impl Rotator {
                 let s = &self.settings;
                 let preset_az = az.map(|az| geom::az_for_bearing(s.preset_az, az, lim));
                 paint_dial(ui.painter(), dial_rect);
+                // Failures go to the status line (status_line).
+                let map = if s.map.show { self.map_cache.get(&s.map).ok() } else { None };
+                let (mc, mr) = (dial_rect.center(), dial_radius(dial_rect) * MAP_R);
+                if let Some(m) = map {
+                    // Ocean and land under the elevation globe.
+                    map::paint_fill(ui.painter(), mc, mr, m);
+                }
                 paint_globe(ui.painter(), dial_rect, el, Some(s.preset_el), lim.el_hi);
-                if s.map.show {
-                    // Failures go to the status line (status_line).
-                    if let Ok(lines) = self.map_cache.get(&s.map) {
-                        map::paint(ui.painter(), dial_rect.center(), dial_radius(dial_rect) * MAP_R, lines);
-                    }
+                if let Some(m) = map {
+                    // Coasts and rings over the globe, under the rose.
+                    map::paint(ui.painter(), mc, mr, m);
                 }
                 // The azimuth scale, needle and lamp go back on top of the globe.
                 paint_dial_top(ui.painter(), dial_rect, az, Some(s.preset_az), lim, preset_az);
@@ -914,6 +919,22 @@ mod tests {
             assert!(lines.iter().all(|(i, _)| *i < first_amber), "map under the rose scale");
             assert!(lines.iter().all(|(_, r)| r.is_finite()));
             assert!(!rot.status_line().contains("MAP OFF"));
+            // Ocean disc and land mesh stay inside the map circle.
+            let ocean = out.shapes.iter().find_map(|c| match &c.shape {
+                egui::Shape::Circle(k) if k.fill == map::OCEAN_COLOR => Some(*k),
+                _ => None,
+            }).expect("ocean disc");
+            let meshes: Vec<&egui::Mesh> = out.shapes.iter().filter_map(|c| match &c.shape {
+                egui::Shape::Mesh(m) if m.vertices.first().is_some_and(|v| v.color == map::LAND_COLOR) => Some(&**m),
+                _ => None,
+            }).collect();
+            assert_eq!(meshes.len(), 1, "one land mesh");
+            let n = meshes[0].indices.len() / 3;
+            assert!(n > 100 && n < 40_000, "land triangles {n}");
+            assert!(meshes[0].vertices.iter().all(|v| v.pos.distance(ocean.center) <= ocean.radius + 0.5), "land inside the map circle");
+            let first_amber = out.shapes.iter().position(|c| matches!(&c.shape, egui::Shape::LineSegment { stroke, .. } if stroke.color == AMBER && stroke.width == 2.5)).unwrap();
+            let land_at = out.shapes.iter().position(|c| matches!(&c.shape, egui::Shape::Mesh(m) if m.vertices.first().is_some_and(|v| v.color == map::LAND_COLOR))).unwrap();
+            assert!(land_at < first_amber, "fill under the rose");
         }
     }
 
