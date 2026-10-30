@@ -64,8 +64,8 @@ pub fn sky_polygon(hy: f64, r: f64, steps: usize) -> Vec<(f64, f64)> {
         .collect()
 }
 
-const SKY: egui::Color32 = egui::Color32::from_rgb(0x3A, 0x36, 0x32);
-const GROUND: egui::Color32 = egui::Color32::from_rgb(0x2A, 0x1E, 0x14);
+pub(super) const SKY: egui::Color32 = egui::Color32::from_rgb(0x3A, 0x36, 0x32);
+pub(super) const GROUND: egui::Color32 = egui::Color32::from_rgb(0x2A, 0x1E, 0x14);
 const LINE: egui::Color32 = egui::Color32::from_rgb(0x8C, 0x78, 0x5C);
 const HORIZON: egui::Color32 = egui::Color32::from_rgb(0xC8, 0xA8, 0x78);
 const WINGS: egui::Color32 = egui::Color32::from_rgb(0xFF, 0xA8, 0x2E);
@@ -79,14 +79,19 @@ pub fn paint(
     el: Option<f64>,
     preset_el: Option<f64>,
     max_el: f64,
+    see_through: bool,
 ) {
     let rr = r as f64;
     let e = el.unwrap_or(0.0);
     let at = |x: f64, y: f64| c + egui::vec2(x as f32, y as f32);
-    painter.circle_filled(c, r, GROUND);
+    // With the world map on, the globe has no fill so land and ocean show
+    // through; the horizon line, ladder, rim and markers carry the reading.
+    if !see_through {
+        painter.circle_filled(c, r, GROUND);
+    }
     let hy = horizon_dy(e, rr, max_el);
     let sky: Vec<egui::Pos2> = sky_polygon(hy, rr, 64).into_iter().map(|(x, y)| at(x, y)).collect();
-    if sky.len() > 2 {
+    if sky.len() > 2 && !see_through {
         painter.add(egui::Shape::convex_polygon(sky, SKY, egui::Stroke::NONE));
     }
     // Meridians: fixed ellipses, a sphere seen face on.

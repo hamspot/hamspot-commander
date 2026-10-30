@@ -205,7 +205,7 @@ impl Rotator {
                     // Ocean and land under the elevation globe.
                     map::paint_fill(ui.painter(), mc, mr, m);
                 }
-                paint_globe(ui.painter(), dial_rect, el, Some(s.preset_el), lim.el_hi);
+                paint_globe(ui.painter(), dial_rect, el, Some(s.preset_el), lim.el_hi, map.is_some());
                 if let Some(m) = map {
                     // Coasts and rings over the globe, under the rose.
                     map::paint(ui.painter(), mc, mr, m);
@@ -741,9 +741,10 @@ fn paint_globe(
     el: Option<f64>,
     preset_el: Option<f64>,
     max_el: f64,
+    see_through: bool,
 ) {
     let r = dial_radius(rect);
-    horizon::paint(painter, rect.center(), r * GLOBE, el, preset_el, max_el);
+    horizon::paint(painter, rect.center(), r * GLOBE, el, preset_el, max_el, see_through);
 }
 
 /// Globe radius as a share of the dial radius. The 30-degree labels sit at
@@ -910,7 +911,10 @@ mod tests {
     fn map_draws_faint_behind_the_rose_docked_and_small() {
         for (w, h) in [(1400.0, 900.0), (500.0, 700.0), (360.0, 300.0)] {
             let mut rot = Rotator::new();
-            assert!(map_shapes(&draw_rot(&mut rot, w, h)).is_empty(), "map off by default");
+            let off = draw_rot(&mut rot, w, h);
+            assert!(map_shapes(&off).is_empty(), "map off by default");
+            assert!(off.shapes.iter().any(|c| matches!(&c.shape, egui::Shape::Circle(k) if k.fill == horizon::GROUND)), "map off: globe ground as before");
+            assert!(off.shapes.iter().any(|c| matches!(&c.shape, egui::Shape::Path(p) if p.fill == horizon::SKY)), "map off: globe sky as before");
             rot.settings.map = map::MapSettings { show: true, lat: "39.77".into(), lon: "-86.16".into(), ..Default::default() };
             let out = draw_rot(&mut rot, w, h);
             let lines = map_shapes(&out);
@@ -935,6 +939,14 @@ mod tests {
             let first_amber = out.shapes.iter().position(|c| matches!(&c.shape, egui::Shape::LineSegment { stroke, .. } if stroke.color == AMBER && stroke.width == 2.5)).unwrap();
             let land_at = out.shapes.iter().position(|c| matches!(&c.shape, egui::Shape::Mesh(m) if m.vertices.first().is_some_and(|v| v.color == map::LAND_COLOR))).unwrap();
             assert!(land_at < first_amber, "fill under the rose");
+            // Globe is see-through over the map: nothing after the land mesh
+            // paints an opaque fill over the map centre except the rose's
+            // own small hub items, and no globe ground/sky shape at all.
+            let ground = out.shapes.iter().skip(land_at + 1).any(|c| matches!(&c.shape,
+                egui::Shape::Circle(k) if k.fill == horizon::GROUND || k.fill == horizon::SKY));
+            let sky = out.shapes.iter().skip(land_at + 1).any(|c| matches!(&c.shape,
+                egui::Shape::Path(p) if p.fill == horizon::SKY || p.fill == horizon::GROUND));
+            assert!(!ground && !sky, "globe fill hides the map at {w}x{h}");
         }
     }
 
