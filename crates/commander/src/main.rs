@@ -37,6 +37,7 @@ mod estop;
 mod hfdata;
 mod toggle;
 mod render;
+mod redraw;
 mod tune_style;
 mod tx_lockout;
 mod vna_devices;
@@ -163,6 +164,12 @@ fn page_detachable(page: Page) -> bool {
 }
 
 /// Memory id of a page's detach state (memory only; not saved).
+/// Pages that draw HackRF spectrum data: the Tune chart and the TG scanner's
+/// RSSI. None of them is detachable.
+fn page_shows_spectrum(page: Page) -> bool {
+    matches!(page, Page::Tune | Page::Talkgroups(_) | Page::RadioIds(_))
+}
+
 fn page_detach_id(page: Page) -> egui::Id {
     group_box::DetachState::id(("page", page_name(page)))
 }
@@ -3075,6 +3082,15 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // E-STOP chord: read once, act after the input closure.
         self.estop_chord.poll(ui.ctx());
+        // Spectrum frames redraw only while something shows them (or a scan
+        // steps on them). Tune and the TG pages are not detachable.
+        let view = redraw::View {
+            page_shows_spectrum: page_shows_spectrum(self.page),
+            detached_shows_spectrum: false,
+            root_minimized: ui.ctx().input(|i| i.viewport().minimized == Some(true)),
+            scanning: self.memory_scan.is_on(),
+        };
+        self.hub.set_spectrum_watched(redraw::spectrum_wanted(view));
         let (mut snap, live_gen, poll_gen) = self.snap_gen();
         self.overlay_hackrf(&mut snap);
         self.clear_stale_channel_note(&snap);
@@ -13556,6 +13572,17 @@ mod config_sections_tests {
 
     /// The page tabs (plus a TG and an ID tab) fit a 1400 px window: no more
     /// key there.
+    #[test]
+    fn spectrum_pages_are_not_detachable() {
+        for p in [Page::Tune, Page::Talkgroups(1), Page::RadioIds(1)] {
+            assert!(page_shows_spectrum(p));
+            assert!(!DETACHABLE_PAGES.contains(&p), "a spectrum page became detachable: set detached_shows_spectrum");
+        }
+        for p in [Page::Plan, Page::Channels, Page::Config, Page::Meters, Page::Rotator, Page::Tools] {
+            assert!(!page_shows_spectrum(p));
+        }
+    }
+
     #[test]
     fn page_tabs_all_fit_at_1400() {
         let mut labels: Vec<String> = PAGES.iter().map(|(_, n)| (*n).to_owned()).collect();

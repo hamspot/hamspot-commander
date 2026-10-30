@@ -339,6 +339,10 @@ pub struct Hub {
     /// Latest HackRF spectrum. Copied when the capture thread publishes a
     /// frame. Kept off `HubView` so a quiet poll does not clone the bins.
     spectrum: Mutex<crate::hackrf::SpectrumSnap>,
+    /// Is a spectrum frame wanted on screen now (Tune / TG page shown, or a
+    /// scan stepping on frames)? When not, new frames are still copied but do
+    /// not ask for a redraw. Capture, audio, recording are unaffected.
+    spectrum_watched: std::sync::atomic::AtomicBool,
 }
 
 struct HackrfPending {
@@ -1069,6 +1073,7 @@ impl Hub {
             identity_log: Mutex::new(BTreeMap::new()),
             hackrf_log: Mutex::new(BTreeMap::new()),
             spectrum: Mutex::new(crate::hackrf::SpectrumSnap::default()),
+            spectrum_watched: std::sync::atomic::AtomicBool::new(true),
         });
         let thread_hub = Arc::clone(&hub);
         thread::spawn(move || supervise(thread_hub, face, kick, ctx));
@@ -1081,6 +1086,15 @@ impl Hub {
 
     /// Latest spectrum from the selected HackRF capture. Empty when that
     /// radio is not running.
+    /// Set by the UI each frame from [`crate::redraw::spectrum_wanted`].
+    pub fn set_spectrum_watched(&self, on: bool) {
+        self.spectrum_watched.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn spectrum_watched(&self) -> bool {
+        self.spectrum_watched.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn spectrum(&self) -> crate::hackrf::SpectrumSnap {
         self.spectrum.lock().expect("hackrf spectrum").clone()
     }
@@ -2612,16 +2626,57 @@ fn publish_spectrum(hub: &Hub, slots: &[Slot], selected: u64, ctx: &egui::Contex
         .find(|slot| slot.id == selected && slot.hackrf.is_some())
         .and_then(|slot| slot.hackrf.as_ref().map(|session| session.spectrum()))
         .unwrap_or_default();
-    let mut held = hub.spectrum.lock().expect("hackrf spectrum");
+    // Only a visible spectrum (or a scan) needs every frame drawn; a hidden
+    // one is redrawn on its next real event. A capture starting or stopping
+    // always repaints so status never goes stale.
+    if store_spectrum(&hub.spectrum, hub.spectrum_watched(), next) {
+        ctx.request_repaint();
+    }
+}
+
+/// Store a new frame (always, so a scan or RSSI reader sees it) and say
+/// whether it should redraw the window.
+fn store_spectrum(slot: &Mutex<crate::hackrf::SpectrumSnap>, watched: bool, next: crate::hackrf::SpectrumSnap) -> bool {
+    let mut held = slot.lock().expect("hackrf spectrum");
     if next.seq == held.seq
         && (next.center_hz - held.center_hz).abs() < 1.0
         && next.db.len() == held.db.len()
     {
-        return;
+        return false;
     }
+    let cleared = next.db.is_empty() != held.db.is_empty();
     *held = next;
-    drop(held);
-    ctx.request_repaint();
+    crate::redraw::repaint_for_frame(watched, cleared)
+}
+
+#[cfg(test)]
+mod spectrum_redraw_tests {
+    use super::*;
+    use crate::hackrf::SpectrumSnap;
+
+    fn frame(seq: u64) -> SpectrumSnap {
+        SpectrumSnap { seq, center_hz: 146e6, db: vec![-80.0; 1024] }
+    }
+
+    #[test]
+    fn hidden_page_still_gets_every_frame_but_no_redraw() {
+        let slot = Mutex::new(SpectrumSnap::default());
+        assert!(store_spectrum(&slot, false, frame(1)), "capture start repaints");
+        for seq in 2..20 {
+            assert!(!store_spectrum(&slot, false, frame(seq)), "hidden: no redraw");
+            assert_eq!(slot.lock().unwrap().seq, seq, "frame still stored for scan / RSSI");
+        }
+        assert!(store_spectrum(&slot, false, SpectrumSnap::default()), "capture stop repaints");
+    }
+
+    #[test]
+    fn scanning_with_the_page_hidden_keeps_redrawing() {
+        let watched = crate::redraw::spectrum_wanted(crate::redraw::View { scanning: true, ..Default::default() });
+        let slot = Mutex::new(frame(1));
+        for seq in 2..10 {
+            assert!(store_spectrum(&slot, watched, frame(seq)), "scan steps each frame");
+        }
+    }
 }
 
 fn park_until(hub: &Hub, watch: &Option<DevWatch>, wait: Duration) {
