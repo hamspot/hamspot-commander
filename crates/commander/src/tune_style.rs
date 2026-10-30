@@ -82,6 +82,71 @@ pub fn spectrum_height(ui: &egui::Ui, reserve: f32) -> f32 {
     if h.is_finite() { h.clamp(crate::dial::SPECTRUM_H, SPECTRUM_MAX_H) } else { crate::dial::SPECTRUM_H }
 }
 
+/// Below this page width the scope stacks under the keys instead of beside them.
+pub const TWO_COL_MIN_W: f32 = 720.0;
+/// Smallest scope pane (inside the header and status strips).
+pub const SCOPE_MIN_W: f32 = 320.0;
+pub const SCOPE_MIN_H: f32 = 160.0;
+const GAP: f32 = 8.0;
+
+/// The page below the tuning widget, NanoVNA style: keys on the left half,
+/// scope on the right half at full height (David, 2026-10-30). Narrow pages
+/// stack the scope under a scrolling key column; the scope keeps its minimum.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Split {
+    pub keys: Rect,
+    /// Whole scope block: header strip, pane, status strip.
+    pub scope: Rect,
+    pub two_col: bool,
+}
+
+impl Split {
+    pub fn pane_h(&self) -> f32 {
+        (self.scope.height() - 2.0 * STRIP_H).max(0.0)
+    }
+}
+
+pub fn split(area: Rect) -> Split {
+    let w = area.width().max(0.0);
+    let h = area.height().max(0.0);
+    if w >= TWO_COL_MIN_W {
+        let keys_w = ((w - GAP) * 0.5).floor();
+        let keys = Rect::from_min_size(area.min, vec2(keys_w, h));
+        let scope = Rect::from_min_max(Pos2::new(keys.right() + GAP, area.top()), area.max);
+        Split { keys, scope, two_col: true }
+    } else {
+        // Scope first: it keeps its minimum, up to half, and the keys scroll.
+        let want = (h * 0.5).max(SCOPE_MIN_H + 2.0 * STRIP_H).min(SPECTRUM_MAX_H + 2.0 * STRIP_H);
+        let scope_h = want.min(h);
+        let keys = Rect::from_min_size(area.min, vec2(w, (h - scope_h - GAP).max(0.0)));
+        let scope = Rect::from_min_max(Pos2::new(area.left(), area.bottom() - scope_h), area.max);
+        Split { keys, scope, two_col: false }
+    }
+}
+
+/// Lay out keys (scrolling if they do not fit) and the scope in `area`.
+pub fn keys_and_scope(
+    ui: &mut egui::Ui,
+    area: Rect,
+    keys: impl FnOnce(&mut egui::Ui),
+    scope: impl FnOnce(&mut egui::Ui, f32),
+) -> Split {
+    let sp = split(area);
+    ui.scope_builder(egui::UiBuilder::new().max_rect(sp.keys).id_salt("tune-keys"), |ui| {
+        egui::ScrollArea::vertical()
+            .id_salt("tune-keys-scroll")
+            .max_height(sp.keys.height())
+            .min_scrolled_height(sp.keys.height())
+            .auto_shrink([false, true])
+            .show(ui, keys);
+    });
+    ui.scope_builder(egui::UiBuilder::new().max_rect(sp.scope).id_salt("tune-scope"), |ui| {
+        scope(ui, sp.pane_h());
+    });
+    ui.advance_cursor_after_rect(area);
+    sp
+}
+
 fn strip(ui: &mut egui::Ui, left: &str, right: &str, ink: Color32) -> Rect {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), STRIP_H), Sense::hover());
     let p = ui.painter_at(rect);
@@ -285,5 +350,76 @@ mod tests {
             egui::ScrollArea::vertical().show(ui, |ui| hh = spectrum_height(ui, 0.0));
         });
         assert!(hh.is_finite() && hh >= crate::dial::SPECTRUM_H && hh <= SPECTRUM_MAX_H);
+    }
+
+    /// Window sizes from David's report and the usual ones. `chrome` is the
+    /// elbow frame plus the tuning widget above the split (measured on the
+    /// 1024x550 screenshot: the keys started about 260 px down).
+    const SIZES: [(f32, f32); 6] = [(1024.0, 550.0), (1280.0, 720.0), (1400.0, 900.0), (800.0, 500.0), (700.0, 600.0), (640.0, 480.0)];
+    const CHROME: f32 = 260.0;
+
+    fn tune_page(w: f32, h: f32) -> (Split, Vec<Rect>, Rect, Rect) {
+        let ctx = ctx();
+        let db: Vec<f32> = (0..1024).map(|i| -80.0 + (i % 13) as f32).collect();
+        let (mut sp, mut keys, mut chart) = (None, Vec::new(), Rect::NOTHING);
+        let page = Rect::from_min_max(Pos2::new(8.0, CHROME), Pos2::new(w - 8.0, h - 8.0));
+        run(&ctx, w, h, &mut |ui| {
+            keys.clear();
+            sp = Some(keys_and_scope(
+                ui,
+                page,
+                |ui| {
+                    for cap in ["VFO · BAND", "MODE · RECEIVER", "FUNCTIONS", "SPECTRUM · GAIN"] {
+                        caption(ui, cap);
+                        ui.horizontal_wrapped(|ui| {
+                            for k in KEYS {
+                                let r = toggle(ui, k, true, false, palette::TEAL);
+                                if ui.clip_rect().contains_rect(r.rect) {
+                                    keys.push(r.rect);
+                                }
+                            }
+                        });
+                    }
+                },
+                |ui, ph| {
+                    let c = Chart { header: "SPEC AVG", header_right: "LNA 40 dB  VGA 32 dB", center_hz: 146e6, rate_hz: 8e6, usable_hz: 6e6, db: &db, needle_hz: 146.1e6, height: ph, status: "ok" };
+                    chart = spectrum_chart(ui, c).1;
+                },
+            ));
+        });
+        (sp.unwrap(), keys, chart, page)
+    }
+
+    #[test]
+    fn scope_right_keys_left_and_usable_at_every_size() {
+        for (w, h) in SIZES {
+            let (sp, keys, chart, page) = tune_page(w, h);
+            assert!(page.expand(0.5).contains_rect(chart), "scope pane out of the page at {w}x{h}: {chart:?}");
+            assert!(chart.height() >= SCOPE_MIN_H - 0.5, "scope only {} tall at {w}x{h}", chart.height());
+            if page.height() >= SCOPE_MIN_H + 2.0 * STRIP_H + 8.0 + 60.0 || sp.two_col {
+                assert!(!keys.is_empty(), "no key visible at {w}x{h}");
+            }
+            for k in &keys {
+                assert!(sp.keys.expand(0.5).contains_rect(*k), "key {k:?} outside its column {:?} at {w}x{h}", sp.keys);
+            }
+            if w - 16.0 >= TWO_COL_MIN_W {
+                assert!(sp.two_col);
+                assert!(chart.left() >= page.center().x - 1.0, "scope not on the right half at {w}x{h}");
+                assert!(chart.width() >= SCOPE_MIN_W, "scope only {} wide at {w}x{h}", chart.width());
+                assert!(keys.iter().all(|k| k.right() <= page.center().x + 1.0), "keys spill into the scope half at {w}x{h}");
+                assert!((chart.height() - (page.height() - 2.0 * STRIP_H)).abs() < 1.0, "scope not full height at {w}x{h}");
+            } else {
+                assert!(!sp.two_col, "narrow page stacks at {w}x{h}");
+                assert!(chart.top() >= sp.keys.bottom(), "stacked scope under the keys at {w}x{h}");
+            }
+        }
+    }
+
+    /// David's screenshot: 1024x550 docked showed the keys and no scope.
+    #[test]
+    fn regression_1024x550_shows_the_scope() {
+        let (sp, _, chart, _) = tune_page(1024.0, 550.0);
+        assert!(sp.two_col);
+        assert!(chart.height() >= SCOPE_MIN_H && chart.bottom() <= 550.0, "{chart:?}");
     }
 }

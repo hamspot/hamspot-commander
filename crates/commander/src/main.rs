@@ -3707,89 +3707,115 @@ impl App {
             }
         });
         ui.add_space(4.0);
-        tune_style::caption(ui, "VFO · BAND");
-        ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
-                let alt = tune_style::action(ui, "ALT", true);
-                if alt.clicked() && snap.caps.vfo_ops.contains("XCHG") {
-                    self.send(Command::VfoOp("XCHG".into()));
-                }
-                let bsp = tune_style::toggle(ui, "BSP", true, self.show_spread, bar_key_hue("BSP", KeyLamp::Dark));
-                if bsp.clicked() {
-                    self.show_spread = !self.show_spread;
-                }
-                if tune_style::action(ui, "LOAD", true).clicked() {
-                    self.browse_plan(false);
-                }
-                let mut chip_pick = None;
-                // Memory is keyed by band name, the same key `band_step` uses.
-                let rx = rx_pairs(snap);
-                let listed: Vec<(usize, String, String, f64, Vec<(f64, f64)>)> = self
-                    .plan
-                    .zones
-                    .get(self.zone_sel)
-                    .map(|zone| {
-                        zone.bands
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(idx, band)| {
-                                let pieces = plan::pieces_inside(band.lo_hz, band.hi_hz, &rx);
-                                if pieces.is_empty() {
-                                    return None;
-                                }
-                                Some((
-                                    idx,
-                                    band.chip.clone(),
-                                    band.name.clone(),
-                                    band.home_hz,
-                                    pieces,
-                                ))
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let chips: Vec<(usize, String, String, f64)> = listed
-                    .into_iter()
-                    .map(|(idx, chip, name, home, pieces)| {
-                        let remembered = self.band_mem.get(&name).copied().unwrap_or(home);
-                        let hz = if pieces
-                            .iter()
-                            .any(|(start, end)| remembered >= *start && remembered <= *end)
-                        {
-                            remembered
-                        } else {
-                            pieces[0].0
-                        };
-                        (idx, chip, name, hz)
-                    })
-                    .collect();
-                for (idx, chip, name, hz) in &chips {
-                    let on = self.band_sel == *idx;
-                    if tune_style::toggle(ui, chip, true, on, tab_color(*idx)).clicked() && !self.following() {
-                        self.band_sel = *idx;
-                        if snap.caps.can_set_freq {
-                            let tuned = self.band_mem.get(name).copied().unwrap_or(*hz);
-                            chip_pick = Some(tuned);
+        // Keys left, scope right (NanoVNA layout); the BSP keeps its share below.
+        let hackrf = self.selected_hackrf();
+        let mut keys = |this: &mut Self, ui: &mut egui::Ui, snap: &mut Snapshot| {
+            tune_style::caption(ui, "VFO · BAND");
+            ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                    let alt = tune_style::action(ui, "ALT", true);
+                    if alt.clicked() && snap.caps.vfo_ops.contains("XCHG") {
+                        this.send(Command::VfoOp("XCHG".into()));
+                    }
+                    let bsp = tune_style::toggle(ui, "BSP", true, this.show_spread, bar_key_hue("BSP", KeyLamp::Dark));
+                    if bsp.clicked() {
+                        this.show_spread = !this.show_spread;
+                    }
+                    if tune_style::action(ui, "LOAD", true).clicked() {
+                        this.browse_plan(false);
+                    }
+                    let mut chip_pick = None;
+                    // Memory is keyed by band name, the same key `band_step` uses.
+                    let rx = rx_pairs(snap);
+                    let listed: Vec<(usize, String, String, f64, Vec<(f64, f64)>)> = this
+                        .plan
+                        .zones
+                        .get(this.zone_sel)
+                        .map(|zone| {
+                            zone.bands
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(idx, band)| {
+                                    let pieces = plan::pieces_inside(band.lo_hz, band.hi_hz, &rx);
+                                    if pieces.is_empty() {
+                                        return None;
+                                    }
+                                    Some((
+                                        idx,
+                                        band.chip.clone(),
+                                        band.name.clone(),
+                                        band.home_hz,
+                                        pieces,
+                                    ))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let chips: Vec<(usize, String, String, f64)> = listed
+                        .into_iter()
+                        .map(|(idx, chip, name, home, pieces)| {
+                            let remembered = this.band_mem.get(&name).copied().unwrap_or(home);
+                            let hz = if pieces
+                                .iter()
+                                .any(|(start, end)| remembered >= *start && remembered <= *end)
+                            {
+                                remembered
+                            } else {
+                                pieces[0].0
+                            };
+                            (idx, chip, name, hz)
+                        })
+                        .collect();
+                    for (idx, chip, name, hz) in &chips {
+                        let on = this.band_sel == *idx;
+                        if tune_style::toggle(ui, chip, true, on, tab_color(*idx)).clicked() && !this.following() {
+                            this.band_sel = *idx;
+                            if snap.caps.can_set_freq {
+                                let tuned = this.band_mem.get(name).copied().unwrap_or(*hz);
+                                chip_pick = Some(tuned);
+                            }
                         }
                     }
-                }
-                if let Some(hz) = chip_pick {
-                    self.tune(snap, hz);
-                }
+                    if let Some(hz) = chip_pick {
+                        this.tune(snap, hz);
+                    }
+                });
+            tune_style::caption(ui, "MODE · RECEIVER");
+            ui.horizontal_wrapped(|ui| {
+                this.mode_box(ui, snap, "Mode", true);
+                ui.add_space(8.0);
+                this.mode_box(ui, snap, "Sub", false);
+                ui.add_space(8.0);
+                this.receiver_box(ui, snap);
             });
-        tune_style::caption(ui, "MODE · RECEIVER");
-        ui.horizontal_wrapped(|ui| {
-            self.mode_box(ui, snap, "Mode", true);
-            ui.add_space(8.0);
-            self.mode_box(ui, snap, "Sub", false);
-            ui.add_space(8.0);
-            self.receiver_box(ui, snap);
-        });
         tune_style::caption(ui, "FUNCTIONS");
-        self.buttons(ui, snap);
-        if self.selected_hackrf() {
-            ui.add_space(8.0);
-            self.hackrf_spectrum(ui, snap, freq);
+            this.buttons(ui, snap);
+            if hackrf {
+                this.hackrf_gain_keys(ui, snap);
+            }
+        };
+        if hackrf {
+            let bsp = if self.show_spread { 160.0 } else { 0.0 };
+            let top = ui.cursor().top();
+            let bottom = ui.max_rect().bottom().min(ui.clip_rect().bottom()) - bsp;
+            let area = egui::Rect::from_min_max(egui::pos2(ui.max_rect().left(), top), egui::pos2(ui.max_rect().right(), bottom.max(top)));
+            let me = std::cell::RefCell::new((&mut *self, &mut *snap));
+            tune_style::keys_and_scope(
+                ui,
+                area,
+                |ui| {
+                    let mut g = me.borrow_mut();
+                    let (this, snap) = &mut *g;
+                    keys(this, ui, snap);
+                },
+                |ui, h| {
+                    let mut g = me.borrow_mut();
+                    let (this, snap) = &mut *g;
+                    this.hackrf_scope(ui, snap, freq, h);
+                },
+            );
+        } else {
+            keys(self, ui, snap);
         }
         if self.show_spread {
             ui.add_space(8.0);
@@ -11980,40 +12006,55 @@ impl App {
 
     /// Spectrum under the tuner buttons, the height of the bandspread block.
     /// Avg and Peak use the same buttons as the row above the glass.
-    fn hackrf_spectrum(&mut self, ui: &mut egui::Ui, snap: &Snapshot, freq: f64) {
-        ui.scope(|ui| {
-            let radio = self.hub.view().rows.into_iter().find(|row| {
-                row.selected && row.spec.driver == cat::RadioDriver::Hackrf
+    /// The HackRF row: the selected radio, with a gain hold that has landed cleared.
+    fn hackrf_row(&mut self) -> Option<crate::cat::RadioRow> {
+        let radio = self.hub.view().rows.into_iter().find(|row| {
+            row.selected && row.spec.driver == cat::RadioDriver::Hackrf
+        });
+        if let Some(row) = radio.as_ref() {
+            let matched = self.hackrf_gain_hold.as_ref().is_some_and(|hold| {
+                hold.id == row.id
+                    && row.spec.lna_db == Some(hold.lna)
+                    && row.spec.vga_db == Some(hold.vga)
             });
-            if let Some(row) = radio.as_ref() {
-                let matched = self.hackrf_gain_hold.as_ref().is_some_and(|hold| {
-                    hold.id == row.id
-                        && row.spec.lna_db == Some(hold.lna)
-                        && row.spec.vga_db == Some(hold.vga)
-                });
-                if matched {
-                    self.hackrf_gain_hold = None;
-                }
+            if matched {
+                self.hackrf_gain_hold = None;
             }
-            tune_style::caption(ui, "SPECTRUM · GAIN");
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
-                if tune_style::toggle(ui, "Avg", true, !self.spectrum_peak, bar_key_hue("Avg", KeyLamp::Dark)).clicked() {
-                    self.spectrum_peak = false;
-                }
-                if tune_style::toggle(ui, "Peak", true, self.spectrum_peak, bar_key_hue("Peak", KeyLamp::Dark)).clicked() {
-                    self.spectrum_peak = true;
-                }
-                if let Some(row) = radio.as_ref() {
-                    ui.add_space(8.0);
-                    let id = row.id;
-                    let spec = row.spec.clone();
-                    self.hackrf_gain_slider(ui, snap, id, &spec, true);
-                    ui.add_space(8.0);
-                    self.hackrf_gain_slider(ui, snap, id, &spec, false);
-                }
-            });
-            ui.add_space(4.0);
+        }
+        radio
+    }
+
+    /// SPECTRUM · GAIN keys: Avg / Peak and the LNA / VGA fields (left column).
+    fn hackrf_gain_keys(&mut self, ui: &mut egui::Ui, snap: &Snapshot) {
+        let radio = self.hackrf_row();
+        tune_style::caption(ui, "SPECTRUM · GAIN");
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+            if tune_style::toggle(ui, "Avg", true, !self.spectrum_peak, bar_key_hue("Avg", KeyLamp::Dark)).clicked() {
+                self.spectrum_peak = false;
+            }
+            if tune_style::toggle(ui, "Peak", true, self.spectrum_peak, bar_key_hue("Peak", KeyLamp::Dark)).clicked() {
+                self.spectrum_peak = true;
+            }
+            if let Some(row) = radio.as_ref() {
+                ui.add_space(8.0);
+                let id = row.id;
+                let spec = row.spec.clone();
+                self.hackrf_gain_slider(ui, snap, id, &spec, true);
+                ui.add_space(8.0);
+                self.hackrf_gain_slider(ui, snap, id, &spec, false);
+            }
+        });
+    }
+
+    /// The spectrum scope (right column): header line, pane `height` tall, status strip.
+    fn hackrf_scope(&mut self, ui: &mut egui::Ui, snap: &Snapshot, freq: f64, height: f32) {
+        let radio = self.hackrf_row();
+        self.hackrf_scope_draw(ui, snap, freq, height, radio);
+    }
+
+    fn hackrf_scope_draw(&mut self, ui: &mut egui::Ui, snap: &Snapshot, freq: f64, height: f32, radio: Option<crate::cat::RadioRow>) {
+        ui.scope(|ui| {
             let frame = self.hub.spectrum();
             self.fold_spectrum(&frame);
             let center = if frame.center_hz > 0.0 {
@@ -12047,9 +12088,6 @@ impl App {
             } else {
                 format!("VFO {:.6} MHz  click or drag to tune", freq / 1e6)
             };
-            // Fill the room left, bounded; the BSP below keeps its share.
-            let reserve = if self.show_spread { 160.0 } else { 0.0 };
-            let height = tune_style::spectrum_height(ui, reserve);
             let (pick, _) = tune_style::spectrum_chart(
                 ui,
                 tune_style::Chart {
