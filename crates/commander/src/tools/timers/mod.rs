@@ -43,6 +43,21 @@ pub const ID_W: f32 = 110.0;
 /// Slot width the bar controls need (buttons, one gap between, black margin each side).
 pub const BAR_SLOT_W: f32 = COPY_W + ID_W + 3.0 * 4.0;
 
+pub fn tab_labels() -> Vec<String> {
+    TIMER_TABS.iter().map(|(_, l)| (*l).to_owned()).collect()
+}
+
+impl Timers {
+    /// The Timers sub-tabs in a top-bar gap (page bar or detached window row).
+    pub fn bar_tabs(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let labels = tab_labels();
+        let sel = TIMER_TABS.iter().position(|(t, _)| *t == self.tab);
+        if let Some(i) = crate::tools::bar_tab_row(ui, rect, "timer-tabs", &labels, sel) {
+            self.tab = TIMER_TABS[i].0;
+        }
+    }
+}
+
 pub struct Timers {
     pub theme: LcarsTheme,
     pub sw: Stopwatch,
@@ -159,9 +174,10 @@ impl Timers {
         if let Some(tab) = tabs(ui, self.tab) {
             self.tab = tab;
         }
-        ui.add_space(4.0);
-        ui.label(self.status_line(now));
+        // One fixed status line; the open tab's notes join it.
+        let status = crate::status_note::reserve(ui);
         ui.add_space(self.theme.frame_gap);
+        crate::status_note::clear(ui.ctx());
         egui::ScrollArea::vertical()
             .id_salt("timers-body")
             .auto_shrink([false, false])
@@ -171,6 +187,8 @@ impl Timers {
                 TimerTab::Stopwatch => self.stopwatch_panel(ui, now),
                 TimerTab::Countdown => self.countdown_panel(ui, now),
             });
+        let base = self.status_line(now);
+        crate::status_note::paint(ui, status, &base);
     }
 
     fn clocks_panel(&mut self, ui: &mut egui::Ui) {
@@ -214,12 +232,6 @@ impl Timers {
                     ui.end_row();
                 }
             });
-        ui.add_space(t.main_gap / 2.0);
-        ui.label(
-            egui::RichText::new("COPY TIME (PAGE BAR): CLICK UTC LOG · DOUBLE LOCAL · TRIPLE ISO 8601")
-                .size(t.data_size)
-                .color(palette::TEXT_MUTED),
-        );
     }
 
     fn world_panel(&mut self, ui: &mut egui::Ui) {
@@ -246,15 +258,7 @@ impl Timers {
                     true,
                 );
             }
-            None => {
-                ui.label(
-                    egui::RichText::new(
-                        "CLICK A ZONE TO PIN IT · DOUBLE 12 HOUR · TRIPLE ISO 8601",
-                    )
-                    .size(t.data_size)
-                    .color(palette::TEXT_MUTED),
-                );
-            }
+            None => crate::status_note::note(ui, "ZONES: CLICK PINS · DOUBLE 12 HOUR · TRIPLE ISO 8601"),
         }
         for (i, (label, _)) in self.zone_modes.iter_mut().enumerate() {
             let (name, min) = ZONES[i];
@@ -286,11 +290,7 @@ impl Timers {
                 self.status = "UNPINNED".into();
             }
         }
-        ui.label(
-            egui::RichText::new("FIXED OFFSETS: NO DAYLIGHT SAVING TIME")
-                .size(t.data_size)
-                .color(palette::TEXT_MUTED),
-        );
+        crate::status_note::note(ui, "WORLD CLOCKS: FIXED OFFSETS, NO DAYLIGHT SAVING TIME");
     }
 
     fn stopwatch_panel(&mut self, ui: &mut egui::Ui, now: f64) {
@@ -374,11 +374,7 @@ impl Timers {
                 self.start_id(now);
             }
         });
-        ui.label(
-            egui::RichText::new("ADD TIME: CLICK +1 MIN · DOUBLE +5 MIN · TRIPLE +10 MIN")
-                .size(t.data_size)
-                .color(palette::TEXT_MUTED),
-        );
+
         let mut m = Mode::Inactive; // momentary
         mode_button(ui, &t, "Add time", &mut m, egui::vec2(180.0, 40.0))
             .on_hover_text("click +1 min · double +5 min · triple +10 min");

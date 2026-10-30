@@ -31,6 +31,7 @@ mod pipes;
 mod rx_pipe;
 mod scan;
 mod tools;
+mod status_note;
 mod group_box;
 mod estop;
 mod hfdata;
@@ -3088,7 +3089,18 @@ impl eframe::App for App {
                 // Timers' COPY TIME / ID 10:00 share the gap too, while attached.
                 let timers_bar = self.page == Page::Timers && !page_detached(ui.ctx(), Page::Timers);
                 let timers_w = if timers_bar { tools::timers::BAR_SLOT_W } else { 0.0 };
-                let slot_w = Some(in_frame.map(rec_ui::bar_slot_width).unwrap_or(0.0) + timers_w + estop_w);
+                // Tools' and Timers' sub-tabs sit in the bar too, directly left
+                // of the E-STOP (David, #221): as wide as they need, never more
+                // than the bar has; the rest go into the more-tabs key.
+                let tab_page = matches!(self.page, Page::Tools | Page::Timers) && !page_detached(ui.ctx(), self.page);
+                let tabs_w = if tab_page {
+                    let labels = if self.page == Page::Tools { tools::Tools::tab_labels() } else { tools::timers::tab_labels() };
+                    let room = (ui.available_width() - tools::BAR_TABS_RESERVE - timers_w - estop_w).max(tools::more_key_w() + 80.0);
+                    tools::bar_tabs_width(ui, &labels).min(room) + 2.0 * tools::BAR_TAB_GAP
+                } else {
+                    0.0
+                };
+                let slot_w = Some(in_frame.map(rec_ui::bar_slot_width).unwrap_or(0.0) + timers_w + tabs_w + estop_w);
                 let (frame_rect, slot) = tools::frame_with_slot(ui, slot_w, |ui| {
                     if page_detached(ui.ctx(), self.page) {
                         page_stub(ui, self.page);
@@ -3130,6 +3142,19 @@ impl eframe::App for App {
                                 self.tools.lock().expect("tools").timers_mut().bar(ui);
                             });
                         });
+                    }
+                    if tab_page {
+                        // [COPY TIME · ID 10:00] [tabs … more] [E-STOP]
+                        let tabs_r = egui::Rect::from_min_max(
+                            egui::pos2(rec_r.left() + timers_w, rec_r.top()),
+                            egui::pos2(rec_r.right() - tools::BAR_TAB_GAP, rec_r.bottom()),
+                        );
+                        let mut t = self.tools.lock().expect("tools");
+                        if self.page == Page::Tools {
+                            t.bar_tabs(ui, tabs_r);
+                        } else {
+                            t.timers_mut().bar_tabs(ui, tabs_r);
+                        }
                     }
                     if let Some(compact) = in_frame {
                         ui.scope_builder(egui::UiBuilder::new().max_rect(rec_r).id_salt("rec-bar-in-frame"), |ui| {
@@ -8548,19 +8573,8 @@ impl App {
     /// line, then the open tab. The bar controls sit in the page-bar slot.
     fn page_timers(&mut self, ui: &mut egui::Ui) {
         let mut tools = self.tools.lock().expect("tools");
-        tools.timers_mut().draw_in(ui, |ui, cur| {
-            let labels: Vec<String> = tools::timers::TIMER_TABS.iter().map(|(_, l)| l.to_string()).collect();
-            let sel = tools::timers::TIMER_TABS.iter().position(|(t, _)| *t == cur);
-            tools::overflow_tab_row(
-                ui,
-                "timer-tabs",
-                &labels,
-                sel,
-                |ui, i| folder_tab_width(ui, &labels[i], false),
-                |ui, i, lead| folder_tab(ui, Some(i) == sel, i, &labels[i], lead),
-            )
-            .map(|i| tools::timers::TIMER_TABS[i].0)
-        });
+        // The sub-tabs are in the top bar (page bar or window row).
+        tools.timers_mut().draw_in(ui, |_, _| None);
     }
 
     /// Every detached page in its own window, every frame, whatever page
@@ -8627,7 +8641,16 @@ impl App {
                 match page {
                     Page::Timers => {
                         ui.spacing_mut().item_spacing.x = 4.0;
-                        self.tools.lock().expect("tools").timers_mut().bar(ui);
+                        let mut t = self.tools.lock().expect("tools");
+                        t.timers_mut().bar(ui);
+                        let estop_w = estop::button_width(ui, estop::engaged()) + 8.0;
+                        let left = ui.cursor().left();
+                        let r = ui.max_rect();
+                        let tabs_r = egui::Rect::from_min_max(
+                            egui::pos2(left, r.top()),
+                            egui::pos2((r.right() - estop_w).max(left), r.top() + h),
+                        );
+                        t.timers_mut().bar_tabs(ui, tabs_r);
                     }
                     Page::Rec => {
                         ui.spacing_mut().item_spacing.x = rec_ui::BAR_GAP;

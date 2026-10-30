@@ -181,11 +181,7 @@ impl HexView {
             ))
             .size(t.header_size),
         );
-        ui.label(
-            egui::RichText::new("CLICK INSPECTS · DOUBLE BOOKMARKS · TRIPLE COPIES THE ROW")
-                .size(t.data_size)
-                .color(palette::TEXT_MUTED),
-        );
+        crate::status_note::note(ui, "ROWS: CLICK INSPECTS · DOUBLE BOOKMARKS · TRIPLE COPIES");
         // show_rows measures a row as height + item spacing: keep it equal to mode_list's gap
         ui.spacing_mut().item_spacing.y = GAP;
         let mut area = egui::ScrollArea::vertical()
@@ -271,7 +267,7 @@ impl HexView {
                 self.do_find();
             }
         });
-        readout(ui, &t, &self.status, self.status.starts_with("FOUND"));
+        crate::status_note::note(ui, self.status.clone());
         ui.add_space(t.main_gap / 2.0);
         ui.label(egui::RichText::new("INSPECTOR").size(t.header_size));
         match self.selected {
@@ -287,18 +283,12 @@ impl HexView {
                         }
                     });
             }
-            None => {
-                ui.label(
-                    egui::RichText::new("CLICK A ROW, OR USE GO TO").color(palette::TEXT_MUTED),
-                );
-            }
+            None => {}
         }
         ui.add_space(t.main_gap / 2.0);
         ui.label(egui::RichText::new("BOOKMARKS").size(t.header_size));
         let marks = self.bookmarks();
-        if marks.is_empty() {
-            ui.label(egui::RichText::new("DOUBLE-CLICK A ROW").color(palette::TEXT_MUTED));
-        }
+
         ui.horizontal_wrapped(|ui| {
             for row in marks.into_iter().take(12) {
                 let label = format!("{:06X}", row * ROW);

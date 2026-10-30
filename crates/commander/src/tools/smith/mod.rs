@@ -216,12 +216,10 @@ impl Smith {
                             .show(ui, |ui| self.panel(ui));
                     });
                 });
+                // The chart has no right-hand elbow, as on NanoVNA (#221).
                 ui.scope_builder(egui::UiBuilder::new().max_rect(right), |ui| {
-                    let mut f = LcarsFrame::new(&t, Side::Right, 0.6);
-                    f.top_color = palette::PLUM;
-                    f.bottom_color = palette::SLATE;
-                    f.min_height = right.height();
-                    f.show(ui, &t, |ui| self.chart(ui));
+                    ui.set_min_height(right.height());
+                    self.chart(ui);
                 });
             });
     }
@@ -316,7 +314,7 @@ impl Smith {
             let f_hz = num(&self.f).unwrap_or(0.0) * 1e6;
             let all = math::l_match(zn);
             if all.is_empty() {
-                ui.label(egui::RichText::new("NO L NETWORK NEEDED (MATCHED) OR LOAD IS PURE REACTANCE").color(palette::TEXT_MUTED));
+                crate::status_note::note(ui, "NO L NETWORK NEEDED (MATCHED) OR LOAD IS PURE REACTANCE");
             }
             let rows: Vec<(String, String)> = all
                 .iter()
@@ -371,20 +369,12 @@ impl Smith {
                         ),
                     ],
                 ),
-                None => {
-                    ui.label(
-                        egui::RichText::new("NO STUB NEEDED (MATCHED) OR LOAD IS PURE REACTANCE")
-                            .color(palette::TEXT_MUTED),
-                    );
-                }
+                None => crate::status_note::note(ui, "NO STUB NEEDED (MATCHED) OR LOAD IS PURE REACTANCE"),
             }
         }
         ui.add_space(t.main_gap / 2.0);
         ui.label(egui::RichText::new("MARKERS").size(t.header_size));
-        ui.label(
-            egui::RichText::new("CLICK THE CHART · DOUBLE ALT 1 · TRIPLE ALT 2")
-                .color(palette::TEXT_MUTED),
-        );
+
         for (i, m) in [Mode::Primary, Mode::Alt1, Mode::Alt2].iter().enumerate() {
             if let Some(p) = self.markers[i] {
                 let z = math::z_of(p);

@@ -159,12 +159,7 @@ impl Rotator {
                     Cap::Left,
                     true,
                 );
-                ui.add_space(t.main_gap);
-                let label = match &row {
-                    Some(row) => format!("{}  {}  {}", row.spec.name, row.model_label, row.status),
-                    None => "No rotator. Add one in Config Automation (Dummy is model 1).".into(),
-                };
-                ui.label(egui::RichText::new(label).color(t.text));
+                // The rotator, model and state are on the Tools status line.
             });
         });
         let az = row.as_ref().and_then(|row| row.azimuth);

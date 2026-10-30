@@ -149,9 +149,14 @@ impl Tools {
     pub fn window_body(&mut self, ui: &mut egui::Ui) {
         self.estop_chord.poll(ui.ctx());
         let h = self.theme.bar_thin;
-        ui.allocate_ui_with_layout(
-            egui::vec2(ui.available_width(), h),
-            egui::Layout::right_to_left(egui::Align::Center),
+        let row = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), egui::Sense::hover()).0;
+        let estop_w = crate::estop::button_width(ui, crate::estop::engaged()) + 8.0;
+        let tabs = egui::Rect::from_min_max(row.min, egui::pos2(row.right() - estop_w, row.bottom()));
+        self.bar_tabs(ui, tabs);
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(egui::Rect::from_min_max(egui::pos2(tabs.right(), row.top()), row.max))
+                .layout(egui::Layout::right_to_left(egui::Align::Center)),
             |ui| {
                 crate::estop::button(ui);
             },
@@ -165,26 +170,29 @@ impl Tools {
     /// tool, then the tool screen in the remaining area. The tool screens
     /// add their panels inside `ui`, so they stay within the frame.
     pub fn draw_in(&mut self, ui: &mut egui::Ui) {
-        let labels: Vec<String> = SCREENS.iter().map(|(_, l)| (*l).to_owned()).collect();
-        let sel = SCREENS.iter().position(|(s, _)| *s == self.screen);
-        let picked = overflow_tab_row(
-            ui,
-            "tool-tabs",
-            &labels,
-            sel,
-            |ui, i| crate::folder_tab_width(ui, &labels[i], false),
-            |ui, i, lead| crate::folder_tab(ui, Some(i) == sel, i, &labels[i], lead),
-        );
-        if let Some(i) = picked {
-            self.screen = SCREENS[i].0;
-        }
-        ui.add_space(4.0);
-        ui.label(self.status_line());
+        // The tool sub-tabs are in the top elbow bar (`bar_tabs`), not here.
+        let status = crate::status_note::reserve(ui);
         ui.add_space(self.theme.frame_gap);
+        crate::status_note::clear(ui.ctx());
         let rect = ui.available_rect_before_wrap();
         ui.scope_builder(egui::UiBuilder::new().max_rect(rect).id_salt("tool-screen"), |ui| {
             self.screen(ui);
         });
+        let base = self.status_line();
+        crate::status_note::paint(ui, status, &base);
+    }
+
+    pub fn tab_labels() -> Vec<String> {
+        SCREENS.iter().map(|(_, l)| (*l).to_owned()).collect()
+    }
+
+    /// The tool sub-tabs in a top-bar gap (page bar or detached window row).
+    pub fn bar_tabs(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let labels = Self::tab_labels();
+        let sel = SCREENS.iter().position(|(s, _)| *s == self.screen);
+        if let Some(i) = bar_tab_row(ui, rect, "tool-tabs", &labels, sel) {
+            self.screen = SCREENS[i].0;
+        }
     }
 
     /// One status line per tool, under the sub-tabs. Plain text.
@@ -536,6 +544,80 @@ pub fn partition_tabs(
 /// When all fit, the cap stays plain chrome. `width(i)` is tab i's real
 /// width; `draw(ui, i, lead)` paints tab i and returns its response.
 /// Returns the index picked from the row or from the list.
+/// Bar width kept for the left elbow, its tan run and the end cap when
+/// sub-tabs share the top bar.
+pub const BAR_TABS_RESERVE: f32 = 220.0;
+
+/// Gap between sub-tabs in the top bar.
+pub const BAR_TAB_GAP: f32 = 4.0;
+
+/// Width of the more-tabs key in the top bar.
+pub fn more_key_w() -> f32 {
+    LcarsTheme::default().bar_thin * 1.2
+}
+
+/// Width all `labels` take as sub-tabs in the top bar, with gaps.
+pub fn bar_tabs_width(ui: &egui::Ui, labels: &[String]) -> f32 {
+    let w: f32 = labels.iter().map(|l| crate::folder_tab_width(ui, l, false)).sum();
+    w + BAR_TAB_GAP * labels.len().saturating_sub(1) as f32
+}
+
+/// Sub-tabs inside the top elbow bar (`rect` is the black gap opened in the
+/// bar, directly left of the E-STOP slot). Tabs run left to right. When they
+/// do not all fit, the more-tabs key takes the right end of `rect` (so it
+/// sits directly left of E-STOP) and the hidden tabs are in its menu; the
+/// open tab always stays visible.
+pub fn bar_tab_row(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    id_salt: &str,
+    labels: &[String],
+    selected: Option<usize>,
+) -> Option<usize> {
+    let widths: Vec<f32> = labels.iter().map(|l| crate::folder_tab_width(ui, l, false)).collect();
+    let all = bar_tabs_width(ui, labels);
+    let overflow = all > rect.width() + 0.5;
+    let room = if overflow { (rect.width() - more_key_w() - BAR_TAB_GAP).max(0.0) } else { rect.width() };
+    let (shown, hidden) = partition_tabs(&widths, BAR_TAB_GAP, room, selected);
+    let mut picked = None;
+    let row = egui::Rect::from_min_max(rect.min, egui::pos2(rect.left() + room, rect.bottom()));
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(row)
+            .id_salt(("bar-tabs", id_salt))
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = BAR_TAB_GAP;
+            for (n, &i) in shown.iter().enumerate() {
+                if crate::folder_tab(ui, selected == Some(i), i, &labels[i], n == 0).clicked() {
+                    picked = Some(i);
+                }
+            }
+        },
+    );
+    if !hidden.is_empty() {
+        let key = egui::Rect::from_min_max(egui::pos2(rect.right() - more_key_w(), rect.top()), rect.max);
+        let id = ui.id().with(("bar-more-tabs", id_salt));
+        let resp = ui.interact(key, id, egui::Sense::click());
+        paint_more_key(ui, key, &resp);
+        let resp = resp.on_hover_text(format!("More tabs ({} hidden)", hidden.len()));
+        let l = format!("More tabs, {} hidden", hidden.len());
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &l));
+        egui::Popup::menu(&resp).show(|ui| {
+            for &i in &hidden {
+                if ui.selectable_label(selected == Some(i), labels[i].to_uppercase()).clicked() {
+                    picked = Some(i);
+                    ui.close();
+                }
+            }
+        });
+    }
+    if picked.is_some() {
+        ui.ctx().request_repaint();
+    }
+    picked
+}
+
 pub fn overflow_tab_row(
     ui: &mut egui::Ui,
     id_salt: &str,
@@ -879,50 +961,110 @@ mod page_frame_tests {
             .collect()
     }
 
-    /// Real LCARS fonts and theme: every tool screen draws inside the page
-    /// frame it is given (sub-tabs, status line and screen), the sub-tabs
-    /// label each tool, and a narrow window moves tabs into more-tabs.
+    /// One main-window frame as main.rs draws Tools: the sub-tabs in the
+    /// top-bar gap directly left of the E-STOP, the screen in the frame.
+    /// Returns (output, frame rect, tab gap rect, E-STOP rect).
+    fn tools_frame(ctx: &egui::Context, tools: &mut Tools, w: f32) -> (egui::FullOutput, egui::Rect, egui::Rect, egui::Rect) {
+        let (mut frame, mut tabs_r, mut stop_r) = (egui::Rect::NOTHING, egui::Rect::NOTHING, egui::Rect::NOTHING);
+        let mut out = egui::FullOutput::default();
+        for _ in 0..3 {
+            out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, 800.0))),
+                    ..Default::default()
+                },
+                |ui| {
+                    let estop_w = crate::estop::button_width(ui, false) + 16.0;
+                    let room = (ui.available_width() - BAR_TABS_RESERVE - estop_w).max(more_key_w() + 80.0);
+                    let tabs_w = bar_tabs_width(ui, &Tools::tab_labels()).min(room) + 2.0 * BAR_TAB_GAP;
+                    let (f, slot) = frame_with_slot(ui, Some(tabs_w + estop_w), |ui| tools.draw_in(ui));
+                    let r = slot.expect("slot");
+                    tabs_r = egui::Rect::from_min_max(r.min, egui::pos2(r.right() - estop_w - BAR_TAB_GAP, r.bottom()));
+                    stop_r = egui::Rect::from_min_max(egui::pos2(r.right() - estop_w, r.top()), r.max);
+                    tools.bar_tabs(ui, tabs_r);
+                    frame = f;
+                },
+            );
+            out.textures_delta.clear();
+        }
+        (out, frame, tabs_r, stop_r)
+    }
+
+    /// Real LCARS fonts and theme. The tool sub-tabs are inside the top bar,
+    /// left of the E-STOP slot, never overlapping it; nothing else of the
+    /// page sits in the bar; a narrow window puts the rest into more-tabs
+    /// at the right end of the gap. The status line is one row.
     #[test]
-    fn every_tool_screen_draws_inside_the_page_frame() {
+    fn tool_tabs_sit_in_the_bar_left_of_the_estop() {
         let ctx = egui::Context::default();
         let mut tools = Tools::new(&ctx);
-        for (w, all_tabs) in [(1400.0, true), (640.0, false)] {
+        let th = LcarsTheme::default();
+        for w in [1400.0, 760.0] {
             for (screen, label) in SCREENS {
                 tools.screen = screen;
-                let mut frame = egui::Rect::NOTHING;
-                let mut out = egui::FullOutput::default();
-                for _ in 0..3 {
-                    out = ctx.run_ui(
-                        egui::RawInput {
-                            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, 800.0))),
-                            ..Default::default()
-                        },
-                        |ui| {
-                            frame = frame_with_slot(ui, Some(200.0), |ui| tools.draw_in(ui)).0;
-                        },
-                    );
-                    out.textures_delta.clear();
-                }
+                let (out, frame, tabs_r, stop_r) = tools_frame(&ctx, &mut tools, w);
                 let t = texts(&out);
-                let status = tools.status_line();
-                assert!(t.iter().any(|(s, _)| *s == status), "{label}: status line {status:?} missing");
-                assert!(t.iter().any(|(s, _)| s.eq_ignore_ascii_case(label)), "{label}: its sub-tab is missing");
-                if all_tabs {
-                    for (_, l) in SCREENS {
-                        assert!(t.iter().any(|(s, _)| s.eq_ignore_ascii_case(l)), "{label}: tab {l} missing at {w}");
-                    }
+                assert!(tabs_r.top() == frame.top() && tabs_r.bottom() <= frame.top() + th.bar_thin + 0.5, "gap is in the top bar");
+                assert!(tabs_r.right() <= stop_r.left(), "tabs end left of the E-STOP");
+                let in_bar: Vec<_> = t.iter().filter(|(_, r)| r.top() < frame.top() + th.bar_thin).collect();
+                for (s, r) in &in_bar {
+                    assert!(tabs_r.expand(1.0).contains_rect(*r), "{label} at {w}: {s:?} {r:?} in the bar outside the tab gap {tabs_r:?}");
                 }
-                // Inside the frame: right of the side bar, under the top bar.
-                let th = LcarsTheme::default();
-                let inner = egui::Rect::from_min_max(
-                    frame.min + egui::vec2(th.bar_thick, th.bar_thin),
-                    frame.max,
-                );
-                for (s, r) in &t {
+                assert!(in_bar.iter().any(|(s, _)| s.eq_ignore_ascii_case(label)), "{label} at {w}: open tab shown in the bar");
+                if w >= 1400.0 {
+                    for (_, l) in SCREENS {
+                        assert!(in_bar.iter().any(|(s, _)| s.eq_ignore_ascii_case(l)), "tab {l} in the bar at {w}");
+                    }
+                } else {
+                    assert!(SCREENS.iter().any(|(_, l)| !in_bar.iter().any(|(s, _)| s.eq_ignore_ascii_case(l))), "narrow: some tabs hidden");
+                }
+                // Below the bar: the page content, inside the frame.
+                let inner = egui::Rect::from_min_max(frame.min + egui::vec2(th.bar_thick, th.bar_thin), frame.max);
+                let body: Vec<_> = t.iter().filter(|(_, r)| r.top() >= frame.top() + th.bar_thin).collect();
+                for (s, r) in &body {
                     assert!(inner.expand(1.0).contains_rect(*r), "{label} at {w}: {s:?} {r:?} outside frame {inner:?}");
                 }
+                // The status line: the first body row, a single row.
+                let top = body.iter().map(|(_, r)| r.top()).fold(f32::INFINITY, f32::min);
+                let first: Vec<_> = body.iter().filter(|(_, r)| (r.top() - top).abs() < 1.0).collect();
+                let base = tools.status_line();
+                let head: String = base.chars().take(8).collect();
+                assert!(first.iter().any(|(s, _)| s.starts_with(&head)), "{label}: status line first, got {first:?}");
+                let line_h = 30.0;
+                assert!(first.iter().all(|(_, r)| r.height() < line_h), "{label}: status is one row");
             }
         }
+        tools.conceal_nanovna();
+    }
+
+    /// NanoVNA: the display has no right-hand elbow and runs to the bottom
+    /// of the frame; the status text does not move it.
+    #[test]
+    fn nanovna_display_has_no_right_elbow_and_fills_the_height() {
+        let ctx = egui::Context::default();
+        let mut tools = Tools::new(&ctx);
+        tools.screen = Screen::NanoVna;
+        let (out, frame, _, _) = tools_frame(&ctx, &mut tools, 1400.0);
+        let grid = tools.nanovna.last_grid();
+        assert!(grid.is_positive(), "chart drawn");
+        let plum = rustcars::palette::PLUM;
+        let _ = plum;
+        // An elbow hugs the frame's right edge below the top bar.
+        let edge = frame.right() - 2.0;
+        let below = frame.top() + LcarsTheme::default().bar_thin + 1.0;
+        let right_elbow: Vec<_> = out.shapes.iter().filter(|c| match &c.shape {
+            egui::Shape::Rect(r) => r.fill == plum && r.rect.right() >= edge && r.rect.top() > below,
+            egui::Shape::Path(p) => p.fill == plum && p.points.iter().any(|q| q.x >= edge && q.y > below),
+            _ => false,
+        }).collect();
+        let right_elbow = !right_elbow.is_empty();
+        assert!(!right_elbow, "no right-hand elbow around the display");
+        assert!(grid.right() > frame.right() - 40.0, "display runs to the right edge: {grid:?} in {frame:?}");
+        // Fixed parts under the grid: band strip, status strip, NanoVNA status bar.
+        assert!(frame.bottom() - grid.bottom() < 120.0, "display fills the height: {grid:?} in {frame:?}");
+        // Stable: redrawing does not move the chart.
+        let _ = tools_frame(&ctx, &mut tools, 1400.0);
+        assert_eq!(tools.nanovna.last_grid(), grid, "chart is stable frame to frame");
         tools.conceal_nanovna();
     }
 

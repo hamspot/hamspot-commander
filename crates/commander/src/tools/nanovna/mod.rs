@@ -1385,15 +1385,9 @@ impl NanoVna {
         self.band_strip(ui, theme, live);
         if self.cal_page {
             let (left, right) = body_split(ui, theme, 280.0);
-            show_frame(ui, theme, left, Side::Left, |ui| {
-                readout(
-                    ui,
-                    theme,
-                    "Each zone stores open, short, 50 ohm, the cable, and both loads.",
-                    false,
-                );
-            });
-            show_frame(ui, theme, right, Side::Right, |ui| {
+            show_frame(ui, theme, left, Side::Left, |_| {});
+            crate::status_note::note(ui, "Each zone stores open, short, 50 ohm, the cable, and both loads.");
+            show_display(ui, right, |ui| {
                 self.cal_body(ui, theme, live);
             });
             self.cal_graph_dialog(ui, theme);
@@ -1436,16 +1430,6 @@ impl NanoVna {
                 .show(ui, |ui| {
                     self.softkeys(ui, theme, live, trace.as_deref());
                     ui.add_space(8.0);
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(&caption)
-                                .monospace()
-                                .size(theme.data_size * 0.85)
-                                .color(palette::TEXT_MUTED),
-                        )
-                        .wrap(),
-                    );
-                    ui.add_space(6.0);
                     self.marker_block(ui, theme, trace.as_deref());
                 });
         });
@@ -1477,7 +1461,11 @@ impl NanoVna {
         };
         self.cal_state = state;
         self.sync_traces();
-        show_frame(ui, theme, right, Side::Right, |ui| {
+        // The caption (device, sweep, notes) is status: the Tools status line.
+        crate::status_note::note(ui, caption.clone());
+        // The display has no right-hand elbow: it takes the whole width
+        // and height right of the keys (David, #221).
+        show_display(ui, right, |ui| {
             let table_h = if placed.is_empty() { 0.0 } else { 22.0 * (placed.len() as f32 + 1.0) + 6.0 };
             let status_h = 26.0;
             let now = std::time::Instant::now();
@@ -5938,6 +5926,25 @@ fn body_split(ui: &mut Ui, theme: &LcarsTheme, left_w: f32) -> (Rect, Rect) {
     let right = Rect::from_min_max(Pos2::new((split + gap).min(full.right()), full.top()), full.max);
     ui.allocate_rect(full, Sense::hover());
     (left, right)
+}
+
+/// The chart side: no elbow, the rect as given.
+fn show_display(ui: &mut Ui, rect: Rect, add: impl FnOnce(&mut Ui)) {
+    if rect.width() < 8.0 || rect.height() < 8.0 {
+        return;
+    }
+    ui.scope_builder(egui::UiBuilder::new().max_rect(rect).id_salt("nanovna-display"), |ui| {
+        ui.set_min_height(rect.height());
+        add(ui);
+    });
+}
+
+/// Last chart grid rect (tests).
+impl NanoVna {
+    #[cfg(test)]
+    pub(crate) fn last_grid(&self) -> Rect {
+        self.last_grid
+    }
 }
 
 fn show_frame(ui: &mut Ui, theme: &LcarsTheme, rect: Rect, side: Side, add: impl FnOnce(&mut Ui)) {

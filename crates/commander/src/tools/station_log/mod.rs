@@ -11,7 +11,7 @@ mod store;
 
 use rustcars::{
     Cap, LcarsFrame, LcarsTheme, Mode, Side, action_button, apply_theme, install_lcars_font,
-    lcars_button, mode_list, palette, readout,
+    lcars_button, mode_list, palette,
 };
 use std::collections::HashMap;
 use store::{Entry, Stamp, Store};
@@ -171,7 +171,7 @@ impl Diary {
         } else if ui.ctx().memory(|m| m.focused().is_none()) {
             resp.request_focus();
         }
-        readout(ui, &t, &self.status, self.status.starts_with("SAVED"));
+        crate::status_note::note(ui, self.status.clone());
         let b = egui::vec2(160.0, 40.0);
         ui.horizontal(|ui| {
             if action_button(ui, &t, "Log", b).clicked() {
@@ -407,7 +407,8 @@ impl StationLog {
         } else {
             self.note.as_str()
         };
-        readout(ui, &theme, message, false);
+        let _ = theme;
+        crate::status_note::note(ui, message);
     }
 }
 

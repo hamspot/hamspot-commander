@@ -119,11 +119,6 @@ pub fn pick(ui: &mut Ui, t: &LcarsTheme, title: &str, labels: &[&str], idx: &mut
             *idx = n;
         }
     }
-    ui.label(
-        egui::RichText::new(hint)
-            .size(t.data_size)
-            .color(palette::TEXT_MUTED),
-    );
 }
 
 /// A row of single-choice buttons (selected one is green, any gesture selects).
@@ -179,20 +174,14 @@ fn kv(ui: &mut Ui, t: &LcarsTheme, id: &str, rows: &[(&str, String)]) {
         });
 }
 
-fn error(ui: &mut Ui, t: &LcarsTheme, msg: &str) {
-    ui.label(
-        egui::RichText::new(format!("ERROR: {msg}"))
-            .size(t.data_size)
-            .color(Mode::Alt1.colors().label),
-    );
+/// Input errors go to the Tools status line (plain text, "ERROR:").
+fn error(ui: &mut Ui, _t: &LcarsTheme, msg: &str) {
+    crate::status_note::note(ui, format!("ERROR: {msg}"));
 }
 
-fn note(ui: &mut Ui, t: &LcarsTheme, msg: &str) {
-    ui.label(
-        egui::RichText::new(msg)
-            .size(t.data_size)
-            .color(palette::TEXT_MUTED),
-    );
+/// Explanations and approximation notes go to the Tools status line.
+fn note(ui: &mut Ui, _t: &LcarsTheme, msg: &str) {
+    crate::status_note::note(ui, msg);
 }
 
 fn heading(ui: &mut Ui, t: &LcarsTheme, s: &str) {
@@ -369,7 +358,7 @@ impl HamRf {
                         let title = TOOLS.iter().find(|x| x.0 == self.tool).unwrap().2;
                         heading(ui, &t, title);
                         if self.status != "READY" && !self.status.is_empty() {
-                            readout(ui, &t, &self.status, self.status.starts_with("COPIED"));
+                            crate::status_note::note(ui, self.status.clone());
                         }
                         egui::ScrollArea::vertical()
                             .auto_shrink([false, false])
