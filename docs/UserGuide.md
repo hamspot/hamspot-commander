@@ -670,6 +670,13 @@ Decoded text is only shown. Demodulated audio is never saved.
 
 # 11. Config: radios, audio and automation
 
+**Detaching.** The rounded end at the top right of the Config page, and the rounded end of each group's bar (Station, Display, Radio, Rotator, Amplifier, Trunking, Audio patch, Automation patch, RF patch), detach what they belong to into its own window. Click the end to detach; it then looks pressed in, and a line in the original place says where the group went. Click it again (in either place) to bring it back. Hover it for a reminder of what a click does.
+
+- Detached windows have no title bar or border; the coloured elbow is the frame. **Drag the rounded end to move the window.** Your window manager's snapping (full, half or quarter screen) works as usual.
+- Resize from the small grip in the bottom-right corner, or with your window manager's resize gesture.
+- If dragging does nothing, your window system ignores move requests from applications; use its own move gesture (often Super + drag). Clicking still brings the window back.
+- Detached windows close and come back when Commander restarts.
+
 <!-- screenshot: cfg-01 — The Config page. -->
 
 The page is split into groups. Each group sits inside a thin elbow: a bar across the top, with the group's name printed in it, that turns down the left side of the group. From the top:
