@@ -242,7 +242,6 @@ fn worker(rx: Receiver<Cmd>, live: Arc<Mutex<Live>>, ctx: egui::Context, opener:
                     guard.status = format!("Disconnected. {path_open} went away.");
                     drop(guard);
                     ctx.request_repaint_of(egui::ViewportId::ROOT);
-                    ctx.request_repaint_of(super::super::viewport_id());
                 }
                 continue;
             }
@@ -270,7 +269,6 @@ fn worker(rx: Receiver<Cmd>, live: Arc<Mutex<Live>>, ctx: egui::Context, opener:
                 crate::estop::Outcome::Stopped,
             );
             ctx.request_repaint_of(egui::ViewportId::ROOT);
-            ctx.request_repaint_of(super::super::viewport_id());
             continue;
         }
         set_busy(&live, true);
@@ -444,7 +442,6 @@ fn worker(rx: Receiver<Cmd>, live: Arc<Mutex<Live>>, ctx: egui::Context, opener:
         }
         set_busy(&live, false);
         ctx.request_repaint_of(egui::ViewportId::ROOT);
-        ctx.request_repaint_of(super::super::viewport_id());
     }
 }
 

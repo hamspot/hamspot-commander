@@ -94,8 +94,20 @@ fn config_page_detach_id() -> egui::Id {
 /// HackRF TG / ID pages stay out: they hold the Tune and scanner widgets,
 /// which are not wrapped. Meters and Tools keep their own detach until their
 /// settings migrate.
-const DETACHABLE_PAGES: [Page; 6] =
-    [Page::Config, Page::Rec, Page::Timers, Page::HfData, Page::Levels, Page::Keys];
+const DETACHABLE_PAGES: [Page; 7] =
+    [Page::Config, Page::Rec, Page::Timers, Page::HfData, Page::Levels, Page::Keys, Page::Tools];
+
+/// The old Tools tear-off saved `tool_detach` ("1"), `tool_win_pos` and
+/// `tool_win_size` ("x,y"). They now seed the Tools page pill, and the same
+/// keys keep being written from it, so an older build reads them back too.
+fn migrate_tool_detach(detach: Option<&str>, pos: Option<&str>, size: Option<&str>) -> group_box::DetachState {
+    group_box::DetachState {
+        detached: detach == Some("1"),
+        pos: pos.and_then(parse_point),
+        size: size.and_then(parse_size),
+        failed: false,
+    }
+}
 
 fn page_detachable(page: Page) -> bool {
     DETACHABLE_PAGES.contains(&page)
@@ -576,9 +588,6 @@ struct App {
     /// Calculator, station log, and the other rustcars screens.
     tools: Arc<Mutex<tools::Tools>>,
     /// Position and size handed to the tools window when it opens.
-    tool_place: Option<egui::Pos2>,
-    tool_size: Option<egui::Vec2>,
-    tool_placed: bool,
     /// REC recorder state (#119).
     rec: rec_ui::RecUi,
 }
@@ -2327,9 +2336,6 @@ impl App {
             meter_size: None,
             meter_placed: false,
             tools: Arc::new(Mutex::new(tools::Tools::new(&cc.egui_ctx))),
-            tool_place: None,
-            tool_size: None,
-            tool_placed: false,
         };
         {
             let mut tools = app.tools.lock().expect("tools");
@@ -2337,20 +2343,18 @@ impl App {
             if let Some(text) = cc.storage.and_then(|storage| storage.get_string("rotator_settings")) {
                 tools.load_rotator_settings(&text);
             }
-            tools.detached = cc
-                .storage
-                .and_then(|storage| storage.get_string("tool_detach"))
-                .is_some_and(|value| value == "1");
-            tools.saved_pos = cc
-                .storage
-                .and_then(|storage| storage.get_string("tool_win_pos"))
-                .as_deref()
-                .and_then(parse_point);
-            tools.saved_size = cc
-                .storage
-                .and_then(|storage| storage.get_string("tool_win_size"))
-                .as_deref()
-                .and_then(parse_size);
+            // Migration (decisions.md, "Tools detach is the page pill"): the
+            // old tear-off keys seed the Tools page pill's state.
+            let get = |k: &str| cc.storage.and_then(|storage| storage.get_string(k));
+            let st = migrate_tool_detach(
+                get("tool_detach").as_deref(),
+                get("tool_win_pos").as_deref(),
+                get("tool_win_size").as_deref(),
+            );
+            st.store(&cc.egui_ctx, page_detach_id(Page::Tools));
+            tools.detached = st.detached;
+            tools.saved_pos = st.pos;
+            tools.saved_size = st.size;
         }
         app.open_startup_station();
         app
@@ -2862,12 +2866,7 @@ impl eframe::App for App {
         }
 
         // One row, at the top of the window. A later tab scrolls sideways instead of wrapping onto
-        // a second line and pushing the page body down. On Tools, the right end of this same
-        // row is a square tab that tears the tools off. Closing that window docks them.
-        let tools_open = self.tools.lock().expect("tools").detached;
-        if tools_open && self.page == Page::Tools {
-            self.page = self.page_return;
-        }
+        // a second line and pushing the page body down. Tools detach with the page pill.
         let tab_side = rustcars::LcarsTheme::default().bar_thin;
         let mut rec_place: Option<rec_ui::BarPlace> = None;
         egui::Panel::top("pages")
@@ -2877,7 +2876,6 @@ impl eframe::App for App {
             let gap = 4.0;
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = gap;
-                let show_tear = self.page == Page::Tools && !tools_open;
                 // On REC the right end of the bar carries the view controls.
                 let show_rec_bar = rec_ui::bar_shown(self.page == Page::Rec)
                     && !page_detached(ui.ctx(), Page::Rec);
@@ -2888,9 +2886,7 @@ impl eframe::App for App {
                     rec_ui::BarPlace::TabRow { compact } => (show_rec_bar, compact),
                     rec_ui::BarPlace::InFrame { .. } => (false, false),
                 };
-                let tabs_w = if show_tear {
-                    (ui.available_width() - tab_side - gap).max(0.0)
-                } else if show_rec_bar {
+                let tabs_w = if show_rec_bar {
                     (ui.available_width() - rec_ui::bar_width(rec_compact) - gap).max(0.0)
                 } else {
                     ui.available_width()
@@ -3063,23 +3059,7 @@ impl eframe::App for App {
                                 }
                             }
                             if let Some(page) = open_page {
-                                if tools_open && page == Page::Tools {
-                                    let id = tools::viewport_id();
-                                    ui.ctx().send_viewport_cmd_to(
-                                        id,
-                                        egui::ViewportCommand::Minimized(false),
-                                    );
-                                    ui.ctx().send_viewport_cmd_to(
-                                        id,
-                                        egui::ViewportCommand::Focus,
-                                    );
-                                    ui.ctx().send_viewport_cmd_to(
-                                        id,
-                                        egui::ViewportCommand::RequestUserAttention(
-                                            egui::UserAttentionType::Informational,
-                                        ),
-                                    );
-                                } else {
+                                {
                                     if page != Page::Tools {
                                         self.page_return = page;
                                     }
@@ -3093,10 +3073,6 @@ impl eframe::App for App {
                     });
                 if show_rec_bar {
                     self.rec_bar(ui, rec_compact);
-                }
-                if show_tear && tools::tear_off_button(ui).clicked() {
-                    self.tools.lock().expect("tools").detached = true;
-                    self.page = self.page_return;
                 }
             });
         });
@@ -3234,7 +3210,6 @@ impl eframe::App for App {
         }
         self.show_page_windows(&ctx, &mut snap);
         self.show_meter_window(&ctx, &snap);
-        self.show_tools_window(&ctx);
         self.show_vna_wizard(&ctx);
         // Clicks in this frame already ran. A channel or zone pick stops
         // the scan before this hop, and service_cc has already stored any
@@ -6266,8 +6241,10 @@ impl App {
         let detached = {
             let mut tools = self.tools.lock().expect("tools");
             tools.screen = tools::Screen::NanoVna;
+            // Mirrors the Tools page pill (show_page_windows).
             tools.detached
         };
+        // Detached Tools: the window already shows NanoVNA.
         if !detached {
             self.page = Page::Tools;
         }
@@ -8576,13 +8553,8 @@ impl App {
             .map(|row| row.spec.name.clone())
             .unwrap_or_default();
         let plan = self.plan.clone();
-        let (dock, nanovna_dirty, vna_dirty) = {
+        let (nanovna_dirty, vna_dirty) = {
             let mut tools = self.tools.lock().expect("tools");
-            let dock = tools.dock;
-            if dock {
-                tools.detached = false;
-                tools.dock = false;
-            }
             // Detached tools still draw in their window. Any other page,
             // including Timers, leaves NanoVNA so the next visit can connect.
             if self.page != Page::Tools && !tools.detached {
@@ -8595,11 +8567,8 @@ impl App {
             tools.set_plan(&plan);
             let nanovna_dirty = tools.nanovna_dirty();
             let vna_dirty = tools.take_vna_dirty();
-            (dock, nanovna_dirty, vna_dirty)
+            (nanovna_dirty, vna_dirty)
         };
-        if dock {
-            self.tool_placed = false;
-        }
         let station_open = self.station_saved.is_some() && !self.config_path.is_empty();
         // A finished sweep updates the VNA file only. The station file is
         // rewritten when the port or the sweep settings change.
@@ -8614,12 +8583,7 @@ impl App {
     /// Tools inside the shared page frame: sub-tabs, a status line, then the
     /// tool screen. E-STOP / RELEASE ride the page-bar slot like every page.
     fn page_tools(&mut self, ui: &mut egui::Ui) {
-        let mut tools = self.tools.lock().expect("tools");
-        if tools.detached {
-            ui.label("Tools: torn off into their own window. Close that window to bring them back.");
-            return;
-        }
-        tools.draw_in(ui);
+        self.tools.lock().expect("tools").draw_in(ui);
     }
 
     /// Timers inside the shared page frame, REC style: sub-tabs, a status
@@ -8641,48 +8605,6 @@ impl App {
         });
     }
 
-    /// Open the tools as a native window when they are torn off.
-    /// The builder's position is fixed for the life of that window.
-    fn show_tools_window(&mut self, ctx: &egui::Context) {
-        let viewport = tools::viewport_id();
-        let closing = ctx.input_for(viewport, |input| input.viewport().close_requested());
-        let mut tools = self.tools.lock().expect("tools");
-        if closing {
-            tools.detached = false;
-            tools.dock = false;
-            drop(tools);
-            self.tool_placed = false;
-            return;
-        }
-        let detached = tools.detached;
-        drop(tools);
-        if !detached {
-            self.tool_placed = false;
-            return;
-        }
-        if !self.tool_placed {
-            let tools = self.tools.lock().expect("tools");
-            self.tool_place = tools.saved_pos;
-            self.tool_size = tools.saved_size;
-            self.tool_placed = true;
-        }
-        let mut builder = egui::ViewportBuilder::default()
-            .with_title("Tools")
-            .with_app_id("hamspotcommander")
-            .with_inner_size(self.tool_size.unwrap_or(egui::vec2(1180.0, 760.0)))
-            .with_min_inner_size([720.0, 480.0])
-            .with_icon(Arc::clone(&self.icon));
-        if let Some(pos) = self.tool_place {
-            builder = builder.with_position(pos);
-        }
-        let tools = Arc::clone(&self.tools);
-        let viewport = tools::viewport_id();
-        ctx.show_viewport_deferred(viewport, builder, move |ui, _class| {
-            tools.lock().expect("tools").ui(ui, true);
-        });
-        ctx.request_repaint_of(viewport);
-    }
-
     /// Every detached page in its own window, every frame, whatever page
     /// the main window shows. Config groups detached on their own keep their
     /// windows too (the Config page runs hidden for them when it is not shown).
@@ -8690,6 +8612,14 @@ impl App {
         for page in DETACHABLE_PAGES {
             let id = page_detach_id(page);
             let mut st = group_box::DetachState::load(ctx, id);
+            if page == Page::Tools {
+                // Mirror for NanoVNA visibility and the saved tool_* keys,
+                // attached or not (a docked pill must save tool_detach=0).
+                let mut tools = self.tools.lock().expect("tools");
+                tools.detached = st.detached;
+                tools.saved_pos = st.pos.or(tools.saved_pos);
+                tools.saved_size = st.size.or(tools.saved_size);
+            }
             if !st.detached {
                 if page == Page::Config {
                     self.config_hidden_run(ctx, snap);
@@ -8729,6 +8659,7 @@ impl App {
                 ui.add_space(4.0);
                 ui.label(egui::RichText::new(rec_ui::PRIVACY).weak().small());
             }
+            Page::Tools => self.tools.lock().expect("tools").window_body(ui),
             Page::HfData | Page::Levels | Page::Keys => {
                 egui::ScrollArea::vertical()
                     .id_salt(("detached-body", page_name(page)))
@@ -12610,15 +12541,29 @@ fn fixed_slider(ui: &mut egui::Ui, label: &str, value: f64) {
 
 #[cfg(test)]
 mod config_order_tests {
+    /// The old Tools tear-off keys seed the Tools page pill (decisions.md).
+    #[test]
+    fn tool_detach_migrates_to_the_page_pill() {
+        let st = crate::migrate_tool_detach(Some("1"), Some("120,80"), Some("1180,760"));
+        assert!(st.detached && !st.failed);
+        assert_eq!(st.pos, Some(egui::pos2(120.0, 80.0)));
+        assert_eq!(st.size, Some(egui::vec2(1180.0, 760.0)));
+        let st = crate::migrate_tool_detach(Some("0"), None, Some("junk"));
+        assert!(!st.detached && st.pos.is_none() && st.size.is_none());
+        assert!(!crate::migrate_tool_detach(None, None, None).detached);
+        let src = include_str!("main.rs");
+        assert!(!src.contains(&["tear_off", "_button("].concat()), "the tear-off tab is gone");
+    }
+
     #[test]
     fn rec_and_config_share_the_page_detach_path() {
         use crate::{Page, page_detachable, page_detach_id, page_detached, page_stub};
         assert!(page_detachable(Page::Config) && page_detachable(Page::Rec));
         assert!(!page_detachable(Page::Tune), "Tune is not wrapped");
-        for p in [Page::Timers, Page::HfData, Page::Levels, Page::Keys] {
+        for p in [Page::Timers, Page::HfData, Page::Levels, Page::Keys, Page::Tools] {
             assert!(page_detachable(p), "{} carries the page pill", crate::page_name(p));
         }
-        for p in [Page::Plan, Page::Channels, Page::Talkgroups(0), Page::RadioIds(0), Page::Meters, Page::Tools] {
+        for p in [Page::Plan, Page::Channels, Page::Talkgroups(0), Page::RadioIds(0), Page::Meters] {
             assert!(!page_detachable(p), "{} stays out (scanner widgets / own detach)", crate::page_name(p));
         }
         assert_ne!(page_detach_id(Page::Config), page_detach_id(Page::Rec));

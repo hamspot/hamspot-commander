@@ -10,7 +10,7 @@ pub(crate) mod smith;
 mod station_log;
 pub mod timers;
 
-use rustcars::{Cap, LcarsTheme, Side, lcars_button, palette, readout};
+use rustcars::{Cap, LcarsTheme, Side, palette};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -35,8 +35,8 @@ const SCREENS: [(Screen, &str); 7] = [
 
 pub struct Tools {
     pub screen: Screen,
+    /// Mirror of the Tools page pill's detach state (show_page_windows).
     pub detached: bool,
-    pub dock: bool,
     pub saved_pos: Option<egui::Pos2>,
     pub saved_size: Option<egui::Vec2>,
     theme: LcarsTheme,
@@ -64,7 +64,6 @@ impl Tools {
             screen: Screen::Log,
             estop_chord: crate::estop::Chord::default(),
             detached: false,
-            dock: false,
             saved_pos: None,
             saved_size: None,
             theme,
@@ -144,30 +143,20 @@ impl Tools {
         self.log.follow(ctx, saved, station);
     }
 
-    /// `in_window` is the torn-off viewport. Closing that window docks the
-    /// tools. The main window's tab row owns the tear-off square.
-    ///
-    /// The torn-off Tools window: E-STOP / RELEASE at the right of the top
-    /// row (as in the page-bar slot), then the same body as the page.
-    pub fn ui(&mut self, ui: &mut egui::Ui, in_window: bool) {
-        if in_window && ui.input(|input| input.viewport().close_requested()) {
-            self.dock = true;
-            self.detached = false;
-        }
-        if in_window {
-            self.remember_window(ui);
-            // The torn-off window has its own keyboard focus.
-            self.estop_chord.poll(ui.ctx());
-            let h = self.theme.bar_thin;
-            ui.allocate_ui_with_layout(
-                egui::vec2(ui.available_width(), h),
-                egui::Layout::right_to_left(egui::Align::Center),
-                |ui| {
-                    crate::estop::button(ui);
-                },
-            );
-            ui.add_space(self.theme.frame_gap);
-        }
+    /// The detached Tools window (page pill): E-STOP / RELEASE at the right
+    /// of the top row, as in the page-bar slot, then the same body as the
+    /// page. The window has its own keyboard focus, so it polls the chord.
+    pub fn window_body(&mut self, ui: &mut egui::Ui) {
+        self.estop_chord.poll(ui.ctx());
+        let h = self.theme.bar_thin;
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), h),
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
+                crate::estop::button(ui);
+            },
+        );
+        ui.add_space(self.theme.frame_gap);
         self.draw_in(ui);
     }
 
@@ -254,19 +243,6 @@ impl Tools {
         }
     }
 
-    fn remember_window(&mut self, ui: &egui::Ui) {
-        let info = ui.input(|input| input.viewport().clone());
-        if let Some(outer) = info.outer_rect {
-            self.saved_pos = Some(outer.min);
-        }
-        if let Some(inner) = info.inner_rect {
-            let size = inner.size();
-            if size.x >= 64.0 && size.y >= 64.0 {
-                self.saved_size = Some(size);
-            }
-        }
-    }
-
     fn open_hex(&mut self) {
         let Some(path) = rfd::FileDialog::new()
             .set_title("Open file")
@@ -341,54 +317,6 @@ pub(crate) fn screen_header(
         .show(ui, add);
 }
 
-/// Square tab at the right end of the page row. Same height as those tabs.
-/// The mark is an arrow leaving a box: the tools window will open.
-pub fn tear_off_button(ui: &mut egui::Ui) -> egui::Response {
-    let theme = LcarsTheme::default();
-    let side = theme.bar_thin;
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::click());
-    let base = palette::TAN;
-    let fill = if resp.is_pointer_button_down_on() {
-        rustcars::tint(base, -0.25)
-    } else if resp.hovered() {
-        rustcars::tint(base, 0.3)
-    } else {
-        base
-    };
-    let painter = ui.painter();
-    painter.rect_filled(rect, rustcars::cap_radius(Cap::None, rect.height()), fill);
-    paint_window_mark(painter, rect, rustcars::ink_on(fill), theme.frame_gap * 0.5);
-    let name = "Tear off";
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), name));
-    resp.on_hover_text(name)
-}
-
-/// A box and a diagonal arrow pointing out of it.
-fn paint_window_mark(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32, stroke_width: f32) {
-    let stroke = egui::Stroke::new(stroke_width.max(1.0), color);
-    let box_rect = rect.shrink(rect.width() * 0.30);
-    painter.rect_stroke(
-        box_rect,
-        egui::CornerRadius::ZERO,
-        stroke,
-        egui::StrokeKind::Inside,
-    );
-    let outside = rect.right_top() + egui::vec2(-rect.width() * 0.16, rect.width() * 0.16);
-    let from = box_rect.center();
-    let to = outside;
-    painter.line_segment([from, to], stroke);
-    let delta = to - from;
-    let len = delta.length();
-    if len < 1.0 {
-        return;
-    }
-    let dir = delta / len;
-    let normal = egui::vec2(-dir.y, dir.x);
-    let head = rect.width() * 0.16;
-    painter.line_segment([to, to - dir * head + normal * (head * 0.55)], stroke);
-    painter.line_segment([to, to - dir * head - normal * (head * 0.55)], stroke);
-}
-
 /// Name block at the left of a screen's header: the same tan cap as a tab,
 /// but it is a label. It has no click sense and no hover or press color.
 pub(crate) fn title_block(
@@ -459,23 +387,6 @@ pub(crate) fn header_key(
 
 /// One list row, on every tool screen. Monospace at `data_size`.
 pub(crate) const LIST_ROW: f32 = 28.0;
-
-fn screen_color(index: usize) -> egui::Color32 {
-    const COLORS: [egui::Color32; 6] = [
-        palette::SLATE,
-        palette::OLIVE,
-        palette::BRICK,
-        palette::TEAL,
-        palette::PLUM,
-        palette::TAN,
-    ];
-    COLORS[index % COLORS.len()]
-}
-
-/// The tools window is its own viewport, same idea as the meter window.
-pub fn viewport_id() -> egui::ViewportId {
-    egui::ViewportId::from_hash_of("hamspot-tools")
-}
 
 /// Paint one page inside an LCARS frame. Instrument paint stays in the content well.
 pub fn frame(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) -> egui::Rect {

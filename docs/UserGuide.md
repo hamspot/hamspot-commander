@@ -184,7 +184,7 @@ The top of the window is one row of page tabs. The default order is **Tune**, **
 
 ## 4.2 Separate windows
 
-- **Tools** can be torn off: on the Tools page, the square at the right end of the tab row opens the tools in their own window. Close that window to put them back.
+- **Config, REC, Timers, HF Data, Levels, Keys and Tools** detach with the rounded pill at the top right of the page: click it to open the page in its own window, click it again (on the window or the main page) to put it back.
 - **Meters** has a **Detach** button that opens it in its own window, and **Dock** puts it back.
 
 <!-- screenshot: main-03 — Any page can be torn off into its own window. -->
@@ -210,7 +210,7 @@ A frequency the radio refuses doesn't move the readout.
 
 ## 4.4 E-STOP
 
-The red **E-STOP** button with a black stop-sign octagon sits at the right end of the tan top bar of every main page (Tune, Plan, Channels, Talkgroups, Radio IDs, Keys, Meters, Levels, Timers, REC, Tools and Config); on Tools it is there for every tool screen, and in the torn-off Tools window it sits at the right of the top row. It is also and in the bar of the Config groups Radio, Rotator, Amplifier, Automation patch and RF patch. Every copy is the same switch.
+The red **E-STOP** button with a black stop-sign octagon sits at the right end of the tan top bar of every main page (Tune, Plan, Channels, Talkgroups, Radio IDs, Keys, Meters, Levels, Timers, REC, Tools and Config); on Tools it is there for every tool screen, and in the detached Tools window it sits at the right of the top row. It is also and in the bar of the Config groups Radio, Rotator, Amplifier, Automation patch and RF patch. Every copy is the same switch.
 
 Press it and it latches. Every copy then reads **E-STOP ENGAGED**, and Commander:
 
@@ -630,7 +630,7 @@ Hamlib and GQRX radios give only demodulated audio, and REC does not record them
 
 # 10. Meters, Levels, Timers and HF Data
 
-**Detaching a page.** HF Data, Levels, Keys and Timers carry the same rounded pill at the top right as Config and REC: click it to move the whole page into its own window, click it again (in either place) to bring it back, drag it to move the window. The main window shows a line saying where the page went. Tune, Plan, Channels and the TG / ID pages have no page pill. Meters keeps its own detach for now.
+**Detaching a page.** HF Data, Levels, Keys and Timers carry the same rounded pill at the top right as Config and REC: click it to move the whole page into its own window, click it again (in either place) to bring it back, drag it to move the window. The main window shows a line saying where the page went. Tune, Plan, Channels and the TG / ID pages have no page pill. Tools detach the same way (see Tools). Meters keeps its own detach for now.
 
 ## 10.1 Meters
 
@@ -809,7 +809,7 @@ Any box with coax jacks on the RF patch can be measured with the NanoVNA, and ev
 
 # 12. Tools
 
-The Tools page has seven screens: **NanoVNA**, **RF Calc**, **Calc**, **Smith**, **Hex**, **Logbook** and **Rotator**. One is shown at a time. The page is laid out like REC: the tools are sub-tabs under the page bar (extra tabs move into the three-dot more-tabs button when the window is narrow), a status line under the tabs sums up the open tool (NanoVNA connection and sweep, the RF calculator in use, the calculator's angle mode and answer, the Smith chart impedance, the open hex file, the open logbook and its filter, the selected rotator and its bearing), and the tool screen fills the rest of the frame. E-STOP and RELEASE sit in the page bar like every page. Tear the tools off into their own window with the square at the right of the page row.
+The Tools page has seven screens: **NanoVNA**, **RF Calc**, **Calc**, **Smith**, **Hex**, **Logbook** and **Rotator**. One is shown at a time. The page is laid out like REC: the tools are sub-tabs under the page bar (extra tabs move into the three-dot more-tabs button when the window is narrow), a status line under the tabs sums up the open tool (NanoVNA connection and sweep, the RF calculator in use, the calculator's angle mode and answer, the Smith chart impedance, the open hex file, the open logbook and its filter, the selected rotator and its bearing), and the tool screen fills the rest of the frame. E-STOP and RELEASE sit in the page bar like every page. Detach the Tools page into its own window with the rounded pill at the top right of the page, as on Config and REC: click it to detach, click it again (in either place) to bring the tools back, drag it to move the window. The detached window has E-STOP and RELEASE at the right of its top row; the main window shows a line saying where Tools went. Whether Tools are detached, and the window's place and size, are remembered between runs (a Tools window torn off in an older version opens detached the same way).
 
 ## 12.1 NanoVNA
 
