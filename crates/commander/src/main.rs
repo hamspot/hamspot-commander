@@ -13355,3 +13355,21 @@ mod detached_fit_tests {
     }
 
 }
+
+/// Detached windows keep drawing while the main window is minimized or fully
+/// covered (David, 2026-10-30): the workspace builds the patched eframe in
+/// vendor/eframe (see its PATCHES.md). Guard that the patch stays wired in.
+#[cfg(test)]
+mod eframe_patch_tests {
+    #[test]
+    fn patched_eframe_is_used_and_keeps_its_changes() {
+        let ws = include_str!("../../../Cargo.toml");
+        assert!(ws.contains("[patch.crates-io]") && ws.contains("eframe = { path = \"vendor/eframe\" }"));
+        let glow = include_str!("../../../vendor/eframe/src/native/glow_integration.rs");
+        assert!(glow.contains("fn logic_pass_plan(") && glow.contains("fn has_visible_immediate_child("));
+        assert!(glow.contains("PassMode::LogicOnly => (immediate_child_visible, false)"), "logic-only pass runs the UI for a visible detached window, without painting the parent");
+        assert!(glow.contains("let is_visible = is_visible && paint_parent;"));
+        let run = include_str!("../../../vendor/eframe/src/native/run.rs");
+        assert!(run.contains("MISSED_REDRAW_TIMEOUT: Duration = Duration::from_millis(40)"));
+    }
+}

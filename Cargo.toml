@@ -7,3 +7,9 @@ edition = "2021"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/hamspot/hamspot-commander"
 rust-version = "1.80"
+
+# eframe 0.37.0 with one change (vendor/eframe/PATCHES.md): detached
+# (immediate) viewports keep drawing while the main window gets no frame
+# callbacks (minimized or fully covered on GNOME Wayland).
+[patch.crates-io]
+eframe = { path = "vendor/eframe" }
