@@ -719,6 +719,16 @@ The groups only separate the page visually. Every setting works as before.
 <!-- screenshot: station-01 — Opening a station file (.HSCommander). -->
 <!-- screenshot: station-02 — Commander asks before discarding unsaved station changes. -->
 
+## 11.1a Rendering (GPU or software)
+
+Under **Display**, **Rendering** picks how Commander draws its windows: `Auto`, `GPU` or `Software` (● marks the saved choice). The change takes effect the next time Commander starts.
+
+- **GPU** draws with the graphics card through OpenGL.
+- **Software** draws on the CPU (Mesa llvmpipe) and opens no GPU device. Use it if video in other programs stalls, or the desktop misbehaves, while Commander runs, especially on a machine with several graphics cards. It costs some CPU.
+- **Auto** (the default) uses Software when the computer has more than one GPU, and GPU otherwise.
+
+The line under the keys shows what this run uses, why, and the OpenGL renderer that actually loaded; it warns if Software was asked for but a GPU driver loaded. For one run you can override the setting with `HAMSPOT_SOFTWARE_RENDER=1` (software) or `HAMSPOT_SOFTWARE_RENDER=0` (GPU); any other value is ignored and reported. Commander also prints its choice to the terminal at start. The setting is kept in `render.json` in Commander's data folder (`~/.local/share/hamspotcommander`).
+
 ## 11.2 CAT Control
 
 A table of radios: **Name**, **Driver**, **Device**, **Listen** and **Status**. **Click a row** to make it the radio Tune drives; the others keep running. **Add hamlib**, **Add GQRX**, **Add HackRF**, **Add audio tap**, **Edit** and **Remove** manage the list. Closing Commander stops everything it started.

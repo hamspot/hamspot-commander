@@ -11,9 +11,9 @@ name = "commander"
 path = "src/main.rs"
 
 [dependencies]
-eframe = { version = "0.37", features = ["default_fonts", "glow", "persistence"] }
+eframe = { version = "0.37", default-features = false, features = ["accesskit", "clipboard", "default_fonts", "glow", "links", "persistence", "system_fonts", "wayland", "x11"] }
 egui = "0.37"
-rustcars = { git = "https://github.com/webaugur/rustcars", rev = "ae9a4004242b9cde3c207754188c0c929d001770" }
+rustcars = { git = "https://github.com/webaugur/rustcars", rev = "f0ffc2bed9533ef1c78a5fee097c3f189a4efdb3" }
 rusqlite = { version = "0.40", features = ["bundled"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 rigctl = { path = "../rigctl" }

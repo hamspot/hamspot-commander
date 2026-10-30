@@ -10,7 +10,9 @@ Upstream: crates.io eframe 0.37.0, copied unchanged except:
    The parent itself is not painted in that pass. `logic_pass_plan`,
    `has_visible_immediate_child`, test `hamspot_patch_tests`.
 2. `src/native/run.rs`: `MISSED_REDRAW_TIMEOUT` 250 ms -> 40 ms, so those
-   passes come at about 25 fps instead of 4.
+   passes come at about 25 fps instead of 4 — only for a window that has a
+   visible detached (immediate) child (`WinitApp::hs_fast_overdue`); any other
+   unseen window keeps upstream's 250 ms (`UPSTREAM_MISSED_REDRAW_TIMEOUT`).
 
 Remove when upstream draws immediate children of an unseen parent.
 3. Diagnostics: `HAMSPOT_VP_TRACE=1` prints the viewport event flow to

@@ -106,6 +106,14 @@ pub trait WinitApp {
 
     fn window_id_from_viewport_id(&self, id: ViewportId) -> Option<WindowId>;
 
+    /// HamSpot patch: should an overdue redraw of this window be retried
+    /// quickly (it drives a visible detached child)? Otherwise the slow
+    /// upstream timeout is used, so an unseen window with no detached child
+    /// does not run logic passes at 25 fps.
+    fn hs_fast_overdue(&self, _window_id: WindowId) -> bool {
+        false
+    }
+
     fn save(&mut self);
 
     fn save_and_destroy(&mut self);

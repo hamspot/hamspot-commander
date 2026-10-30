@@ -36,6 +36,7 @@ mod group_box;
 mod estop;
 mod hfdata;
 mod toggle;
+mod render;
 mod tune_style;
 mod tx_lockout;
 mod vna_devices;
@@ -246,7 +247,11 @@ fn square_icon(icon: &egui::IconData) -> egui::IconData {
     }
 }
 
+static RENDER_CHOICE: std::sync::OnceLock<render::Choice> = std::sync::OnceLock::new();
+
 fn main() -> eframe::Result {
+    // First, before any thread or GL init: GPU or software rendering.
+    let _ = RENDER_CHOICE.set(render::apply());
     if exit_watch::run_cleanup_arg() {
         return Ok(());
     }
@@ -598,6 +603,9 @@ struct App {
     /// Last folder chosen in the config browser. Absent means the working directory.
     config_dir: Option<PathBuf>,
     config_note: String,
+    /// Rendering mode saved for the next start, and what this run uses.
+    render_mode: render::Mode,
+    render_note: String,
     /// Station last loaded or written. Exit compares the face to this.
     station_saved: Option<config::ConfigFile>,
     /// The window close was held so the operator can save or drop the station.
@@ -2559,6 +2567,17 @@ impl App {
             config_path: String::new(),
             config_dir,
             config_note: String::new(),
+            render_mode: render::load().0.mode,
+            render_note: {
+                let renderer = cc.gl.as_ref().map(|gl| {
+                    use eframe::glow::HasContext;
+                    // SAFETY: a plain glGetString on the current context.
+                    unsafe { gl.get_parameter_string(eframe::glow::RENDERER) }
+                });
+                let note = render::note(&RENDER_CHOICE.get().cloned().unwrap_or_default(), renderer.as_deref());
+                eprintln!("commander: {note}");
+                note
+            },
             station_saved: None,
             exit_prompt: false,
             exit_discard: false,
@@ -4829,6 +4848,23 @@ impl App {
             ui.label(format!("Talkgroups: {} zones", self.talkgroups.zones.len()));
         });
         cfg_group(ui, "Display", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Rendering");
+                for (mode, label) in [(render::Mode::Auto, "Auto"), (render::Mode::Gpu, "GPU"), (render::Mode::Software, "Software")] {
+                    if tune_style::toggle(ui, label, true, self.render_mode == mode, bar_key_hue(label, KeyLamp::Dark)).clicked() && self.render_mode != mode {
+                        let s = render::RenderSettings { mode, ..Default::default() };
+                        match render::save(&s) {
+                            Ok(()) => {
+                                self.render_mode = mode;
+                                self.render_note = format!("Rendering set to {label}; restart Commander to apply. {}", self.render_note);
+                            }
+                            Err(e) => self.render_note = format!("Could not save the rendering setting: {e}"),
+                        }
+                    }
+                }
+            });
+            ui.label(egui::RichText::new(&self.render_note).color(if self.render_note.contains("WARNING") || self.render_note.contains("Could not") { caution() } else { ui.visuals().text_color() }))
+                .on_hover_text(format!("{} = 1 forces software, 0 forces GPU, for one run.", render::ENV));
             let mut pulse_on = self.pulse_on;
             if ui.checkbox(&mut pulse_on, "Pulse busy tabs").changed() {
                 self.pulse_on = pulse_on;

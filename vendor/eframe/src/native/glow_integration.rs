@@ -481,6 +481,15 @@ impl WinitApp for GlowWinitApp<'_> {
         }
     }
 
+    fn hs_fast_overdue(&self, window_id: WindowId) -> bool {
+        let Some(running) = self.running.as_ref() else { return false };
+        let glutin = running.glutin.borrow();
+        glutin
+            .viewport_from_window
+            .get(&window_id)
+            .is_some_and(|id| has_visible_immediate_child(&glutin.viewports, *id))
+    }
+
     fn window_id_from_viewport_id(&self, id: ViewportId) -> Option<WindowId> {
         self.running
             .as_ref()?

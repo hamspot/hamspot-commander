@@ -37,6 +37,8 @@ const INVISIBLE_WINDOW_REPAINT_INTERVAL: Duration = Duration::from_millis(100);
 // (no frame callbacks on Wayland), detached windows are drawn on this
 // timeout, so keep it short enough to feel live (~25 fps).
 const MISSED_REDRAW_TIMEOUT: Duration = Duration::from_millis(40);
+/// HamSpot patch: upstream's 250 ms, for windows with no visible detached child.
+const UPSTREAM_MISSED_REDRAW_TIMEOUT: Duration = Duration::from_millis(250);
 
 // ----------------------------------------------------------------------------
 fn create_event_loop(native_options: &mut epi::NativeOptions) -> Result<EventLoop<UserEvent>> {
@@ -234,9 +236,14 @@ impl<T: WinitApp> WinitAppWrapper<T> {
                         // See https://github.com/emilk/egui/issues/8326.
                         crate::hs_trace!("window {window_id:?}: request_redraw");
                         window.request_redraw();
+                        let timeout = if self.winit_app.hs_fast_overdue(*window_id) {
+                            MISSED_REDRAW_TIMEOUT
+                        } else {
+                            UPSTREAM_MISSED_REDRAW_TIMEOUT
+                        };
                         self.windows_redraw_deadlines
                             .entry(*window_id)
-                            .or_insert(now + MISSED_REDRAW_TIMEOUT);
+                            .or_insert(now + timeout);
                     }
                 } else {
                     log::trace!("No window found for {window_id:?}");
