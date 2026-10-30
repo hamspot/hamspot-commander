@@ -643,7 +643,15 @@ pub fn bar_tab_row(
         |ui| {
             ui.spacing_mut().item_spacing.x = BAR_TAB_GAP;
             for (n, &i) in shown.iter().enumerate() {
-                if crate::folder_tab(ui, selected == Some(i), i, &labels[i], n == 0).clicked() {
+                // In the bar every tab is a plain segment: no left end cap.
+                let _ = n;
+                let resp = crate::folder_tab(ui, selected == Some(i), i, &labels[i], false);
+                if selected == Some(i) {
+                    // The open tab: a frame in the ink, so it is not shown by colour alone.
+                    let ink = rustcars::ink_on(rustcars::tint(crate::tab_color(i), 0.35));
+                    ui.painter().rect_stroke(resp.rect.shrink(1.0), 0.0, egui::Stroke::new(2.0, ink), egui::StrokeKind::Inside);
+                }
+                if resp.clicked() {
                     picked = Some(i);
                 }
             }
@@ -719,66 +727,24 @@ pub fn overflow_tab_row(
 /// The "more tabs" button: a pill (round both ends) in the bar colour with a
 /// highlight outline, like the detach pill, and three painted dots. No text;
 /// the tooltip and accessibility label say "More tabs".
-/// Corner radius of every elbow-bar button (the app's button rule).
-pub const BAR_BUTTON_RADIUS: u8 = 4;
-
-/// Colours of a bar button `(fill, border)`: a momentary key is a solid
-/// pill with no border; a toggle has a thin border and is solid when on,
-/// a dimmed fill of its hue when off (state is also the ●/○ marker).
-pub fn bar_button_colors(base: egui::Color32, on: Option<bool>, enabled: bool, hovered: bool) -> (egui::Color32, Option<egui::Color32>) {
-    let mut fill = match on {
-        Some(false) => rustcars::tint(base, -0.55),
-        _ => base,
-    };
-    if !enabled {
-        fill = rustcars::tint(fill, -0.5);
-    } else if hovered {
-        fill = rustcars::tint(fill, 0.2);
-    }
-    let border = on.map(|_| rustcars::tint(base, 0.6));
-    (fill, border)
-}
-
-/// Paint one elbow-bar button at `rect` (see [`bar_button`]).
-pub fn paint_bar_button(ui: &egui::Ui, rect: egui::Rect, resp: &egui::Response, label: &str, base: egui::Color32, on: Option<bool>, enabled: bool) {
-    let theme = LcarsTheme::default();
-    let painter = ui.painter();
-    let r = egui::CornerRadius::same(BAR_BUTTON_RADIUS);
-    let (fill, border) = bar_button_colors(base, on, enabled, enabled && resp.hovered());
-    // Black gap on both sides so neighbours read as separate keys.
-    painter.rect_filled(rect, r, fill);
-    if let Some(b) = border {
-        painter.rect_stroke(rect, r, egui::Stroke::new(rustcars::TOGGLE_BORDER, b), egui::StrokeKind::Inside);
-    }
-    let ink = rustcars::ink_on(fill);
-    let font = egui::FontId::proportional(theme.data_size);
+/// An elbow-bar button, by the rustcars rules (AGENTS.md §0 P1/P1b,
+/// docs/manual/04-controls.md §4.4) and the REC bar (the reference):
+/// a momentary key is a solid square frame segment (`lcars_button`,
+/// `Cap::None`, no border, ink by `ink_on`) in its own hue; a key that
+/// switches a state is a rustcars `toggle_button` (thin border, ●/○
+/// marker). Each key brings its own palette hue.
+pub fn bar_button(ui: &mut egui::Ui, label: &str, base: egui::Color32, size: egui::Vec2, on: Option<bool>, enabled: bool) -> egui::Response {
+    let t = LcarsTheme::default();
     match on {
-        Some(state) => rustcars::paint_toggle_marker_label(painter, rect, label, state, font, ink),
-        None => {
-            painter.text(rect.center(), egui::Align2::CENTER_CENTER, label.to_uppercase(), font, ink);
+        None => rustcars::lcars_button(ui, &t, label, base, size, Cap::None, enabled),
+        Some(state) => {
+            ui.add_enabled_ui(enabled, |ui| {
+                let mut local = state;
+                rustcars::toggle_button(ui, &t, label, &mut local, base, size)
+            })
+            .inner
         }
     }
-    if resp.has_focus() {
-        painter.rect_stroke(rect.shrink(3.0), r, egui::Stroke::new(1.0, ink), egui::StrokeKind::Inside);
-    }
-}
-
-/// The one elbow-bar button style (David, #222): a filled pill at the bar
-/// height, radius 4, label in the ink for its fill; toggles add a thin
-/// border and the ●/○ marker. E-STOP / RELEASE keep their own square keys.
-pub fn bar_button(ui: &mut egui::Ui, label: &str, base: egui::Color32, size: egui::Vec2, on: Option<bool>, enabled: bool) -> egui::Response {
-    let sense = if enabled { egui::Sense::click() } else { egui::Sense::hover() };
-    let (rect, resp) = ui.allocate_exact_size(size, sense);
-    paint_bar_button(ui, rect, &resp, label, base, on, enabled);
-    let text = match on {
-        Some(state) => rustcars::toggle_label(label, state),
-        None => label.to_uppercase(),
-    };
-    match on {
-        Some(state) => resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, enabled, state, &text)),
-        None => resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, &text)),
-    }
-    resp
 }
 
 fn paint_more_key(ui: &egui::Ui, rect: egui::Rect, resp: &egui::Response) {
@@ -789,7 +755,8 @@ fn paint_more_key(ui: &egui::Ui, rect: egui::Rect, resp: &egui::Response) {
     let gap = theme.frame_gap;
     // Black gap on both sides so it reads as its own button on the bar.
     painter.rect_filled(rect.expand2(egui::vec2(gap, 0.0)), 0.0, theme.bg);
-    let r = egui::CornerRadius::same(BAR_BUTTON_RADIUS);
+    // A plain segment in the bar (Cap::None), like the keys beside it.
+    let r = egui::CornerRadius::ZERO;
     painter.rect_filled(rect, r, fill);
     let w = if resp.hovered() { rustcars::group::PILL_BORDER + 0.5 } else { rustcars::group::PILL_BORDER };
     painter.rect_stroke(rect, r, egui::Stroke::new(w, outline), egui::StrokeKind::Inside);
@@ -1063,19 +1030,57 @@ mod top_cap_deadlock_tests {
 mod page_frame_tests {
     use super::*;
 
-    /// One bar style: momentary keys solid with no border; toggles have a
-    /// thin border both ways and differ on/off by fill and the ●/○ marker.
+    /// In the bar the tool tabs are plain segments: no end cap on the
+    /// first (NANOVNA) or any tab, at wide and narrow widths.
     #[test]
-    fn bar_buttons_share_one_style() {
-        let tan = rustcars::palette::TAN;
-        let (m, mb) = bar_button_colors(tan, None, true, false);
-        assert_eq!((m, mb), (tan, None));
-        let (on, onb) = bar_button_colors(tan, Some(true), true, false);
-        let (off, offb) = bar_button_colors(tan, Some(false), true, false);
-        assert!(onb.is_some() && offb.is_some(), "toggles are thin-bordered");
-        assert_ne!(on, off);
-        assert_eq!(rustcars::toggle_label("FOLLOW", true), "\u{25cf} FOLLOW");
-        assert_eq!(BAR_BUTTON_RADIUS, 4);
+    fn bar_tabs_have_no_end_caps() {
+        let ctx = egui::Context::default();
+        let labels = Tools::tab_labels();
+        for w in [700.0, 300.0] {
+            let mut out = egui::FullOutput::default();
+            for _ in 0..2 {
+                out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    let r = egui::Rect::from_min_size(egui::pos2(10.0, 0.0), egui::vec2(w, 40.0));
+                    bar_tab_row(ui, r, "t", &labels, Some(0));
+                });
+                out.textures_delta.clear();
+            }
+            for c in &out.shapes {
+                if let egui::Shape::Rect(r) = &c.shape {
+                    assert_eq!(r.corner_radius, egui::CornerRadius::ZERO, "no rounded tab or more key in the bar at {w}: {r:?}");
+                }
+            }
+        }
+    }
+
+    /// Bar buttons follow rustcars: momentary = square solid segment with
+    /// no outline, toggle = rustcars toggle (thin border, ●/○ marker).
+    #[test]
+    fn bar_buttons_follow_rustcars() {
+        let ctx = egui::Context::default();
+        for on in [None, Some(false), Some(true)] {
+            let mut out = egui::FullOutput::default();
+            for _ in 0..2 {
+                out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    bar_button(ui, "Load", rustcars::palette::SLATE, egui::vec2(80.0, 40.0), on, true);
+                });
+                out.textures_delta.clear();
+            }
+            let rects: Vec<_> = out.shapes.iter().filter_map(|c| match &c.shape {
+                egui::Shape::Rect(r) => Some(r.clone()),
+                _ => None,
+            }).collect();
+            let body = rects.iter().find(|r| r.fill != egui::Color32::TRANSPARENT).expect("filled");
+            match on {
+                None => {
+                    assert_eq!(body.corner_radius, egui::CornerRadius::ZERO, "momentary bar key is square");
+                    assert!(rects.iter().all(|r| r.stroke.width == 0.0), "momentary: no outline");
+                }
+                Some(_) => {
+                    assert!(rects.iter().any(|r| (r.stroke.width - rustcars::TOGGLE_BORDER).abs() < 0.01), "toggle: thin border");
+                }
+            }
+        }
     }
 
     fn texts(out: &egui::FullOutput) -> Vec<(String, egui::Rect)> {

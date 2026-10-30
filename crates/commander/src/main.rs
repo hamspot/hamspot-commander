@@ -1406,7 +1406,7 @@ fn talkgroup_zone_of(file: &talkgroups::TalkgroupFile, tg: u32) -> Option<usize>
         .position(|zone| zone.talkgroups.iter().any(|row| row.tg == tg))
 }
 
-fn tab_color(index: usize) -> egui::Color32 {
+pub(crate) fn tab_color(index: usize) -> egui::Color32 {
     const COLORS: [egui::Color32; 6] = [
         rustcars::palette::TAN,
         rustcars::palette::SLATE,
@@ -1785,7 +1785,7 @@ fn radio_key(ui: &mut egui::Ui, label: &str, lamp: KeyLamp, enabled: bool) -> eg
         // In the elbow bar: the one bar style (#222).
         let size = radio_key_size(ui);
         let on = (!radio_key_is_momentary(label)).then(|| !matches!(lamp, KeyLamp::Dark));
-        let base = if radio_key_is_momentary(label) { rustcars::palette::TAN } else { radio_key_hue(lamp) };
+        let base = bar_key_hue(label, lamp);
         return tools::bar_button(ui, label, base, size, on, enabled);
     }
     let (rect, response) = ui.allocate_exact_size(radio_key_size(ui), egui::Sense::click());
@@ -1904,6 +1904,26 @@ fn bar_keys(ui: &mut egui::Ui, salt: &str, n: usize, mut key: impl FnMut(&mut eg
 /// Keys that act once on the click and hold no state.
 fn radio_key_is_momentary(label: &str) -> bool {
     matches!(label.to_ascii_uppercase().as_str(), "LOAD" | "SAVE" | "ADD")
+}
+
+/// Each bar key's own palette hue, like REC's bar (SLATE day keys, TEAL
+/// zoom, BRICK live…): file keys slate, ADD teal, REC brick, SCAN olive,
+/// DWELL teal, FOLLOW plum. A lit key keeps its lamp colour (green, amber,
+/// purple scan, red REC) so the lamp still reads; the ●/○ carries the state.
+fn bar_key_hue(label: &str, lamp: KeyLamp) -> egui::Color32 {
+    use rustcars::palette::*;
+    if !matches!(lamp, KeyLamp::Dark) {
+        return radio_key_hue(lamp);
+    }
+    match label.to_ascii_uppercase().as_str() {
+        "LOAD" | "SAVE" => SLATE,
+        "ADD" => TEAL,
+        "REC" => BRICK,
+        "SCAN" => OLIVE,
+        "DWELL" => TEAL,
+        "FOLLOW" => PLUM,
+        _ => SLATE,
+    }
 }
 
 /// Hue of a state key's lamp. Off keys use slate, the app's neutral hue.

@@ -1331,8 +1331,16 @@ Planned work, including a TV tab, a cleaner layout for station data, and more de
 
 ## Buttons in the page bar
 
-Every button that sits in a page's top elbow bar has one style: a filled pill as tall as the bar with corners of radius 4 and the label in the ink for its fill. A button that switches a state on and off also has a thin border and shows its state as ● (on) or ○ (off) before the label, so the state never depends on colour alone. E-STOP and RELEASE keep their own square keys at the right end of the bar and never shrink.
+Buttons in a page's top elbow bar follow the rustcars rules, the same as REC's bar:
 
-The **Plan** keys (**LOAD**, **SAVE**, **ADD**), the **Channels** keys (**REC**, **LOAD**, **SAVE**, **SCAN**, **DWELL**) and the **HackRF TG** keys (**REC**, **LOAD**, **SAVE**, **FOLLOW**) are in the page bar directly left of E-STOP, in that order. Double-clicks, tooltips and lamps work as before. The radio panel, band readouts and lists under the bar start at the left edge of the page and use the full width. When the bar is too short, the keys that do not fit move behind the three-dot more-tabs key, directly left of E-STOP; click it for the rest. The same pill style is used for Timers' **Copy time** and **ID 10:00**, REC's view controls and the more-tabs key.
+- A key that does one thing (LOAD, SAVE, ADD, ID 10:00, REC's day and zoom keys) is a solid, square segment of the bar in its own colour, with no outline.
+- A key that switches something on and off (REC, SCAN, DWELL, FOLLOW, REC's LIVE / DATA / PLAY NEXT) has a thin border and shows its state as ● (on) or ○ (off) before the label, so the state never depends on colour alone. A lit key keeps its lamp colour.
+- **Copy time** has click modes, so it is a rustcars mode button (click, double-click, triple-click).
+- Tool and Timers tabs in the bar are square segments (no rounded end); the open tab has a frame round it.
+- E-STOP and RELEASE are square keys at the right end of the bar and never shrink.
+
+Key colours: LOAD and SAVE slate, ADD teal, REC brick, SCAN olive, DWELL teal, FOLLOW plum, ID 10:00 brick.
+
+The **Plan** keys (**LOAD**, **SAVE**, **ADD**), the **Channels** keys (**REC**, **LOAD**, **SAVE**, **SCAN**, **DWELL**) and the **HackRF TG** keys (**REC**, **LOAD**, **SAVE**, **FOLLOW**) are in the page bar directly left of E-STOP, in that order. Double-clicks, tooltips and lamps work as before. The radio panel, band readouts and lists under the bar start at the left edge of the page and use the full width. When the bar is too short, the keys that do not fit move behind the three-dot more-tabs key, directly left of E-STOP; click it for the rest.
 
 On the NanoVNA screen, panel keys are filled keys of radius 4; a lit key (an on state) also has a thin border and the ● marker.

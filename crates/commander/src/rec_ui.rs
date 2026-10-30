@@ -1242,10 +1242,19 @@ impl App {
             };
             let base = bar_colour(seg.action);
             let size = egui::vec2(seg.width, theme.bar_thin);
-            // One bar style on every page (#222): filled pill, radius 4;
-            // toggles add the thin border and ●/○ marker.
-            let _ = cap;
-            let resp = crate::tools::bar_button(ui, seg.label, base, size, on, true);
+            let resp = match on {
+                // Toggles: the rustcars toggle button (thin border, painted
+                // ●/○). The timeline applies the action, so the local flip
+                // is discarded here.
+                Some(state) => {
+                    let mut local = state;
+                    let resp = rustcars::toggle_button(ui, &theme, seg.label, &mut local, base, size);
+                    let name = bar_label(seg, on);
+                    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, true, state, &name));
+                    resp
+                }
+                None => rustcars::lcars_button(ui, &theme, &bar_label(seg, on), base, size, cap, true),
+            };
             let resp = resp.on_hover_text(bar_hint(seg.action, on));
             if resp.clicked() {
                 self.rec.bar_actions.push(seg.action);
