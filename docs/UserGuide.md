@@ -464,6 +464,8 @@ The REC state is saved and comes back on the next start. A talkgroup recording s
 
 ## 9.3 The REC tab
 
+**Detaching REC.** The rounded end at the top right of the REC page detaches the whole page into its own window, as on Config: click it to detach, click it again (in either place) to bring it back, drag it to move the window. In the detached window the timeline controls sit in a row at the top of the page; the main window shows a line saying where REC went.
+
 While REC is open, the timeline controls sit inside the tan bar at the top of the page, at its right end just before the rounded end cap. They are plain rectangular buttons, the same height as the bar. Below the bar, from top to bottom: source tabs (**HackRF TG**, **HackRF Channels**, plus any other source found; if they don't all fit, click the three-dot **more tabs** button on the tan bar above them for a list of the rest, as on the Plan page), a status line (REC state, TG, Channels, disk use), the search row, and the timeline.
 
 | Control in the tan bar | What it does |

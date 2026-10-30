@@ -84,7 +84,32 @@ fn config_page_pill_rect(ctx: &egui::Context, frame_rect: egui::Rect) -> egui::R
 
 /// Memory id of the whole Config page's detach state.
 fn config_page_detach_id() -> egui::Id {
-    group_box::DetachState::id("config-page")
+    page_detach_id(Page::Config)
+}
+
+/// Pages whose whole frame detaches from the top-right end pill. One shared
+/// path: the pill in the page bar, a stub in the page while it is out, and
+/// the page drawn in its own window every frame (`show_page_windows`).
+const DETACHABLE_PAGES: [Page; 2] = [Page::Config, Page::Rec];
+
+fn page_detachable(page: Page) -> bool {
+    DETACHABLE_PAGES.contains(&page)
+}
+
+/// Memory id of a page's detach state (memory only; not saved).
+fn page_detach_id(page: Page) -> egui::Id {
+    group_box::DetachState::id(("page", page_name(page)))
+}
+
+fn page_detached(ctx: &egui::Context, page: Page) -> bool {
+    page_detachable(page) && group_box::DetachState::load(ctx, page_detach_id(page)).detached
+}
+
+/// The plain-text line left in a page whose frame is in its own window.
+fn page_stub(ui: &mut egui::Ui, page: Page) {
+    let st = group_box::DetachState::load(ui.ctx(), page_detach_id(page));
+    let name = page_name(page);
+    ui.label(if st.failed { group_box::detach_failed_text(&name) } else { group_box::detached_stub_text(&name) });
 }
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -2849,7 +2874,8 @@ impl eframe::App for App {
                 ui.spacing_mut().item_spacing.x = gap;
                 let show_tear = self.page == Page::Tools && !tools_open;
                 // On REC the right end of the bar carries the view controls.
-                let show_rec_bar = rec_ui::bar_shown(self.page == Page::Rec);
+                let show_rec_bar = rec_ui::bar_shown(self.page == Page::Rec)
+                    && !page_detached(ui.ctx(), Page::Rec);
                 let row_w = ui.available_width();
                 let place = rec_ui::bar_place(row_w - rec_ui::FRAME_MARGIN_X, row_w);
                 rec_place = show_rec_bar.then_some(place);
@@ -3106,7 +3132,9 @@ impl eframe::App for App {
                 let estop_w = estop::button_width(ui, estop::engaged()) + 16.0;
                 let slot_w = Some(in_frame.map(rec_ui::bar_slot_width).unwrap_or(0.0) + estop_w);
                 let (frame_rect, slot) = tools::frame_with_slot(ui, slot_w, |ui| {
-                    if self.page == Page::Tune {
+                    if page_detached(ui.ctx(), self.page) {
+                        page_stub(ui, self.page);
+                    } else if self.page == Page::Tune {
                         self.page_tune(ui, &mut snap);
                     } else if self.page == Page::Plan {
                         self.page_plan(ui, &mut snap);
@@ -3149,13 +3177,14 @@ impl eframe::App for App {
                         },
                     );
                 }
-                // Config's whole page detaches from the top elbow's end pill
-                // (top right, right of the E-STOP gap).
-                if self.page == Page::Config {
-                    let id = config_page_detach_id();
+                // A detachable page's frame detaches from the top elbow's
+                // end pill (top right, right of the E-STOP gap).
+                if page_detachable(self.page) {
+                    let id = page_detach_id(self.page);
                     let mut st = group_box::DetachState::load(ui.ctx(), id);
                     let cap = config_page_pill_rect(ui.ctx(), frame_rect);
-                    let pill = group_box::detach_pill(ui, cap, id.with("page-pill"), rustcars::palette::TAN, "Config", st.detached);
+                    let name = page_name(self.page);
+                    let pill = group_box::detach_pill(ui, cap, id.with("page-pill"), rustcars::palette::TAN, &name, st.detached);
                     if pill.clicked() {
                         st.toggle();
                         st.store(ui.ctx(), id);
@@ -3185,7 +3214,7 @@ impl eframe::App for App {
         if self.amp_edit.is_some() {
             self.amplifier_window(&ctx);
         }
-        self.show_config_window(&ctx, &mut snap);
+        self.show_page_windows(&ctx, &mut snap);
         self.show_meter_window(&ctx, &snap);
         self.show_tools_window(&ctx);
         self.show_vna_wizard(&ctx);
@@ -3213,13 +3242,8 @@ impl App {
             Page::Rec => self.page_rec(ui, snap),
             Page::HfData => self.page_hfdata(ui, snap),
             Page::Config => {
-                let st = group_box::DetachState::load(ui.ctx(), config_page_detach_id());
-                if st.detached {
-                    ui.label(if st.failed {
-                        group_box::detach_failed_text("Config")
-                    } else {
-                        group_box::detached_stub_text("Config")
-                    });
+                if page_detached(ui.ctx(), Page::Config) {
+                    page_stub(ui, Page::Config);
                 } else {
                     self.page_config(ui, snap);
                 }
@@ -8624,34 +8648,64 @@ impl App {
         ctx.request_repaint_of(viewport);
     }
 
-    /// The whole Config page in its own window while it is detached. Groups
-    /// detached on their own keep their own windows.
-    fn show_config_window(&mut self, ctx: &egui::Context, snap: &mut Snapshot) {
-        let id = config_page_detach_id();
-        let mut st = group_box::DetachState::load(ctx, id);
-        if !st.detached {
-            // A group detached on its own keeps its window on every page.
-            // Off the Config page, run the page hidden so those windows draw;
-            // attached groups there are not painted and take no clicks.
-            let any = CONFIG_GROUPS.iter().any(|(name, _)| {
-                group_box::DetachState::load(ctx, group_box::DetachState::id(("config-group", *name))).detached
-            });
-            if any && self.page != Page::Config {
-                egui::Area::new(egui::Id::NULL.with("config-hidden-host"))
-                    .fixed_pos(egui::pos2(0.0, 0.0))
-                    .interactable(false)
-                    .show(ctx, |ui| {
-                        ui.set_invisible();
-                        self.page_config(ui, snap);
-                    });
+    /// Every detached page in its own window, every frame, whatever page
+    /// the main window shows. Config groups detached on their own keep their
+    /// windows too (the Config page runs hidden for them when it is not shown).
+    fn show_page_windows(&mut self, ctx: &egui::Context, snap: &mut Snapshot) {
+        for page in DETACHABLE_PAGES {
+            let id = page_detach_id(page);
+            let mut st = group_box::DetachState::load(ctx, id);
+            if !st.detached {
+                if page == Page::Config {
+                    self.config_hidden_run(ctx, snap);
+                }
+                continue;
             }
-            return;
+            let m = group_box::Metrics::default();
+            let name = page_name(page);
+            group_box::detached_window(ctx, id, &m, &name, rustcars::palette::TAN, &mut st, |ui| {
+                self.detached_page_body(ui, page, snap);
+            });
+            st.store(ctx, id);
         }
-        let m = group_box::Metrics::default();
-        group_box::detached_window(ctx, id, &m, "Config", rustcars::palette::TAN, &mut st, |ui| {
-            self.page_config(ui, snap);
+    }
+
+    /// A detached page's contents. REC's view controls ride the main page
+    /// bar when attached; detached they head the window instead (drawn once:
+    /// the main bar leaves them out while REC is detached).
+    fn detached_page_body(&mut self, ui: &mut egui::Ui, page: Page, snap: &mut Snapshot) {
+        match page {
+            Page::Config => self.page_config(ui, snap),
+            Page::Rec => {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = rec_ui::BAR_GAP;
+                    self.rec_bar(ui, false);
+                });
+                ui.add_space(4.0);
+                self.page_rec(ui, snap);
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(rec_ui::PRIVACY).weak().small());
+            }
+            _ => self.page_body(ui, snap),
+        }
+    }
+
+    /// Config groups detached on their own keep their windows on every page:
+    /// off the Config page, run it hidden so those windows draw; attached
+    /// groups there are not painted and take no clicks.
+    fn config_hidden_run(&mut self, ctx: &egui::Context, snap: &mut Snapshot) {
+        let any = CONFIG_GROUPS.iter().any(|(name, _)| {
+            group_box::DetachState::load(ctx, group_box::DetachState::id(("config-group", *name))).detached
         });
-        st.store(ctx, id);
+        if any && self.page != Page::Config {
+            egui::Area::new(egui::Id::NULL.with("config-hidden-host"))
+                .fixed_pos(egui::pos2(0.0, 0.0))
+                .interactable(false)
+                .show(ctx, |ui| {
+                    ui.set_invisible();
+                    self.page_config(ui, snap);
+                });
+        }
     }
 
     /// Open the meters as a native window when they are detached.
@@ -12501,6 +12555,34 @@ fn fixed_slider(ui: &mut egui::Ui, label: &str, value: f64) {
 
 #[cfg(test)]
 mod config_order_tests {
+    #[test]
+    fn rec_and_config_share_the_page_detach_path() {
+        use crate::{Page, page_detachable, page_detach_id, page_detached, page_stub};
+        assert!(page_detachable(Page::Config) && page_detachable(Page::Rec));
+        assert!(!page_detachable(Page::Tune), "Tune is not wrapped");
+        assert_ne!(page_detach_id(Page::Config), page_detach_id(Page::Rec));
+        assert_eq!(crate::config_page_detach_id(), page_detach_id(Page::Config));
+        let ctx = egui::Context::default();
+        rustcars::install_lcars_font(&ctx);
+        rustcars::apply_theme(&ctx, &rustcars::LcarsTheme::default());
+        crate::group_box::DetachState { detached: true, ..Default::default() }.store(&ctx, page_detach_id(Page::Rec));
+        assert!(page_detached(&ctx, Page::Rec) && !page_detached(&ctx, Page::Config));
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| page_stub(ui, Page::Rec));
+        out.textures_delta.clear();
+        let texts: Vec<String> = out.shapes.iter().filter_map(|c| match &c.shape {
+            egui::Shape::Text(t) => Some(t.galley.text().to_owned()),
+            _ => None,
+        }).collect();
+        assert!(texts.iter().any(|t| t.contains("REC: detached")), "{texts:?}");
+        // Main-page source: REC's bar leaves the page bar while REC is out,
+        // and the detached window heads REC with it (drawn once).
+        let src = include_str!("main.rs");
+        assert!(src.contains("&& !page_detached(ui.ctx(), Page::Rec);"));
+        let body = &src[src.find("fn detached_page_body(").unwrap()..];
+        let body = &body[..body.find("\n    fn ").unwrap()];
+        assert_eq!(body.matches("self.rec_bar(ui, false)").count(), 1);
+    }
+
     struct Bar {
         frame: egui::Rect,
         cap: egui::Rect,
