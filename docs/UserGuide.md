@@ -1344,3 +1344,9 @@ Key colours: LOAD and SAVE slate, ADD teal, REC brick, SCAN olive, DWELL teal, F
 The **Plan** keys (**LOAD**, **SAVE**, **ADD**), the **Channels** keys (**REC**, **LOAD**, **SAVE**, **SCAN**, **DWELL**) and the **HackRF TG** keys (**REC**, **LOAD**, **SAVE**, **FOLLOW**) are in the page bar directly left of E-STOP, in that order. Double-clicks, tooltips and lamps work as before. The radio panel, band readouts and lists under the bar start at the left edge of the page and use the full width. When the bar is too short, the keys that do not fit move behind the three-dot more-tabs key, directly left of E-STOP; click it for the rest.
 
 On the NanoVNA screen, panel keys are filled keys of radius 4; a lit key (an on state) also has a thin border and the ● marker.
+
+## Detached windows: maximize, snap and move
+
+A detached page window can be maximized, snapped to half or a quarter of the screen, and restored; it keeps taking clicks in every case. Dragging its end pill moves it; a maximized or full-screen window is restored first, then moves with the pointer. A detached window always opens restored (never maximized), and its size is remembered only while it is not maximized, capped at 80% of the screen so the desktop does not maximize it again on its own.
+
+On Linux, Commander runs through X11 (XWayland on a Wayland desktop) so a detached window keeps working when it covers the main window. To use native Wayland instead, start it with `HAMSPOT_WAYLAND=1`; then a detached window that completely covers the main window stops responding until the main window is visible again.

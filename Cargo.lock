@@ -718,6 +718,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serialport",
+ "winit",
 ]
 
 [[package]]
@@ -3123,7 +3124,7 @@ dependencies = [
 [[package]]
 name = "rustcars"
 version = "0.2.0"
-source = "git+https://github.com/webaugur/rustcars?rev=c7c431c8ffcb59b9b38130f61d4c1c643db762de#c7c431c8ffcb59b9b38130f61d4c1c643db762de"
+source = "git+https://github.com/webaugur/rustcars?rev=d771fae096b24b87132c9682534c0563bb0d111a#d771fae096b24b87132c9682534c0563bb0d111a"
 dependencies = [
  "eframe",
  "egui",
