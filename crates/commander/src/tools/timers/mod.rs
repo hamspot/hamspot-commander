@@ -16,9 +16,32 @@ mod clock;
 use chrono::{DateTime, FixedOffset, Local, Offset, Utc};
 use clock::{ClockFmt, Countdown, Stamp, Stopwatch, ZONES};
 use rustcars::{
-    LcarsFrame, LcarsTheme, Mode, Side, action_button, apply_theme, install_lcars_font,
-    mode_button, mode_list, palette, readout,
+    LcarsTheme, Mode, action_button, apply_theme, install_lcars_font, mode_button, mode_list,
+    palette, readout,
 };
+
+/// The Timers page's sub-tabs (REC-style folder tabs under the page bar).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum TimerTab {
+    #[default]
+    Clocks,
+    World,
+    Stopwatch,
+    Countdown,
+}
+
+pub const TIMER_TABS: [(TimerTab, &str); 4] = [
+    (TimerTab::Clocks, "Clocks"),
+    (TimerTab::World, "World"),
+    (TimerTab::Stopwatch, "Stopwatch"),
+    (TimerTab::Countdown, "Countdown"),
+];
+
+/// Bar-slot buttons: COPY TIME and ID 10:00, page-bar height.
+pub const COPY_W: f32 = 150.0;
+pub const ID_W: f32 = 110.0;
+/// Slot width the bar controls need (buttons, one gap between, black margin each side).
+pub const BAR_SLOT_W: f32 = COPY_W + ID_W + 3.0 * 4.0;
 
 pub struct Timers {
     pub theme: LcarsTheme,
@@ -26,6 +49,7 @@ pub struct Timers {
     pub cd: Countdown,
     pub zone_modes: Vec<(String, Mode)>,
     pub status: String,
+    pub tab: TimerTab,
     /// Fixed clock for tests and screenshots.
     pub fixed_now: Option<(DateTime<Utc>, FixedOffset)>,
     /// Fixed UI time (seconds) for tests and screenshots.
@@ -43,6 +67,7 @@ impl Timers {
             cd: Countdown::default(),
             zone_modes: vec![(String::new(), Mode::Inactive); ZONES.len()],
             status: "READY".into(),
+            tab: TimerTab::Clocks,
             fixed_now: None,
             fixed_time: None,
         }
@@ -62,38 +87,89 @@ impl Timers {
         self.status = format!("COPIED: {text}");
     }
 
-    pub fn draw(&mut self, ui: &mut egui::Ui) {
-        let t = self.theme;
+    fn now(&self, ui: &egui::Ui) -> f64 {
         let now = self.fixed_time.unwrap_or_else(|| ui.input(|i| i.time));
         if self.fixed_time.is_none() {
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(100));
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
         }
-        super::screen_header(ui, "timers_header", &t, |ui| {
-                ui.horizontal(|ui| {
-                    super::title_block(ui, &t, "Timers", palette::TAN, egui::vec2(120.0, t.bar_thin));
-                });
-        });
-        egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(t.bg))
-            .show(ui, |ui| {
-                let full = ui.available_rect_before_wrap();
-                let split = full.left() + full.width() * 0.52;
-                let left = egui::Rect::from_min_max(full.min, egui::pos2(split, full.bottom()));
-                let right =
-                    egui::Rect::from_min_max(egui::pos2(split + t.main_gap, full.top()), full.max);
-                ui.scope_builder(egui::UiBuilder::new().max_rect(left), |ui| {
-                    let mut f = LcarsFrame::new(&t, Side::Left, 0.6);
-                    f.min_height = left.height();
-                    f.show(ui, &t, |ui| self.clocks_panel(ui));
-                });
-                ui.scope_builder(egui::UiBuilder::new().max_rect(right), |ui| {
-                    let mut f = LcarsFrame::new(&t, Side::Right, 0.6);
-                    f.top_color = palette::PLUM;
-                    f.bottom_color = palette::TEAL;
-                    f.min_height = right.height();
-                    f.show(ui, &t, |ui| self.watch_panel(ui, now));
-                });
+        now
+    }
+
+    /// The page-bar controls, REC style: COPY TIME (click UTC log, double
+    /// local, triple ISO 8601) and ID 10:00. Drawn in the page bar's slot, or
+    /// at the top of the detached window.
+    pub fn bar(&mut self, ui: &mut egui::Ui) {
+        let t = self.theme;
+        let now = self.now(ui);
+        let mut m = Mode::Inactive; // momentary: the gesture picks the format
+        mode_button(ui, &t, "Copy time", &mut m, egui::vec2(COPY_W, t.bar_thin)).on_hover_text(
+            "click: 2026-10-23 1948Z · double: local with offset · triple: ISO 8601",
+        );
+        match m {
+            Mode::Primary => self.copy(ui, Stamp::Utc),
+            Mode::Alt1 => self.copy(ui, Stamp::Local),
+            Mode::Alt2 => self.copy(ui, Stamp::Iso),
+            Mode::Inactive => {}
+        }
+        if action_button(ui, &t, "ID 10:00", egui::vec2(ID_W, t.bar_thin))
+            .on_hover_text("Start a 10 minute station identification countdown")
+            .clicked()
+        {
+            self.start_id(now);
+        }
+    }
+
+    fn start_id(&mut self, now: f64) {
+        self.cd.set(600.0);
+        self.cd.start(now);
+        self.status = "ID TIMER STARTED: IDENTIFY BEFORE IT REACHES ZERO".into();
+    }
+
+    /// One line under the sub-tabs: UTC, the ID / countdown state, and the
+    /// last action. Plain text, like REC's status line.
+    pub fn status_line(&self, now: f64) -> String {
+        let (utc, _) = self.clock();
+        let cd = if self.cd.finished(now) {
+            "COUNTDOWN 00:00 TIME!".to_owned()
+        } else if self.cd.running() {
+            format!("COUNTDOWN {}", clock::fmt_hms(self.cd.remaining(now)))
+        } else {
+            "COUNTDOWN OFF".to_owned()
+        };
+        let mut line = format!("UTC {}Z   {cd}", clock::face(utc, clock::offset(0), ClockFmt::H24));
+        if self.sw.running() {
+            line.push_str(&format!("   STOPWATCH {}", clock::fmt_stopwatch(self.sw.elapsed(now))));
+        }
+        if self.status != "READY" && !self.status.is_empty() {
+            line.push_str("   ");
+            line.push_str(&self.status);
+        }
+        line
+    }
+
+    /// The Timers page body inside the shared page frame: sub-tabs, the
+    /// status line, then the open tab. `tabs` draws the sub-tab row and
+    /// returns a picked tab (Commander passes its folder tabs).
+    pub fn draw_in(
+        &mut self,
+        ui: &mut egui::Ui,
+        tabs: impl FnOnce(&mut egui::Ui, TimerTab) -> Option<TimerTab>,
+    ) {
+        let now = self.now(ui);
+        if let Some(tab) = tabs(ui, self.tab) {
+            self.tab = tab;
+        }
+        ui.add_space(4.0);
+        ui.label(self.status_line(now));
+        ui.add_space(self.theme.frame_gap);
+        egui::ScrollArea::vertical()
+            .id_salt("timers-body")
+            .auto_shrink([false, false])
+            .show(ui, |ui| match self.tab {
+                TimerTab::Clocks => self.clocks_panel(ui),
+                TimerTab::World => self.world_panel(ui),
+                TimerTab::Stopwatch => self.stopwatch_panel(ui, now),
+                TimerTab::Countdown => self.countdown_panel(ui, now),
             });
     }
 
@@ -140,21 +216,15 @@ impl Timers {
             });
         ui.add_space(t.main_gap / 2.0);
         ui.label(
-            egui::RichText::new("COPY TIME: CLICK UTC LOG · DOUBLE LOCAL · TRIPLE ISO 8601")
+            egui::RichText::new("COPY TIME (PAGE BAR): CLICK UTC LOG · DOUBLE LOCAL · TRIPLE ISO 8601")
                 .size(t.data_size)
                 .color(palette::TEXT_MUTED),
         );
-        let mut m = Mode::Inactive; // momentary: the gesture picks the format
-        mode_button(ui, &t, "Copy time", &mut m, egui::vec2(180.0, 40.0)).on_hover_text(
-            "click: 2026-10-23 1948Z · double: local with offset · triple: ISO 8601",
-        );
-        match m {
-            Mode::Primary => self.copy(ui, Stamp::Utc),
-            Mode::Alt1 => self.copy(ui, Stamp::Local),
-            Mode::Alt2 => self.copy(ui, Stamp::Iso),
-            Mode::Inactive => {}
-        }
-        ui.add_space(t.main_gap);
+    }
+
+    fn world_panel(&mut self, ui: &mut egui::Ui) {
+        let t = self.theme;
+        let (utc, _) = self.clock();
         ui.label(egui::RichText::new("WORLD CLOCKS").size(t.header_size));
         // one pinned zone at a time; its face format follows the click mode
         let pinned = self.zone_modes.iter().position(|z| z.1 != Mode::Inactive);
@@ -223,7 +293,7 @@ impl Timers {
         );
     }
 
-    fn watch_panel(&mut self, ui: &mut egui::Ui, now: f64) {
+    fn stopwatch_panel(&mut self, ui: &mut egui::Ui, now: f64) {
         let t = self.theme;
         let b = egui::vec2(120.0, 40.0);
         ui.label(egui::RichText::new("STOPWATCH").size(t.header_size));
@@ -268,7 +338,11 @@ impl Timers {
                 }
             });
 
-        ui.add_space(t.main_gap);
+    }
+
+    fn countdown_panel(&mut self, ui: &mut egui::Ui, now: f64) {
+        let t = self.theme;
+        let b = egui::vec2(120.0, 40.0);
         ui.label(egui::RichText::new("COUNTDOWN").size(t.header_size));
         let rem = self.cd.remaining(now);
         let done = self.cd.finished(now);
@@ -297,9 +371,7 @@ impl Timers {
                 self.cd.set(0.0);
             }
             if action_button(ui, &t, "ID 10:00", b).clicked() {
-                self.cd.set(600.0);
-                self.cd.start(now);
-                self.status = "ID TIMER STARTED: IDENTIFY BEFORE IT REACHES ZERO".into();
+                self.start_id(now);
             }
         });
         ui.label(
@@ -319,9 +391,6 @@ impl Timers {
         if add > 0.0 {
             self.cd.add(now, add);
             self.status = format!("ADDED {} MIN", add / 60.0);
-        }
-        if self.status != "READY" && !self.status.is_empty() {
-            readout(ui, &t, &self.status, self.status.starts_with("COPIED"));
         }
     }
 }
@@ -343,5 +412,38 @@ mod logic {
         let (u, l) = a.clock();
         assert_eq!(clock::stamp(u, l, Stamp::Iso), "2026-01-02T03:04:05Z");
         assert_eq!(a.zone_modes.len(), ZONES.len());
+        assert_eq!(a.tab, TimerTab::Clocks);
+        assert!(a.status_line(0.0).starts_with("UTC 03:04:05Z   COUNTDOWN OFF"), "{}", a.status_line(0.0));
+        a.start_id(0.0);
+        assert!(a.status_line(1.0).contains("COUNTDOWN 09:59"), "{}", a.status_line(1.0));
+        assert!(a.status_line(1.0).contains("ID TIMER STARTED"));
+    }
+
+    /// Real LCARS fonts and theme: the bar fits its slot width, every tab
+    /// draws, and the status line shows under the tabs.
+    #[test]
+    fn bar_fits_slot_and_tabs_draw() {
+        let ctx = egui::Context::default();
+        let mut a = Timers::new(&ctx);
+        a.fixed_time = Some(0.0);
+        a.fixed_now = Some((Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap(), clock::offset(0)));
+        for tab in TIMER_TABS.map(|(t, _)| t) {
+            let mut bar_w = 0.0;
+            let mut seen = None;
+            let mut out = ctx.run_ui(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 700.0))),
+                ..Default::default()
+            }, |ui| {
+                bar_w = ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    a.bar(ui);
+                }).response.rect.width();
+                a.draw_in(ui, |_, cur| { seen = Some(cur); Some(tab) });
+            });
+            out.textures_delta.clear();
+            assert!(bar_w <= BAR_SLOT_W, "bar {bar_w} > slot {BAR_SLOT_W}");
+            assert!(seen.is_some());
+            assert_eq!(a.tab, tab);
+        }
     }
 }

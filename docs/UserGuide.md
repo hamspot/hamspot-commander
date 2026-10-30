@@ -651,6 +651,10 @@ Sliders for AF gain, RF gain, AGC, RF power, noise reduction, IF shift, filter w
 
 Station clocks at fixed offsets (no daylight saving time), a 10-minute **ID timer** that warns you to identify, a **countdown** (click +1 min, double-click +5 min, triple-click +10 min), and a **stopwatch** with laps. **Copy time** copies a timestamp.
 
+The page is laid out like REC. Sub-tabs under the page bar pick **Clocks** (UTC, date, local time, day of year, top of hour), **World** (the world clocks), **Stopwatch** or **Countdown**; when the window is too narrow, the extra tabs move into the three-dot more-tabs button. A status line under the tabs always shows UTC, the countdown (or COUNTDOWN OFF), a running stopwatch and the last action, so the ID timer is visible from every tab. **Copy time** (click UTC log, double-click local with offset, triple-click ISO 8601) and **ID 10:00** sit in the page bar, left of E-STOP.
+
+Like Config and REC, Timers can be detached with the pill at the top right of the page. The detached window carries Copy time and ID 10:00 in its top row; the main window shows a stub until you reattach it.
+
 <!-- screenshot: timers-01 — Station clocks and timers. -->
 
 ## 10.4 HF Data

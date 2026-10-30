@@ -8,7 +8,7 @@ mod rotator;
 pub mod nanovna;
 pub(crate) mod smith;
 mod station_log;
-mod timers;
+pub mod timers;
 
 use rustcars::{Cap, LcarsTheme, Side, lcars_button, palette, readout};
 
@@ -168,10 +168,10 @@ impl Tools {
         self.screen(ui);
     }
 
-    /// Station clocks. The Timers page calls this on the root ui, the same
-    /// way the tool screens add their own panels.
-    pub fn draw_timers(&mut self, ui: &mut egui::Ui) {
-        self.timers.draw(ui);
+    /// Station clocks and timers. The Timers page draws them inside the
+    /// shared page frame (sub-tabs, status line, bar controls in the slot).
+    pub fn timers_mut(&mut self) -> &mut timers::Timers {
+        &mut self.timers
     }
 
     /// The tools are not on screen. The next visit to NanoVNA may connect.

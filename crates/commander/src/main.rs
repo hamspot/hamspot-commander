@@ -90,7 +90,7 @@ fn config_page_detach_id() -> egui::Id {
 /// Pages whose whole frame detaches from the top-right end pill. One shared
 /// path: the pill in the page bar, a stub in the page while it is out, and
 /// the page drawn in its own window every frame (`show_page_windows`).
-const DETACHABLE_PAGES: [Page; 2] = [Page::Config, Page::Rec];
+const DETACHABLE_PAGES: [Page; 3] = [Page::Config, Page::Rec, Page::Timers];
 
 fn page_detachable(page: Page) -> bool {
     DETACHABLE_PAGES.contains(&page)
@@ -1433,7 +1433,7 @@ pub(crate) fn caution() -> egui::Color32 {
 }
 
 /// A page or zone tab drawn as an LCARS segment. The open tab is lifted.
-fn folder_tab(
+pub(crate) fn folder_tab(
     ui: &mut egui::Ui,
     selected: bool,
     index: usize,
@@ -3107,8 +3107,6 @@ impl eframe::App for App {
         self.refresh_tools(ui.ctx(), &snap);
         if self.page == Page::Tools {
             self.page_tools(ui);
-        } else if self.page == Page::Timers {
-            self.page_timers(ui);
         } else {
             // The stock central panel keeps an 8px margin on every side.
             // The bottom one would lift the elbows off the window.
@@ -3130,7 +3128,10 @@ impl eframe::App for App {
                 // tan top bar (issue #198; Tune is the reference placement).
                 // REC's in-frame view controls share the same gap, to its left.
                 let estop_w = estop::button_width(ui, estop::engaged()) + 16.0;
-                let slot_w = Some(in_frame.map(rec_ui::bar_slot_width).unwrap_or(0.0) + estop_w);
+                // Timers' COPY TIME / ID 10:00 share the gap too, while attached.
+                let timers_bar = self.page == Page::Timers && !page_detached(ui.ctx(), Page::Timers);
+                let timers_w = if timers_bar { tools::timers::BAR_SLOT_W } else { 0.0 };
+                let slot_w = Some(in_frame.map(rec_ui::bar_slot_width).unwrap_or(0.0) + timers_w + estop_w);
                 let (frame_rect, slot) = tools::frame_with_slot(ui, slot_w, |ui| {
                     if page_detached(ui.ctx(), self.page) {
                         page_stub(ui, self.page);
@@ -3146,6 +3147,9 @@ impl eframe::App for App {
                         self.page_radio_ids(ui, id, &snap);
                     } else if self.page == Page::Rec {
                         self.page_rec(ui, &snap);
+                    } else if self.page == Page::Timers {
+                        // Timers scrolls its own body under the sub-tabs.
+                        self.page_timers(ui);
                     } else {
                         egui::ScrollArea::vertical()
                             .id_salt("body")
@@ -3159,6 +3163,14 @@ impl eframe::App for App {
                         egui::Rect::from_min_max(r.min, egui::pos2(r.right() - estop_w, r.bottom())),
                         egui::Rect::from_min_max(egui::pos2(r.right() - estop_w, r.top()), r.max),
                     );
+                    if timers_bar {
+                        ui.scope_builder(egui::UiBuilder::new().max_rect(rec_r).id_salt("timers-bar-in-frame"), |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                self.tools.lock().expect("tools").timers_mut().bar(ui);
+                            });
+                        });
+                    }
                     if let Some(compact) = in_frame {
                         ui.scope_builder(egui::UiBuilder::new().max_rect(rec_r).id_salt("rec-bar-in-frame"), |ui| {
                             ui.horizontal(|ui| {
@@ -8602,8 +8614,23 @@ impl App {
         self.tools.lock().expect("tools").ui(ui, false);
     }
 
+    /// Timers inside the shared page frame, REC style: sub-tabs, a status
+    /// line, then the open tab. The bar controls sit in the page-bar slot.
     fn page_timers(&mut self, ui: &mut egui::Ui) {
-        self.tools.lock().expect("tools").draw_timers(ui);
+        let mut tools = self.tools.lock().expect("tools");
+        tools.timers_mut().draw_in(ui, |ui, cur| {
+            let labels: Vec<String> = tools::timers::TIMER_TABS.iter().map(|(_, l)| l.to_string()).collect();
+            let sel = tools::timers::TIMER_TABS.iter().position(|(t, _)| *t == cur);
+            tools::overflow_tab_row(
+                ui,
+                "timer-tabs",
+                &labels,
+                sel,
+                |ui, i| folder_tab_width(ui, &labels[i], false),
+                |ui, i, lead| folder_tab(ui, Some(i) == sel, i, &labels[i], lead),
+            )
+            .map(|i| tools::timers::TIMER_TABS[i].0)
+        });
     }
 
     /// Open the tools as a native window when they are torn off.
@@ -8676,6 +8703,14 @@ impl App {
     fn detached_page_body(&mut self, ui: &mut egui::Ui, page: Page, snap: &mut Snapshot) {
         match page {
             Page::Config => self.page_config(ui, snap),
+            Page::Timers => {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    self.tools.lock().expect("tools").timers_mut().bar(ui);
+                });
+                ui.add_space(4.0);
+                self.page_timers(ui);
+            }
             Page::Rec => {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = rec_ui::BAR_GAP;
