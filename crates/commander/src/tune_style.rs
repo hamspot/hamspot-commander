@@ -61,18 +61,86 @@ pub fn toggle(ui: &mut egui::Ui, label: &str, enabled: bool, on: bool, hue: Colo
     resp
 }
 
-/// Inset field frame (dark glass, thin grid border, radius 4) around a control.
-pub fn inset<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    egui::Frame::new()
-        .fill(PANE_BG)
-        .stroke(Stroke::new(1.0, GRID))
-        .corner_radius(4.0)
-        .inner_margin(egui::Margin::symmetric(6, 4))
-        .show(ui, |ui| {
-            ui.set_min_height(KEY_H - 8.0);
-            add(ui)
-        })
-        .inner
+/// Gain slider font: smaller than the key labels so the field fits one key row.
+pub const GAIN_FONT: f32 = 11.0;
+/// Track width bounds; the track shrinks (never clips) on a narrow column.
+pub const GAIN_TRACK_MAX: f32 = 112.0;
+pub const GAIN_TRACK_MIN: f32 = 40.0;
+
+/// Instrument-style gain field, exactly one key row (`KEY_H`) tall: a square
+/// inset with a thin border, small "LNA" caption, 2 px track with the filled
+/// part in the trace colour, a slim square handle, and the value ("24 dB").
+/// Drag or click sets the value; arrow keys step it while focused (as
+/// `egui::Slider`). The value is printed, so state is never colour alone.
+pub fn gain_slider(ui: &mut egui::Ui, label: &str, value: &mut u32, max: u32, step: u32) -> egui::Response {
+    let font = egui::FontId::proportional(GAIN_FONT);
+    let text = ui.visuals().text_color();
+    let (cap_g, val_w) = ui.fonts_mut(|f| {
+        let cap = f.layout_no_wrap(label.to_owned(), font.clone(), GRID);
+        let w = f.layout_no_wrap(format!("{max} dB"), font.clone(), text).size().x;
+        (cap, w)
+    });
+    let pad = 6.0;
+    let fixed = pad + cap_g.size().x + 6.0 + 6.0 + val_w + pad;
+    let room = ui.max_rect().width().min(ui.clip_rect().right() - ui.max_rect().left());
+    let track_w = (room - fixed).clamp(GAIN_TRACK_MIN, GAIN_TRACK_MAX);
+    let (rect, mut resp) = ui.allocate_exact_size(vec2((fixed + track_w).ceil(), KEY_H), Sense::click_and_drag());
+    let track = Rect::from_min_size(
+        Pos2::new(rect.left() + pad + cap_g.size().x + 6.0, rect.center().y - 1.0),
+        vec2(track_w, 2.0),
+    );
+    let step = step.max(1);
+    let snap = |v: f32| -> u32 { ((v / step as f32).round() as u32 * step).min(max) };
+    let old = *value;
+    if resp.clicked() || resp.drag_started() {
+        resp.request_focus();
+    }
+    if resp.is_pointer_button_down_on() || resp.dragged() || resp.clicked() {
+        if let Some(p) = resp.interact_pointer_pos() {
+            let t = ((p.x - track.left()) / track.width()).clamp(0.0, 1.0);
+            *value = snap(t * max as f32);
+        }
+    }
+    if resp.has_focus() {
+        let (up, down) = ui.input(|i| {
+            (
+                i.key_pressed(egui::Key::ArrowRight) || i.key_pressed(egui::Key::ArrowUp),
+                i.key_pressed(egui::Key::ArrowLeft) || i.key_pressed(egui::Key::ArrowDown),
+            )
+        });
+        if up {
+            *value = (*value + step).min(max);
+        }
+        if down {
+            *value = value.saturating_sub(step);
+        }
+    }
+    if *value != old {
+        resp.mark_changed();
+    }
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter();
+        p.rect_filled(rect, 0.0, PANE_BG);
+        let border = if resp.has_focus() || resp.hovered() { TRACE1 } else { GRID };
+        p.rect_stroke(rect.shrink(0.5), 0.0, Stroke::new(1.0, border), egui::StrokeKind::Inside);
+        p.galley(Pos2::new(rect.left() + pad, rect.center().y - cap_g.size().y / 2.0), cap_g, GRID);
+        p.rect_filled(track, 0.0, GRID_FAINT);
+        let t = if max == 0 { 0.0 } else { *value as f32 / max as f32 };
+        let x = track.left() + t * track.width();
+        p.rect_filled(Rect::from_min_max(track.min, Pos2::new(x, track.max.y)), 0.0, TRACE1);
+        let handle = Rect::from_center_size(Pos2::new(x, rect.center().y), vec2(4.0, 12.0));
+        p.rect_filled(handle, 0.0, text);
+        p.text(
+            Pos2::new(rect.right() - pad, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            format!("{} dB", *value),
+            font,
+            text,
+        );
+    }
+    let name = format!("{label} {} dB", *value);
+    resp.widget_info(|| egui::WidgetInfo::slider(true, *value as f64, &name));
+    resp
 }
 
 /// Height for the spectrum pane: fill what is left, bounded, never NaN.
@@ -761,6 +829,57 @@ mod tests {
                     assert!(rects.iter().any(|r| r.expand(0.5).contains_rect(b)), "label {} spills", t.galley.text());
                 }
             }
+        }
+    }
+
+    /// David: LNA/VGA fields looked cartoonish. Each gain field is exactly the
+    /// AVG/PEAK key height, square, value text inside, nothing clipped, at the
+    /// left-column widths of 1024x550 / 1400x900 and a narrow column.
+    #[test]
+    fn gain_fields_match_the_key_row_and_never_clip() {
+        // Left column widths: half the page at 1024 and 1400, and narrow.
+        for w in [470.0, 650.0, 260.0] {
+            let ctx = ctx();
+            let mut keys = Vec::new();
+            let mut fields = Vec::new();
+            let out = run(&ctx, w, 300.0, &mut |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+                    keys.push(toggle(ui, "Avg", true, true, TRACE1).rect);
+                    keys.push(toggle(ui, "Peak", true, false, TRACE1).rect);
+                    let (mut l, mut v) = (24u32, 30u32);
+                    ui.add_space(8.0);
+                    fields.push(gain_slider(ui, "LNA", &mut l, 40, 8).rect);
+                    ui.add_space(8.0);
+                    fields.push(gain_slider(ui, "VGA", &mut v, 62, 2).rect);
+                });
+            });
+            let screen = Rect::from_min_size(Pos2::ZERO, vec2(w, 300.0));
+            for f in &fields {
+                assert_eq!(f.height(), keys[0].height(), "field height at {w}");
+                assert!(screen.contains_rect(*f), "field clipped at {w}: {f:?}");
+                assert!(f.width() >= GAIN_TRACK_MIN, "too small");
+            }
+            let mut texts = 0;
+            for c in &out.shapes {
+                match &c.shape {
+                    egui::Shape::Text(t) => {
+                        let b = t.visual_bounding_rect();
+                        let s = t.galley.text();
+                        if ["LNA", "VGA", "24 dB", "30 dB"].contains(&s) {
+                            texts += 1;
+                            assert!(fields.iter().any(|f| f.contains_rect(b)), "{s} spills its field at {w}");
+                        }
+                    }
+                    egui::Shape::Rect(r) if fields.iter().any(|f| f.contains_rect(r.rect)) => {
+                        assert_eq!(r.corner_radius, egui::CornerRadius::ZERO, "rounded part");
+                        assert!(r.stroke.width == 0.0 || r.stroke.color != Color32::BLACK, "black stroke");
+                    }
+                    egui::Shape::Circle(c) if fields.iter().any(|f| f.contains(c.center)) => panic!("round blob in a gain field"),
+                    _ => {}
+                }
+            }
+            assert_eq!(texts, 4, "captions and values drawn at {w}");
         }
     }
 }

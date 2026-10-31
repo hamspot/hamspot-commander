@@ -12078,18 +12078,8 @@ impl App {
         } else {
             self.gain_drag_vga.unwrap_or(base)
         };
-        ui.spacing_mut().slider_width = 112.0;
-        // Inset labelled field, as NanoVNA's sweep fields.
-        let response = tune_style::inset(ui, |ui| {
-            ui.add(
-                egui::Slider::new(&mut value, 0u32..=max)
-                    .integer()
-                    .step_by(f64::from(step))
-                    .suffix(" dB")
-                    .text(if lna { "LNA" } else { "VGA" })
-                    .trailing_fill(true),
-            )
-        });
+        // Instrument-style field, one key row tall (NanoVNA look).
+        let response = tune_style::gain_slider(ui, if lna { "LNA" } else { "VGA" }, &mut value, max, step);
         let notch = if lna { "8 dB" } else { "2 dB" };
         let stage = if lna { "LNA" } else { "VGA" };
         let response = response.on_hover_text(format!(
