@@ -114,3 +114,8 @@ LNA/VGA on the Tune SPECTRUM · GAIN row use `tune_style::gain_slider` instead o
 ## Tune frame tightened (2026-10-30)
 
 Tune tuning screen margins 10 → left 8 / right 6 / top 4 / bottom 6 (`TUNE_SCREEN_MARGIN`, `lcd_panel_in`; other LCD panels keep 10). VFO key grid: key height 24 → 23, label padding 16 → 14 (2 px narrower keys), gap 4 → 3, group frame margin 6 → 3, space between VFO stack and grid 16 → 12. Frame 212 → 187 px tall (25 px to the panes below); grid starts 15 px under the bezel top (was 24); with the sub VFO shown the VFO+grid row is 21 px narrower. Test `tune_frame_is_tight_around_the_vfo_keys`.
+
+## Tune scope AUTO FLOOR (2026-10-31)
+
+Old scaling (unchanged with Auto Floor off): the trace is already dB (FFT power in dB); the axis top was the strongest finite bin of the current frame and the span a fixed 70 dB in 7 x 10 dB divisions, labels on odd lines, so labels were not round numbers and the axis jumped with the peak every frame. Most of the height was noise when signals were < 40 dB over the floor.
+New `scope_axis.rs`: noise = 20th percentile of finite bins, peak = max; target bottom = noise - 8, top = max(peak + 6, bottom + 30). Each edge ignores changes <= 2 dB and moves at most 1 dB/frame; drawn edges are rounded outwards to 5 dB (span <= 40), 10 dB (<= 80) or 20 dB steps. Reset on Avg/Peak switch, toggle or station load. No data / NaN / inf: keep the last axis, else the manual axis. Station file field `spectrum_auto_floor` (bool, default true, written only when false, so default files are byte-identical; an older build refuses a file that has it set false because of deny_unknown_fields). Header shows `AUTO`; the key has ●/○.

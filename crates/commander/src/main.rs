@@ -38,6 +38,7 @@ mod hfdata;
 mod toggle;
 mod render;
 mod redraw;
+mod scope_axis;
 mod tune_style;
 mod tx_lockout;
 mod vna_devices;
@@ -558,6 +559,9 @@ struct App {
     hackrf_probe_note: String,
     /// Peak holds the spectrum trace. Clear is the running average.
     spectrum_peak: bool,
+    /// Tune scope AUTO FLOOR (station file `spectrum_auto_floor`, default on).
+    spectrum_auto_floor: bool,
+    spectrum_axis: scope_axis::AutoFloor,
     /// LNA position while that slider is dragging. The dongle is unchanged.
     gain_drag_lna: Option<u32>,
     /// VGA position while that slider is dragging. The dongle is unchanged.
@@ -2546,6 +2550,8 @@ impl App {
             hackrf_seen: Vec::new(),
             hackrf_probe_note: String::new(),
             spectrum_peak: false,
+            spectrum_auto_floor: true,
+            spectrum_axis: scope_axis::AutoFloor::default(),
             gain_drag_lna: None,
             gain_drag_vga: None,
             hackrf_gain_hold: None,
@@ -7576,6 +7582,7 @@ impl App {
             meters: self.meters_face(),
             nanovna: self.tools.lock().expect("tools").nanovna_face(),
             pulse: self.pulse_on,
+            spectrum_auto_floor: self.spectrum_auto_floor,
             pulse_secs: self.pulse_secs,
             voice_hang_ms: self.voice_hang_ms,
             override_hold_emergency_priority: self.override_hold,
@@ -7647,6 +7654,7 @@ impl App {
             meters,
             nanovna,
             pulse,
+            spectrum_auto_floor,
             pulse_secs,
             voice_hang_ms,
             override_hold_emergency_priority,
@@ -7663,6 +7671,8 @@ impl App {
         self.patchbay = patchbay;
         self.patchbay_ui = Default::default();
         self.pulse_on = pulse;
+        self.spectrum_auto_floor = spectrum_auto_floor;
+        self.spectrum_axis.reset();
         self.pulse_secs = pulse_secs;
         self.voice_hang_ms = voice_hang_ms;
         self.override_hold = override_hold_emergency_priority;
@@ -11951,9 +11961,19 @@ impl App {
             ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
             if tune_style::toggle(ui, "Avg", true, !self.spectrum_peak, bar_key_hue("Avg", KeyLamp::Dark)).clicked() {
                 self.spectrum_peak = false;
+                self.spectrum_axis.reset();
             }
             if tune_style::toggle(ui, "Peak", true, self.spectrum_peak, bar_key_hue("Peak", KeyLamp::Dark)).clicked() {
                 self.spectrum_peak = true;
+                self.spectrum_axis.reset();
+            }
+            // Bottom of the dB axis follows the noise floor (David, 2026-10-31).
+            if tune_style::toggle(ui, "Auto Floor", true, self.spectrum_auto_floor, bar_key_hue("Auto Floor", KeyLamp::Dark))
+                .on_hover_text("AUTO FLOOR: the dB axis starts a few dB under the noise floor and ends just above the strongest signal. Off: the strongest signal at the top, 70 dB down.")
+                .clicked()
+            {
+                self.spectrum_auto_floor = !self.spectrum_auto_floor;
+                self.spectrum_axis.reset();
             }
             if let Some(row) = radio.as_ref() {
                 ui.add_space(8.0);
@@ -11989,9 +12009,16 @@ impl App {
                 &self.spectrum_avg
             };
             let rate = crate::hackrf::SAMPLE_RATE as f64;
+            let auto = self.spectrum_auto_floor;
+            let axis = if auto {
+                self.spectrum_axis.update(trace).unwrap_or(scope_axis::Axis::manual(trace))
+            } else {
+                scope_axis::Axis::manual(trace)
+            };
             let header = format!(
-                "SPEC  {}  CTR {:.4} MHz  SPAN {:.1} MHz",
+                "SPEC  {}{}  CTR {:.4} MHz  SPAN {:.1} MHz",
                 if self.spectrum_peak { "PEAK" } else { "AVG" },
+                if auto { " AUTO" } else { "" },
                 center / 1e6,
                 rate / 1e6
             );
@@ -12019,6 +12046,8 @@ impl App {
                     needle_hz: freq,
                     height,
                     status: &status,
+                    axis,
+                    auto,
                 },
             );
             if let Some(hz) = pick {

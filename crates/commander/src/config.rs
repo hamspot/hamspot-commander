@@ -112,6 +112,10 @@ pub struct ConfigFile {
     /// The speaker mark stays when this is off.
     #[serde(default = "default_pulse", skip_serializing_if = "is_pulse_on")]
     pub pulse: bool,
+    /// Tune scope AUTO FLOOR. Absent (older files) means on; written only
+    /// when off, so files stay unchanged for the default.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub spectrum_auto_floor: bool,
     /// Seconds for one brightness cycle. Absent means two seconds.
     #[serde(default = "default_pulse_secs", skip_serializing_if = "is_default_pulse_secs")]
     pub pulse_secs: f64,
@@ -797,6 +801,7 @@ mod tests {
             meters: MetersFace::default(),
             nanovna: crate::tools::nanovna::Face::default(),
             pulse: true,
+            spectrum_auto_floor: true,
             pulse_secs: crate::pulse::PERIOD_DEFAULT,
             voice_hang_ms: default_voice_hang_ms(),
             override_hold_emergency_priority: true,
@@ -1160,6 +1165,18 @@ mod tests {
         assert!(loaded.talkgroups.zones[0].talkgroups.is_empty());
         assert!(loaded.units.is_empty());
         assert!(!text.contains("\"units\""));
+    }
+
+    #[test]
+    fn auto_floor_defaults_on_and_off_round_trips() {
+        let mut file = sample();
+        let text = to_string(&file).unwrap();
+        assert!(!text.contains("spectrum_auto_floor"), "default not written");
+        assert!(parse(&text).unwrap().spectrum_auto_floor);
+        file.spectrum_auto_floor = false;
+        let text = to_string(&file).unwrap();
+        assert!(text.contains("\"spectrum_auto_floor\": false"));
+        assert!(!parse(&text).unwrap().spectrum_auto_floor);
     }
 
     #[test]

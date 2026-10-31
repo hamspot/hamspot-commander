@@ -409,6 +409,10 @@ pub struct Chart<'a> {
     pub needle_hz: f64,
     pub height: f32,
     pub status: &'a str,
+    /// Vertical axis (dB); `Axis::manual` is the original fixed 70 dB view.
+    pub axis: crate::scope_axis::Axis,
+    /// AUTO FLOOR: label every grid line of the clean axis.
+    pub auto: bool,
 }
 
 /// NanoVNA chart: header line, dark pane with labelled graticule, status strip.
@@ -425,8 +429,11 @@ pub fn spectrum_chart(ui: &mut egui::Ui, c: Chart) -> (Option<f64>, Rect) {
     let rate = if c.rate_hz.is_finite() && c.rate_hz > 0.0 { c.rate_hz } else { 1.0 };
     let center = if c.center_hz.is_finite() { c.center_hz } else { 0.0 };
     let (lo, hi) = (center - rate / 2.0, center + rate / 2.0);
-    let top = c.db.iter().copied().filter(|v| v.is_finite()).fold(f32::MIN, f32::max);
-    let (floor, span) = (if top > f32::MIN / 2.0 { top - 70.0 } else { -70.0 }, 70.0f32);
+    let ax = c.axis;
+    let floor = if ax.bottom.is_finite() { ax.bottom } else { -70.0 };
+    let span = if (ax.top - ax.bottom).is_finite() && ax.top > ax.bottom { ax.top - ax.bottom } else { 70.0 };
+    let step = if ax.step.is_finite() && ax.step > 0.0 { ax.step } else { 10.0 };
+    let n = ((span / step).round() as usize).clamp(1, 20);
     for i in 0..=10 {
         let x = band.left() + band.width() * i as f32 / 10.0;
         p.line_segment([Pos2::new(x, band.top()), Pos2::new(x, band.bottom())], Stroke::new(1.0, if i % 5 == 0 { GRID } else { GRID_FAINT }));
@@ -436,11 +443,12 @@ pub fn spectrum_chart(ui: &mut egui::Ui, c: Chart) -> (Option<f64>, Rect) {
             p.text(Pos2::new(x, band.bottom() + 2.0), align, format!("{:.3}", hz / 1e6), font.clone(), palette::TEXT_MUTED);
         }
     }
-    for i in 0..=7 {
-        let y = band.bottom() - band.height() * i as f32 / 7.0;
-        p.line_segment([Pos2::new(band.left(), y), Pos2::new(band.right(), y)], Stroke::new(1.0, if i == 0 || i == 7 { GRID } else { GRID_FAINT }));
-        if i % 2 == 1 || i == 7 {
-            p.text(Pos2::new(band.left() - 4.0, y), egui::Align2::RIGHT_CENTER, format!("{:.0}", floor + span * i as f32 / 7.0), font.clone(), palette::TEXT_MUTED);
+    for i in 0..=n {
+        let y = band.bottom() - band.height() * i as f32 / n as f32;
+        p.line_segment([Pos2::new(band.left(), y), Pos2::new(band.right(), y)], Stroke::new(1.0, if i == 0 || i == n { GRID } else { GRID_FAINT }));
+        let label = if c.auto { n <= 8 || i % 2 == 0 || i == n } else { i % 2 == 1 || i == n };
+        if label {
+            p.text(Pos2::new(band.left() - 4.0, y), egui::Align2::RIGHT_CENTER, format!("{:.0}", floor + span * i as f32 / n as f32), font.clone(), palette::TEXT_MUTED);
         }
     }
     if c.usable_hz.is_finite() && c.usable_hz > 0.0 && c.usable_hz < rate {
@@ -578,7 +586,7 @@ mod tests {
             run(&ctx, w, h, &mut |ui| {
                 ui.add_space(120.0);
                 let height = spectrum_height(ui, 0.0);
-                let c = Chart { header: "SPEC AVG", header_right: "LNA 16 dB", center_hz: 146e6, rate_hz: 2e6, usable_hz: 1.75e6, db: &db, needle_hz: 146.1e6, height, status: "ok" };
+                let c = Chart { header: "SPEC AVG", header_right: "LNA 16 dB", center_hz: 146e6, rate_hz: 2e6, usable_hz: 1.75e6, db: &db, needle_hz: 146.1e6, height, status: "ok", axis: crate::scope_axis::Axis::manual(&db), auto: false };
                 got = spectrum_chart(ui, c).1;
             });
             let screen = Rect::from_min_size(Pos2::ZERO, vec2(w, h));
@@ -626,7 +634,7 @@ mod tests {
                     }
                 },
                 |ui, ph| {
-                    let c = Chart { header: "SPEC AVG", header_right: "LNA 40 dB  VGA 32 dB", center_hz: 146e6, rate_hz: 8e6, usable_hz: 6e6, db: &db, needle_hz: 146.1e6, height: ph, status: "ok" };
+                    let c = Chart { header: "SPEC AVG", header_right: "LNA 40 dB  VGA 32 dB", center_hz: 146e6, rate_hz: 8e6, usable_hz: 6e6, db: &db, needle_hz: 146.1e6, height: ph, status: "ok", axis: crate::scope_axis::Axis::manual(&db), auto: false };
                     chart = spectrum_chart(ui, c).1;
                 },
             ));
@@ -699,7 +707,7 @@ mod tests {
                 };
                 if hackrf {
                     keys_and_scope(ui, p.top, rows, |ui, h| {
-                        let c = Chart { header: "SPEC", header_right: "", center_hz: 1e8, rate_hz: 8e6, usable_hz: 6e6, db: &[], needle_hz: 1e8, height: h, status: "NO CAPTURE" };
+                        let c = Chart { header: "SPEC", header_right: "", center_hz: 1e8, rate_hz: 8e6, usable_hz: 6e6, db: &[], needle_hz: 1e8, height: h, status: "NO CAPTURE", axis: crate::scope_axis::Axis::manual(&[]), auto: false };
                         spectrum_chart(ui, c);
                     });
                 } else {
@@ -884,6 +892,33 @@ mod tests {
                 }
             }
             assert_eq!(texts, 4, "captions and values drawn at {w}");
+        }
+    }
+
+    /// AUTO FLOOR draws the clean axis: every label is a multiple of the step,
+    /// the bottom label sits under the noise and the top over the carrier;
+    /// with auto off the labels are the original top-70 dB set.
+    #[test]
+    fn auto_floor_axis_labels_are_clean_and_auto_off_is_unchanged() {
+        let db: Vec<f32> = (0..512).map(|i| if i == 250 { -30.0 } else { -80.0 + (i % 5) as f32 * 0.4 }).collect();
+        for auto in [true, false] {
+            let axis = if auto { crate::scope_axis::AutoFloor::default().update(&db).unwrap() } else { crate::scope_axis::Axis::manual(&db) };
+            let ctx = ctx();
+            let out = run(&ctx, 900.0, 500.0, &mut |ui| {
+                let c = Chart { header: "SPEC AVG AUTO", header_right: "", center_hz: 146e6, rate_hz: 2e6, usable_hz: 1.75e6, db: &db, needle_hz: 146.1e6, height: 300.0, status: "ok", axis, auto };
+                spectrum_chart(ui, c);
+            });
+            let labels: Vec<f32> = out.shapes.iter().filter_map(|c| match &c.shape {
+                egui::Shape::Text(t) => t.galley.text().parse::<f32>().ok().filter(|v| *v <= 50.0 && *v >= -200.0 && !t.galley.text().contains('.')),
+                _ => None,
+            }).collect();
+            if auto {
+                assert_eq!(axis, crate::scope_axis::Axis { bottom: -90.0, top: -20.0, step: 10.0 });
+                assert!(labels.contains(&-90.0) && labels.contains(&-20.0), "{labels:?}");
+                assert!(labels.iter().all(|v| v % 10.0 == 0.0), "{labels:?}");
+            } else {
+                assert_eq!(labels, vec![-90.0, -70.0, -50.0, -30.0], "original labels");
+            }
         }
     }
 }
