@@ -8,7 +8,7 @@
 //! otherwise from the model preset. Issues #77-#86.
 pub mod geom;
 mod horizon;
-mod led;
+pub(crate) mod led;
 pub mod map;
 
 use std::sync::Arc;

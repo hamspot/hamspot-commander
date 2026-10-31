@@ -143,6 +143,69 @@ pub fn gain_slider(ui: &mut egui::Ui, label: &str, value: &mut u32, max: u32, st
     resp
 }
 
+/// VFD-style VFO digits (David, 2026-10-31): lit segment core, two
+/// translucent glow strokes behind it, and a very faint ghost for unlit ones.
+pub const VFD_LIT: Color32 = Color32::from_rgb(0x5C, 0xD6, 0xFF);
+pub const VFD_GLOW_OUTER: Color32 = Color32::from_rgba_premultiplied(0x0C, 0x24, 0x30, 0x30);
+pub const VFD_GLOW_INNER: Color32 = Color32::from_rgba_premultiplied(0x1C, 0x50, 0x68, 0x68);
+pub const VFD_GHOST: Color32 = Color32::from_rgba_premultiplied(0x08, 0x12, 0x18, 0x40);
+/// Underline under the selected (step) digit, so it is not colour alone.
+pub const VFD_CURSOR: Color32 = palette::TEXT;
+
+/// Segment strokes (a..g) for one digit cell inside `rect`, inset so the
+/// widest glow stroke stays inside the rect. Returns (segments, stroke width).
+pub fn vfd_segments(rect: Rect) -> ([[Pos2; 2]; 7], f32) {
+    let h = rect.height() * 0.74;
+    let w = (rect.width() * 0.62).min(h * 0.56);
+    let th = (h * 0.10).max(1.5);
+    let x0 = rect.center().x - w / 2.0;
+    let top = rect.center().y - h / 2.0;
+    let mid = top + h / 2.0;
+    let bot = top + h;
+    let p = |x: f32, y: f32| Pos2::new(x, y);
+    let mut segs = [
+        [p(x0, top), p(x0 + w, top)],
+        [p(x0 + w, top), p(x0 + w, mid)],
+        [p(x0 + w, mid), p(x0 + w, bot)],
+        [p(x0, bot), p(x0 + w, bot)],
+        [p(x0, mid), p(x0, bot)],
+        [p(x0, top), p(x0, mid)],
+        [p(x0, mid), p(x0 + w, mid)],
+    ];
+    for s in &mut segs {
+        let d = (s[1] - s[0]).normalized() * th * 0.7;
+        *s = [s[0] + d, s[1] - d];
+    }
+    (segs, th)
+}
+
+/// Paint one VFO character as VFD seven-segment (digits) or an LED dot ('.').
+/// Uses the Rotator LED segment table. Cheap: 3 strokes per lit segment.
+pub fn vfd_char(p: &egui::Painter, rect: Rect, ch: char) {
+    if ch == '.' {
+        let r = (rect.height() * 0.06).max(1.5);
+        let c = Pos2::new(rect.center().x, rect.center().y + rect.height() * 0.37 - r);
+        p.circle_filled(c, r * 2.0, VFD_GLOW_OUTER);
+        p.circle_filled(c, r * 1.5, VFD_GLOW_INNER);
+        p.circle_filled(c, r, VFD_LIT);
+        return;
+    }
+    let (segs, th) = vfd_segments(rect);
+    let bits = crate::tools::rotator::led::segments(ch);
+    for (n, s) in segs.iter().enumerate() {
+        if bits & (1 << n) == 0 {
+            p.line_segment(*s, Stroke::new(th, VFD_GHOST));
+        }
+    }
+    for (n, s) in segs.iter().enumerate() {
+        if bits & (1 << n) != 0 {
+            p.line_segment(*s, Stroke::new(th * 2.2, VFD_GLOW_OUTER));
+            p.line_segment(*s, Stroke::new(th * 1.5, VFD_GLOW_INNER));
+            p.line_segment(*s, Stroke::new(th, VFD_LIT));
+        }
+    }
+}
+
 /// Height for the spectrum pane: fill what is left, bounded, never NaN.
 pub fn spectrum_height(ui: &egui::Ui, reserve: f32) -> f32 {
     let room = ui.available_height().min(ui.clip_rect().bottom() - ui.cursor().top());
@@ -920,5 +983,51 @@ mod tests {
                 assert_eq!(labels, vec![-90.0, -70.0, -50.0, -30.0], "original labels");
             }
         }
+    }
+
+    /// VFD VFO digits: each of 0-9 lights exactly its segment set (lit core
+    /// strokes in VFD_LIT, the rest faint ghosts), the dot is an LED dot,
+    /// everything (glow included) stays inside the digit block, no black strokes.
+    #[test]
+    fn vfd_digits_light_the_right_segments_inside_the_block() {
+        let want: [u8; 10] = [0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F];
+        for scale in [0.9f32, 0.63] {
+            for (d, bits) in want.iter().enumerate() {
+                let ch = char::from_digit(d as u32, 10).unwrap();
+                let ctx = ctx();
+                // Block the size of a 48 px monospace digit button at this scale.
+                let block = Rect::from_min_size(Pos2::new(20.0, 20.0), vec2(36.0 * scale, 62.0 * scale));
+                let out = run(&ctx, 200.0, 200.0, &mut |ui| {
+                    vfd_char(&ui.painter_at(block), block, ch);
+                });
+                let (segs, th) = vfd_segments(block);
+                let mut lit = 0u8;
+                for c in &out.shapes {
+                    match &c.shape {
+                        egui::Shape::LineSegment { points, stroke } => {
+                            assert_ne!(stroke.color, Color32::BLACK, "black stroke");
+                            let half = stroke.width / 2.0;
+                            for q in points {
+                                assert!(block.shrink(half - 0.01).contains(*q), "glow leaves the block: {q:?} {d}");
+                            }
+                            if stroke.color == VFD_LIT {
+                                let n = segs.iter().position(|s| s == points).expect("lit stroke is a segment");
+                                lit |= 1 << n;
+                                assert_eq!(stroke.width, th);
+                            }
+                        }
+                        other => panic!("unexpected shape {other:?}"),
+                    }
+                }
+                assert_eq!(lit, *bits, "digit {d}");
+            }
+        }
+        let ctx = ctx();
+        let block = Rect::from_min_size(Pos2::new(20.0, 20.0), vec2(20.0, 56.0));
+        let out = run(&ctx, 200.0, 200.0, &mut |ui| vfd_char(&ui.painter_at(block), block, '.'));
+        let dots: Vec<_> = out.shapes.iter().filter_map(|c| match &c.shape { egui::Shape::Circle(c) => Some(*c), _ => None }).collect();
+        assert_eq!(dots.len(), 3);
+        assert!(dots.iter().all(|c| block.contains_rect(Rect::from_center_size(c.center, vec2(c.radius * 2.0, c.radius * 2.0)))));
+        assert!(dots.iter().any(|c| c.fill == VFD_LIT));
     }
 }

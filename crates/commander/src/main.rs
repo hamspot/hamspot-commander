@@ -11826,22 +11826,41 @@ impl App {
                 let pointer = ui.input(|i| i.pointer.hover_pos());
                 let mut hovered_step = None;
                 for (ch, step) in digit_steps(freq) {
+                    // The glyph keeps its size and hit area but is drawn
+                    // transparent; the VFD segments are painted on top.
                     let Some(step) = step else {
-                        ui.label(
+                        let r = ui.label(
                             egui::RichText::new(ch.to_string())
                                 .size(48.0 * scale)
                                 .strong()
-                                .monospace(),
+                                .monospace()
+                                .color(egui::Color32::TRANSPARENT),
                         );
+                        tune_style::vfd_char(&ui.painter_at(r.rect), r.rect, ch);
                         continue;
                     };
                     let selected = (step - self.step_hz).abs() < 0.1;
                     let text = egui::RichText::new(ch.to_string())
                         .size(48.0 * scale)
                         .strong()
-                        .monospace();
+                        .monospace()
+                        .color(egui::Color32::TRANSPARENT);
                     let response =
                         ui.add_enabled(can_tune, egui::Button::new(text).selected(selected));
+                    let cell = response.rect.shrink2(ui.spacing().button_padding * 0.5);
+                    let mut painter = ui.painter_at(response.rect);
+                    if !can_tune {
+                        painter.multiply_opacity(0.45);
+                    }
+                    tune_style::vfd_char(&painter, cell, ch);
+                    if selected {
+                        // Step cursor: underline, not colour alone.
+                        let y = response.rect.bottom() - 3.0;
+                        painter.line_segment(
+                            [egui::pos2(response.rect.left() + 4.0, y), egui::pos2(response.rect.right() - 4.0, y)],
+                            egui::Stroke::new(2.0, tune_style::VFD_CURSOR),
+                        );
+                    }
                     // The pointer position, not widget hover: a later hover
                     // sense would sit on top of these buttons and steal it.
                     if pointer.is_some_and(|pos| response.rect.contains(pos)) {

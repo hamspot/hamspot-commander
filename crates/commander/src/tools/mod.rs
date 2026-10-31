@@ -4,7 +4,7 @@
 mod calculator;
 pub(crate) mod ham_rf;
 mod hexview;
-mod rotator;
+pub(crate) mod rotator;
 pub mod nanovna;
 pub(crate) mod smith;
 mod station_log;
