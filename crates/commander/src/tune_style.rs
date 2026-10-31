@@ -210,7 +210,11 @@ impl GridKey {
 }
 
 /// Compact grid key height and font (smaller than the page keys).
-pub const GRID_KEY_H: f32 = 24.0;
+pub const GRID_KEY_H: f32 = 23.0;
+/// Gap between grid keys (rows and columns).
+pub const GRID_GAP: f32 = 3.0;
+/// Horizontal padding around the widest label.
+pub const GRID_PAD: f32 = 14.0;
 pub const GRID_FONT: f32 = 13.0;
 
 /// One size for every key: the widest label plus the ●/○ marker and padding.
@@ -220,7 +224,7 @@ pub fn grid_key_size(ui: &mut egui::Ui, keys: &[GridKey]) -> egui::Vec2 {
         .iter()
         .map(|k| ui.fonts_mut(|f| f.layout_no_wrap(format!("● {}", k.label.to_uppercase()), font.clone(), Color32::WHITE).size().x))
         .fold(0.0, f32::max);
-    vec2((w + 16.0).ceil(), GRID_KEY_H)
+    vec2((w + GRID_PAD).ceil(), GRID_KEY_H)
 }
 
 /// Square (radius 0) key in its own hue. Latching keys carry a border and
@@ -266,7 +270,7 @@ pub fn grid_key(ui: &mut egui::Ui, k: &GridKey, size: egui::Vec2) -> egui::Respo
 /// Returns the index of the key clicked this frame.
 pub fn key_grid(ui: &mut egui::Ui, keys: &[GridKey], cols: usize) -> Option<usize> {
     let size = grid_key_size(ui, keys);
-    let gap = 4.0;
+    let gap = GRID_GAP;
     let fit = (((ui.available_width() + gap) / (size.x + gap)).floor() as usize).max(1);
     let cols = cols.min(fit).max(1);
     let mut hit = None;

@@ -1770,13 +1770,21 @@ const KEY_LIST_HEAD: [&str; 4] = ["Key ID", "Algorithm", "Status", "Name"];
 /// window and stretched the lists under it. The inner column is top-down and locked
 /// to the width still free, so the bezel cannot grow the page.
 fn lcd_panel(ui: &mut egui::Ui, body: impl FnOnce(&mut egui::Ui)) {
+    lcd_panel_in(ui, egui::Margin::same(10), body);
+}
+
+/// Screen margins of the Tune tuning frame: tight top so the VFO and keys
+/// start high and the freed height goes to the panes below (David, 2026-10-30).
+const TUNE_SCREEN_MARGIN: egui::Margin = egui::Margin { left: 8, right: 6, top: 4, bottom: 6 };
+
+fn lcd_panel_in(ui: &mut egui::Ui, margin: egui::Margin, body: impl FnOnce(&mut egui::Ui)) {
     let bezel = egui::Frame::new()
         .fill(egui::Color32::from_rgb(42, 42, 46))
         .inner_margin(7)
         .corner_radius(8);
     let screen = egui::Frame::new()
         .fill(egui::Color32::from_rgb(8, 8, 6))
-        .inner_margin(10)
+        .inner_margin(margin)
         .corner_radius(3);
     bezel.show(ui, |ui| {
         screen.show(ui, |ui| {
@@ -3628,7 +3636,7 @@ impl App {
         let freq = self.shown_freq(snap);
         let sub_freq = self.shown_sub_freq(snap);
         let status = self.tune_status();
-        lcd_panel(ui, |ui| {
+        lcd_panel_in(ui, TUNE_SCREEN_MARGIN, |ui| {
             // Main VFO with the sub VFO stacked under it, then the VFO keys.
             // Wraps instead of clipping at the right edge.
             ui.horizontal_wrapped(|ui| {
@@ -3639,8 +3647,8 @@ impl App {
                         self.vfo_cluster(ui, snap, false, sub_freq);
                     }
                 });
-                ui.add_space(16.0);
-                egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.add_space(12.0);
+                egui::Frame::group(ui.style()).inner_margin(3).show(ui, |ui| {
                     self.vfo_column(ui, snap);
                 });
             });
@@ -13467,6 +13475,63 @@ mod config_sections_tests {
 
     /// The page tabs (plus a TG and an ID tab) fit a 1400 px window: no more
     /// key there.
+    /// David: less black above the VFO keys, narrower grid. Draws the Tune
+    /// screen with the real key grid at 1024 and 1400 wide: equal keys, the
+    /// grid starts 15 px below the bezel top (was 24), the frame is 25 px
+    /// shorter than with the old margins/sizes, and nothing clips.
+    #[test]
+    fn tune_frame_is_tight_around_the_vfo_keys() {
+        let keys: Vec<tune_style::GridKey> = ["A <> B", "R-6kHz", "A > B", "R-3kHz", "A > Mem", "R-15kHz", "Mem > A", "R-Auto", "TX main", "TX sub", "VFO A", "VFO B"]
+            .iter()
+            .enumerate()
+            .map(|(i, l)| if i % 2 == 0 { tune_style::GridKey::action(l, true) } else { tune_style::GridKey::toggle(l, true, i == 1) })
+            .collect();
+        for w in [1024.0f32, 1400.0] {
+            let ctx = egui::Context::default();
+            rustcars::install_lcars_font(&ctx);
+            rustcars::apply_theme(&ctx, &rustcars::LcarsTheme::default());
+            let mut frame = egui::Rect::NOTHING;
+            let mut grid = egui::Rect::NOTHING;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, 550.0))),
+                ..Default::default()
+            };
+            let mut out = egui::FullOutput::default();
+            for _ in 0..2 {
+                out = ctx.run_ui(input.clone(), |ui| {
+                    let top = ui.cursor().top();
+                    lcd_panel_in(ui, TUNE_SCREEN_MARGIN, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.allocate_exact_size(egui::vec2(600.0, 120.0), egui::Sense::hover());
+                            ui.add_space(12.0);
+                            grid = egui::Frame::group(ui.style()).inner_margin(3).show(ui, |ui| {
+                                tune_style::key_grid(ui, &keys, 2);
+                            }).response.rect;
+                        });
+                    });
+                    frame = egui::Rect::from_x_y_ranges(0.0..=w, top..=ui.cursor().top());
+                });
+                out.textures_delta.clear();
+            }
+            let caps: Vec<egui::Rect> = out.shapes.iter().filter_map(|c| match &c.shape {
+                egui::Shape::Rect(r) if r.rect.height() == tune_style::GRID_KEY_H && r.fill.a() > 0 => Some(r.rect),
+                _ => None,
+            }).collect();
+            assert_eq!(caps.len(), 12, "12 keys at {w}");
+            assert!(caps.iter().all(|r| (r.size() - caps[0].size()).length() < 0.01), "keys differ");
+            let top = caps.iter().map(|r| r.top()).fold(f32::MAX, f32::min);
+            assert!(top - frame.top() <= 15.5, "grid starts {} below the bezel at {w}", top - frame.top());
+            let grid_h = 6.0 * tune_style::GRID_KEY_H + 5.0 * tune_style::GRID_GAP;
+            assert_eq!(grid_h, 153.0);
+            // Old: 6x24 + 5x4 keys, group 6+6 margin + 2 stroke, screen 10+10,
+            // bezel 7+7 => 164+14+20+14 = 212. New: 153+8+10+14 = 185 (+2 layout).
+            let old_h = 164.0 + 14.0 + 20.0 + 14.0 + 2.0;
+            assert!(frame.height() <= old_h - 25.0 + 0.5, "frame {} tall at {w}", frame.height());
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, 550.0));
+            assert!(caps.iter().all(|r| screen.contains_rect(*r)) && screen.contains_rect(grid), "clipped at {w}");
+        }
+    }
+
     /// Every tab the page row can save is a name the station file accepts.
     #[test]
     fn every_page_tab_is_a_known_station_tab() {

@@ -110,3 +110,7 @@ David (annotated screenshot): sub VFO under the main VFO, remove the Fine bar, r
 ## Tune gain fields (2026-10-30)
 
 LNA/VGA on the Tune SPECTRUM · GAIN row use `tune_style::gain_slider` instead of `egui::Slider` inside a rounded inset: one `KEY_H` row, square, 1 px border (trace colour on hover/focus), 11 px caption and value, 2 px track, 4x12 square handle. The track is 40-112 px and shrinks to the column width before clipping. Behaviour is the same: drag/click sets, wheel steps (handled by the caller as before), arrow keys step while focused, and the commit happens on drag stop / wheel / key. `tune_style::inset` removed (it was only used here). Other `egui::Slider`s (rotator speed, Config 1-10, audio/filter sliders) are unchanged.
+
+## Tune frame tightened (2026-10-30)
+
+Tune tuning screen margins 10 → left 8 / right 6 / top 4 / bottom 6 (`TUNE_SCREEN_MARGIN`, `lcd_panel_in`; other LCD panels keep 10). VFO key grid: key height 24 → 23, label padding 16 → 14 (2 px narrower keys), gap 4 → 3, group frame margin 6 → 3, space between VFO stack and grid 16 → 12. Frame 212 → 187 px tall (25 px to the panes below); grid starts 15 px under the bezel top (was 24); with the sub VFO shown the VFO+grid row is 21 px narrower. Test `tune_frame_is_tight_around_the_vfo_keys`.
