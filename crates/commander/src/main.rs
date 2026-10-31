@@ -199,7 +199,7 @@ use dial::{
     channel_dial, channel_window, digit_steps, format_hz, lock_toggle,
     merge_meter_order, meter, meter_columns, meter_faces, meter_hit, meter_origin, move_meter,
     order_with_clock, SYSTEM_CLOCK,
-    gqrx_dbfs_to_s9, needle_settled, paint_analog_meter, parse_freq, scale,
+    gqrx_dbfs_to_s9, needle_settled, paint_analog_meter, parse_freq,
     step_needle, strength_frac, strength_label, swatch, vfo_label, wheel_notches, zone_scale,
     MeterFace, Needle, PaintSpan, SubBand, HAM, METER_GAP, METER_H, METER_W,
 };
@@ -401,7 +401,6 @@ struct App {
     hold_freq: Option<f64>,
     hold_levels: HashMap<String, f64>,
     hold_pass: Option<i32>,
-    fine_lock: Option<(f64, f64)>,
     page: Page,
     /// Page to show when Tools is torn off. Clicking Tools then focuses that
     /// window. This is never `Page::Tools`.
@@ -434,12 +433,6 @@ struct App {
     mode_hold: Option<String>,
     /// Last split frequency and mode requested by a right-click on the bandspread.
     sub_freq_hold: Option<f64>,
-    /// Heights of the Tune VFO row from the previous frame. A horizontal row
-    /// pins a shorter neighbor to the top, so each piece is padded to the
-    /// tallest of the current VFO, the VFO button frame, and the paired VFO.
-    main_cluster_height: f32,
-    vfo_frame_height: f32,
-    sub_vfo_height: f32,
     sub_mode_hold: Option<String>,
     channels: channels::ChannelFile,
     channel_zone: usize,
@@ -2458,7 +2451,6 @@ impl App {
             hold_freq: None,
             hold_levels: HashMap::new(),
             hold_pass: None,
-            fine_lock: None,
             page: Page::Tune,
             page_return: Page::Tune,
             hf: hfdata::HfState::default(),
@@ -2476,9 +2468,6 @@ impl App {
             mode_hold: None,
             sub_freq_hold: None,
             sub_mode_hold: None,
-            main_cluster_height: 0.0,
-            vfo_frame_height: 0.0,
-            sub_vfo_height: 0.0,
             channels: channels::empty(),
             channel_zone: 0,
             zone_list_follow: true,
@@ -2974,21 +2963,19 @@ impl App {
 
     /// ±1.2 kHz around `freq`, cut off at the receive segment so the fine
     /// scale cannot offer a frequency the radio will not tune.
-    fn fine_window(&self, snap: &Snapshot, freq: f64) -> (f64, f64) {
-        if let Some(locked) = self.fine_lock {
-            return locked;
+    /// The tuning widget's status line: follow state and plan notes (a
+    /// refusal to transmit is a warning). Empty when there is nothing to say.
+    fn tune_status(&self) -> (String, bool) {
+        let mut parts = Vec::new();
+        if self.following() {
+            parts.push("FOLLOWING GPREDICT".to_string());
+        } else if self.following_control() {
+            parts.push("FOLLOWING CONTROL".to_string());
         }
-        let mut lo = freq - 1_200.0;
-        let mut hi = freq + 1_200.0;
-        if let Some(seg) = snap.caps.rx_segment(freq) {
-            lo = lo.max(seg.min);
-            hi = hi.min(seg.max);
+        if !self.plan_note.is_empty() {
+            parts.push(self.plan_note.clone());
         }
-        if lo > hi {
-            (freq, freq)
-        } else {
-            (lo, hi)
-        }
+        (parts.join("  ·  "), !self.plan_note.is_empty())
     }
 
     fn shown_level(&mut self, name: &str, snap: &Snapshot) -> f64 {
@@ -3166,9 +3153,6 @@ impl eframe::App for App {
             self.plan_note_ptt = false;
         }
         let ctx = ui.ctx().clone();
-        if ctx.input(|i| i.pointer.any_released()) {
-            self.fine_lock = None;
-        }
 
         // One row, at the top of the window. A later tab scrolls sideways instead of wrapping onto
         // a second line and pushing the page body down. Tools detach with the page pill.
@@ -3643,68 +3627,25 @@ impl App {
     fn page_tune(&mut self, ui: &mut egui::Ui, snap: &mut Snapshot) {
         let freq = self.shown_freq(snap);
         let sub_freq = self.shown_sub_freq(snap);
+        let status = self.tune_status();
         lcd_panel(ui, |ui| {
-            if self.following() {
-                ui.label(
-                    egui::RichText::new("Following Gpredict")
-                        .monospace()
-                        .color(LCD_ORANGE),
-                );
-            } else if self.following_control() {
-                ui.label(
-                    egui::RichText::new("Following control")
-                        .monospace()
-                        .color(LCD_ORANGE),
-                );
-            }
-            ui.horizontal(|ui| {
-                let known_main = self.main_cluster_height;
-                let known_frame = self.vfo_frame_height;
-                let known_sub = self.sub_vfo_height;
-                let show_sub = !snap.sub_vfo.is_empty();
-                let row_h = known_main
-                    .max(known_frame)
-                    .max(if show_sub { known_sub } else { 0.0 });
-                let main_h = place_centered(ui, row_h, known_main, |ui| {
+            // Main VFO with the sub VFO stacked under it, then the VFO keys.
+            // Wraps instead of clipping at the right edge.
+            ui.horizontal_wrapped(|ui| {
+                ui.vertical(|ui| {
                     self.vfo_cluster(ui, snap, true, freq);
+                    if !snap.sub_vfo.is_empty() {
+                        ui.add_space(6.0);
+                        self.vfo_cluster(ui, snap, false, sub_freq);
+                    }
                 });
                 ui.add_space(16.0);
-                let frame_h = place_centered(ui, row_h, known_frame, |ui| {
-                    egui::Frame::group(ui.style()).show(ui, |ui| {
-                        self.vfo_column(ui, snap);
-                    });
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    self.vfo_column(ui, snap);
                 });
-                let sub_h = if show_sub {
-                    ui.add_space(16.0);
-                    place_centered(ui, row_h, known_sub, |ui| {
-                        self.vfo_cluster(ui, snap, false, sub_freq);
-                    })
-                } else {
-                    known_sub
-                };
-                let moved = (main_h - known_main).abs() > 0.5
-                    || (frame_h - known_frame).abs() > 0.5
-                    || (show_sub && (sub_h - known_sub).abs() > 0.5);
-                self.main_cluster_height = main_h;
-                self.vfo_frame_height = frame_h;
-                if show_sub {
-                    self.sub_vfo_height = sub_h;
-                }
-                if moved {
-                    ui.ctx()
-                        .request_discard("center the VFO frame with the readouts");
-                }
             });
-            ui.add_space(6.0);
-            let (lo, hi) = self.fine_window(snap, freq);
-            if let Some(hz) = scale(ui, "Fine", freq, lo, hi, HAM, 36.0, &[]) {
-                if self.fine_lock.is_none() {
-                    self.fine_lock = Some((lo, hi));
-                }
-                if self.can_tune_freq(snap, true) {
-                    self.tune(snap, hz);
-                }
-            }
+            // One status line for the tuning widget (follow state, plan refusals).
+            tune_style::status_line(ui, &status.0, status.1);
         });
         ui.add_space(4.0);
         // Keys left, scope right (NanoVNA layout); the BSP keeps its share below.
@@ -3794,15 +3735,21 @@ impl App {
                 this.hackrf_gain_keys(ui, snap);
             }
         };
+        // Below the tuning widget: keys (and scope) on top, the bandspread
+        // pane at the bottom. Each pane is clipped to its own rect so nothing
+        // is drawn over a neighbour (David, 2026-10-30).
+        let panes = tune_style::tune_panes(
+            egui::Rect::from_min_max(
+                egui::pos2(ui.max_rect().left(), ui.cursor().top()),
+                egui::pos2(ui.max_rect().right(), ui.max_rect().bottom().min(ui.clip_rect().bottom())),
+            ),
+            self.show_spread,
+        );
         if hackrf {
-            let bsp = if self.show_spread { 160.0 } else { 0.0 };
-            let top = ui.cursor().top();
-            let bottom = ui.max_rect().bottom().min(ui.clip_rect().bottom()) - bsp;
-            let area = egui::Rect::from_min_max(egui::pos2(ui.max_rect().left(), top), egui::pos2(ui.max_rect().right(), bottom.max(top)));
             let me = std::cell::RefCell::new((&mut *self, &mut *snap));
             tune_style::keys_and_scope(
                 ui,
-                area,
+                panes.top,
                 |ui| {
                     let mut g = me.borrow_mut();
                     let (this, snap) = &mut *g;
@@ -3815,10 +3762,11 @@ impl App {
                 },
             );
         } else {
-            keys(self, ui, snap);
+            tune_style::keys_only(ui, panes.top, |ui| keys(self, ui, snap));
         }
-        if self.show_spread {
-            ui.add_space(8.0);
+        if let Some(bsp_rect) = panes.bsp {
+            ui.scope_builder(egui::UiBuilder::new().max_rect(bsp_rect).id_salt("tune-bsp-pane"), |ui| {
+            ui.set_clip_rect(bsp_rect.intersect(ui.clip_rect()));
             // One line per zone. Subbands share that line, with a small gap
             // between them. The frequency wheel stays above this scroll.
             let frame = egui::Frame::group(ui.style());
@@ -3915,6 +3863,7 @@ impl App {
                     }
                 }
             }
+        });
         }
     }
 
@@ -12772,27 +12721,6 @@ fn scale_vfo(ui: &mut egui::Ui, scale: f32) {
     }
 }
 
-/// egui keeps a shorter widget on the top edge of a horizontal row. Pad it so
-/// its middle lines up with `row_h`. `known_h` is last frame's measurement;
-/// the returned height is this frame's.
-fn place_centered(
-    ui: &mut egui::Ui,
-    row_h: f32,
-    known_h: f32,
-    add: impl FnOnce(&mut egui::Ui),
-) -> f32 {
-    let pad = ((row_h - known_h) * 0.5).max(0.0);
-    let mut measured = 0.0;
-    ui.vertical(|ui| {
-        ui.spacing_mut().item_spacing.y = 0.0;
-        if pad > 0.0 {
-            ui.add_space(pad);
-        }
-        let piece = ui.scope(add);
-        measured = piece.response.rect.height();
-    });
-    measured
-}
 
 fn offline(last: &Snapshot, message: &str) -> Snapshot {
     let mut snap = last.clone();

@@ -236,16 +236,19 @@ The Tune page has the frequency frame (digits, VFO keys, the paired VFO), a band
 
 ## 5.1 The frequency readout
 
-The readout shows four MHz digits, then kHz and Hz groups: 14.153608 MHz is `0014.153.608`. The left readout is the current VFO, with the S-meter. The right readout, when the radio has one, is the paired VFO (A with B, Main with Sub). Tuning the right digits sets the split frequency.
+The readout shows four MHz digits, then kHz and Hz groups: 14.153608 MHz is `0014.153.608`. The top readout is the current VFO, with the S-meter. The smaller readout stacked under it, when the radio has one, is the paired VFO (A with B, Main with Sub); tuning its digits sets the split frequency. The VFO keys sit to their right and wrap below on a narrow window, so nothing is cut off.
 
 | Action | Result |
 | --- | --- |
 | Click a digit | Select that place and add one to it |
 | Wheel on a digit | Step that digit up or down, one step per notch |
 | Wheel elsewhere on the VFO block | Step the selected digit |
-| Drag the **Fine** scale under the digits | Fine-tune within the current window |
 
 The line under the digits shows the step size, such as `step 1 kHz`.
+
+The last line of the tuning display is its status line. It shows **FOLLOWING GPREDICT** or **FOLLOWING CONTROL** while the frequency follows Gpredict or a control channel, and band-plan notes such as a refused transmit, which start with `!`. It's always there (blank when there is nothing to say), so the page doesn't jump.
+
+Below the tuning display, the keys (and the HackRF scope) and the bandspread (`BSP`) each have their own area; neither draws over the other. The bandspread takes about a third of the height (80–200 px).
 
 <!-- screenshot: tune-02 — Scroll or click a digit to tune by that step. -->
 

@@ -124,6 +124,44 @@ pub fn split(area: Rect) -> Split {
     }
 }
 
+/// Bandspread share at the bottom of the Tune page when BSP is on.
+pub const BSP_MIN_H: f32 = 80.0;
+pub const BSP_MAX_H: f32 = 200.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TunePanes {
+    /// Keys (and scope) area.
+    pub top: Rect,
+    /// Bandspread pane, when shown.
+    pub bsp: Option<Rect>,
+}
+
+/// Split the area under the tuning widget into the keys/scope area and the
+/// bandspread pane; they never overlap.
+pub fn tune_panes(area: Rect, bsp: bool) -> TunePanes {
+    if !bsp {
+        return TunePanes { top: area, bsp: None };
+    }
+    let h = (area.height() * 0.35).clamp(BSP_MIN_H, BSP_MAX_H).min(area.height());
+    let bsp_r = Rect::from_min_max(Pos2::new(area.left(), area.bottom() - h), area.max);
+    let top = Rect::from_min_max(area.min, Pos2::new(area.right(), (bsp_r.top() - GAP).max(area.top())));
+    TunePanes { top, bsp: Some(bsp_r) }
+}
+
+/// Keys alone in `area` (no HackRF scope), scrolling and clipped.
+pub fn keys_only(ui: &mut egui::Ui, area: Rect, keys: impl FnOnce(&mut egui::Ui)) {
+    ui.scope_builder(egui::UiBuilder::new().max_rect(area).id_salt("tune-keys"), |ui| {
+        ui.set_clip_rect(area.intersect(ui.clip_rect()));
+        egui::ScrollArea::vertical()
+            .id_salt("tune-keys-scroll")
+            .max_height(area.height())
+            .min_scrolled_height(area.height())
+            .auto_shrink([false, true])
+            .show(ui, keys);
+    });
+    ui.advance_cursor_after_rect(area);
+}
+
 /// Lay out keys (scrolling if they do not fit) and the scope in `area`.
 pub fn keys_and_scope(
     ui: &mut egui::Ui,
@@ -133,6 +171,7 @@ pub fn keys_and_scope(
 ) -> Split {
     let sp = split(area);
     ui.scope_builder(egui::UiBuilder::new().max_rect(sp.keys).id_salt("tune-keys"), |ui| {
+        ui.set_clip_rect(sp.keys.intersect(ui.clip_rect()));
         egui::ScrollArea::vertical()
             .id_salt("tune-keys-scroll")
             .max_height(sp.keys.height())
@@ -141,10 +180,21 @@ pub fn keys_and_scope(
             .show(ui, keys);
     });
     ui.scope_builder(egui::UiBuilder::new().max_rect(sp.scope).id_salt("tune-scope"), |ui| {
+        ui.set_clip_rect(sp.scope.intersect(ui.clip_rect()));
         scope(ui, sp.pane_h());
     });
     ui.advance_cursor_after_rect(area);
     sp
+}
+
+/// Fixed-height status line (never appears or disappears, so nothing
+/// below it jumps). `warn` text is drawn in the caution colour and prefixed
+/// "!" so it does not rely on colour alone.
+pub fn status_line(ui: &mut egui::Ui, text: &str, warn: bool) -> Rect {
+    let shown = if warn && !text.is_empty() { format!("! {text}") } else { text.to_string() };
+    let ink = if warn { Color32::from_rgb(0xFF, 0xB0, 0x60) } else { palette::TEXT };
+    let r = strip(ui, &shown, "", ink);
+    r
 }
 
 fn strip(ui: &mut egui::Ui, left: &str, right: &str, ink: Color32) -> Rect {
@@ -356,7 +406,9 @@ mod tests {
     /// elbow frame plus the tuning widget above the split (measured on the
     /// 1024x550 screenshot: the keys started about 260 px down).
     const SIZES: [(f32, f32); 6] = [(1024.0, 550.0), (1280.0, 720.0), (1400.0, 900.0), (800.0, 500.0), (700.0, 600.0), (640.0, 480.0)];
-    const CHROME: f32 = 260.0;
+    /// Frame plus tuning widget with the sub VFO stacked under the main one
+    /// and the status line (estimated; the real widget needs a running App).
+    const CHROME: f32 = 300.0;
 
     fn tune_page(w: f32, h: f32) -> (Split, Vec<Rect>, Rect, Rect) {
         let ctx = ctx();
@@ -395,7 +447,14 @@ mod tests {
         for (w, h) in SIZES {
             let (sp, keys, chart, page) = tune_page(w, h);
             assert!(page.expand(0.5).contains_rect(chart), "scope pane out of the page at {w}x{h}: {chart:?}");
-            assert!(chart.height() >= SCOPE_MIN_H - 0.5, "scope only {} tall at {w}x{h}", chart.height());
+            // Below the window's own minimum (960x640) the page can be shorter
+            // than the scope minimum; then the scope takes all of it.
+            let need = SCOPE_MIN_H + 2.0 * STRIP_H;
+            if page.height() >= need {
+                assert!(chart.height() >= SCOPE_MIN_H - 0.5, "scope only {} tall at {w}x{h}", chart.height());
+            } else {
+                assert!(chart.height() >= page.height() - 2.0 * STRIP_H - 0.5, "scope not given the whole page at {w}x{h}");
+            }
             if page.height() >= SCOPE_MIN_H + 2.0 * STRIP_H + 8.0 + 60.0 || sp.two_col {
                 assert!(!keys.is_empty(), "no key visible at {w}x{h}");
             }
@@ -421,5 +480,74 @@ mod tests {
         let (sp, _, chart, _) = tune_page(1024.0, 550.0);
         assert!(sp.two_col);
         assert!(chart.height() >= SCOPE_MIN_H && chart.bottom() <= 550.0, "{chart:?}");
+    }
+
+    /// 1024x550 with BSP on: keys and the bandspread pane never overlap and
+    /// every shape is clipped to its own pane (David's overlap screenshot).
+    #[test]
+    fn bsp_pane_and_keys_do_not_overlap_at_1024x550() {
+        for hackrf in [false, true] {
+            let ctx = ctx();
+            let area = Rect::from_min_max(Pos2::new(8.0, CHROME), Pos2::new(1016.0, 542.0));
+            let p = tune_panes(area, true);
+            let bsp = p.bsp.unwrap();
+            assert!(p.top.bottom() <= bsp.top() - GAP + 0.5, "{p:?}");
+            assert!(bsp.height() >= BSP_MIN_H && area.contains_rect(bsp));
+            let mut key_clip = Rect::NOTHING;
+            let out = run(&ctx, 1024.0, 550.0, &mut |ui| {
+                let rows = |ui: &mut egui::Ui| {
+                    for cap in ["VFO · BAND", "MODE · RECEIVER", "FUNCTIONS"] {
+                        caption(ui, cap);
+                        ui.horizontal_wrapped(|ui| {
+                            for k in KEYS {
+                                toggle(ui, k, true, false, palette::TEAL);
+                            }
+                        });
+                    }
+                };
+                if hackrf {
+                    keys_and_scope(ui, p.top, rows, |ui, h| {
+                        let c = Chart { header: "SPEC", header_right: "", center_hz: 1e8, rate_hz: 8e6, usable_hz: 6e6, db: &[], needle_hz: 1e8, height: h, status: "NO CAPTURE" };
+                        spectrum_chart(ui, c);
+                    });
+                } else {
+                    keys_only(ui, p.top, rows);
+                }
+                ui.scope_builder(egui::UiBuilder::new().max_rect(bsp).id_salt("bsp"), |ui| {
+                    ui.set_clip_rect(bsp.intersect(ui.clip_rect()));
+                    for _ in 0..12 {
+                        ui.label("700  lte  n700  lteu");
+                    }
+                });
+                key_clip = p.top;
+            });
+            for c in &out.shapes {
+                let r = c.shape.visual_bounding_rect();
+                if !r.is_finite() || r.area() <= 0.0 {
+                    continue;
+                }
+                // A shape is drawn in exactly one pane: its clip never
+                // reaches into the other.
+                let in_bsp = c.clip_rect.intersects(bsp.shrink(1.0));
+                let in_top = c.clip_rect.intersects(key_clip.shrink(1.0));
+                assert!(!(in_bsp && in_top), "shape clip {:?} spans keys and BSP (hackrf {hackrf})", c.clip_rect);
+            }
+        }
+    }
+
+    #[test]
+    fn status_line_has_a_fixed_height_and_marks_warnings() {
+        let ctx = ctx();
+        let (mut a, mut b) = (Rect::NOTHING, Rect::NOTHING);
+        let out = run(&ctx, 600.0, 200.0, &mut |ui| {
+            a = status_line(ui, "", false);
+            b = status_line(ui, "Voice is refused on a CW segment", true);
+        });
+        assert_eq!(a.height(), b.height());
+        let texts: Vec<String> = out.shapes.iter().filter_map(|c| match &c.shape {
+            egui::Shape::Text(t) => Some(t.galley.text().to_owned()),
+            _ => None,
+        }).collect();
+        assert!(texts.iter().any(|t| t.starts_with("! Voice")), "{texts:?}");
     }
 }
