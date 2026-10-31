@@ -3644,8 +3644,6 @@ impl App {
                     self.vfo_column(ui, snap);
                 });
             });
-            // One status line for the tuning widget (follow state, plan refusals).
-            tune_style::status_line(ui, &status.0, status.1);
         });
         ui.add_space(4.0);
         // Keys left, scope right (NanoVNA layout); the BSP keeps its share below.
@@ -3738,13 +3736,18 @@ impl App {
         // Below the tuning widget: keys (and scope) on top, the bandspread
         // pane at the bottom. Each pane is clipped to its own rect so nothing
         // is drawn over a neighbour (David, 2026-10-30).
-        let panes = tune_style::tune_panes(
-            egui::Rect::from_min_max(
-                egui::pos2(ui.max_rect().left(), ui.cursor().top()),
-                egui::pos2(ui.max_rect().right(), ui.max_rect().bottom().min(ui.clip_rect().bottom())),
-            ),
-            self.show_spread,
+        let below = egui::Rect::from_min_max(
+            egui::pos2(ui.max_rect().left(), ui.cursor().top()),
+            egui::pos2(ui.max_rect().right(), ui.max_rect().bottom().min(ui.clip_rect().bottom())),
         );
+        // The page's one status strip (follow state, plan notes) sits at the
+        // very bottom, NanoVNA style, under the band plan (David, 2026-10-30).
+        let (below, status_rect) = tune_style::status_strip_split(below);
+        ui.scope_builder(egui::UiBuilder::new().max_rect(status_rect).id_salt("tune-status"), |ui| {
+            ui.set_clip_rect(status_rect.intersect(ui.clip_rect()));
+            tune_style::status_line(ui, &status.0, status.1);
+        });
+        let panes = tune_style::tune_panes(below, self.show_spread);
         if hackrf {
             let me = std::cell::RefCell::new((&mut *self, &mut *snap));
             tune_style::keys_and_scope(
@@ -11672,91 +11675,50 @@ impl App {
         });
     }
 
+    /// VFO keys: one fixed key size (widest label at the small font), two
+    /// columns beside a stacked main + sub VFO, four columns when there is
+    /// no sub VFO so the frame stays as short as the readout (David, 2026-10-30).
     fn vfo_column(&mut self, ui: &mut egui::Ui, snap: &Snapshot) {
-        ui.vertical(|ui| {
-            let can = snap.online();
-            two(ui, |ui| {
-                op_button(
-                    ui,
-                    can && snap.caps.vfo_ops.contains("XCHG"),
-                    "A <> B",
-                    || {
-                        self.send(Command::VfoOp("XCHG".into()));
-                    },
-                );
-                rit_button(ui, snap, "R-6kHz", -6_000, &|cmd| self.send(cmd));
-            });
-            two(ui, |ui| {
-                op_button(
-                    ui,
-                    can && snap.caps.vfo_ops.contains("CPY"),
-                    "A > B",
-                    || {
-                        self.send(Command::VfoOp("CPY".into()));
-                    },
-                );
-                rit_button(ui, snap, "R-3kHz", -3_000, &|cmd| self.send(cmd));
-            });
-            two(ui, |ui| {
-                if ui.add_enabled(can, egui::Button::new("A > Mem")).clicked() {
-                    self.local_mem = Some(snap.freq_hz);
+        let can = snap.online();
+        let rit = can && snap.caps.can_set_rit;
+        let split = can && snap.caps.can_set_split;
+        let main_tx = !snap.tx_vfo.contains('B');
+        let on_vfo = |n: &str| snap.vfo.eq_ignore_ascii_case(n);
+        let keys: [tune_style::GridKey; 12] = [
+            tune_style::GridKey::action("A <> B", can && snap.caps.vfo_ops.contains("XCHG")),
+            tune_style::GridKey::toggle("R-6kHz", rit, snap.rit_hz == -6_000),
+            tune_style::GridKey::action("A > B", can && snap.caps.vfo_ops.contains("CPY")),
+            tune_style::GridKey::toggle("R-3kHz", rit, snap.rit_hz == -3_000),
+            tune_style::GridKey::action("A > Mem", can),
+            tune_style::GridKey::toggle("R-15kHz", rit, snap.rit_hz == -15_000),
+            tune_style::GridKey::action("Mem > A", can && self.local_mem.is_some()),
+            // R-Auto clears RIT; it is a momentary key, not a lit state.
+            tune_style::GridKey::action("R-Auto", rit),
+            tune_style::GridKey::toggle("TX main", split, main_tx),
+            tune_style::GridKey::toggle("TX sub", split, !main_tx),
+            tune_style::GridKey::toggle("VFO A", can, on_vfo("VFOA")),
+            tune_style::GridKey::toggle("VFO B", can, on_vfo("VFOB")),
+        ];
+        let cols = if snap.sub_vfo.is_empty() { 4 } else { 2 };
+        let Some(i) = tune_style::key_grid(ui, &keys, cols) else { return };
+        match i {
+            0 => self.send(Command::VfoOp("XCHG".into())),
+            1 => self.send(Command::SetRit(-6_000)),
+            2 => self.send(Command::VfoOp("CPY".into())),
+            3 => self.send(Command::SetRit(-3_000)),
+            4 => self.local_mem = Some(snap.freq_hz),
+            5 => self.send(Command::SetRit(-15_000)),
+            6 => {
+                if let Some(hz) = self.local_mem {
+                    self.tune(snap, hz);
                 }
-                rit_button(ui, snap, "R-15kHz", -15_000, &|cmd| self.send(cmd));
-            });
-            two(ui, |ui| {
-                if ui
-                    .add_enabled(
-                        can && self.local_mem.is_some(),
-                        egui::Button::new("Mem > A"),
-                    )
-                    .clicked()
-                {
-                    if let Some(hz) = self.local_mem {
-                        self.tune(snap, hz);
-                    }
-                }
-                rit_button(ui, snap, "R-Auto", 0, &|cmd| self.send(cmd));
-            });
-            two(ui, |ui| {
-                let main = !snap.tx_vfo.contains('B');
-                if ui
-                    .add_enabled(
-                        can && snap.caps.can_set_split,
-                        egui::Button::new("TX main").selected(main),
-                    )
-                    .clicked()
-                {
-                    self.send(Command::SetSplit {
-                        on: false,
-                        tx_vfo: snap.vfo.clone(),
-                    });
-                }
-                if ui
-                    .add_enabled(
-                        can && snap.caps.can_set_split,
-                        egui::Button::new("TX sub").selected(!main),
-                    )
-                    .clicked()
-                {
-                    self.send(Command::SetSplit {
-                        on: true,
-                        tx_vfo: "VFOB".into(),
-                    });
-                }
-            });
-            two(ui, |ui| {
-                for name in ["VFOA", "VFOB"] {
-                    let label = if name == "VFOA" { "VFO A" } else { "VFO B" };
-                    let on = snap.vfo.eq_ignore_ascii_case(name);
-                    if ui
-                        .add_enabled(can, egui::Button::new(label).selected(on))
-                        .clicked()
-                    {
-                        self.send(Command::SetVfo(name.into()));
-                    }
-                }
-            });
-        });
+            }
+            7 => self.send(Command::SetRit(0)),
+            8 => self.send(Command::SetSplit { on: false, tx_vfo: snap.vfo.clone() }),
+            9 => self.send(Command::SetSplit { on: true, tx_vfo: "VFOB".into() }),
+            10 => self.send(Command::SetVfo("VFOA".into())),
+            _ => self.send(Command::SetVfo("VFOB".into())),
+        }
     }
 
     /// One VFO: the digit row, the typed frequency, and the hamlib name with
@@ -12792,30 +12754,7 @@ fn on_air_sign(ui: &mut egui::Ui, text: &str, hot: bool, width: f32) {
     );
 }
 
-fn two(ui: &mut egui::Ui, body: impl FnOnce(&mut egui::Ui)) {
-    ui.horizontal(body);
-}
 
-fn op_button(ui: &mut egui::Ui, enabled: bool, label: &str, on_click: impl FnOnce()) {
-    if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
-        on_click();
-    }
-}
-
-fn rit_button(ui: &mut egui::Ui, snap: &Snapshot, label: &str, hz: i32, send: &impl Fn(Command)) {
-    // R-Auto clears RIT. Leaving it selected whenever RIT is zero would light
-    // the button for the whole session, so only the offset buttons select.
-    let selected = hz != 0 && snap.rit_hz == hz;
-    if ui
-        .add_enabled(
-            snap.online() && snap.caps.can_set_rit,
-            egui::Button::new(label).selected(selected),
-        )
-        .clicked()
-    {
-        send(Command::SetRit(hz));
-    }
-}
 
 fn step_label(step: f64) -> String {
     if step >= 1_000_000.0 {
@@ -13538,6 +13477,17 @@ mod config_sections_tests {
 
     /// The page tabs (plus a TG and an ID tab) fit a 1400 px window: no more
     /// key there.
+    /// Every tab the page row can save is a name the station file accepts.
+    #[test]
+    fn every_page_tab_is_a_known_station_tab() {
+        for (page, name) in PAGES {
+            assert!(config::known_tab(name), "{name} would fail the station save");
+            assert!(config::known_tab(&page_name(*page)));
+        }
+        assert!(config::known_tab(&page_name(Page::Talkgroups(7))));
+        assert!(config::known_tab(&page_name(Page::RadioIds(7))));
+    }
+
     #[test]
     fn spectrum_pages_are_not_detachable() {
         for p in [Page::Tune, Page::Talkgroups(1), Page::RadioIds(1)] {

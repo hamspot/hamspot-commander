@@ -124,6 +124,107 @@ pub fn split(area: Rect) -> Split {
     }
 }
 
+/// One key of the VFO grid: momentary (`on` None) or latching.
+#[derive(Clone, Copy, Debug)]
+pub struct GridKey {
+    pub label: &'static str,
+    pub enabled: bool,
+    pub on: Option<bool>,
+}
+
+impl GridKey {
+    pub const fn action(label: &'static str, enabled: bool) -> Self {
+        Self { label, enabled, on: None }
+    }
+    pub const fn toggle(label: &'static str, enabled: bool, on: bool) -> Self {
+        Self { label, enabled, on: Some(on) }
+    }
+}
+
+/// Compact grid key height and font (smaller than the page keys).
+pub const GRID_KEY_H: f32 = 24.0;
+pub const GRID_FONT: f32 = 13.0;
+
+/// One size for every key: the widest label plus the ●/○ marker and padding.
+pub fn grid_key_size(ui: &mut egui::Ui, keys: &[GridKey]) -> egui::Vec2 {
+    let font = egui::FontId::proportional(GRID_FONT);
+    let w = keys
+        .iter()
+        .map(|k| ui.fonts_mut(|f| f.layout_no_wrap(format!("● {}", k.label.to_uppercase()), font.clone(), Color32::WHITE).size().x))
+        .fold(0.0, f32::max);
+    vec2((w + 16.0).ceil(), GRID_KEY_H)
+}
+
+/// Square (radius 0) key in its own hue. Latching keys carry a border and
+/// the ●/○ marker; momentary keys are solid. Disabled keys are faded.
+pub fn grid_key(ui: &mut egui::Ui, k: &GridKey, size: egui::Vec2) -> egui::Response {
+    let sense = if k.enabled { Sense::click() } else { Sense::hover() };
+    let (rect, resp) = ui.allocate_exact_size(size, sense);
+    let hue = crate::bar_key_hue(k.label, crate::KeyLamp::Dark);
+    let fade = |c: Color32| if k.enabled { c } else { c.gamma_multiply(0.45) };
+    let font = egui::FontId::proportional(GRID_FONT);
+    let p = ui.painter();
+    match k.on {
+        Some(on) => {
+            let (fill, border, ink) = rustcars::toggle_colors(hue, on);
+            let fill = if k.enabled && resp.hovered() { rustcars::tint(fill, 0.08) } else { fill };
+            p.rect_filled(rect, 0.0, fade(fill));
+            p.rect_stroke(rect, 0.0, Stroke::new(rustcars::TOGGLE_BORDER, fade(border)), egui::StrokeKind::Inside);
+            rustcars::paint_toggle_marker_label(p, rect, k.label, on, font, fade(ink));
+        }
+        None => {
+            let fill = if k.enabled && resp.hovered() { rustcars::tint(hue, 0.25) } else { hue };
+            p.rect_filled(rect, 0.0, fade(fill));
+            let ink = rustcars::ink_on(hue);
+            p.text(rect.center(), egui::Align2::CENTER_CENTER, k.label.to_uppercase(), font, fade(ink));
+        }
+    }
+    if resp.has_focus() {
+        p.rect_stroke(rect.expand(2.0), 0.0, Stroke::new(1.0, palette::TEXT), egui::StrokeKind::Outside);
+    }
+    let name = match k.on {
+        Some(on) => rustcars::toggle_label(k.label, on),
+        None => k.label.to_uppercase(),
+    };
+    let (enabled, on) = (k.enabled, k.on);
+    resp.widget_info(|| match on {
+        Some(v) => egui::WidgetInfo::selected(egui::Role::CheckBox, enabled, v, &name),
+        None => egui::WidgetInfo::labeled(egui::Role::Button, enabled, &name),
+    });
+    resp
+}
+
+/// Equal-size keys in `cols` columns (fewer if the row has no room).
+/// Returns the index of the key clicked this frame.
+pub fn key_grid(ui: &mut egui::Ui, keys: &[GridKey], cols: usize) -> Option<usize> {
+    let size = grid_key_size(ui, keys);
+    let gap = 4.0;
+    let fit = (((ui.available_width() + gap) / (size.x + gap)).floor() as usize).max(1);
+    let cols = cols.min(fit).max(1);
+    let mut hit = None;
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing = vec2(gap, gap);
+        for (r, row) in keys.chunks(cols).enumerate() {
+            ui.horizontal(|ui| {
+                for (c, k) in row.iter().enumerate() {
+                    if grid_key(ui, k, size).clicked() {
+                        hit = Some(r * cols + c);
+                    }
+                }
+            });
+        }
+    });
+    hit
+}
+
+/// Bottom status strip and the area above it (status strip 4 px clear of it).
+pub fn status_strip_split(area: Rect) -> (Rect, Rect) {
+    let h = STRIP_H.min(area.height());
+    let strip = Rect::from_min_max(Pos2::new(area.left(), area.bottom() - h), area.max);
+    let above = Rect::from_min_max(area.min, Pos2::new(area.right(), (strip.top() - 4.0).max(area.top())));
+    (above, strip)
+}
+
 /// Bandspread share at the bottom of the Tune page when BSP is on.
 pub const BSP_MIN_H: f32 = 80.0;
 pub const BSP_MAX_H: f32 = 200.0;
@@ -191,9 +292,28 @@ pub fn keys_and_scope(
 /// below it jumps). `warn` text is drawn in the caution colour and prefixed
 /// "!" so it does not rely on colour alone.
 pub fn status_line(ui: &mut egui::Ui, text: &str, warn: bool) -> Rect {
-    let shown = if warn && !text.is_empty() { format!("! {text}") } else { text.to_string() };
+    let full = if warn && !text.is_empty() { format!("! {text}") } else { text.to_string() };
+    // Too long for the strip: end with "…" (full text on hover), never cut mid-glyph.
+    let room = ui.available_width() - 12.0;
+    let font = egui::FontId::monospace(12.0);
+    let fits = |t: &str, ui: &mut egui::Ui| ui.fonts_mut(|f| f.layout_no_wrap(t.to_owned(), font.clone(), Color32::WHITE).size().x) <= room;
+    let mut shown = full.clone();
+    if !fits(&shown, ui) {
+        let chars: Vec<char> = full.chars().collect();
+        let mut n = chars.len();
+        while n > 0 {
+            n -= 1;
+            shown = chars[..n].iter().collect::<String>() + "…";
+            if fits(&shown, ui) {
+                break;
+            }
+        }
+    }
     let ink = if warn { Color32::from_rgb(0xFF, 0xB0, 0x60) } else { palette::TEXT };
     let r = strip(ui, &shown, "", ink);
+    if shown != full {
+        ui.interact(r, ui.id().with("status-hover"), Sense::hover()).on_hover_text(full);
+    }
     r
 }
 
@@ -549,5 +669,98 @@ mod tests {
             _ => None,
         }).collect();
         assert!(texts.iter().any(|t| t.starts_with("! Voice")), "{texts:?}");
+    }
+
+    /// The status strip is the bottom-most thing on the page, below the
+    /// band plan and the keys/scope, and its text is not clipped.
+    #[test]
+    fn status_strip_is_at_the_page_bottom_under_the_band_plan() {
+        for (w, h) in [(1024.0, 550.0), (1280.0, 720.0), (1400.0, 900.0)] {
+            let page = Rect::from_min_max(Pos2::new(8.0, CHROME - 40.0), Pos2::new(w - 8.0, h - 8.0));
+            let (above, strip_r) = status_strip_split(page);
+            assert!((strip_r.bottom() - page.bottom()).abs() < 0.01 && strip_r.height() == STRIP_H);
+            assert!((strip_r.width() - page.width()).abs() < 0.01, "full page width");
+            let p = tune_panes(above, true);
+            assert!(p.bsp.unwrap().bottom() <= strip_r.top() - 3.9, "band plan runs into the status strip at {w}x{h}");
+            assert!(p.top.bottom() <= strip_r.top());
+            let ctx = ctx();
+            let msg = "FOLLOWING CONTROL  ·  Voice is refused on the CW segment 7.000–7.025 MHz";
+            let mut got = Rect::NOTHING;
+            let out = run(&ctx, w, h, &mut |ui| {
+                ui.scope_builder(egui::UiBuilder::new().max_rect(strip_r), |ui| {
+                    ui.set_clip_rect(strip_r);
+                    got = status_line(ui, msg, true);
+                });
+            });
+            assert_eq!(got, strip_r);
+            let text = out.shapes.iter().find_map(|c| match &c.shape {
+                egui::Shape::Text(t) if t.galley.text().starts_with('!') => Some((t.galley.text().to_owned(), t.visual_bounding_rect())),
+                _ => None,
+            }).expect("status text drawn");
+            assert!(strip_r.contains_rect(text.1), "status text clipped at {w}x{h}");
+            assert_eq!(text.0, format!("! {msg}"), "fits whole at {w}");
+        }
+    }
+
+    #[test]
+    fn long_status_ends_with_an_ellipsis_not_a_cut() {
+        let ctx = ctx();
+        let r = Rect::from_min_size(Pos2::new(0.0, 0.0), vec2(200.0, STRIP_H));
+        let out = run(&ctx, 400.0, 100.0, &mut |ui| {
+            ui.scope_builder(egui::UiBuilder::new().max_rect(r), |ui| {
+                status_line(ui, "A very long band plan note that cannot fit in two hundred pixels", true);
+            });
+        });
+        let (t, b) = out.shapes.iter().find_map(|c| match &c.shape {
+            egui::Shape::Text(t) if t.galley.text().starts_with('!') => Some((t.galley.text().to_owned(), t.visual_bounding_rect())),
+            _ => None,
+        }).unwrap();
+        assert!(t.ends_with('…') && r.contains_rect(b), "{t}");
+    }
+
+    /// VFO key grid: every key the same size, columns equal and aligned, in
+    /// both the 2-column (sub VFO shown) and 4-column layouts, unclipped.
+    #[test]
+    fn vfo_grid_keys_are_one_size_and_columns_align() {
+        let keys = [
+            GridKey::action("A <> B", true), GridKey::toggle("R-6kHz", true, false),
+            GridKey::action("A > B", false), GridKey::toggle("R-3kHz", true, true),
+            GridKey::action("A > Mem", true), GridKey::toggle("R-15kHz", true, false),
+            GridKey::action("Mem > A", false), GridKey::action("R-Auto", true),
+            GridKey::toggle("TX main", true, true), GridKey::toggle("TX sub", true, false),
+            GridKey::toggle("VFO A", true, true), GridKey::toggle("VFO B", true, false),
+        ];
+        for (cols, width) in [(2usize, 400.0), (4, 900.0), (4, 230.0)] {
+            let ctx = ctx();
+            let out = run(&ctx, width, 400.0, &mut |ui| {
+                key_grid(ui, &keys, cols);
+            });
+            let rects: Vec<Rect> = out.shapes.iter().filter_map(|c| match &c.shape {
+                egui::Shape::Rect(r) if r.corner_radius == egui::CornerRadius::ZERO && r.fill.a() > 0 && r.rect.height() == GRID_KEY_H => Some(r.rect),
+                _ => None,
+            }).collect();
+            assert_eq!(rects.len(), keys.len(), "one cap per key ({cols} cols at {width})");
+            let s = rects[0].size();
+            assert!(rects.iter().all(|r| (r.size() - s).length() < 0.01), "keys differ in size");
+            assert!(s.y < KEY_H, "grid keys are more compact than page keys");
+            let mut xs: Vec<i32> = rects.iter().map(|r| r.left().round() as i32).collect();
+            xs.sort();
+            xs.dedup();
+            let n = xs.len();
+            assert!(n == cols || width < 400.0, "{n} columns, wanted {cols}");
+            if n > 1 {
+                let step = xs[1] - xs[0];
+                assert!(xs.windows(2).all(|w| w[1] - w[0] == step), "columns not evenly spaced: {xs:?}");
+            }
+            let screen = Rect::from_min_size(Pos2::ZERO, vec2(width, 400.0));
+            assert!(rects.iter().all(|r| screen.contains_rect(*r)), "a key is clipped at {width}");
+            // Labels fit inside their keys.
+            for c in &out.shapes {
+                if let egui::Shape::Text(t) = &c.shape {
+                    let b = t.visual_bounding_rect();
+                    assert!(rects.iter().any(|r| r.expand(0.5).contains_rect(b)), "label {} spills", t.galley.text());
+                }
+            }
+        }
     }
 }

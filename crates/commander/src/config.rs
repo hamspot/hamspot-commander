@@ -637,7 +637,7 @@ pub fn validate(file: &ConfigFile) -> Result<(), String> {
 
 /// Page names the tab row can store. Fixed names match the standing pages.
 /// `Talkgroups:<id>` and `RadioIds:<id>` are one radio's tabs.
-fn known_tab(name: &str) -> bool {
+pub(crate) fn known_tab(name: &str) -> bool {
     const PAGES: &[&str] = &[
         "Tune",
         "Plan",
@@ -648,6 +648,10 @@ fn known_tab(name: &str) -> bool {
         "Keys",
         "Tools",
         "Config",
+        // Page layout 2 (Rotator is a top tab) and the REC / HF Data tabs.
+        "Rotator",
+        "REC",
+        "HF Data",
     ];
     if PAGES.contains(&name) {
         return true;
@@ -913,6 +917,25 @@ mod tests {
         assert!(to_string(&file).is_err());
         file.tabs = vec!["Talkgroups:03".into()];
         assert!(to_string(&file).is_err());
+    }
+
+    /// David: on exit "tab Rotator is not a page" and the save failed. A
+    /// layout-2 station (Rotator in the top tabs, REC, HF Data) saves to disk
+    /// and loads back.
+    #[test]
+    fn rotator_in_the_top_tabs_saves_and_reloads() {
+        let mut file = sample();
+        file.page_layout = 2;
+        file.tabs = ["Tune", "Plan", "Channels", "Rotator", "REC", "HF Data", "Meters", "Timers", "Tools", "Config"]
+            .map(String::from)
+            .to_vec();
+        let dir = std::env::temp_dir().join(format!("hs-rotator-tabs-{}", std::process::id()));
+        let path = dir.join("station.HSCommander");
+        save_file(&path, &file).expect("saves");
+        let back = load_file_in(&path, &[]).expect("loads").0;
+        assert_eq!(back.tabs, file.tabs);
+        assert_eq!(back.page_layout, 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

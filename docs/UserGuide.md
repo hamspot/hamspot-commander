@@ -236,7 +236,7 @@ The Tune page has the frequency frame (digits, VFO keys, the paired VFO), a band
 
 ## 5.1 The frequency readout
 
-The readout shows four MHz digits, then kHz and Hz groups: 14.153608 MHz is `0014.153.608`. The top readout is the current VFO, with the S-meter. The smaller readout stacked under it, when the radio has one, is the paired VFO (A with B, Main with Sub); tuning its digits sets the split frequency. The VFO keys sit to their right and wrap below on a narrow window, so nothing is cut off.
+The readout shows four MHz digits, then kHz and Hz groups: 14.153608 MHz is `0014.153.608`. The top readout is the current VFO, with the S-meter. The smaller readout stacked under it, when the radio has one, is the paired VFO (A with B, Main with Sub); tuning its digits sets the split frequency. The VFO keys sit to their right in an even grid of same-size keys (two columns beside a stacked sub VFO, four when there is none); latching keys (R-offsets, TX main/sub, VFO A/B) show ● or ○. They wrap below on a narrow window, so nothing is cut off.
 
 | Action | Result |
 | --- | --- |
@@ -246,7 +246,7 @@ The readout shows four MHz digits, then kHz and Hz groups: 14.153608 MHz is `001
 
 The line under the digits shows the step size, such as `step 1 kHz`.
 
-The last line of the tuning display is its status line. It shows **FOLLOWING GPREDICT** or **FOLLOWING CONTROL** while the frequency follows Gpredict or a control channel, and band-plan notes such as a refused transmit, which start with `!`. It's always there (blank when there is nothing to say), so the page doesn't jump.
+The bottom line of the Tune page, inside the frame and under the band plan, is its status strip (the same strip as NanoVNA's). It shows **FOLLOWING GPREDICT** or **FOLLOWING CONTROL** while the frequency follows Gpredict or a control channel, and band-plan notes such as a refused transmit, which start with `!`. It's always there (blank when there is nothing to say), so the page doesn't jump.
 
 Below the tuning display, the keys (and the HackRF scope) and the bandspread (`BSP`) each have their own area; neither draws over the other. The bandspread takes about a third of the height (80–200 px).
 
