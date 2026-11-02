@@ -13791,7 +13791,7 @@ mod config_sections_tests {
         let mut poisoned_total = 0;
         for (page, window, w, h, heads) in cases {
             let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, h));
-            let min_texts = match page { Page::Keys => 1, Page::RadioIds(_) | Page::Talkgroups(_) => 2, _ => 3 }; // empty-state pages say so in a line or two
+            let min_texts = match page { Page::Keys | Page::Config => 1, Page::RadioIds(_) | Page::Talkgroups(_) => 2, _ => 3 }; // empty-state pages say so in a line or two
             let what = format!("{:?} {} {w}x{h}", page_name(page), if window { "detached" } else { "docked" });
             purge_saved_scroll(&ctx); // each case starts at the top
             for f in 0..40 {
