@@ -1,6 +1,6 @@
 # Hamspot Commander User Guide
 
-Hamspot Commander is a station console for amateur radio and scanner listening on Linux. This guide covers the program as it is today: how to install it, how to find your way round the window, and how to do the everyday jobs: tune, scan, follow a trunked system, record and replay traffic, sweep an antenna with a NanoVNA, and write your own pipe files.
+Hamspot Commander is a station console for amateur radio and scanner listening on Linux. This guide covers version 0.9.0: how to install it, how to find your way round the window, and how to do the everyday jobs: tune, scan, follow a trunked system, record and replay traffic, sweep an antenna with a NanoVNA, and write your own pipe files.
 
 The program is licensed under the GNU General Public License, version 3 or later. See `LICENSE` in the source tree.
 
