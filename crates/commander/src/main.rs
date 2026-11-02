@@ -13827,7 +13827,11 @@ mod config_sections_tests {
                     }
                     _ => None,
                 }).collect();
-                if visible.len() < min_texts + 1 && f > 0 {
+                // Not blank: enough text in view, or (a patch-bay canvas at the
+                // bottom has little text) plenty of drawn shapes in the body.
+                let body = egui::Rect::from_min_max(egui::pos2(0.0, 60.0), screen.max);
+                let drawn = out.shapes.iter().filter(|c| c.clip_rect.intersects(body) && c.shape.visual_bounding_rect().is_finite() && body.intersects(c.shape.visual_bounding_rect())).count();
+                if visible.len() < min_texts + 1 && drawn < 40 && f > 0 {
                     let all: Vec<String> = out.shapes.iter().filter_map(|c| match &c.shape { egui::Shape::Text(t) => Some(format!("{:?}@{:?} clip {:?}", t.galley.text(), t.visual_bounding_rect(), c.clip_rect)), _ => None }).take(15).collect();
                     panic!("{what} frame {f}: page blank ({visible:?}); {} shapes; texts {all:#?}", out.shapes.len());
                 }
