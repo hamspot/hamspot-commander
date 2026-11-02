@@ -76,6 +76,17 @@ fn cfg_colour(name: &str) -> egui::Color32 {
 /// and everything in it to its own window.
 /// `add` is FnMut and the result optional: a detached group's window may draw
 /// twice in a frame, or not at all if the window could not open (rustcars 1f2f06e).
+/// Height left for a page body, never unbounded. Inside a Config group box
+/// (rustcars group child with an unbounded bottom) `available_height` is
+/// infinite; sizing an inner list from it made the Config scroll content
+/// "a mile tall" (Keys group, 2026-11-01). Capped at the visible clip rect.
+fn bounded_avail_h(ui: &egui::Ui) -> f32 {
+    let h = ui.available_height();
+    let view = ui.clip_rect().height();
+    let view = if view.is_finite() && view > 0.0 { view } else { 600.0 };
+    if h.is_finite() { h.min(view) } else { view }
+}
+
 fn cfg_group<R>(ui: &mut egui::Ui, name: &str, add: impl FnMut(&mut egui::Ui) -> R) -> Option<R> {
     group_box::GroupBox::new(name, cfg_colour(name))
         .detachable(("config-group", name))
@@ -3789,7 +3800,7 @@ impl App {
             let frame = egui::Frame::group(ui.style());
             let chrome =
                 frame.inner_margin.sum().y + frame.stroke.width * 2.0 + frame.outer_margin.sum().y;
-            let height = (ui.available_height() - chrome).max(80.0);
+            let height = (bounded_avail_h(ui) - chrome).max(80.0);
             let mut scale_pick: Option<(usize, usize, f64, bool)> = None;
             frame.show(ui, |ui| {
                 ui.take_available_width();
@@ -4035,7 +4046,7 @@ impl App {
         let widths = fit_columns(total_w, gap, &[280.0, 320.0], 0);
         let left_w = widths[0];
         let right_w = widths[1];
-        let height = ui.available_height();
+        let height = bounded_avail_h(ui);
         ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
                 ui.set_width(left_w);
@@ -4390,7 +4401,7 @@ impl App {
         let zone_w = widths[0];
         let channel_w = widths[1];
         let editor_w = widths[2];
-        let height = ui.available_height().max(80.0);
+        let height = bounded_avail_h(ui).max(80.0);
         ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
                 ui.set_width(zone_w);
@@ -10169,7 +10180,7 @@ impl App {
         let gap = ui.spacing().item_spacing.x;
         let editor_w = 320.0;
         let list_w = (ui.available_width() - gap - editor_w).max(220.0);
-        let height = ui.available_height().max(80.0);
+        let height = bounded_avail_h(ui).max(80.0);
         let mut picked = None;
         ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
@@ -10817,7 +10828,7 @@ impl App {
         let widths = fit_columns(ui.available_width(), gap, &[460.0, 320.0], 0);
         let list_w = widths[0];
         let editor_w = widths[1];
-        let height = ui.available_height().max(80.0);
+        let height = bounded_avail_h(ui).max(80.0);
         ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
                 ui.set_width(list_w);
@@ -11064,7 +11075,7 @@ impl App {
         let total_w = ui.available_width();
         let list_w = (total_w - gap * 2.0 - zone_w - editor_w).max(220.0);
         let editor_w = (total_w - gap * 2.0 - zone_w - list_w).max(0.0);
-        let height = ui.available_height().max(80.0);
+        let height = bounded_avail_h(ui).max(80.0);
         let recent_now = std::time::Instant::now();
         if self.tg_recent.any(recent_now) {
             // The tint decays; repaint slowly so it fades without a busy loop.
@@ -11159,7 +11170,7 @@ impl App {
             });
             ui.vertical(|ui| {
                 ui.set_width(list_w + gap + editor_w);
-                let list_h = ui.available_height().max(80.0);
+                let list_h = bounded_avail_h(ui).max(80.0);
                 ui.horizontal_top(|ui| {
                     ui.vertical(|ui| {
                         ui.set_width(list_w);
@@ -13578,6 +13589,85 @@ mod config_sections_tests {
             let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, 550.0));
             assert!(caps.iter().all(|r| screen.contains_rect(*r)) && screen.contains_rect(grid), "clipped at {w}");
         }
+    }
+
+    /// David: Config scroll "goes crazy", scrollbar "a mile tall", then a
+    /// black page. Root cause: the Keys group sized its list ScrollArea
+    /// (auto_shrink false) from `available_height()`, which is infinite inside
+    /// a Config group box (its child ui has an unbounded bottom). This mimics the Config body (groups
+    /// of labels, then the Keys list) docked and detached, scrolls with the
+    /// mouse wheel for many frames, and checks the content stays finite,
+    /// bounded, stable, scrolls in range and is never blank.
+    fn config_like(ui: &mut egui::Ui, bounded: bool) -> (egui::Vec2, egui::Rect, egui::Vec2) {
+        let o = egui::ScrollArea::vertical().id_salt("cfg-body").auto_shrink([false, false]).show(ui, |ui| {
+            for g in 0..8 {
+                ui.label(format!("GROUP {g}"));
+                for i in 0..12 {
+                    ui.label(format!("setting {g}.{i}"));
+                }
+            }
+            // The real Config group box: its child has an unbounded bottom.
+            cfg_group(ui, "Keys", |ui| {
+                let h = if bounded { bounded_avail_h(ui) } else { ui.available_height() }.max(80.0);
+                egui::ScrollArea::vertical().id_salt("key-list").auto_shrink([false, false]).max_height((h - 22.0).max(40.0))
+                    .show(ui, |ui| for i in 0..40 { ui.label(format!("key {i}")); });
+            });
+            ui.label("LEVELS END");
+        });
+        (o.content_size, o.inner_rect, o.state.offset())
+    }
+
+    #[test]
+    fn config_scroll_content_is_finite_and_stable_while_wheeling() {
+        // The old sizing really was unbounded.
+        let ctx = egui::Context::default();
+        let mut old = egui::Vec2::ZERO;
+        let mut o = ctx.run_ui(egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1024.0, 550.0))), ..Default::default() },
+            |ui| old = config_like(ui, false).0);
+        o.textures_delta.clear();
+        assert!(!old.y.is_finite() || old.y > 1e6, "old sizing was bounded? {old:?}");
+
+        for (w, h) in [(1024.0f32, 550.0f32), (1400.0, 900.0), (700.0, 500.0), (480.0, 360.0)] {
+            let ctx = egui::Context::default();
+            rustcars::install_lcars_font(&ctx);
+            rustcars::apply_theme(&ctx, &rustcars::LcarsTheme::default());
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, h));
+            let mut first: Option<egui::Vec2> = None;
+            for f in 0..60 {
+                let mut events = vec![egui::Event::PointerMoved(egui::pos2(w / 2.0, 40.0))];
+                if f > 2 {
+                    let dy = if f < 40 { -120.0 } else { 120.0 };
+                    events.push(egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, dy), modifiers: egui::Modifiers::NONE, phase: egui::TouchPhase::Move, source: egui::MouseWheelSource::Wheel });
+                }
+                let input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
+                let mut res = (egui::Vec2::ZERO, egui::Rect::NOTHING, egui::Vec2::ZERO);
+                let mut out = ctx.run_ui(input, |ui| res = config_like(ui, true));
+                out.textures_delta.clear();
+                let (content, view, offset) = res;
+                let what = format!("{w}x{h} frame {f}");
+                assert!(content.y.is_finite() && content.y < 20_000.0, "{what}: content {content:?}");
+                match first {
+                    None if f > 1 => first = Some(content),
+                    Some(c) => assert!((content.y - c.y).abs() < 0.5, "{what}: content grew {} -> {}", c.y, content.y),
+                    _ => {}
+                }
+                assert!(offset.y >= 0.0 && offset.y <= (content.y - view.height()).max(0.0) + 0.5, "{what}: offset {} out of range", offset.y);
+                let texts = out.shapes.iter().filter(|c| matches!(&c.shape, egui::Shape::Text(t) if c.clip_rect.intersects(t.visual_bounding_rect()) && screen.intersects(t.visual_bounding_rect()))).count();
+                assert!(texts > 3, "{what}: page blank");
+            }
+        }
+    }
+
+    /// No page body in main.rs sizes itself from a raw `available_height()`;
+    /// they go through `bounded_avail_h` (a page may sit in a scroll area).
+    #[test]
+    fn page_bodies_never_use_raw_available_height() {
+        let src = include_str!("main.rs");
+        let code = &src[..src.find("mod detached_fit_tests").unwrap()];
+        let uses: Vec<&str> = code.lines().filter(|l| l.contains("ui.available_height()") && !l.trim_start().starts_with("//")).collect();
+        // The helper itself, and radio_key_size which only takes a min with it.
+        assert_eq!(uses.len(), 2, "{uses:#?}");
+        assert!(uses.iter().all(|l| l.contains("let h = ui.available_height()") || l.contains(".min(ui.available_height())")));
     }
 
     /// Every tab the page row can save is a name the station file accepts.
