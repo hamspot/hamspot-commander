@@ -675,6 +675,7 @@ dependencies = [
  "libc",
  "rfd",
  "rigctl",
+ "ron",
  "rusqlite",
  "rustcars",
  "serde",

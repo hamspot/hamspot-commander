@@ -25,3 +25,6 @@ rfd = "0.15"
 libc = "0.2.190"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 serialport = "4.10.1"
+
+[dev-dependencies]
+ron = "=0.12.2"

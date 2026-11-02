@@ -87,6 +87,37 @@ fn bounded_avail_h(ui: &egui::Ui) -> f32 {
     if h.is_finite() { h.min(view) } else { view }
 }
 
+/// egui persists every ScrollArea's state (offset, max offset, rects) in
+/// eframe storage (`app.ron`, key "egui"). The infinite Config content of
+/// the Keys bug saved `offset y: NaN` there, and a NaN offset survives the
+/// clamp, so the page body was translated off to NaN: blank page on every
+/// start, docked and detached (2026-11-01). Scroll positions are not worth
+/// keeping across runs: drop them all at start. Returns how many.
+fn purge_saved_scroll(ctx: &egui::Context) -> usize {
+    ctx.memory_mut(|m| {
+        let n = m.data.count::<egui::scroll_area::State>();
+        m.data.remove_by_type::<egui::scroll_area::State>();
+        n
+    })
+}
+
+/// A ScrollArea offset that is NaN, infinite or absurdly large.
+fn scroll_offset_poisoned(v: egui::Vec2) -> bool {
+    !(v.x.is_finite() && v.y.is_finite()) || v.x.abs() > 1.0e6 || v.y.abs() > 1.0e6
+}
+
+/// After a ScrollArea ran: drop its state when the offset is poisoned and
+/// ask for another frame, so the next frame draws from the top. Returns true
+/// when it reset (the caller reports it).
+fn reset_poisoned_scroll(ctx: &egui::Context, id: egui::Id, offset: egui::Vec2) -> bool {
+    if !scroll_offset_poisoned(offset) {
+        return false;
+    }
+    ctx.data_mut(|d| d.remove::<egui::scroll_area::State>(id));
+    ctx.request_repaint();
+    true
+}
+
 fn cfg_group<R>(ui: &mut egui::Ui, name: &str, add: impl FnMut(&mut egui::Ui) -> R) -> Option<R> {
     group_box::GroupBox::new(name, cfg_colour(name))
         .detachable(("config-group", name))
@@ -2376,6 +2407,10 @@ fn radio_page_tabs(
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        let dropped = purge_saved_scroll(&cc.egui_ctx);
+        if dropped > 0 {
+            eprintln!("commander: cleared {dropped} saved scroll positions (not kept across runs)");
+        }
         // The face talks to the hamlib dummy this window starts. Demo does not.
         let mut snap = empty_snap();
         snap.message = "starting dummy".into();
@@ -3537,10 +3572,24 @@ impl App {
                     } else if page == Page::Rotator {
                         self.tools.lock().expect("tools").draw_rotator_in(ui);
                     } else {
-                        egui::ScrollArea::vertical()
+                        // Before the area runs: a poisoned saved offset would put
+                        // the whole body at NaN (blank page) this frame.
+                        let sid = ui.make_persistent_id(egui::IdSalt::new(("body", page_name(page))));
+                        let saved = egui::scroll_area::State::load(ui.ctx(), sid).map(|st| st.offset());
+                        if saved.is_some_and(|v| reset_poisoned_scroll(ui.ctx(), sid, v)) {
+                            let note = format!("{}: saved scroll position was invalid and was reset.", page_name(page));
+                            eprintln!("commander: {note}");
+                            self.config_note = note;
+                        }
+                        let o = egui::ScrollArea::vertical()
                             .id_salt(("body", page_name(page)))
                             .auto_shrink([false, false])
                             .show(ui, |ui| self.page_body_of(page, window, ui, snap));
+                        if reset_poisoned_scroll(ui.ctx(), o.id, o.state.offset()) {
+                            let note = format!("{}: scroll position was invalid and was reset.", page_name(page));
+                            eprintln!("commander: {note}");
+                            self.config_note = note;
+                        }
                     }
                 });
                 // REC's view controls and the E-STOP sit in the gap opened in the top bar.
@@ -13668,6 +13717,137 @@ mod config_sections_tests {
         // The helper itself, and radio_key_size which only takes a min with it.
         assert_eq!(uses.len(), 2, "{uses:#?}");
         assert!(uses.iter().all(|l| l.contains("let h = ui.available_height()") || l.contains(".min(ui.available_height())")));
+    }
+
+    /// David: after the scroll fix, Config was a black page docked and
+    /// detached. The REAL App (App::new, real framed_page, real page bodies)
+    /// is built in a child test process with HOME in a temp dir, so it never
+    /// reads or writes the user's files. Memory is poisoned exactly as
+    /// David's app.ron was (scroll offsets of NaN), then pages are drawn
+    /// docked and detached with wheel scrolling: section headers and content
+    /// must be in view every frame and no scroll state stays non-finite.
+    /// Stop the hubs (and the dummy rigctld they started) of a test App.
+    fn stop_test_app(app: &App) {
+        app.hub.shutdown();
+        app.rotators.shutdown();
+        app.amplifiers.shutdown();
+    }
+
+    #[test]
+    fn real_pages_render_not_blank_even_with_poisoned_scroll_memory() {
+        const ME: &str = "config_sections_tests::real_pages_render_not_blank_even_with_poisoned_scroll_memory";
+        if std::env::var_os("HS_REAL_PAGES_CHILD").is_none() {
+            let tmp = std::env::temp_dir().join(format!("hs-real-pages-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&tmp);
+            for d in ["config", "data", "cache", "state"] {
+                std::fs::create_dir_all(tmp.join(d)).unwrap();
+            }
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([ME, "--exact", "--nocapture", "--test-threads=1"])
+                .env("HS_REAL_PAGES_CHILD", "1")
+                .env("HOME", &tmp)
+                .env("XDG_CONFIG_HOME", tmp.join("config"))
+                .env("XDG_DATA_HOME", tmp.join("data"))
+                .env("XDG_CACHE_HOME", tmp.join("cache"))
+                .env("XDG_STATE_HOME", tmp.join("state"))
+                .output()
+                .unwrap();
+            let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            let _ = std::fs::remove_dir_all(&tmp);
+            assert!(out.status.success() && text.contains("1 passed"), "child failed:\n{text}");
+            return;
+        }
+        let ctx = egui::Context::default();
+        rustcars::install_lcars_font(&ctx);
+        rustcars::apply_theme(&ctx, &rustcars::LcarsTheme::default());
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = App::new(&cc);
+        app.config_note.clear();
+        let poison = |ctx: &egui::Context| {
+            let json = ctx.memory(|m| ron::to_string(m).unwrap());
+            let bad = json.replace("offset:(x:0.0,y:0.0)", "offset:(x:0.0,y:NaN)");
+            let mem: egui::Memory = ron::from_str(&bad).unwrap();
+            ctx.memory_mut(|m| *m = mem);
+            bad.matches("y:NaN").count()
+        };
+        let clean = |ctx: &egui::Context| {
+            let json = ctx.memory(|m| ron::to_string(m).unwrap());
+            !json.contains("NaN") && !json.contains(":inf") && !json.contains("-inf")
+        };
+        let cases: Vec<(Page, bool, f32, f32, Vec<&str>)> = vec![
+            (Page::Config, false, 1024.0, 550.0, vec!["STATION", "DISPLAY"]),
+            (Page::Config, false, 1400.0, 900.0, vec!["STATION", "DISPLAY"]),
+            (Page::Config, false, 700.0, 500.0, vec!["STATION"]),
+            (Page::Config, true, 1024.0, 550.0, vec!["STATION", "DISPLAY"]),
+            (Page::Config, true, 700.0, 500.0, vec!["STATION"]),
+            // Keys without a saved station shows only its note.
+            (Page::Keys, false, 1024.0, 550.0, vec!["The station has not been saved."]),
+            (Page::Plan, false, 1024.0, 550.0, vec![]),
+            (Page::Channels, false, 1024.0, 550.0, vec![]),
+            (Page::Tune, false, 1024.0, 550.0, vec![]),
+            (Page::Talkgroups(1), false, 1024.0, 550.0, vec![]),
+            (Page::RadioIds(1), false, 1024.0, 550.0, vec![]),
+        ];
+        let mut poisoned_total = 0;
+        for (page, window, w, h, heads) in cases {
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, h));
+            let min_texts = match page { Page::Keys => 1, Page::RadioIds(_) | Page::Talkgroups(_) => 2, _ => 3 }; // empty-state pages say so in a line or two
+            let what = format!("{:?} {} {w}x{h}", page_name(page), if window { "detached" } else { "docked" });
+            purge_saved_scroll(&ctx); // each case starts at the top
+            for f in 0..40 {
+                let mut events = vec![egui::Event::PointerMoved(egui::pos2(w / 2.0, h / 2.0))];
+                if f > 3 {
+                    let dy = if f < 25 { -200.0 } else { 150.0 };
+                    events.push(egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, dy), modifiers: egui::Modifiers::NONE, phase: egui::TouchPhase::Move, source: egui::MouseWheelSource::Wheel });
+                }
+                if f == 2 {
+                    // As on David's machine: memory saved with NaN offsets,
+                    // then Commander starts again from it.
+                    poisoned_total += poison(&ctx);
+                    stop_test_app(&app);
+                    app = App::new(&cc);
+                    app.config_note.clear();
+                    assert!(clean(&ctx), "{what}: start-up left a NaN scroll state");
+                }
+                let input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
+                let mut out = ctx.run_ui(input, |ui| {
+                    let mut snap = empty_snap();
+                    // As ui(): the docked page is self.page.
+                    if !window {
+                        app.page = page;
+                    }
+                    app.framed_page(ui, page, &mut snap, None, window);
+                });
+                out.textures_delta.clear();
+                let visible: Vec<String> = out.shapes.iter().filter_map(|c| match &c.shape {
+                    egui::Shape::Text(t) if !t.galley.text().trim().is_empty() => {
+                        let b = t.visual_bounding_rect();
+                        assert!(b.min.is_finite() && b.max.is_finite(), "{what} f{f}: text {:?} at non-finite {b:?}; finite so far: {}", t.galley.text(), out.shapes.iter().filter(|c| matches!(&c.shape, egui::Shape::Text(t) if t.visual_bounding_rect().is_finite())).count());
+                        (screen.intersects(b) && c.clip_rect.intersects(b)).then(|| t.galley.text().to_string())
+                    }
+                    _ => None,
+                }).collect();
+                if visible.len() < min_texts + 1 && f > 0 {
+                    let all: Vec<String> = out.shapes.iter().filter_map(|c| match &c.shape { egui::Shape::Text(t) => Some(format!("{:?}@{:?} clip {:?}", t.galley.text(), t.visual_bounding_rect(), c.clip_rect)), _ => None }).take(15).collect();
+                    panic!("{what} frame {f}: page blank ({visible:?}); {} shapes; texts {all:#?}", out.shapes.len());
+                }
+                if (1..4).contains(&f) {
+                    for head in &heads {
+                        assert!(visible.iter().any(|t| t == head), "{what} frame {f}: no {head} header in view: {visible:?}");
+                    }
+                }
+            }
+            assert!(clean(&ctx), "{what}: a non-finite scroll state is left in memory");
+        }
+        stop_test_app(&app);
+        assert!(poisoned_total > 0, "the poison never hit a scroll state");
+        // The start-up purge drops persisted scroll states, and the body
+        // guard resets a poisoned offset before the area runs.
+        poison(&ctx);
+        purge_saved_scroll(&ctx);
+        assert!(clean(&ctx));
+        assert!(scroll_offset_poisoned(egui::vec2(0.0, f32::NAN)) && scroll_offset_poisoned(egui::vec2(0.0, 1e9)));
+        assert!(!scroll_offset_poisoned(egui::vec2(0.0, 2400.0)));
     }
 
     /// Every tab the page row can save is a name the station file accepts.
