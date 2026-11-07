@@ -140,10 +140,6 @@ fn config_page_detach_id() -> egui::Id {
 /// Pages whose whole frame detaches from the top-right end pill. One shared
 /// path: the pill in the page bar, a stub in the page while it is out, and
 /// the page drawn in its own window every frame (`show_page_windows`).
-/// Pages that carry the page detach pill. Tune, Plan, Channels and the
-/// HackRF TG / ID pages stay out: they hold the Tune and scanner widgets,
-/// which are not wrapped. Meters and Tools keep their own detach until their
-/// settings migrate.
 /// How each detached page window opens: a default size for a first open
 /// (big pages large, up to the 80% monitor cap rustcars applies), a minimum
 /// inner size the page needs to render fully (a saved size is raised to it),
@@ -152,6 +148,7 @@ fn config_page_detach_id() -> egui::Id {
 /// each page scrolls inside itself (David, pt365u).
 fn detach_opts(page: Page) -> group_box::DetachOpts {
     let (default, min) = match page {
+        Page::Tune => ((1400.0, 900.0), (800.0, 560.0)),
         Page::Tools => ((1600.0, 1000.0), (900.0, 620.0)),
         Page::Rec => ((1400.0, 900.0), (760.0, 520.0)),
         Page::Config => ((1100.0, 850.0), (640.0, 480.0)),
@@ -169,8 +166,8 @@ fn detach_opts(page: Page) -> group_box::DetachOpts {
     }
 }
 
-const DETACHABLE_PAGES: [Page; 7] = [
-    Page::Config, Page::Rec, Page::Timers, Page::HfData, Page::Rotator, Page::Tools, Page::Meters,
+const DETACHABLE_PAGES: [Page; 8] = [
+    Page::Tune, Page::Config, Page::Rec, Page::Timers, Page::HfData, Page::Rotator, Page::Tools, Page::Meters,
 ];
 
 /// The old Tools tear-off saved `tool_detach` ("1"), `tool_win_pos` and
@@ -206,13 +203,92 @@ fn page_detachable(page: Page) -> bool {
     DETACHABLE_PAGES.contains(&page)
 }
 
-/// Memory id of a page's detach state (memory only; not saved).
 /// Pages that draw HackRF spectrum data: the Tune chart and the TG scanner's
-/// RSSI. None of them is detachable.
+/// RSSI. Tune can detach (#225); the others stay in the main window.
 fn page_shows_spectrum(page: Page) -> bool {
     matches!(page, Page::Tune | Page::Talkgroups(_) | Page::RadioIds(_))
 }
 
+/// What the spectrum redraw should see. A detached Tune window counts only
+/// while that window is open and not minimized. The Tune stub in the main
+/// window does not.
+fn spectrum_view(
+    page: Page,
+    tune_detached: bool,
+    tune_minimized: bool,
+    root_minimized: bool,
+    scanning: bool,
+) -> redraw::View {
+    let on_tune_stub = page == Page::Tune && tune_detached;
+    redraw::View {
+        page_shows_spectrum: page_shows_spectrum(page) && !on_tune_stub,
+        detached_shows_spectrum: tune_detached && !tune_minimized,
+        root_minimized,
+        scanning,
+    }
+}
+
+/// Left side of the Tune top elbow, after the curve and before the E-STOP gap.
+fn tune_radio_run(frame: egui::Rect, slot: Option<egui::Rect>) -> egui::Rect {
+    let t = rustcars::LcarsTheme::default();
+    let r_out = t.bar_thick * 0.75;
+    let curve = (t.bar_thick + t.bar_thin).max(2.0 * r_out);
+    let left = frame.left() + curve + t.frame_gap;
+    let right = slot
+        .map(|s| s.left() - 2.0 * t.frame_gap)
+        .unwrap_or_else(|| frame.right() - 48.0 - 2.0 * t.frame_gap);
+    egui::Rect::from_min_max(
+        egui::pos2(left, frame.top()),
+        egui::pos2(right.max(left), frame.top() + t.bar_thin),
+    )
+}
+
+/// Frequencies painted on the Tune digits while a radio is trunking.
+/// `voice_hz` is the large VFO A. `control_hz` is the smaller VFO B.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TrunkVfo {
+    voice_hz: f64,
+    control_hz: f64,
+}
+
+/// Main is the newest voice frequency. The sub VFO is the control channel
+/// for the whole trunk session. A missing voice frequency leaves the main
+/// readout on the control channel.
+fn trunk_vfo(control_hz: f64, current_voice: Option<f64>, last_voice: Option<f64>) -> Option<TrunkVfo> {
+    if !control_hz.is_finite() || control_hz <= 0.0 {
+        return None;
+    }
+    let usable = |hz: f64| hz.is_finite() && hz > 0.0;
+    let voice = current_voice
+        .filter(|hz| usable(*hz))
+        .or_else(|| last_voice.filter(|hz| usable(*hz)))
+        .unwrap_or(control_hz);
+    Some(TrunkVfo {
+        voice_hz: voice,
+        control_hz,
+    })
+}
+
+/// One control frequency for a HackRF cluster. The capture center is the
+/// midpoint, so the channel nearest that midpoint is the one the LO sits on.
+fn cluster_control_hz(controls: &[f64]) -> Option<f64> {
+    let (center, kept) = crate::hackrf::place(controls)?;
+    kept.into_iter().min_by(|left, right| {
+        (left - center)
+            .abs()
+            .partial_cmp(&(right - center).abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })
+}
+
+/// The smaller VFO stays up for a whole trunk session. A HackRF has no
+/// paired VFO of its own, so a hamlib sub VFO left on the shared snapshot
+/// is not drawn on that tab.
+fn show_sub_vfo(trunking: bool, hackrf: bool, sub_named: bool) -> bool {
+    trunking || (!hackrf && sub_named)
+}
+
+/// Memory id of a page's detach state (memory only; not saved).
 fn page_detach_id(page: Page) -> egui::Id {
     group_box::DetachState::id(("page", page_name(page)))
 }
@@ -574,6 +650,9 @@ struct App {
     hackrf_open: HashMap<u64, Vec<HeardGrant>>,
     /// The grant on the voice discriminator. `None` is silence.
     hackrf_call: HashMap<u64, Option<(f64, u32)>>,
+    /// Last voice-channel frequency for Tune VFO A. Kept after the call
+    /// ends so the main digits stay on that channel. Not stored.
+    hackrf_last_voice: HashMap<u64, f64>,
     /// Hold and hang for the call each HackRF is decoding.
     hackrf_hold: HashMap<u64, follow::VoiceHold>,
     /// A HackRF that left its control cluster for one voice call.
@@ -2582,6 +2661,7 @@ impl App {
             followers: HashMap::new(),
             hackrf_open: HashMap::new(),
             hackrf_call: HashMap::new(),
+            hackrf_last_voice: HashMap::new(),
             hackrf_hold: HashMap::new(),
             hackrf_away: HashMap::new(),
             trunk_pool: Vec::new(),
@@ -2883,6 +2963,84 @@ impl App {
         self.sub_freq_hold.unwrap_or(snap.sub_freq_hz)
     }
 
+    /// Tune digits while this radio is trunking. `None` leaves the normal
+    /// single or paired VFO alone.
+    fn trunk_face(&self) -> Option<TrunkVfo> {
+        if !self.following_control() {
+            return None;
+        }
+        let rows = self.hub.view().rows;
+        let row = rows.iter().find(|row| row.selected)?;
+        let hackrf = row.spec.driver == cat::RadioDriver::Hackrf;
+        let control = self.trunk_control_hz(row.id, hackrf)?;
+        trunk_vfo(
+            control,
+            self.trunk_current_voice(row.id),
+            self.trunk_last_voice(row.id),
+        )
+    }
+
+    /// Control channel under the dial. A scanner step that is itself a
+    /// control memory wins. Otherwise the follower's control, or the
+    /// HackRF cluster channel nearest the capture center.
+    fn trunk_control_hz(&self, id: u64, hackrf: bool) -> Option<f64> {
+        if self.memory_scan.is_on() {
+            if let Some(hz) = self.scan_memory_hz() {
+                let marked = channels::zone_controls(&self.channels, self.channel_zone)
+                    .iter()
+                    .any(|(channel, _, _)| (*channel - hz).abs() < 1.0);
+                if marked {
+                    return Some(hz);
+                }
+            }
+        }
+        if let Some(hz) = self
+            .followers
+            .get(&id)
+            .and_then(|follower| follower.shown_control_hz())
+        {
+            if hz.is_finite() && hz > 0.0 {
+                return Some(hz);
+            }
+        }
+        if !hackrf {
+            return None;
+        }
+        let list: Vec<f64> = channels::zone_controls(&self.channels, self.channel_zone)
+            .into_iter()
+            .map(|(hz, _, _)| hz)
+            .collect();
+        cluster_control_hz(&list)
+    }
+
+    fn trunk_current_voice(&self, id: u64) -> Option<f64> {
+        if let Some(hz) = self.followers.get(&id).and_then(|follower| follower.voice_hz()) {
+            return Some(hz);
+        }
+        self.hackrf_call
+            .get(&id)
+            .copied()
+            .flatten()
+            .map(|(hz, _)| hz)
+    }
+
+    fn trunk_last_voice(&self, id: u64) -> Option<f64> {
+        if let Some(heard) = self.followers.get(&id).and_then(|follower| follower.heard()) {
+            return Some(heard.hz);
+        }
+        self.hackrf_last_voice.get(&id).copied()
+    }
+
+    /// Mode printed beside VFO B for a control frequency. FM when the
+    /// memory has no mode of its own.
+    fn control_mode_label(&self, hz: f64) -> String {
+        channels::zone_controls(&self.channels, self.channel_zone)
+            .into_iter()
+            .find(|(channel, mode, _)| (*channel - hz).abs() < 500.0 && !mode.is_empty())
+            .map(|(_, mode, _)| mode)
+            .unwrap_or_else(|| "FM".to_string())
+    }
+
     fn send_plan_mode(&mut self, snap: &Snapshot, wanted: &str) {
         if !snap.online() || !snap.caps.can_set_mode {
             return;
@@ -3130,13 +3288,19 @@ impl eframe::App for App {
         // E-STOP chord: read once, act after the input closure.
         self.estop_chord.poll(ui.ctx());
         // Spectrum frames redraw only while something shows them (or a scan
-        // steps on them). Tune and the TG pages are not detachable.
-        let view = redraw::View {
-            page_shows_spectrum: page_shows_spectrum(self.page),
-            detached_shows_spectrum: false,
-            root_minimized: ui.ctx().input(|i| i.viewport().minimized == Some(true)),
-            scanning: self.memory_scan.is_on(),
-        };
+        // steps on them). A detached Tune window (#225) counts on its own.
+        let tune_detached = page_detached(ui.ctx(), Page::Tune);
+        let tune_minimized = tune_detached
+            && ui.ctx().input_for(rustcars::group::detach_viewport_id(page_detach_id(Page::Tune)), |i| {
+                i.viewport().minimized == Some(true)
+            });
+        let view = spectrum_view(
+            self.page,
+            tune_detached,
+            tune_minimized,
+            ui.ctx().input(|i| i.viewport().minimized == Some(true)),
+            self.memory_scan.is_on(),
+        );
         self.hub.set_spectrum_watched(redraw::spectrum_wanted(view));
         let (mut snap, live_gen, poll_gen) = self.snap_gen();
         self.overlay_hackrf(&mut snap);
@@ -3637,6 +3801,10 @@ impl App {
                         },
                     );
                 }
+                // Radio tabs sit on the left of the Tune elbow (#225).
+                if page == Page::Tune {
+                    self.tune_radio_tabs(ui, frame_rect, slot);
+                }
                 // A detachable page's frame detaches from the top elbow's
                 // end pill (top right, right of the E-STOP gap).
                 if page_detachable(page) {
@@ -3660,6 +3828,38 @@ impl App {
                     tools::bottom_bar_watermark(ui, frame_rect, rec_ui::PRIVACY);
                 }
         pill_clicked
+    }
+
+    /// One tab per station radio, left of the Tune top elbow. Clicking a tab
+    /// selects that radio, the same as its Config row (#225).
+    fn tune_radio_tabs(&mut self, ui: &mut egui::Ui, frame: egui::Rect, slot: Option<egui::Rect>) {
+        let rows = self.hub.view().rows;
+        if rows.is_empty() {
+            return;
+        }
+        let labels: Vec<String> = rows
+            .iter()
+            .map(|row| {
+                let name = row.spec.name.trim();
+                if name.is_empty() { "Radio".to_string() } else { name.to_string() }
+            })
+            .collect();
+        let selected = rows.iter().position(|row| row.selected);
+        let run = tune_radio_run(frame, slot);
+        if run.width() < 72.0 || run.height() < 8.0 {
+            return;
+        }
+        let need = tools::bar_tabs_width(ui, &labels);
+        let width = need.min(run.width());
+        let tabs = egui::Rect::from_min_size(run.min, egui::vec2(width, run.height()));
+        let theme = rustcars::LcarsTheme::default();
+        ui.painter().rect_filled(tabs.expand2(egui::vec2(theme.frame_gap, 0.0)), 0.0, theme.bg);
+        let Some(index) = tools::bar_tab_row(ui, tabs, "tune-radios", &labels, selected) else {
+            return;
+        };
+        if rows.get(index).is_some_and(|row| !row.selected) {
+            self.hub.select(rows[index].id);
+        }
     }
 
     fn page_body_of(&mut self, page: Page, window: bool, ui: &mut egui::Ui, snap: &mut Snapshot) {
@@ -3699,18 +3899,34 @@ impl App {
     }
 
     fn page_tune(&mut self, ui: &mut egui::Ui, snap: &mut Snapshot) {
-        let freq = self.shown_freq(snap);
-        let sub_freq = self.shown_sub_freq(snap);
+        let trunk = self.trunk_face();
+        let radio_freq = self.shown_freq(snap);
+        let freq = trunk.map(|pair| pair.voice_hz).unwrap_or(radio_freq);
+        let sub_freq = trunk
+            .map(|pair| pair.control_hz)
+            .unwrap_or_else(|| self.shown_sub_freq(snap));
+        let show_sub = show_sub_vfo(trunk.is_some(), self.selected_hackrf(), !snap.sub_vfo.is_empty());
+        // The follower owns the dial while these digits are a trunk readout.
+        let tune_digits = trunk.is_none();
+        let sub_mode = trunk.map(|pair| self.control_mode_label(pair.control_hz));
         let status = self.tune_status();
         lcd_panel_in(ui, TUNE_SCREEN_MARGIN, |ui| {
             // Main VFO with the sub VFO stacked under it, then the VFO keys.
             // Wraps instead of clipping at the right edge.
             ui.horizontal_wrapped(|ui| {
                 ui.vertical(|ui| {
-                    self.vfo_cluster(ui, snap, true, freq);
-                    if !snap.sub_vfo.is_empty() {
+                    self.vfo_cluster(ui, snap, true, freq, trunk.map(|_| "VFOA"), None, tune_digits);
+                    if show_sub {
                         ui.add_space(6.0);
-                        self.vfo_cluster(ui, snap, false, sub_freq);
+                        self.vfo_cluster(
+                            ui,
+                            snap,
+                            false,
+                            sub_freq,
+                            trunk.map(|_| "VFOB"),
+                            sub_mode.as_deref(),
+                            tune_digits,
+                        );
                     }
                 });
                 ui.add_space(12.0);
@@ -7800,6 +8016,7 @@ impl App {
         self.monitor_talkgroups = monitor_talkgroups.into_iter().collect();
         self.hackrf_open.clear();
         self.hackrf_call.clear();
+        self.hackrf_last_voice.clear();
         self.hackrf_hold.clear();
         self.hackrf_away.clear();
         self.trunk_pool.clear();
@@ -9768,6 +9985,7 @@ impl App {
         let ids: Vec<u64> = direct.iter().map(|row| row.1).collect();
         self.hackrf_open.retain(|id, _| ids.contains(id));
         self.hackrf_call.retain(|id, _| ids.contains(id));
+        self.hackrf_last_voice.retain(|id, _| ids.contains(id));
         self.hackrf_hold.retain(|id, _| ids.contains(id));
         self.hackrf_away.retain(|id, _| ids.contains(id));
         self.hackrf_cc_feeds.retain(|id, _| ids.contains(id));
@@ -10051,6 +10269,11 @@ impl App {
                     .collect(),
             );
             self.hackrf_call.insert(tick.id, picked.call);
+            if let Some((hz, _)) = picked.call {
+                if hz.is_finite() && hz > 0.0 {
+                    self.hackrf_last_voice.insert(tick.id, hz);
+                }
+            }
             if let Some(away) = picked.away {
                 self.hackrf_away.insert(tick.id, away);
             } else {
@@ -11777,7 +12000,12 @@ impl App {
             tune_style::GridKey::toggle("VFO A", can, on_vfo("VFOA")),
             tune_style::GridKey::toggle("VFO B", can, on_vfo("VFOB")),
         ];
-        let cols = if snap.sub_vfo.is_empty() { 4 } else { 2 };
+        let stacked = show_sub_vfo(
+            self.trunk_face().is_some(),
+            self.selected_hackrf(),
+            !snap.sub_vfo.is_empty(),
+        );
+        let cols = if stacked { 2 } else { 4 };
         let Some(i) = tune_style::key_grid(ui, &keys, cols) else { return };
         match i {
             0 => self.send(Command::VfoOp("XCHG".into())),
@@ -11801,25 +12029,27 @@ impl App {
 
     /// One VFO: the digit row, the typed frequency, and the hamlib name with
     /// its mode. `main` is the current VFO (`get_vfo`). The other cluster is
-    /// `snap.sub_vfo`. The S-meter is the receiver, so it stays on the current
-    /// VFO. Hamlib reports one strength.
-    fn vfo_cluster(&mut self, ui: &mut egui::Ui, snap: &Snapshot, main: bool, freq: f64) {
-        let name = if main {
-            snap.vfo.as_str()
-        } else {
-            snap.sub_vfo.as_str()
-        };
-        let mode = if main {
-            snap.mode.as_str()
-        } else {
-            snap.sub_mode.as_str()
-        };
+    /// `snap.sub_vfo`. `name` and `mode` override those labels for the trunk
+    /// readout. `tune` is false while the follower owns the dial. The S-meter
+    /// is the receiver, so it stays on the current VFO. Hamlib reports one strength.
+    fn vfo_cluster(
+        &mut self,
+        ui: &mut egui::Ui,
+        snap: &Snapshot,
+        main: bool,
+        freq: f64,
+        name: Option<&str>,
+        mode: Option<&str>,
+        tune: bool,
+    ) {
+        let name = name.unwrap_or(if main { snap.vfo.as_str() } else { snap.sub_vfo.as_str() });
+        let mode = mode.unwrap_or(if main { snap.mode.as_str() } else { snap.sub_mode.as_str() });
         let cluster = ui.horizontal(|ui| {
             // The sub VFO stays at 70% of the main. Both are then 90% so the
             // VFO button frame fits between them on the default window.
             let scale = if main { 0.9 } else { 0.7 * 0.9 };
             scale_vfo(ui, scale);
-            let hovered_digit = self.frequency(ui, snap, freq, main, scale);
+            let hovered_digit = self.frequency(ui, snap, freq, main, scale, tune);
             ui.add_space(18.0 * scale);
             ui.vertical(|ui| {
                 ui.label(
@@ -11848,7 +12078,7 @@ impl App {
             });
             hovered_digit
         });
-        let can_tune = self.can_tune_freq(snap, main);
+        let can_tune = tune && self.can_tune_freq(snap, main);
         // The cluster, not just the digit buttons. A digit under the pointer
         // wins. Anywhere else on this VFO, the wheel turns the selected digit.
         let over_cluster = ui
@@ -11879,8 +12109,9 @@ impl App {
         freq: f64,
         main: bool,
         scale: f32,
+        tune: bool,
     ) -> Option<f64> {
-        let can_tune = self.can_tune_freq(snap, main);
+        let can_tune = tune && self.can_tune_freq(snap, main);
         ui.vertical(|ui| {
             let digits = ui.horizontal(|ui| {
                 let pointer = ui.input(|i| i.pointer.hover_pos());
@@ -11958,7 +12189,7 @@ impl App {
                         .desired_width(width);
                     ui.add_enabled(can_tune, edit)
                 };
-                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                if can_tune && resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     let raw = if main {
                         self.freq_text.clone()
                     } else {
@@ -12930,7 +13161,7 @@ mod config_order_tests {
     fn rec_and_config_share_the_page_detach_path() {
         use crate::{Page, page_detachable, page_detach_id, page_detached, page_stub};
         assert!(page_detachable(Page::Config) && page_detachable(Page::Rec));
-        assert!(!page_detachable(Page::Tune), "Tune is not wrapped");
+        assert!(page_detachable(Page::Tune), "Tune detaches with the right pill (#225)");
         for p in [Page::Timers, Page::HfData, Page::Rotator, Page::Tools] {
             assert!(page_detachable(p), "{} carries the page pill", crate::page_name(p));
         }
@@ -13237,6 +13468,13 @@ mod detached_fit_tests {
         }
         let tools = detach_opts(Page::Tools).default_size;
         assert!(tools.x >= 1500.0 && tools.y >= 900.0, "NanoVNA / Tools open large");
+        let tune = tune_radio_run(
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1200.0, 800.0)),
+            Some(egui::Rect::from_min_max(egui::pos2(1000.0, 0.0), egui::pos2(1140.0, 40.0))),
+        );
+        assert!(tune.right() < 1000.0, "radio tabs stay left of the E-STOP slot");
+        assert!(tune.left() > 170.0 && tune.left() < 200.0, "radio tabs start after the elbow curve");
+        assert_eq!(tune.height(), rustcars::LcarsTheme::default().bar_thin);
     }
 
     /// Tools, every screen (NanoVNA chart, calibration via its own screen,
@@ -13867,10 +14105,18 @@ mod config_sections_tests {
 
     #[test]
     fn spectrum_pages_are_not_detachable() {
-        for p in [Page::Tune, Page::Talkgroups(1), Page::RadioIds(1)] {
+        for p in [Page::Talkgroups(1), Page::RadioIds(1)] {
             assert!(page_shows_spectrum(p));
             assert!(!DETACHABLE_PAGES.contains(&p), "a spectrum page became detachable: set detached_shows_spectrum");
         }
+        assert!(page_shows_spectrum(Page::Tune));
+        assert!(page_detachable(Page::Tune), "Tune detaches with the right pill (#225)");
+        let attached = spectrum_view(Page::Tune, false, false, false, false);
+        assert!(attached.page_shows_spectrum && !attached.detached_shows_spectrum);
+        let window = spectrum_view(Page::Tune, true, false, true, false);
+        assert!(!window.page_shows_spectrum && window.detached_shows_spectrum);
+        let hidden = spectrum_view(Page::Plan, true, true, false, false);
+        assert!(!hidden.page_shows_spectrum && !hidden.detached_shows_spectrum);
         for p in [Page::Plan, Page::Channels, Page::Config, Page::Meters, Page::Rotator, Page::Tools] {
             assert!(!page_shows_spectrum(p));
         }
@@ -13935,5 +14181,59 @@ mod config_sections_tests {
         assert!(leds.iter().all(|r| r.right() <= stop.left()));
         assert!(texts.iter().any(|t| t.contains("E-STOP")));
         tools.conceal_nanovna();
+    }
+}
+
+#[cfg(test)]
+mod trunk_vfo_tests {
+    use super::{cluster_control_hz, show_sub_vfo, trunk_vfo};
+
+    #[test]
+    fn trunk_main_is_the_latest_voice_and_sub_is_the_control() {
+        let control = 857_200_000.0;
+        let idle = trunk_vfo(control, None, None).unwrap();
+        assert_eq!(idle.voice_hz, control);
+        assert_eq!(idle.control_hz, control);
+
+        let live = trunk_vfo(control, Some(855_712_500.0), Some(851_012_500.0)).unwrap();
+        assert_eq!(live.voice_hz, 855_712_500.0);
+        assert_eq!(live.control_hz, control);
+
+        let hung = trunk_vfo(control, None, Some(855_712_500.0)).unwrap();
+        assert_eq!(hung.voice_hz, 855_712_500.0);
+        assert_eq!(hung.control_hz, control);
+
+        let skipped = trunk_vfo(control, Some(0.0), Some(855_712_500.0)).unwrap();
+        assert_eq!(skipped.voice_hz, 855_712_500.0);
+        assert!(trunk_vfo(control, Some(f64::NAN), Some(852_000_000.0))
+            .unwrap()
+            .voice_hz
+            .eq(&852_000_000.0));
+        assert!(trunk_vfo(0.0, Some(855_712_500.0), None).is_none());
+        assert!(trunk_vfo(f64::NAN, None, None).is_none());
+    }
+
+    #[test]
+    fn hackrf_hides_a_leaked_sub_vfo_until_trunking() {
+        assert!(!show_sub_vfo(false, true, true));
+        assert!(show_sub_vfo(true, true, false));
+        assert!(show_sub_vfo(false, false, true));
+        assert!(!show_sub_vfo(false, false, false));
+    }
+
+    #[test]
+    fn cluster_control_is_the_channel_nearest_the_capture_center() {
+        assert_eq!(cluster_control_hz(&[857_200_000.0]), Some(857_200_000.0));
+        // Two channels sit the same distance from their midpoint. The lower one wins the tie.
+        assert_eq!(
+            cluster_control_hz(&[853_000_000.0, 859_000_000.0]),
+            Some(853_000_000.0)
+        );
+        // 852 is nearer the midpoint of 851..856 than either end.
+        assert_eq!(
+            cluster_control_hz(&[851_000_000.0, 852_000_000.0, 856_000_000.0]),
+            Some(852_000_000.0)
+        );
+        assert!(cluster_control_hz(&[]).is_none());
     }
 }

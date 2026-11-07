@@ -184,7 +184,7 @@ The top of the window is one row of page tabs. The default order is **Tune**, **
 
 ## 4.2 Separate windows
 
-- **Config, REC, Timers, HF Data, Levels, Keys, Meters and Tools** detach with the rounded pill at the top right of the page: click it to open the page in its own window, click it again (on the window or the main page) to put it back.
+- **Tune, Config, REC, Timers, HF Data, Levels, Keys, Meters and Tools** detach with the rounded pill at the top right of the page: click it to open the page in its own window, click it again (on the window or the main page) to put it back. The Tune window keeps a tab for each radio.
 
 <!-- screenshot: main-03 — Any page can be torn off into its own window. -->
 
@@ -209,7 +209,7 @@ A frequency the radio refuses doesn't move the readout.
 
 ## 4.4 E-STOP
 
-The red **E-STOP** button with a black stop-sign octagon sits at the right end of the tan top bar of every main page (Tune, Plan, Channels, Talkgroups, Radio IDs, Keys, Meters, Levels, Timers, REC, Tools and Config); on Tools it is there for every tool screen, and in every detached page window (REC, Timers, Config, HF Data, Levels, Keys, Meters, Tools) it sits at the right of the window's top row, with RELEASE; the E-STOP keyboard chord works in those windows too. It is also in the bar of the Config groups Radio, Rotator, Amplifier, Automation patch and RF patch. Every copy is the same switch.
+The red **E-STOP** button with a black stop-sign octagon sits at the right end of the tan top bar of every main page (Tune, Plan, Channels, Talkgroups, Radio IDs, Keys, Meters, Levels, Timers, REC, Tools and Config); on Tools it is there for every tool screen, and in every detached page window (Tune, REC, Timers, Config, HF Data, Levels, Keys, Meters, Tools) it sits at the right of the window's top row, with RELEASE; the E-STOP keyboard chord works in those windows too. It is also in the bar of the Config groups Radio, Rotator, Amplifier, Automation patch and RF patch. Every copy is the same switch.
 
 Press it and it latches. Every copy then reads **E-STOP ENGAGED**, and Commander:
 
@@ -234,9 +234,11 @@ Press **RELEASE** to return to normal operation. Commander stops blocking: trans
 
 The Tune page has the frequency frame (digits, VFO keys, the paired VFO), a band row (`ALT`, `BSP`, `LOAD`, band chips, `Mode`, `Sub`, `Receiver`), the optional bandspread, and a control row of radio functions.
 
+The left side of the top elbow has one tab for each radio in the station. The open tab is the radio Tune is controlling. Click another tab to switch radios without opening Config. Tabs that do not fit are listed on the more-tabs key at the right of that row. The rounded pill at the right end of the elbow detaches this page.
+
 ## 5.1 The frequency readout
 
-The readout shows four MHz digits, then kHz and Hz groups: 14.153608 MHz is `0014.153.608`. The top readout is the current VFO, with the S-meter. The smaller readout stacked under it, when the radio has one, is the paired VFO (A with B, Main with Sub); tuning its digits sets the split frequency. The VFO keys sit to their right in an even grid of same-size keys (two columns beside a stacked sub VFO, four when there is none); latching keys (R-offsets, TX main/sub, VFO A/B) show ● or ○. They wrap below on a narrow window, so nothing is cut off.
+The readout shows four MHz digits, then kHz and Hz groups: 14.153608 MHz is `0014.153.608`. The top readout is the current VFO, with the S-meter. The smaller readout stacked under it, when the radio has one, is the paired VFO (A with B, Main with Sub); tuning its digits sets the split frequency. While that radio is following a trunked system, both readouts stay up for the whole session: the large VFO A shows the most recent voice channel, and the smaller VFO B shows the control channel. Until the first voice grant, VFO A shows the control channel as well. Those digits are a readout; the follower tunes the radio. A HackRF that is not following shows one readout. The VFO keys sit to their right in an even grid of same-size keys (two columns beside a stacked sub VFO, four when there is none); latching keys (R-offsets, TX main/sub, VFO A/B) show ● or ○. They wrap below on a narrow window, so nothing is cut off.
 
 | Action | Result |
 | --- | --- |

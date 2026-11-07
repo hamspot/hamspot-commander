@@ -14,6 +14,14 @@ Brief record of decisions and why. Dated when recorded here (2026-10-27) unless 
 - **Data layout (proposal, not built):** `Foo.HSCommander` plus a `Foo.HSData/` folder; see `docs/design/data-layout.md` on branch `design-data-layout` and epic #148.
 - **Manual style (2026-10-27):** operator-only content, second person, tables for reference, screenshot placeholders as HTML comments with #149 ids.
 
+## Trunk VFO readout (2026-11-07)
+
+While the selected radio is following a trunked control channel, Tune keeps both digit rows for the whole session. VFO A is the most recent voice channel, and stays on the control channel until the first grant. VFO B is the control channel, including between calls and while the receiver is on a voice channel. The digits do not tune in that mode. A HackRF that is not trunking draws one readout. A paired VFO left on the shared rig snapshot belongs to the hamlib radio and is not painted on the HackRF tab.
+
+## Tune radio tabs (#225, 2026-11-07)
+
+The Tune top elbow carries one tab per station radio, on the left, after the curve and before the E-STOP gap. Clicking a tab selects that radio (`Hub::select`), the same as its Config row. Overflow uses the existing more-tabs key. Tune joins `DETACHABLE_PAGES`; the right pill detaches the whole Tune page, tabs included. Spectrum frames follow the detached Tune window (`detached_shows_spectrum`) and stop when that window is minimized. The Tune stub in the main window does not keep the spectrum running.
+
 ## E-STOP button height (#200, 2026-10-27)
 
 The E-STOP and RELEASE buttons use the standard egui button height
