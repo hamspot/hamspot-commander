@@ -1108,6 +1108,7 @@ mod talkgroup_tab_tests {
             tx_pipe_status: String::new(),
             tx_pipe_diverted: false,
             center_hz: 0.0,
+            voice_empty: false,
         }
     }
 
@@ -10120,6 +10121,15 @@ impl App {
             } else {
                 Vec::new()
             };
+            let now = std::time::Instant::now();
+            let fresh = {
+                let hold = self.hackrf_hold.entry(tick.id).or_default();
+                hold.suppress_barren(fresh, now)
+            };
+            let no_carrier = rows
+                .iter()
+                .find(|row| row.id == tick.id)
+                .is_some_and(|row| row.voice_empty);
             // SCAN reads each control from the capture already running.
             // A memory outside the cluster is a capture of its own, and a
             // voice trip must not fight that hop.
@@ -10163,7 +10173,6 @@ impl App {
             // The shared hold decides whether the call being decoded stays.
             // Control decoders keep running inside the capture and their
             // lines are logged above; only the choice of call is held.
-            let now = std::time::Instant::now();
             let hang = std::time::Duration::from_millis(u64::from(self.voice_hang_ms));
             let priority = talkgroups::priority_tgs(&self.talkgroups);
             let encrypted_end = tick.voice_events.iter().any(|event| {
@@ -10200,6 +10209,7 @@ impl App {
                         &candidates,
                         &reachable,
                         now,
+                        no_carrier,
                     )
                 } else {
                     hold.clear();

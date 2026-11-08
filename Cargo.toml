@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/rigctl", "crates/commander", "crates/hsrec"]
+members = ["crates/rigctl", "crates/commander", "crates/commander-voice", "crates/hsrec"]
 
 [workspace.package]
 edition = "2021"

@@ -203,28 +203,70 @@ pub fn decoder_env(meta: &Meta, overrides: &[(String, String)]) -> Vec<(String, 
     safe_env(&map.into_iter().collect::<Vec<_>>())
 }
 
-/// pw-cat to the system default output. `--raw` is required: without it
-/// pw-cat (PipeWire 1.x) opens `-` through libsndfile, which rejects headerless
-/// s16 with "Format not recognised" and exits. The copier then fails, the
-/// decoder's sox dies with "Broken pipe", and the replay reports no voice.
-pub fn default_play_argv() -> Vec<String> {
-    ["pw-cat", "-p", "--raw", "--rate", "48000", "--channels", "1", "--format", "s16", "-"]
-        .iter()
-        .map(|s| s.to_string())
+/// Sample rate and channel count on a script's stdout.
+///
+/// Shipped digital voice scripts write the decoder's own 8 kHz stream.
+/// P25, Phase 2, DMR, and X2-TDMA are stereo, one slot on each channel.
+/// DRM speech and any other script stay 48 kHz mono, which is the contract
+/// a custom pipe already had.
+pub fn script_pcm(script: &str) -> (u32, u8) {
+    let name = std::path::Path::new(script).file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let stereo = matches!(
+        name,
+        "commander-demod-p25.rxpipe"
+            | "commander-demod-p25p2.rxpipe"
+            | "commander-demod-dmr.rxpipe"
+            | "commander-demod-x2tdma.rxpipe"
+    );
+    let rate = if name == "commander-demod-drm.rxpipe" {
+        48_000
+    } else if name.starts_with("commander-demod-") && name.ends_with(".rxpipe") {
+        8_000
+    } else {
+        48_000
+    };
+    (rate, if stereo { 2 } else { 1 })
+}
+
+/// Sum one stereo frame. A one-slot call stays at full level.
+pub fn mix_slots(samples: &[i16]) -> Vec<i16> {
+    samples
+        .chunks(2)
+        .map(|frame| match frame {
+            [left, right] => left.saturating_add(*right),
+            [only] => *only,
+            _ => 0,
+        })
         .collect()
 }
 
-/// pw-cat to one output, named by its PipeWire / Pulse sink node name. An
-/// empty or unsafe name plays to the system default, as
-/// [`default_play_argv`] does.
-pub fn play_argv(target: &str) -> Vec<String> {
-    let mut argv = default_play_argv();
+/// `commander-voice play` to the system default sink. `rate` and `channels`
+/// are the script stdout, not a resampled copy.
+pub fn voice_play_argv(target: &str, rate: u32, channels: u8) -> Vec<String> {
+    let mut argv = vec![
+        "commander-voice".to_string(),
+        "play".to_string(),
+        "--rate".to_string(),
+        rate.to_string(),
+        "--channels".to_string(),
+        channels.to_string(),
+    ];
     if sink_name_ok(target) {
-        let dash = argv.len() - 1;
-        argv.insert(dash, target.to_string());
-        argv.insert(dash, "--target".to_string());
+        argv.push("--target".to_string());
+        argv.push(target.to_string());
     }
     argv
+}
+
+/// Analog and unknown pipes: 48 kHz mono to the default sink.
+pub fn default_play_argv() -> Vec<String> {
+    voice_play_argv("", 48_000, 1)
+}
+
+/// Analog and unknown pipes to one sink. An empty or unsafe name plays to
+/// the system default, as [`default_play_argv`] does.
+pub fn play_argv(target: &str) -> Vec<String> {
+    voice_play_argv(target, 48_000, 1)
 }
 
 /// A sink node name is plain text: no path, no option, no spaces.
@@ -281,14 +323,17 @@ pub fn list_sinks() -> Vec<Sink> {
 
 /// The player command for the stored output. A stored name missing from
 /// `sinks` falls back to the system default; the second value says so.
-pub fn pick_output(stored: &str, sinks: &[Sink]) -> (Vec<String>, Option<String>) {
+pub fn pick_output(stored: &str, sinks: &[Sink], rate: u32, channels: u8) -> (Vec<String>, Option<String>) {
     if stored.is_empty() {
-        return (default_play_argv(), None);
+        return (voice_play_argv("", rate, channels), None);
     }
     if sinks.iter().any(|s| s.name == stored) {
-        return (play_argv(stored), None);
+        return (voice_play_argv(stored, rate, channels), None);
     }
-    (default_play_argv(), Some(format!("Output {stored} not found; playing to the system default.")))
+    (
+        voice_play_argv("", rate, channels),
+        Some(format!("Output {stored} not found; playing to the system default.")),
+    )
 }
 
 /// Result of an offline render of one recording.
@@ -766,13 +811,29 @@ mod tests {
     #[test]
     fn output_target_argv() {
         let argv = play_argv("bluez_output.08_EB_ED_83_32_13.1");
-        let n = argv.len();
-        assert_eq!(&argv[n - 3..], ["--target", "bluez_output.08_EB_ED_83_32_13.1", "-"]);
-        assert!(argv.iter().any(|a| a == "--raw"));
+        assert_eq!(
+            argv,
+            vec![
+                "commander-voice",
+                "play",
+                "--rate",
+                "48000",
+                "--channels",
+                "1",
+                "--target",
+                "bluez_output.08_EB_ED_83_32_13.1",
+            ]
+        );
         assert_eq!(play_argv(""), default_play_argv());
         assert_eq!(play_argv("--help"), default_play_argv());
         assert_eq!(play_argv("/dev/snd"), default_play_argv());
         assert_eq!(play_argv("a b"), default_play_argv());
+        assert_eq!(script_pcm("modems/commander-demod-p25.rxpipe"), (8_000, 2));
+        assert_eq!(script_pcm("commander-demod-dstar.rxpipe"), (8_000, 1));
+        assert_eq!(script_pcm("commander-demod-p25-trace.rxpipe"), (8_000, 1));
+        assert_eq!(script_pcm("commander-demod-drm.rxpipe"), (48_000, 1));
+        assert_eq!(script_pcm("/tmp/my-nbfm.rxpipe"), (48_000, 1));
+        assert_eq!(mix_slots(&[20_000, 20_000, 3, 4]), vec![32767, 7]);
     }
 
     #[test]
@@ -782,47 +843,23 @@ mod tests {
         assert_eq!(sinks.len(), 2);
         assert_eq!(sinks[0].name, "alsa_output.usb-C-Media.analog-stereo");
         assert_eq!(sinks[0].description, "USB Audio Device Analog Stereo");
-        let (argv, note) = pick_output("hamspot_2_rx", &sinks);
+        let (argv, note) = pick_output("hamspot_2_rx", &sinks, 8_000, 2);
         assert!(argv.contains(&"hamspot_2_rx".to_string()) && note.is_none());
-        let (argv, note) = pick_output("gone_sink", &sinks);
+        assert!(argv.windows(2).any(|pair| pair[0] == "--rate" && pair[1] == "8000"));
+        assert!(argv.windows(2).any(|pair| pair[0] == "--channels" && pair[1] == "2"));
+        let (argv, note) = pick_output("gone_sink", &sinks, 48_000, 1);
         assert_eq!(argv, default_play_argv());
         assert!(note.unwrap().contains("system default"));
-        assert_eq!(pick_output("", &sinks), (default_play_argv(), None));
+        assert_eq!(pick_output("", &sinks, 48_000, 1), (default_play_argv(), None));
     }
 
     #[test]
-    fn default_player_is_raw_pcm() {
+    fn default_player_is_commander_voice() {
         let argv = default_play_argv();
-        assert_eq!(argv[0], "pw-cat");
-        assert!(argv.iter().any(|a| a == "--raw" || a == "-a"), "{argv:?}");
-        assert_eq!(argv.last().map(String::as_str), Some("-"));
-    }
-
-    /// The real pw-cat must stay alive on headerless PCM that arrives late.
-    /// Skipped when pw-cat or a PipeWire session is absent.
-    #[test]
-    fn default_player_accepts_late_raw_pcm() {
-        if std::process::Command::new("pw-cat").arg("--version").output().is_err() || std::env::var_os("XDG_RUNTIME_DIR").is_none() {
-            return;
-        }
-        let mut argv = default_play_argv();
-        // Silence only: zeros, half a second, after a pause like a decoder sync.
-        let mut c = Command::new(&argv.remove(0));
-        let mut child = c.args(&argv).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
-        let mut stdin = child.stdin.take().unwrap();
-        std::thread::sleep(Duration::from_millis(500));
-        let ok = stdin.write_all(&vec![0u8; 48_000]).is_ok();
-        std::thread::sleep(Duration::from_millis(200));
-        let alive = child.try_wait().unwrap().is_none();
-        drop(stdin);
-        let st = child.wait().unwrap();
-        if !alive && st.code() != Some(0) {
-            // No PipeWire daemon in this environment; nothing to check.
-            if std::process::Command::new("pw-cli").arg("info").output().map(|o| !o.status.success()).unwrap_or(true) {
-                return;
-            }
-        }
-        assert!(ok && (alive || st.success()), "pw-cat exited {st:?} on raw PCM");
+        assert_eq!(argv[0], "commander-voice");
+        assert_eq!(argv[1], "play");
+        assert!(argv.windows(2).any(|pair| pair[0] == "--rate" && pair[1] == "48000"));
+        assert!(!argv.iter().any(|arg| arg == "pw-cat" || arg == "--raw"));
     }
 
     #[test]

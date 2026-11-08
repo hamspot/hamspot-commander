@@ -65,7 +65,7 @@ Everything about a station (radios, band plan, channels, talkgroups, levels, lay
 | `gqrx` | Package `gqrx-sdr`, for GQRX rows. |
 | `pw-loopback`, `pw-cat`, `pw-dump` | Package `pipewire-bin`. |
 | `helvum` | Optional PipeWire patchbay, opened from the Audio frame. |
-| `dsd-fme`, `sox`, `socat` | Digital voice pipes. The installer builds `dsd-fme`. |
+| `dsd-fme`, `commander-voice` | Shipped digital decoders, and the PipeWire player for their voice. The installer builds both. `sox` is only for a filter you write yourself. |
 | `hackrf_transfer` | Package `hackrf`, for HackRF rows. |
 
 Supported test equipment is the **NanoVNA V2** (V2.2, USB id `04b4:0008`). Supported SDR hardware for raw capture and REC is the **HackRF**.
@@ -991,7 +991,7 @@ Commander starts an RX pipe as `<pipe file> <port>`, in its own process group, a
   - Hamlib and GQRX radios: the radio's receive audio, recorded with `pw-cat`.
   - Audio taps: the chosen sound card input.
   - HackRF rows: Commander's FM discriminator. It runs at 16 kHz, and each sample is repeated three times to make 48 kHz. 4 kHz of deviation is 12000 in sample units.
-- **stdout:** raw 48 kHz mono s16le, played to the radio's speaker by `pw-cat`. The pipe must keep writing that format and rate. Resample inside the pipe (for example with `sox`) if your decoder works at 8 kHz.
+- **stdout:** raw signed 16-bit, played by `commander-voice` on a PipeWire stream. A custom pipe keeps the old contract: 48 kHz mono. A shipped digital pipe writes the decoder's own rate (8 kHz, stereo when the mode has two slots). PipeWire resamples. `pw-cat` still records the radio sink and still plays the raw discriminator onto the radio card.
 - **`$1`:** a localhost UDP port Commander has reserved for this pipe. Each live pipe gets a different port, starting at 23469. Decoders that send voice over UDP, such as dsd-fme, should use it. A manual run with no argument should default to 23469, as the shipped scripts do.
 - **stderr:** discarded, unless `HAMSPOT_CC_EVENTS=1` or `HAMSPOT_IDENTITY=1` is set. Then Commander reads it line by line, as trunk events or as scanner identity text.
 - **Environment:** set only when it applies.
@@ -1088,19 +1088,15 @@ exec sox -q -t raw -r 48000 -e signed -b 16 -c 1 - \
 ```bash
 #!/bin/bash
 set -euo pipefail                 # any failed tool ends the script -> Commander restarts it
-port="${1:-23469}"                # the reserved UDP port; 23469 for a manual run
-for program in dsd-fme socat sox; do   # fail fast, with a clear stderr line, if a tool is missing
-    command -v "$program" >/dev/null 2>&1 || { echo "…: ${program} is not on PATH" >&2; exit 1; }
-done
+port="${1:-23469}"                # accepted and ignored; 23469 for a manual run
+command -v dsd-fme >/dev/null 2>&1 || { echo "…: dsd-fme is not on PATH" >&2; exit 1; }
 # dsd-fme reads the 48 kHz s16le stdin (-i -), decodes P25 (-ft: Phase 1
-# control plus Phase 2 voice), and sends 8 kHz stereo voice to UDP $port.
+# control plus Phase 2 voice), and writes 8 kHz stereo voice on stdout (-o -).
 # HAMSPOT_P25_X -> dsd-fme -X (Phase 2 WACN/SYS/NAC word, not a key).
 # HAMSPOT_P25_K -> dsd-fme -K <key csv>; empty passes nothing.
 # HAMSPOT_CC_EVENTS=1 keeps dsd-fme stderr for the trunk follower.
-# socat listens on UDP $port; sox mixes the two slots to mono and
-# resamples 8 kHz -> 48 kHz s16le on stdout for the speaker.
-# A trap kills every child on exit, so a dead decoder or player ends the
-# whole script and Commander restarts the pipe group.
+# Commander plays that stdout with `commander-voice play`. The script does not resample.
+# A dead decoder ends the script and Commander restarts it.
 ```
 
 **4. Reading settings from the environment.** A REC replay passes the same `HAMSPOT_*` values back. Test with `--param HAMSPOT_MY_GAIN_DB=3`.

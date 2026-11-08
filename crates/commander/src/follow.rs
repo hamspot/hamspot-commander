@@ -53,6 +53,11 @@ pub const VOICE_REPICK_GRACE: std::time::Duration = std::time::Duration::from_mi
 /// How long a call let go for silence counts as "the same call" for
 /// [`VOICE_REPICK_GRACE`].
 pub const VOICE_REPICK_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+/// After an empty voice channel is released, ignore that frequency until it
+/// has been absent from the control channel for this long. The control
+/// channel repeats the grant, and hopping back onto a dead carrier would
+/// leave the control channel again.
+pub const EMPTY_GRANT_GAP: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
@@ -180,6 +185,10 @@ pub struct VoiceHold {
     overrides: Vec<String>,
     /// The call last let go because no voice frame came, and when.
     silent: Option<((f64, u32), std::time::Instant)>,
+    /// Voice frequency released because the channel had no carrier.
+    barren: Option<f64>,
+    /// Last time that frequency was still being offered.
+    barren_at: Option<std::time::Instant>,
 }
 
 impl Default for VoiceHold {
@@ -192,6 +201,8 @@ impl Default for VoiceHold {
             priority: Vec::new(),
             overrides: Vec::new(),
             silent: None,
+            barren: None,
+            barren_at: None,
         }
     }
 }
@@ -272,6 +283,35 @@ impl VoiceHold {
         self.ending.is_some()
     }
 
+    /// Drop grants on a frequency that had no carrier. The block ends once
+    /// that frequency has been missing for [`EMPTY_GRANT_GAP`].
+    pub fn suppress_barren(
+        &mut self,
+        fresh: Vec<(f64, u32)>,
+        now: std::time::Instant,
+    ) -> Vec<(f64, u32)> {
+        let Some(barren) = self.barren else {
+            return fresh;
+        };
+        let offered = fresh.iter().any(|(hz, _)| (*hz - barren).abs() < 1.0);
+        if offered {
+            self.barren_at = Some(now);
+            fresh
+                .into_iter()
+                .filter(|(hz, _)| (*hz - barren).abs() >= 1.0)
+                .collect()
+        } else if self
+            .barren_at
+            .is_some_and(|at| now.saturating_duration_since(at) >= EMPTY_GRANT_GAP)
+        {
+            self.barren = None;
+            self.barren_at = None;
+            fresh
+        } else {
+            fresh
+        }
+    }
+
     /// The hang ran out, or no voice frame for [`VOICE_SILENCE_LIMIT`].
     pub fn expired(&self, now: std::time::Instant) -> bool {
         if let Some(ending) = self.ending {
@@ -318,6 +358,7 @@ pub enum WideHold {
 /// decoding. `voice_events` are this update's voice-decoder events.
 /// `candidates` are grants heard on any control decoder this update with
 /// their emergency bit; `reachable` says whether the capture can play one.
+/// `no_carrier` is 500 ms of voice audio with no carrier, after the DC block.
 pub fn wide_hold_step(
     hold: &mut VoiceHold,
     held: Option<(f64, u32)>,
@@ -326,11 +367,23 @@ pub fn wide_hold_step(
     candidates: &[(f64, u32, bool)],
     reachable: &dyn Fn(f64) -> bool,
     now: std::time::Instant,
+    no_carrier: bool,
 ) -> WideHold {
     let Some(call) = held else {
         hold.clear();
         return WideHold::Free;
     };
+    // No RF on the voice channel. Decoder frames on noise must not keep it.
+    if no_carrier {
+        hold.barren = Some(call.0);
+        hold.barren_at = Some(now);
+        let silent = !hold.in_hang();
+        hold.clear();
+        if silent {
+            hold.silent = Some((call, now));
+        }
+        return WideHold::Release;
+    }
     if !hold.active() {
         hold.begin_call(call, now);
     }

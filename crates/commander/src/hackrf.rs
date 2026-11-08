@@ -32,6 +32,10 @@ const SCALE_I16: f64 = 12_000.0;
 /// deviation, so a control parked on the LO keeps its modulation.
 const DC_ALPHA: f32 = 1.0 / 65_536.0;
 
+/// Software DC block, on every sample. HackRF One r9 (MAX2839) cancels the
+/// RX DC offset in the tuner. This radio does not: r1–r8 and r10 use the
+/// MAX2837, which leaves the offset in the samples. The block is not
+/// switched off for a newer revision.
 /// Running mean of I and Q. A HackRF ADC sits off the origin. One control
 /// puts that bin on the LO, and the discriminator then has nothing to follow.
 struct Dc {
@@ -955,6 +959,8 @@ struct Ddc {
     tap_on: bool,
     half: (f32, f32),
     tap_out: Vec<i16>,
+    /// Magnitude of the boxcar that just filled, if `take_mag` has not run.
+    box_mag: Option<f32>,
 }
 
 impl Ddc {
@@ -975,6 +981,7 @@ impl Ddc {
             tap_on: false,
             half: (0.0, 0.0),
             tap_out: Vec::new(),
+            box_mag: None,
         };
         ddc.set_offset(offset);
         ddc
@@ -1034,6 +1041,7 @@ impl Ddc {
         self.acc_i = 0.0;
         self.acc_q = 0.0;
         self.filled = 0;
+        self.box_mag = Some((mi * mi + mq * mq).sqrt());
         if !self.have_prev {
             self.prev_i = mi;
             self.prev_q = mq;
@@ -1046,6 +1054,10 @@ impl Ddc {
         self.prev_q = mq;
         let hz = cross.atan2(dot) * (MID_RATE as f32) / (2.0 * PI as f32);
         Some(hz)
+    }
+
+    fn take_mag(&mut self) -> Option<f32> {
+        self.box_mag.take()
     }
 }
 
@@ -1062,6 +1074,75 @@ fn emit(hz: f32, out: &mut Vec<i16>) {
     out.push(sample);
 }
 
+/// Voice boxcars (16 kHz) with no carrier before follow returns to control.
+/// 8000 frames is 500 ms.
+const EMPTY_CHANNEL_FRAMES: u32 = 8_000;
+/// Envelope window, 20 ms. Those frames count toward [`EMPTY_CHANNEL_FRAMES`].
+const CARRIER_WIN: usize = 320;
+/// Rayleigh noise is about 0.52. The C4FM recordings were about 0.10–0.18.
+const CARRIER_CV: f32 = 0.35;
+/// Boxcar-mean magnitude in i8 counts. Below this, a flat envelope is the
+/// DC block's residual, not a carrier.
+const CARRIER_FLOOR: f32 = 0.15;
+
+/// Envelope of the voice channel after the DC block. `push` is one boxcar.
+struct CarrierWatch {
+    mags: std::collections::VecDeque<f32>,
+    sum: f64,
+    sumsq: f64,
+    empty: u32,
+}
+
+impl CarrierWatch {
+    fn new() -> Self {
+        Self {
+            mags: std::collections::VecDeque::with_capacity(CARRIER_WIN),
+            sum: 0.0,
+            sumsq: 0.0,
+            empty: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.mags.clear();
+        self.sum = 0.0;
+        self.sumsq = 0.0;
+        self.empty = 0;
+    }
+
+    /// `true` once 500 ms of boxcars have shown no carrier.
+    fn push(&mut self, mag: f32) -> bool {
+        let mag = if mag.is_finite() && mag >= 0.0 { mag } else { 0.0 };
+        self.mags.push_back(mag);
+        self.sum += mag as f64;
+        self.sumsq += (mag as f64) * (mag as f64);
+        if self.mags.len() > CARRIER_WIN {
+            let old = self.mags.pop_front().unwrap_or(0.0) as f64;
+            self.sum -= old;
+            self.sumsq -= old * old;
+        }
+        let carrier = if self.mags.len() == CARRIER_WIN {
+            let n = CARRIER_WIN as f64;
+            let mean = self.sum / n;
+            let var = (self.sumsq / n - mean * mean).max(0.0);
+            let cv = if mean > 1e-6 {
+                (var.sqrt() / mean) as f32
+            } else {
+                f32::MAX
+            };
+            (mean as f32) >= CARRIER_FLOOR && cv < CARRIER_CV
+        } else {
+            false
+        };
+        if carrier {
+            self.empty = 0;
+        } else {
+            self.empty = self.empty.saturating_add(1);
+        }
+        self.empty >= EMPTY_CHANNEL_FRAMES
+    }
+}
+
 /// One capture's discriminators. Voice output is silence while `voice` is none.
 pub struct Bank {
     center: f64,
@@ -1071,6 +1152,8 @@ pub struct Bank {
     voice_hz: Option<f64>,
     voice_steps: Vec<f32>,
     control_steps: Vec<Vec<f32>>,
+    carrier: CarrierWatch,
+    voice_empty: bool,
 }
 
 impl Bank {
@@ -1086,7 +1169,14 @@ impl Bank {
             voice_hz: None,
             voice_steps: Vec::new(),
             control_steps: vec![Vec::new(); controls.len()],
+            carrier: CarrierWatch::new(),
+            voice_empty: false,
         }
+    }
+
+    /// The voice frequency has had no carrier for 500 ms.
+    pub fn voice_channel_empty(&self) -> bool {
+        self.voice_empty
     }
 
     fn dc_mean(&self) -> (f32, f32) {
@@ -1107,9 +1197,19 @@ impl Bank {
     }
 
     pub fn set_voice(&mut self, hz: Option<f64>) {
-        self.voice_hz = hz.filter(|hz| inside(self.center, *hz));
+        let next = hz.filter(|hz| inside(self.center, *hz));
+        let changed = match (self.voice_hz, next) {
+            (Some(was), Some(now)) => (was - now).abs() >= 1.0,
+            (None, None) => false,
+            _ => true,
+        };
+        self.voice_hz = next;
         let offset = self.voice_hz.unwrap_or(self.center) - self.center;
         self.voice.set_offset(offset);
+        if changed {
+            self.carrier.reset();
+            self.voice_empty = false;
+        }
     }
 
     /// Signed 8-bit interleaved IQ. Each control gets its own buffer.
@@ -1127,11 +1227,20 @@ impl Bank {
             if let Some(hz) = self.voice.push(i, q) {
                 self.voice_steps.push(hz);
             }
+            if let Some(mag) = self.voice.take_mag() {
+                if self.voice_hz.is_some() {
+                    self.voice_empty = self.carrier.push(mag);
+                }
+            }
             for (index, ddc) in self.controls.iter_mut().enumerate() {
                 if let Some(hz) = ddc.push(i, q) {
                     self.control_steps[index].push(hz);
                 }
             }
+        }
+        if self.voice_hz.is_none() {
+            self.carrier.reset();
+            self.voice_empty = false;
         }
         let silent = self.voice_hz.is_none();
         for hz in &self.voice_steps {
@@ -1181,6 +1290,9 @@ pub struct Session {
     /// A change replaces the voice process and leaves the control decoders.
     key_csv: Option<String>,
     voice_hz: Arc<AtomicU64>,
+    /// Set after 500 ms of voice audio with no carrier. Cleared when a
+    /// carrier returns or the voice frequency changes.
+    voice_empty: Arc<AtomicBool>,
     /// Radio id the REC tap files its IQ under.
     rec_key: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
@@ -1202,6 +1314,11 @@ impl Session {
 
     pub fn set_voice(&self, hz: u64) {
         self.voice_hz.store(hz, Ordering::Relaxed);
+    }
+
+    /// The voice channel has had no carrier for 500 ms.
+    pub fn voice_channel_empty(&self) -> bool {
+        self.voice_empty.load(Ordering::Relaxed)
     }
 
     /// Give the voice decoder the site word. Control decoders are left as
@@ -1505,6 +1622,7 @@ pub fn start(
     let mut voice_write = None;
     let mut speech = None;
     let voice_hz = Arc::new(AtomicU64::new(0));
+    let voice_empty = Arc::new(AtomicBool::new(false));
     let site = p2
         .map(str::trim)
         .filter(|word| !word.is_empty() && word.chars().all(|ch| ch.is_ascii_hexdigit()));
@@ -1533,7 +1651,8 @@ pub fn start(
                 voice_write = Some(write);
                 if let Some(audio) = audio {
                     if let Some(name) = speaker {
-                        if let Ok(player) = Speech::spawn(name, audio, Arc::clone(&voice_hz)) {
+                        let argv = crate::rx_pipe::speaker_play_argv(name, script);
+                        if let Ok(player) = Speech::spawn(&argv, audio, Arc::clone(&voice_hz)) {
                             speech = Some(player);
                         }
                     } else {
@@ -1551,6 +1670,7 @@ pub fn start(
     let stop = Arc::new(AtomicBool::new(false));
     let failed = Arc::new(AtomicBool::new(false));
     let voice_flag = Arc::clone(&voice_hz);
+    let empty_flag = Arc::clone(&voice_empty);
     let stop_flag = Arc::clone(&stop);
     let failed_flag = Arc::clone(&failed);
     let control_hz = controls.to_vec();
@@ -1575,6 +1695,7 @@ pub fn start(
             center,
             &control_hz,
             voice_flag,
+            empty_flag,
             stop_flag,
             failed_flag,
             pump,
@@ -1593,6 +1714,7 @@ pub fn start(
         p2_word: site.map(str::to_string),
         key_csv,
         voice_hz,
+        voice_empty,
         rec_key,
         stop,
         failed,
@@ -1639,6 +1761,7 @@ fn run_bank(
     center: f64,
     control_hz: &[f64],
     voice_hz: Arc<AtomicU64>,
+    voice_empty: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     failed: Arc<AtomicBool>,
     mut spec: SpecPump,
@@ -1674,6 +1797,7 @@ fn run_bank(
         let tap = hz != 0 && crate::rec_live::tap_on();
         bank.set_tap(tap);
         bank.push(&buf[..n], &mut voice_out, &mut control_out);
+        voice_empty.store(bank.voice_channel_empty(), Ordering::Relaxed);
         if tap {
             let data = bank.take_tap();
             if !data.is_empty() {
@@ -1847,7 +1971,7 @@ struct SpeechSlot {
 }
 
 impl Speech {
-    fn spawn(speaker: &str, audio: ChildStdout, voice_hz: Arc<AtomicU64>) -> Result<Self, String> {
+    fn spawn(argv: &[String], audio: ChildStdout, voice_hz: Arc<AtomicU64>) -> Result<Self, String> {
         let (read, write) = match std::io::pipe() {
             Ok(pair) => pair,
             Err(err) => {
@@ -1855,9 +1979,13 @@ impl Speech {
                 return Err(format!("hackrf voice play: {err}"));
             }
         };
-        let mut play_cmd = Command::new("pw-cat");
+        let Some(program) = argv.first() else {
+            thread::spawn(move || discard_audio(audio));
+            return Err("hackrf voice play: no player".into());
+        };
+        let mut play_cmd = Command::new(program);
         play_cmd
-            .args(crate::rx_pipe::speaker_play_args(speaker))
+            .args(&argv[1..])
             .stdin(Stdio::from(read))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -1915,7 +2043,7 @@ fn pump_speech(
 ) {
     let mut current: Option<ChildStdout> = None;
     // A closed speaker must not close the decoder pipe. Dropping that pipe
-    // makes sox exit, and the voice script exits with it.
+    // makes commander-voice exit, and the voice script exits with it.
     let mut live = true;
     let mut buf = [0u8; 4096];
     loop {
@@ -2021,6 +2149,54 @@ mod tests {
         assert!(bank.take_tap().is_empty());
     }
 
+    #[test]
+    fn dc_offset_is_not_a_voice_carrier() {
+        let center = 851_987_500.0;
+        let mut bank = Bank::new(center, &[]);
+        bank.set_voice(Some(center));
+        // Constant ADC offset, the MAX2837 spike. The block has to settle,
+        // so this is longer than the 500 ms empty count (4_000_000 samples).
+        let mut block = vec![0u8; 16_384];
+        for sample in block.chunks_exact_mut(2) {
+            sample[0] = 40;
+            sample[1] = 24;
+        }
+        let mut left = 4_800_000usize;
+        let mut voice = Vec::new();
+        while left > 0 {
+            let n = (block.len() / 2).min(left) * 2;
+            bank.push(&block[..n], &mut voice, &mut []);
+            left -= n / 2;
+        }
+        assert!(
+            bank.voice_channel_empty(),
+            "DC offset counted as a carrier"
+        );
+        // One boxcar short of 500 ms stays. A fresh frequency starts over.
+        bank.set_voice(Some(center + 12_500.0));
+        bank.set_voice(Some(center));
+        left = 4_000_000 - 500;
+        while left > 0 {
+            let n = (block.len() / 2).min(left) * 2;
+            bank.push(&block[..n], &mut voice, &mut []);
+            left -= n / 2;
+        }
+        assert!(!bank.voice_channel_empty());
+    }
+
+    #[test]
+    fn a_real_carrier_is_not_an_empty_channel() {
+        let center = 857_200_000.0;
+        let cs8 = hsrec::dsp::synth_fm_cs8(60_000.0, 1_000.0, 2_500.0, 0.55, 40.0);
+        let mut bank = Bank::new(center, &[]);
+        bank.set_voice(Some(center + 60_000.0));
+        let mut voice = Vec::new();
+        for block in cs8.chunks(16_384) {
+            bank.push(block, &mut voice, &mut []);
+        }
+        assert!(!bank.voice_channel_empty());
+    }
+
     use super::*;
 
     #[test]
@@ -2093,19 +2269,32 @@ mod tests {
         events: &[crate::follow::CcEvent],
         now: std::time::Instant,
     ) -> FollowCapture {
+        wide_step(hold, state, fresh, emergencies, events, now, false)
+    }
+
+    fn wide_step(
+        hold: &mut crate::follow::VoiceHold,
+        state: &mut (Option<(f64, u32)>, Vec<(f64, u32, u64)>, Option<VoiceAway>, u64),
+        fresh: &[(f64, u32)],
+        emergencies: &[(f64, u32)],
+        events: &[crate::follow::CcEvent],
+        now: std::time::Instant,
+        no_carrier: bool,
+    ) -> FollowCapture {
         use crate::follow::CcEvent;
         let (center, controls) = cluster();
+        let fresh = hold.suppress_barren(fresh.to_vec(), now);
         let mut candidates: Vec<(f64, u32, bool)> =
             fresh.iter().map(|(hz, tg)| (*hz, *tg, false)).collect();
         candidates.extend(emergencies.iter().map(|(hz, tg)| (*hz, *tg, true)));
         let step = crate::follow::wide_hold_step(
-            hold, state.0, events, false, &candidates, &|_| true, now,
+            hold, state.0, events, false, &candidates, &|_| true, now, no_carrier,
         );
         let saw = |f: fn(&CcEvent) -> bool| events.iter().any(f);
         let mut open = std::mem::take(&mut state.1);
         let (fresh, a, b, c, d) = hold_inputs(
             &step,
-            fresh.to_vec(),
+            fresh,
             (
                 saw(|e| matches!(e, CcEvent::Sync)),
                 saw(|e| matches!(e, CcEvent::SyncLost)),
@@ -2357,6 +2546,76 @@ mod tests {
         assert_eq!(back.controls, controls);
         assert_eq!(back.voice_hz, 0);
         assert!(back.away.is_none());
+    }
+
+    #[test]
+    fn an_empty_voice_channel_returns_to_control_and_is_not_retried() {
+        use crate::follow::{CcEvent, VoiceHold};
+        let t = std::time::Instant::now();
+        let mut hold = VoiceHold::default();
+        let mut state = (None, Vec::new(), None, 0);
+        let voice = 851_975_000.0;
+        let (center, controls) = cluster();
+        let left = wide_step(
+            &mut hold, &mut state, &[(voice, 100)], &[], &[], t, false,
+        );
+        assert!(left.left);
+        assert_eq!(left.center, voice);
+        // A voice frame on noise does not keep a channel with no carrier.
+        let back = wide_step(
+            &mut hold,
+            &mut state,
+            &[(voice, 100)],
+            &[],
+            &[CcEvent::Voice],
+            t + ms(100),
+            true,
+        );
+        assert!(!back.left);
+        assert!((back.center - center).abs() < 1.0);
+        assert_eq!(back.controls, controls);
+        assert_eq!(back.voice_hz, 0);
+        assert!(back.call.is_none());
+        let again = wide_step(
+            &mut hold, &mut state, &[(voice, 100)], &[], &[], t + ms(200), false,
+        );
+        assert!(!again.left, "repeated grant left the control channel");
+        assert!(again.call.is_none());
+        // Still offered inside the two second gap, measured from this offer.
+        let still = wide_step(
+            &mut hold, &mut state, &[(voice, 100)], &[], &[], t + ms(2_199), false,
+        );
+        assert!(still.call.is_none());
+        // Absent for the gap, then the same grant may be followed.
+        let _ = wide_step(&mut hold, &mut state, &[], &[], &[], t + ms(4_199), false);
+        let retry = wide_step(
+            &mut hold, &mut state, &[(voice, 100)], &[], &[], t + ms(4_200), false,
+        );
+        assert!(retry.left);
+        assert_eq!(retry.call, Some((voice, 100)));
+    }
+
+    #[test]
+    fn an_empty_frequency_does_not_block_a_different_grant() {
+        use crate::follow::VoiceHold;
+        let t = std::time::Instant::now();
+        let mut hold = VoiceHold::default();
+        let mut state = (None, Vec::new(), None, 0);
+        let voice = 851_975_000.0;
+        let other = 856_962_500.0;
+        wide_step(&mut hold, &mut state, &[(voice, 100)], &[], &[], t, false);
+        wide_step(&mut hold, &mut state, &[(voice, 100)], &[], &[], t + ms(100), true);
+        let moved = wide_step(
+            &mut hold,
+            &mut state,
+            &[(voice, 100), (other, 200)],
+            &[],
+            &[],
+            t + ms(200),
+            false,
+        );
+        assert_eq!(moved.call, Some((other, 200)));
+        assert!(!moved.left);
     }
 
     #[test]

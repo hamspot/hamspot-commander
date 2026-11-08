@@ -113,7 +113,13 @@ fn render_wav(args: &[String]) -> u8 {
     }
     match hsrec::replay::render(&raw, &meta, decoder.as_ref()) {
         Ok(r) => {
-            let _ = hsrec::replay::write_wav(std::path::Path::new(out), &r.audio, if decoder.is_some() { hsrec::replay::OUT_RATE } else { hsrec::replay::OUT_RATE });
+            let (rate, channels) = decoder
+                .as_ref()
+                .and_then(|d| d.argv.first())
+                .map(|script| hsrec::replay::script_pcm(script))
+                .unwrap_or((hsrec::replay::OUT_RATE, 1));
+            let audio = if channels == 2 { hsrec::replay::mix_slots(&r.audio) } else { r.audio.clone() };
+            let _ = hsrec::replay::write_wav(std::path::Path::new(out), &audio, rate);
             println!("disc_samples={} disc_peak={} audio_samples={} audio_peak={} voice={} decoder_status={:?}",
                 r.disc.len(), hsrec::replay::peak(&r.disc), r.audio.len(), hsrec::replay::peak(&r.audio),
                 hsrec::replay::peak(&r.audio) > hsrec::replay::VOICE_PEAK, r.decoder_status);

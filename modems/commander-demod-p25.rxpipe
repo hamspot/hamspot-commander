@@ -1,29 +1,20 @@
 #!/bin/bash
 # P25 control and Phase 2 voice for a Hamspot Commander RX pipe.
 #
-# stdin and stdout are 48 kHz mono signed 16-bit little-endian. dsd-fme
-# reads that stream. -ft keeps Phase 1 control and also decodes Phase 2
-# voice. It emits 8 kHz stereo signed 16-bit, one slot on each channel.
-# sox mixes both into the mono stream the pipe plays. The first argument
-# is the UDP port. Commander passes a free one so each radio can run this
-# script. A manual run with no argument uses 23469.
+# stdin is 48 kHz mono signed 16-bit little-endian. stdout is dsd-fme's
+# 8 kHz voice. Commander plays it. This script does not resample.
+# The first argument is accepted and ignored. Commander still passes a port.
 #
-# -ft also accepts DMR frames on this pipe. The follower still reads only
-# P25 lines. This script does not pass -T. Commander tunes. The identifier
-# table lives in this dsd-fme, so a hop must not restart it. The search
-# counter stays 204000 bytes because the control channel is still Phase 1.
+# The decoder flag is -ft. It keeps Phase 1 control and also decodes Phase 2 voice. Voice is 8 kHz stereo, one slot on each channel. -ft also accepts DMR frames on this pipe. The follower still reads only P25 lines. HAMSPOT_P25_X is dsd-fme -X: WACN, the system id, and the NAC packed into one hex word. Phase 2 voice prints "P2 Missing Parameters" and stays muted until those three are set. This is not a key. HAMSPOT_P25_K is the path of a dsd-fme hex key CSV, passed as -K. An empty value passes nothing. A path that is not a file is a start error, because dsd-fme quits when -K names a file it cannot open. The search count is 204000 bytes: Phase 1 is 4800 symbols/s, 10 samples per symbol, at 48 kHz.
+# This script does not pass -T. Commander tunes. The identifier table lives
+# in this dsd-fme, so a hop must not restart it.
 #
-# HAMSPOT_P25_X is dsd-fme -X. It is WACN, the system id, and the NAC packed
-# into one hex word. Phase 2 voice prints "P2 Missing Parameters" and stays
-# muted until those three are set. The voice decoder never hears the control
-# channel, so Commander passes the word it already learned. This is not a key.
-#
-# HAMSPOT_P25_K is the path of a dsd-fme hex key CSV. It is passed as -K.
-# An empty value passes nothing. A path that is not a file is a start error,
-# because dsd-fme quits when -K names a file it cannot open.
-#
-# If the decoder or the voice pipeline exits, this script exits too. The
-# supervisor then stops the whole pipe group and starts it again.
+# HAMSPOT_CC_EVENTS=1 keeps dsd-fme stderr for the trunk follower and counts
+# one decoder search. dsd-fme prints "Sync: no sync" only after a carrier
+# has already been seen, so a control channel that never locks is silent.
+# The byte count below is that search of 48 kHz audio. There is no sleep.
+# HAMSPOT_IDENTITY=1 keeps stderr and does not count searches.
+# If the decoder exits, this script exits too.
 
 set -euo pipefail
 
@@ -34,50 +25,14 @@ case "$port" in
         exit 1
         ;;
 esac
+# Commander still passes a port. Nothing listens on it.
+: "$port"
 
-for program in dsd-fme socat sox; do
-    if ! command -v "$program" >/dev/null 2>&1; then
-        echo "commander-demod-p25: ${program} is not on PATH" >&2
-        exit 1
-    fi
-done
+if ! command -v "dsd-fme" >/dev/null 2>&1; then
+    echo "commander-demod-p25: dsd-fme is not on PATH" >&2
+    exit 1
+fi
 
-decoder=""
-feed=""
-listener=""
-player=""
-voice=""
-audio=""
-search=""
-cleanup() {
-    if [[ -n "$decoder" ]]; then
-        kill "$decoder" 2>/dev/null || true
-    fi
-    if [[ -n "$feed" ]]; then
-        kill "$feed" 2>/dev/null || true
-    fi
-    if [[ -n "$listener" ]]; then
-        kill "$listener" 2>/dev/null || true
-    fi
-    if [[ -n "$player" ]]; then
-        kill "$player" 2>/dev/null || true
-    fi
-    if [[ -n "$voice" ]]; then
-        rm -f "$voice"
-    fi
-    if [[ -n "$audio" ]]; then
-        rm -f "$audio"
-    fi
-    if [[ -n "$search" ]]; then
-        rm -f "$search"
-    fi
-}
-trap cleanup EXIT
-
-voice="$(mktemp -u /tmp/hamspot-rxpipe.XXXXXX)"
-mkfifo -m 600 "$voice"
-
-# Empty when the control channel has not named the site yet.
 p2x=()
 if [[ -n "${HAMSPOT_P25_X:-}" ]]; then
     case "$HAMSPOT_P25_X" in
@@ -89,7 +44,6 @@ if [[ -n "${HAMSPOT_P25_X:-}" ]]; then
     p2x=(-X "$HAMSPOT_P25_X")
 fi
 
-# A key list. Absent when every row is still a placeholder.
 p2k=()
 if [[ -n "${HAMSPOT_P25_K:-}" ]]; then
     if [[ ! -f "$HAMSPOT_P25_K" ]]; then
@@ -99,21 +53,22 @@ if [[ -n "${HAMSPOT_P25_K:-}" ]]; then
     p2k=(-K "$HAMSPOT_P25_K")
 fi
 
-# Without job control, bash connects a bare background command's stdin
-# to /dev/null. dsd-fme would see EOF, exit, and the recorder would die
-# with SIGPIPE. <&0 keeps this script's stdin, which is the RX audio.
-# HAMSPOT_CC_EVENTS=1 keeps dsd-fme's stderr. Commander reads the trunking
-# lines from it. The voice UDP path is the same either way. The hop back to
-# a control channel must not restart this process: the identifier table
-# lives in this dsd-fme.
-#
-# dsd-fme prints "Sync: no sync" only after a carrier has already been
-# seen. A control channel that never locks is silent. The perl process
-# counts one search of audio and prints "hamspot: search". dsd walks
-# 10200 symbols before it resets (dsd_frame_sync.c). Phase 1 is 4800
-# symbols/s and this pipe is 48 kHz s16, 10 samples per symbol, so one
-# search is 204000 bytes. -ft does not change samples per symbol on the
-# control, so that count stays. The line is that audio arriving. There is no sleep.
+feed=""
+audio=""
+search=""
+cleanup() {
+    if [[ -n "$feed" ]]; then
+        kill "$feed" 2>/dev/null || true
+    fi
+    if [[ -n "$audio" ]]; then
+        rm -f "$audio"
+    fi
+    if [[ -n "$search" ]]; then
+        rm -f "$search"
+    fi
+}
+trap cleanup EXIT
+
 if [[ "${HAMSPOT_CC_EVENTS:-}" == "1" ]]; then
     audio="$(mktemp -u /tmp/hamspot-rxpipe-audio.XXXXXX)"
     mkfifo -m 600 "$audio"
@@ -157,39 +112,9 @@ exit 0;
 PERL
     perl "$search" <&0 >"$audio" &
     feed=$!
-    dsd-fme -ft "${p2x[@]}" "${p2k[@]}" -i - -o "udp:127.0.0.1:${port}" <"$audio" >/dev/null &
-    decoder=$!
+    dsd-fme "${p2x[@]}" "${p2k[@]}" -ft -i - -o - <"$audio"
 elif [[ "${HAMSPOT_IDENTITY:-}" == "1" ]]; then
-    dsd-fme -ft "${p2x[@]}" "${p2k[@]}" -i - -o "udp:127.0.0.1:${port}" <&0 >/dev/null &
-    decoder=$!
+    dsd-fme "${p2x[@]}" "${p2k[@]}" -ft -i - -o -
 else
-    dsd-fme -ft "${p2x[@]}" "${p2k[@]}" -i - -o "udp:127.0.0.1:${port}" <&0 >/dev/null 2>&1 &
-    decoder=$!
+    dsd-fme "${p2x[@]}" "${p2k[@]}" -ft -i - -o - 2>/dev/null
 fi
-socat -u "udp-listen:${port}" - </dev/null >"$voice" &
-listener=$!
-# -m sums the two slots without the default 1/n cut, so a call on one slot
-# stays at full level while the idle slot is silence.
-# --buffer 512 keeps little audio inside sox, so the tail is not held back.
-sox -q --buffer 512 -t raw -r 8000 -e signed -b 16 -c 2 "$voice" -t raw -r 48000 -e signed -b 16 -c 1 - remix -m 1,2 </dev/null &
-player=$!
-
-# One exit is the crash. The trap stops the others on the way out.
-# When the decoder is the one that ended (its input ran out, as on a
-# replay), the last voice is still in flight: in the UDP socket, in socat
-# and in sox. Let it drain: give socat a moment for the last datagrams,
-# stop it so sox reads end of file, then wait for sox to write the tail.
-set +e
-wait -n
-status=$?
-if ! kill -0 "$decoder" 2>/dev/null && kill -0 "$player" 2>/dev/null; then
-    decoder=""
-    sleep 0.3
-    kill "$listener" 2>/dev/null
-    wait "$listener" 2>/dev/null
-    listener=""
-    wait "$player" 2>/dev/null
-    player=""
-fi
-set -e
-exit "$status"

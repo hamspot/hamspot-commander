@@ -1205,10 +1205,14 @@ impl App {
                 }
             }
         };
+        let (rate, channels) = script
+            .as_ref()
+            .map(|path| hsrec::replay::script_pcm(&path.display().to_string()))
+            .unwrap_or((hsrec::replay::OUT_RATE, 1));
         let decoder = script.and_then(|script| {
-            // The script's socat listens on this port for the whole replay, so
-            // the reservation rides with the player and is released when its
-            // thread ends (finish, stop, or a new selection).
+            // The script accepts this port and does not listen. The reservation
+            // rides with the player and is released when its thread ends
+            // (finish, stop, or a new selection).
             let port = crate::rx_pipe::VoicePort::claim().ok()?;
             let argv = vec![script.display().to_string(), port.port().to_string()];
             let env = hsrec::replay::decoder_env(&rec.meta, &fallback);
@@ -1218,7 +1222,7 @@ impl App {
             self.rec.sinks = hsrec::replay::list_sinks();
             self.rec.sinks_listed = true;
         }
-        let (argv, missing) = hsrec::replay::pick_output(&self.rec.face.output, &self.rec.sinks);
+        let (argv, missing) = hsrec::replay::pick_output(&self.rec.face.output, &self.rec.sinks, rate, channels);
         self.rec.output_note = missing.unwrap_or_default();
         match hsrec::replay::Player::start(&path, &rec.meta, from_ms, decoder, argv) {
             Ok(p) => self.rec.player = Some((id, p)),

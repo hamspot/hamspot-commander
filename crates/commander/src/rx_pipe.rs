@@ -1,8 +1,8 @@
 //! Receiver stdin/stdout pipe. Issue #39.
 //!
 //! `pw-cat` records the radio's RX sink at 48 kHz mono s16le and writes it to
-//! the operator's command. The command's stdout is played to the speaker the
-//! RX stream was using. The caller unlinks that direct wire only after this
+//! the operator's command. The command's stdout is played by `commander-voice`
+//! on a PipeWire stream to the speaker the RX stream was using. The caller unlinks that direct wire only after this
 //! process group is still alive, and puts the wire back when the group ends.
 //!
 //! The sink monitor is stereo (`monitor_FL` / `monitor_FR`). Asking `pw-cat`
@@ -116,23 +116,11 @@ pub fn record_args(id: u64) -> Vec<String> {
     routed_record_args(&tap_node(id), "FL")
 }
 
-/// Play 48 kHz mono s16le to a speaker node. Stdin is the stream.
-pub fn speaker_play_args(speaker: &str) -> Vec<String> {
-    vec![
-        "-p".into(),
-        "--target".into(),
-        speaker.to_string(),
-        "--rate".into(),
-        "48000".into(),
-        "--channels".into(),
-        "1".into(),
-        "--channel-map".into(),
-        "MONO".into(),
-        "--format".into(),
-        "s16".into(),
-        "-a".into(),
-        "-".into(),
-    ]
+/// `commander-voice play` for this script's stdout and this speaker.
+/// An empty speaker name leaves the sink to PipeWire's default.
+pub fn speaker_play_argv(speaker: &str, script: &str) -> Vec<String> {
+    let (rate, channels) = hsrec::replay::script_pcm(script);
+    hsrec::replay::voice_play_argv(speaker, rate, channels)
 }
 
 /// Playback that does not autoconnect. Stdin is 48 kHz mono s16le.
@@ -414,8 +402,8 @@ pub fn claim_voice_port() -> Result<u16, String> {
         if claimed.contains(&port) {
             continue;
         }
-        // `0.0.0.0` fails when the port is already bound on localhost or on
-        // the wildcard, which is where socat's `udp-listen` sits.
+        // `0.0.0.0` fails when the port is already bound. The rxpipes do not
+        // listen. The bind still keeps two pipes from being handed the same number.
         if UdpSocket::bind(("0.0.0.0", port)).is_ok() {
             claimed.insert(port);
             return Ok(port);
@@ -431,8 +419,9 @@ pub fn release_voice_port(port: u16) {
 }
 
 /// A voice port reservation that lasts as long as this value. REC replay
-/// keeps one for the whole playback, so a live decoder that starts mid-replay
-/// takes the next port instead of the one the replay's socat listens on.
+/// keeps one for the whole playback. The rxpipe accepts the number and does
+/// not listen on it. A live decoder that starts mid-replay still gets the
+/// next number.
 #[derive(Debug)]
 pub struct VoicePort(u16);
 
@@ -772,8 +761,9 @@ fn spawn_group(
         (Stdio::from(filt_out), None, None)
     };
 
-    let mut play = Command::new("pw-cat");
-    play.args(speaker_play_args(speaker))
+    let play_argv = speaker_play_argv(speaker, command);
+    let mut play = Command::new(&play_argv[0]);
+    play.args(&play_argv[1..])
     .stdin(play_in)
     .stdout(Stdio::null())
     .stderr(Stdio::null())
@@ -783,7 +773,7 @@ fn spawn_group(
         Err(err) => {
             stop_group(&mut record);
             stop_group(&mut filter);
-            return Err(format!("pw-cat play: {err}"));
+            return Err(format!("voice play: {err}"));
         }
     };
     Ok(Running {
@@ -1180,14 +1170,14 @@ mod tests {
         assert!(!tap_node(3).starts_with("hamspot_"));
         assert!(!tx_record_node(3).starts_with("hamspot_"));
         assert!(!tx_play_node(3).starts_with("hamspot_"));
-        let speaker = speaker_play_args("bluez_output.example");
+        let speaker = speaker_play_argv("bluez_output.example", "commander-demod-p25.rxpipe");
+        assert_eq!(speaker[0], "commander-voice");
         assert!(speaker.windows(2).any(|pair| {
             pair[0] == "--target" && pair[1] == "bluez_output.example"
         }));
-        assert!(speaker
-            .windows(2)
-            .any(|pair| pair[0] == "--channel-map" && pair[1] == "MONO"));
-        assert!(!speaker.iter().any(|arg| arg.starts_with("node.name=")));
+        assert!(speaker.windows(2).any(|pair| pair[0] == "--rate" && pair[1] == "8000"));
+        assert!(speaker.windows(2).any(|pair| pair[0] == "--channels" && pair[1] == "2"));
+        assert!(!speaker.iter().any(|arg| arg == "pw-cat" || arg.starts_with("node.name=")));
         assert_eq!(pipeline_label("commander-mod-am.txpipe"), "am");
         assert_eq!(
             tap_ports(3),

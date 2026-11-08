@@ -236,6 +236,8 @@ pub struct RadioRow {
     pub tx_pipe_diverted: bool,
     /// HackRF center, or 0 when that capture is not running.
     pub center_hz: f64,
+    /// The HackRF voice channel has had no carrier for 500 ms.
+    pub voice_empty: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -2554,6 +2556,10 @@ fn publish(
             tx_pipe_status: slot.tx_pipe_status.clone(),
             tx_pipe_diverted: slot.tx_pipe.as_ref().is_some_and(|pipe| pipe.diverted),
             center_hz: slot.hackrf.as_ref().map(|session| session.center).unwrap_or(0.0),
+            voice_empty: slot
+                .hackrf
+                .as_ref()
+                .is_some_and(|session| session.voice_channel_empty()),
         })
         .collect();
     let mut pids = Vec::new();
