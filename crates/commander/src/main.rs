@@ -14064,6 +14064,7 @@ mod config_sections_tests {
             for d in ["config", "data", "cache", "state"] {
                 std::fs::create_dir_all(tmp.join(d)).unwrap();
             }
+            let _lock = crate::cat::test_rig_lock();
             let out = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([ME, "--exact", "--nocapture", "--test-threads=1"])
                 .env("HS_REAL_PAGES_CHILD", "1")

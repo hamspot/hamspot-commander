@@ -334,6 +334,8 @@ pub struct RecUi {
     bar_live: bool,
     /// The axis LIVE key was clicked: follow NOW from the next frame.
     go_live: bool,
+    /// Lane list scroll offset (points from the top), per source tab.
+    lane_off: HashMap<String, f32>,
     /// Why the database could not be opened or created (shown, never silent).
     db_error: Option<String>,
 }
@@ -912,7 +914,7 @@ impl App {
         let Some(db) = self.rec.db.as_ref() else { return };
         let gen = crate::rec_live::recorder().status.generation.load(Ordering::Relaxed);
         let source = self.rec_source();
-        let stale = self.rec.rows_at.is_none_or(|t| t.elapsed() > Duration::from_secs(2));
+        let stale = self.rec.rows_at.is_none_or(|t| t.elapsed() > Duration::from_millis(900));
         if !force && gen == self.rec.rows_gen && source == self.rec.rows_source && !stale {
             return;
         }
@@ -1583,9 +1585,9 @@ impl App {
             self.rec.go_live = true;
             ui.ctx().request_repaint();
         }
-        // Wheel: over the lanes a plain wheel scrolls them up and down (the
-        // scroll area does that). Ctrl+wheel zooms time and Shift+wheel moves
-        // through time there. Over the time axis a plain wheel zooms too.
+        // Wheel (as before tonight): a plain wheel over the timeline zooms
+        // time. Shift+wheel, or a plain wheel over the lane names, scrolls
+        // the lanes up and down. The scrollbar right of the lanes drags.
         let body_view = egui::Rect::from_min_size(egui::pos2(axis.left(), axis.bottom()), egui::vec2(plot_w, viewport_h));
         let wheel_pos = ui.input(|i| i.pointer.hover_pos());
         // A REC window (Record / Playback, Data) above the timeline owns the
@@ -1593,12 +1595,20 @@ impl App {
         let own_layer = ui.layer_id();
         let layer_ctx = ui.ctx().clone();
         let ours = move |p: egui::Pos2| pointer_is_ours(layer_ctx.layer_id_at(p), own_layer);
+        let solid_shelf = shelf_w * timeline::SHELF_OPAQUE_FRAC;
         let over = match wheel_pos.filter(|p| ours(*p)) {
             Some(p) if axis.contains(p) => WheelOver::Axis,
+            Some(p) if body_view.contains(p) && p.x - body_view.left() < solid_shelf => WheelOver::Names,
             Some(p) if body_view.contains(p) => WheelOver::Lanes,
+            Some(p) if p.y >= body_view.top() && p.y <= body_view.bottom() && p.x > body_view.right() && p.x <= body_view.right() + SCROLL_GUTTER + 2.0 => WheelOver::Names,
             _ => WheelOver::Elsewhere,
         };
-        let (zoom_scroll, pan_scroll) = take_time_wheel(ui, over);
+        let wheel = take_timeline_wheel(ui, over);
+        let zoom_scroll = wheel.zoom;
+        let lane_off_key = source.clone();
+        let mut lane_off = self.rec.lane_off.get(&lane_off_key).copied().unwrap_or(0.0) - wheel.lanes;
+        let max_off = (body_h - viewport_h).max(0.0);
+        lane_off = if lane_off.is_finite() { lane_off.clamp(0.0, max_off) } else { 0.0 };
         let mut drag_dx = if axis_resp.dragged() { axis_resp.drag_delta().x } else { 0.0 };
         let mut hit: Option<(i64, u64)> = None;
         let mut want_wf = Vec::new();
@@ -1609,7 +1619,8 @@ impl App {
         let waveforms = &self.rec.waveforms;
         let no_voice = &self.rec.no_voice;
         let player = self.rec.player.as_ref().map(|(id, pl)| (*id, pl.pos_ms.load(Ordering::Relaxed) as i64));
-        lane_scroll(("rec-timeline", source.clone()), viewport_h)
+        let shown = lane_scroll(("rec-timeline", source.clone()), viewport_h)
+            .vertical_scroll_offset(lane_off)
             .show(ui, |ui| {
                 ui.style_mut().spacing.scroll = egui::style::ScrollStyle::thin();
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(plot_w, body_h), egui::Sense::hover());
@@ -1649,23 +1660,39 @@ impl App {
                 let pointer = gresp.interact_pointer_pos().filter(|p| ours(*p));
                 let hover = gresp.hover_pos().filter(|p| ours(*p));
                 let mut block_tip: Option<String> = None;
+                // NOW tint under the blocks: a call at NOW stays visible.
+                let now_x = grid.left() + view.x(now, width);
+                let now_font = egui::FontId::monospace(10.0);
+                let now_w = ui.fonts_mut(|f| f.layout_no_wrap("NOW".into(), now_font.clone(), egui::Color32::WHITE).size().x);
+                if let Some((x0, x1)) = now_fade_span(now_x - grid.left(), plot_w, right_shelf_w(now_w)) {
+                    let r = egui::Rect::from_min_max(egui::pos2(grid.left() + x0, grid.top()), egui::pos2(grid.left() + x1, grid.bottom()));
+                    paint_shelf_right(&ui.painter_at(rect), r, NOW_SHELF);
+                }
+                if now_x >= grid.left() && now_x <= grid.right() {
+                    gp.line_segment([egui::pos2(now_x, grid.top()), egui::pos2(now_x, grid.bottom())], egui::Stroke::new(1.0, egui::Color32::from_rgb(240, 60, 50)));
+                }
                 for b in &blocks {
                     let Some(r) = by_id.get(&b.id) else { continue };
                     let y = rect.top() + lane_top[b.lane] + b.sub as f32 * row_h;
-                    let br = egui::Rect::from_min_max(egui::pos2(grid.left() + b.x0.max(0.0), y + 3.0), egui::pos2(grid.left() + b.x1.min(width), y + row_h - 3.0));
-                    if br.width() <= 0.0 {
+                    let mut br = egui::Rect::from_min_max(egui::pos2(grid.left() + b.x0.max(0.0), y + 3.0), egui::pos2(grid.left() + b.x1.min(width), y + row_h - 3.0));
+                    if b.x1 < 0.0 || b.x0 > width {
                         continue;
+                    }
+                    // A short call (or one just started) is never a hairline.
+                    if br.width() < MIN_BLOCK_W {
+                        br.min.x = (br.max.x - MIN_BLOCK_W).max(grid.left());
+                        br.max.x = br.min.x + MIN_BLOCK_W;
                     }
                     let fill = if r.offline() || r.missing {
                         egui::Color32::from_gray(70)
                     } else if b.live {
-                        egui::Color32::from_rgb(170, 24, 18)
+                        LIVE_BLOCK
                     } else if r.meta.source_kind == meta::KIND_DEMOD_AUDIO {
                         egui::Color32::from_rgb(40, 90, 120)
                     } else {
                         egui::Color32::from_rgb(46, 120, 70)
                     };
-                    gp.rect_filled(br, egui::CornerRadius::same(2), fill);
+                    gp.rect_filled(br, egui::CornerRadius::ZERO, fill);
                     if let Some(wf) = waveforms.get(&b.id) {
                         let n = wf.len().max(1) as f32;
                         for (k, v) in wf.iter().enumerate() {
@@ -1690,10 +1717,13 @@ impl App {
                         gp.text(br.left_center() + egui::vec2(3.0, 0.0), egui::Align2::LEFT_CENTER, tag.trim(), egui::FontId::monospace(10.0), egui::Color32::WHITE);
                     }
                     if r.meta.emergency {
-                        gp.rect_stroke(br, egui::CornerRadius::same(2), egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 60, 40)), egui::StrokeKind::Outside);
+                        gp.rect_stroke(br, egui::CornerRadius::ZERO, egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 60, 40)), egui::StrokeKind::Outside);
+                    }
+                    if b.live {
+                        gp.rect_stroke(br, egui::CornerRadius::ZERO, egui::Stroke::new(1.0, egui::Color32::WHITE), egui::StrokeKind::Inside);
                     }
                     if selected_id == Some(b.id) {
-                        gp.rect_stroke(br, egui::CornerRadius::same(2), egui::Stroke::new(2.0, egui::Color32::WHITE), egui::StrokeKind::Outside);
+                        gp.rect_stroke(br, egui::CornerRadius::ZERO, egui::Stroke::new(2.0, egui::Color32::WHITE), egui::StrokeKind::Outside);
                     }
                     let t0 = timeline::parse_ms(&r.meta.start_utc).unwrap_or(0);
                     if let Some(p) = pointer {
@@ -1715,22 +1745,10 @@ impl App {
                         }
                     }
                 }
-                let now_x = grid.left() + view.x(now, width);
+                // The NOW label sits at the bottom of the visible lanes.
                 if now_x >= grid.left() && now_x <= grid.right() {
-                    gp.line_segment([egui::pos2(now_x, grid.top()), egui::pos2(now_x, grid.bottom())], egui::Stroke::new(1.0, egui::Color32::from_rgb(240, 60, 50)));
-                }
-                // Dark red shelf on the right edge, mirroring the lane shelf,
-                // just wide enough for the NOW label. Purely painted: input
-                // still goes to the grid underneath.
-                let now_font = egui::FontId::monospace(10.0);
-                let now_w = ui.fonts_mut(|f| f.layout_no_wrap("NOW".into(), now_font.clone(), egui::Color32::WHITE).size().x);
-                if now_x >= grid.left() && now_x <= grid.right() {
-                    gp.text(egui::pos2(now_x - 2.0, grid.bottom() - 2.0), egui::Align2::RIGHT_BOTTOM, "NOW", now_font, egui::Color32::from_rgb(255, 90, 75));
-                }
-                // Tint goes over the NOW line and label so they sit under it.
-                if let Some((x0, x1)) = now_fade_span(now_x - grid.left(), plot_w, right_shelf_w(now_w)) {
-                    let r = egui::Rect::from_min_max(egui::pos2(grid.left() + x0, grid.top()), egui::pos2(grid.left() + x1, grid.bottom()));
-                    paint_shelf_right(&ui.painter_at(rect), r, NOW_SHELF);
+                    let bottom = grid.bottom().min(ui.clip_rect().bottom());
+                    gp.text(egui::pos2(now_x - 2.0, bottom - 2.0), egui::Align2::RIGHT_BOTTOM, "NOW", now_font, egui::Color32::from_rgb(255, 90, 75));
                 }
                 if let Some(tip) = block_tip {
                     gresp.on_hover_text(tip);
@@ -1753,6 +1771,9 @@ impl App {
                     resp.on_hover_text(format!("{name}\nClick to highlight this lane."));
                 }
             });
+        // The scrollbar may have moved it; keep what it shows.
+        let off = shown.state.offset().y;
+        self.rec.lane_off.insert(lane_off_key, if off.is_finite() { off.clamp(0.0, max_off) } else { 0.0 });
         if let Some(name) = lane_click {
             if self.rec.lane_sel.get(&source) == Some(&name) {
                 self.rec.lane_sel.remove(&source);
@@ -1763,9 +1784,6 @@ impl App {
         if drag_dx != 0.0 {
             // Dragging back parks the view; dragging forward onto NOW follows again.
             view.pan(drag_dx, width, now);
-        }
-        if pan_scroll.abs() > 0.5 {
-            view.pan(pan_scroll, width, now);
         }
         if zoom_scroll.abs() > 0.5 {
             let anchor = wheel_pos.map(|p| p.x - axis.left()).unwrap_or(width).clamp(0.0, width);
@@ -2212,6 +2230,9 @@ impl App {
 }
 
 #[cfg(test)]
+mod page_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2237,85 +2258,6 @@ mod tests {
         });
         out.textures_delta.clear();
         (clicked, key)
-    }
-
-    fn wheel(dy: f32, modifiers: egui::Modifiers) -> egui::Event {
-        egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Line, delta: egui::vec2(0.0, dy), modifiers, phase: egui::TouchPhase::Move, source: egui::MouseWheelSource::Wheel }
-    }
-
-    /// One frame of an axis row and a lane viewport like the timeline's:
-    /// 40 lanes in a viewport that fits about 8. Returns the time wheel taken,
-    /// the viewport and the last lane's rect on screen.
-    fn lanes_frame(ctx: &egui::Context, events: Vec<egui::Event>, mods: egui::Modifiers) -> ((f32, f32), egui::Rect, egui::Rect) {
-        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 300.0));
-        let _ = mods;
-        let input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
-        let mut got = ((0.0, 0.0), egui::Rect::NOTHING, egui::Rect::NOTHING);
-        let mut out = ctx.run_ui(input, |ui| {
-            egui::CentralPanel::default().show(ui, |ui| {
-                let (axis, _) = ui.allocate_exact_size(egui::vec2(800.0, AXIS_H), egui::Sense::click_and_drag());
-                let viewport_h = timeline_viewport_h(visible_height(ui).min(220.0));
-                let body_view = egui::Rect::from_min_size(egui::pos2(axis.left(), axis.bottom()), egui::vec2(800.0, viewport_h));
-                let over = match ui.input(|i| i.pointer.hover_pos()) {
-                    Some(p) if axis.contains(p) => WheelOver::Axis,
-                    Some(p) if body_view.contains(p) => WheelOver::Lanes,
-                    _ => WheelOver::Elsewhere,
-                };
-                let taken = take_time_wheel(ui, over);
-                let mut last = egui::Rect::NOTHING;
-                let shown = lane_scroll("test-lanes", viewport_h).show(ui, |ui| {
-                    ui.style_mut().spacing.scroll = egui::style::ScrollStyle::thin();
-                    let n = 40;
-                    let (rect, _) = ui.allocate_exact_size(egui::vec2(800.0, n as f32 * LANE_H), egui::Sense::hover());
-                    // As the real grid: one click-and-drag area over all lanes.
-                    let _ = ui.interact(rect, ui.scope_id().with("grid"), egui::Sense::click_and_drag());
-                    for i in 0..n {
-                        let r = egui::Rect::from_min_size(egui::pos2(rect.left(), rect.top() + i as f32 * LANE_H), egui::vec2(800.0, LANE_H));
-                        ui.painter().text(r.left_center(), egui::Align2::LEFT_CENTER, format!("Lane {i}"), egui::FontId::monospace(12.0), egui::Color32::WHITE);
-                        last = r;
-                    }
-                });
-                got = (taken, shown.inner_rect, last);
-            });
-        });
-        out.textures_delta.clear();
-        got
-    }
-
-    #[test]
-    fn the_wheel_scrolls_lanes_that_do_not_fit_and_ctrl_zooms_time() {
-        let ctx = themed_ctx();
-        let none = egui::Modifiers::NONE;
-        let (_, view, last) = lanes_frame(&ctx, vec![], none);
-        assert!(last.bottom() > view.bottom() + 100.0, "the last lane starts out of view");
-        let over = view.center();
-        // Ctrl+wheel over the lanes zooms time and does not move the lanes.
-        for _ in 0..5 {
-            let ((zoom, pan), _, l) = lanes_frame(&ctx, vec![egui::Event::PointerMoved(over), wheel(-3.0, egui::Modifiers::CTRL)], egui::Modifiers::CTRL);
-            assert!(zoom < 0.0 && pan == 0.0);
-            assert_eq!(l, last, "ctrl+wheel must not scroll the lanes");
-        }
-        // Shift+wheel moves through time.
-        let ((zoom, pan), _, _) = lanes_frame(&ctx, vec![egui::Event::PointerMoved(over), wheel(-1.0, egui::Modifiers::SHIFT)], egui::Modifiers::SHIFT);
-        assert!(zoom == 0.0 && pan != 0.0);
-        // A plain wheel over the lanes scrolls down until the last lane shows.
-        let mut seen = false;
-        for _ in 0..60 {
-            let ((zoom, pan), view, l) = lanes_frame(&ctx, vec![egui::Event::PointerMoved(over), wheel(-3.0, none)], none);
-            assert_eq!((zoom, pan), (0.0, 0.0), "a plain wheel over the lanes is not time");
-            if view.contains_rect(l) {
-                seen = true;
-                break;
-            }
-        }
-        for _ in 0..30 {
-            let (_, view, l) = lanes_frame(&ctx, vec![egui::Event::PointerMoved(over)], none);
-            seen |= view.contains_rect(l);
-        }
-        assert!(seen, "scrolling reveals the last lane");
-        // Over the time axis a plain wheel still zooms.
-        let ((zoom, _), _, _) = lanes_frame(&ctx, vec![egui::Event::PointerMoved(egui::pos2(400.0, 18.0)), wheel(1.0, none)], none);
-        assert!(zoom > 0.0);
     }
 
     #[test]
@@ -2962,45 +2904,61 @@ pub fn status_split(full: egui::Rect) -> (egui::Rect, egui::Rect) {
 /// Where the pointer was for this frame's wheel input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WheelOver {
+    /// The time axis row.
     Axis,
+    /// The lanes (grid), right of the solid name column.
     Lanes,
+    /// The solid lane-name column, or the scrollbar gutter.
+    Names,
     Elsewhere,
 }
 
-/// What one wheel event does on the timeline: `None` leaves it to the lane
-/// scroll area (up and down through the lanes).
+/// What one wheel event does on the timeline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WheelUse {
+    /// Zoom time about the pointer.
     Zoom,
-    Pan,
+    /// Scroll the lane list up and down.
+    Lanes,
 }
 
+/// Plain wheel over the axis or lanes zooms time (as it always did);
+/// Shift+wheel anywhere on the timeline, or a plain wheel over the names,
+/// scrolls the lanes. Ctrl/Cmd+wheel zooms.
 pub fn wheel_use(over: WheelOver, mods: egui::Modifiers) -> Option<WheelUse> {
     match over {
         WheelOver::Elsewhere => None,
-        WheelOver::Axis if mods.shift => Some(WheelUse::Pan),
-        WheelOver::Axis => Some(WheelUse::Zoom),
-        WheelOver::Lanes if mods.command || mods.ctrl => Some(WheelUse::Zoom),
-        WheelOver::Lanes if mods.shift => Some(WheelUse::Pan),
-        WheelOver::Lanes => None,
+        _ if mods.shift => Some(WheelUse::Lanes),
+        _ if mods.command || mods.ctrl => Some(WheelUse::Zoom),
+        WheelOver::Names => Some(WheelUse::Lanes),
+        WheelOver::Axis | WheelOver::Lanes => Some(WheelUse::Zoom),
     }
 }
 
-/// Take this frame's time wheel: (zoom delta, pan delta in px). Raw delta,
-/// once per event: the smoothed delta repeats a notch over several frames,
-/// which zoomed tenfold per click. A wheel used for time is taken away from
-/// the lane scroll area; a plain wheel over the lanes is left to it.
-pub fn take_time_wheel(ui: &mut egui::Ui, over: WheelOver) -> (f32, f32) {
+/// This frame's timeline wheel: zoom delta (points, + = zoom in) and the
+/// lane scroll delta (points, + = toward the top).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TimelineWheel {
+    pub zoom: f32,
+    pub lanes: f32,
+}
+
+/// Take this frame's wheel from the raw events, once per event (the
+/// smoothed delta repeats a notch over several frames, which zoomed tenfold
+/// per click). Shift may arrive as a sideways wheel, so x and y both count.
+/// The wheel is then taken from egui so no scroll area also moves.
+pub fn take_timeline_wheel(ui: &mut egui::Ui, over: WheelOver) -> TimelineWheel {
     if over == WheelOver::Elsewhere {
-        return (0.0, 0.0);
+        return TimelineWheel::default();
     }
     ui.input_mut(|i| {
         let page = i.content_rect().height();
-        let (mut zoom, mut pan) = (0.0f32, 0.0f32);
+        let mut w = TimelineWheel::default();
+        let mut any = false;
         for e in &i.raw.events {
             let egui::Event::MouseWheel { unit, delta, modifiers, .. } = e else { continue };
             let Some(usage) = wheel_use(over, *modifiers) else { continue };
-            // Shift may arrive as a sideways wheel.
+            any = true;
             let d = delta.y + delta.x;
             let d = match unit {
                 egui::MouseWheelUnit::Point => d,
@@ -3008,14 +2966,14 @@ pub fn take_time_wheel(ui: &mut egui::Ui, over: WheelOver) -> (f32, f32) {
                 egui::MouseWheelUnit::Page => d * page,
             };
             match usage {
-                WheelUse::Zoom => zoom += d,
-                WheelUse::Pan => pan += d,
+                WheelUse::Zoom => w.zoom += d,
+                WheelUse::Lanes => w.lanes += d,
             }
         }
-        if zoom != 0.0 || pan != 0.0 || wheel_use(over, i.modifiers).is_some() {
+        if any {
             i.smooth_scroll_delta = egui::Vec2::ZERO;
         }
-        (zoom, pan)
+        w
     })
 }
 
@@ -3028,7 +2986,14 @@ pub fn lane_scroll(salt: impl std::hash::Hash + std::fmt::Debug, viewport_h: f32
         .max_height(viewport_h)
         .auto_shrink([false, false])
         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+        .scroll_source(egui::scroll_area::ScrollSource { scroll_bar: true, drag: egui::scroll_area::DragScroll::Never, mouse_wheel: false })
 }
+
+/// Narrowest block drawn: a short call, or one that just started, is never
+/// a hairline under the NOW line.
+pub const MIN_BLOCK_W: f32 = 6.0;
+/// A recording in progress: bright, with a white edge, over the NOW tint.
+pub const LIVE_BLOCK: egui::Color32 = egui::Color32::from_rgb(255, 64, 40);
 
 /// Height left in `ui` that is on screen: a page inside an unbounded
 /// (detached) scroll area must not size its lane viewport past the window,

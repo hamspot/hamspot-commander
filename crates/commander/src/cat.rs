@@ -500,6 +500,20 @@ pub fn claim_port(start: u16) -> Result<u16, String> {
     Err(format!("no free TCP port from {start} through {last}"))
 }
 
+/// Tests that start a real `rigctld` (or a test `App`, whose hub starts the
+/// dummy one) hold this lock across processes, so two of them never race
+/// for the same port in parallel test runs.
+#[cfg(test)]
+pub fn test_rig_lock() -> std::fs::File {
+    use std::os::fd::AsRawFd;
+    let path = std::env::temp_dir().join(format!("hamspot-commander-test-rig-{}.lock", unsafe { libc::getuid() }));
+    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path).expect("rig test lock");
+    unsafe {
+        libc::flock(f.as_raw_fd(), libc::LOCK_EX);
+    }
+    f
+}
+
 pub fn release_port(port: u16) {
     CLAIMED.lock().expect("ports").remove(&port);
 }
@@ -3997,6 +4011,7 @@ mod tests {
 
     #[test]
     fn dummy_parks_vfo_a_and_the_process_ends() {
+        let _lock = test_rig_lock();
         let spec = RadioSpec::dummy();
         let port = match claim_port(PORT_START) {
             Ok(port) => port,
@@ -4031,6 +4046,7 @@ mod tests {
 
     #[test]
     fn follow_reads_vfo_b_without_leaving_vfo_a() {
+        let _lock = test_rig_lock();
         let spec = RadioSpec::dummy();
         let port = match claim_port(PORT_START) {
             Ok(port) => port,

@@ -507,20 +507,19 @@ One **lane** per talkgroup or channel and one **block** per recording, like a se
 
 | Mouse | Action |
 | --- | --- |
-| Wheel over the lanes | Scroll the lanes up and down |
-| Ctrl+wheel over the lanes, or wheel over the time axis | Zoom about the pointer (about 18% per notch) |
-| Shift+wheel over the lanes or the time axis | Move earlier or later in time |
+| Wheel over the timeline | Zoom about the pointer (about 18% per notch) |
+| Shift+wheel over the timeline, or wheel over the lane names | Scroll the lanes up and down |
 | Drag | Pan |
 | Click a lane name | Highlight that lane |
 | Click a block | Play from that point and open the Record / Playback dialog |
 
-The span runs from 0.5 seconds to 30 days. A recording in progress is a red block that grows.
+The span runs from 0.5 seconds to 30 days. A recording in progress is a bright red block with a white edge that grows up to NOW. A short call is never drawn narrower than a few pixels.
 
-The lane names sit on a shelf over the timeline's left edge that fades out like a shadow. A long name runs on past the shelf into its lane at full brightness, drawn over the recordings, and fades out just before halfway across. Clicks, drags and the wheel on that faded text go to the timeline. When there are more lanes than fit, a thin scrollbar appears in a narrow strip right of the timeline; drag it or use the wheel over the lanes. The time axis stays at the top while the lanes scroll.
+The lane names sit on a shelf over the timeline's left edge that fades out like a shadow. A long name runs on past the shelf into its lane at full brightness, drawn over the recordings, and fades out just before halfway across. Clicks, drags and the wheel on that faded text go to the timeline. When there are more lanes than fit, a thin scrollbar appears in a narrow strip right of the timeline; drag it, use Shift+wheel anywhere on the timeline, or use the wheel over the lane names. The time axis stays at the top while the lanes scroll. When calls overlap, a lane stacks them in up to three rows.
 
 The timeline never shows the future: NOW is its right edge. Zooming out, **FIT**, **TODAY** and **DAY ▶** all stop there.
 
-The timeline opens on the most recent recordings. If the last one ended less than an hour ago, it opens with **LIVE** on: the view ends on NOW and follows it, so new calls scroll in from the right. With **LIVE** on, the right edge is locked to NOW and zooming (Ctrl+wheel, the time axis, or − and +) is around NOW, changing only how much time is shown. Dragging the timeline back into the past turns **LIVE** off and parks the view, so you can look at older calls while new ones keep recording. While it is parked, a red **LIVE ▶** key sits at the right end of the time axis. Click it, click the **LIVE** toggle, or drag the timeline forward until it reaches NOW, and the view follows the present again. **TODAY** and the day buttons also park the view. With **LIVE** off, zooming is around the mouse pointer and the view stays put as time passes.
+The timeline opens on the most recent recordings. If the last one ended less than an hour ago, it opens with **LIVE** on, showing the last hour: the view ends on NOW and follows it, so new calls scroll in from the right. With **LIVE** on, the right edge is locked to NOW and the wheel zooms around NOW, changing only how much time is shown. Dragging the timeline back into the past turns **LIVE** off and parks the view, so you can look at older calls while new ones keep recording. While it is parked, a red **LIVE ▶** key sits at the right end of the time axis. Click it, click the **LIVE** toggle, or drag the timeline forward until it reaches NOW, and the view follows the present again. **TODAY** and the day buttons also park the view. With **LIVE** off, the wheel zooms around the mouse pointer and the view stays put as time passes.
 
 The red NOW line has a translucent red tint on its left, just wide enough for the **NOW** label. It is strongest at the line and fades to clear toward the past. Nothing right of NOW is tinted, and there is no tint when NOW is off screen. The lanes, recordings, NOW line and label all show through it. It is only paint: clicks, drags and the wheel work there as on the rest of the timeline.
 

@@ -143,6 +143,9 @@ pub fn lanes(recs: &[Recording]) -> Vec<String> {
     v
 }
 
+/// Most rows one lane stacks into for overlapping blocks.
+pub const MAX_SUBS: usize = 3;
+
 /// Blocks for recordings visible in `view`. Unfinished recordings grow to `now`.
 /// Every block is at least 2 px wide so short calls stay clickable.
 pub fn layout(recs: &[Recording], lanes: &[String], view: &View, width: f32, now: i64) -> Vec<Block> {
@@ -163,10 +166,13 @@ pub fn layout(recs: &[Recording], lanes: &[String], view: &View, width: f32, now
         let rows = &mut ends[lane];
         let sub = match rows.iter().position(|e| *e <= x0) {
             Some(i) => i,
-            None => {
+            None if rows.len() < MAX_SUBS => {
                 rows.push(f32::MIN);
                 rows.len() - 1
             }
+            // A burst of short calls does not make one lane huge: past
+            // MAX_SUBS rows, a block shares the row that frees up first.
+            None => rows.iter().enumerate().min_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i).unwrap_or(0),
         };
         rows[sub] = x1;
         out.push(Block { id: r.id, lane, sub, x0, x1, live });
@@ -202,8 +208,10 @@ pub fn fit(recs: &[Recording], now: i64) -> View {
     if now.saturating_sub(last) <= FIT_LIVE_MS {
         // Still recording (or the last call just ended): frame the same
         // recordings but end on NOW and follow it, so new calls scroll in.
+        // At most the last hour, so a call that just started is wide
+        // enough to see; zoom out for more.
         let raw = (now - first).max(MIN_SPAN_MS);
-        return View::live(now, (raw + raw / 20).clamp(MIN_SPAN_MS, MAX_SPAN_MS));
+        return View::live(now, (raw + raw / 20).clamp(MIN_SPAN_MS, FIT_LIVE_SPAN_MS));
     }
     let raw = (last - first).max(MIN_SPAN_MS);
     let span = (raw + raw / 10).clamp(MIN_SPAN_MS, MAX_SPAN_MS);
@@ -214,6 +222,8 @@ pub fn fit(recs: &[Recording], now: i64) -> View {
 /// A most recent recording that ended at most this long ago makes [`fit`]
 /// a live view: the session is still going on.
 pub const FIT_LIVE_MS: i64 = 3_600_000;
+/// Widest live view [`fit`] opens.
+pub const FIT_LIVE_SPAN_MS: i64 = 3_600_000;
 
 /// Split of the timeline canvas: a fixed label column on the left and the
 /// grid to its right. They never overlap.
@@ -561,8 +571,8 @@ mod tests {
         let mut v = fit(&r, now);
         assert!(v.live);
         assert_eq!(v.end(), now);
-        assert!(v.start <= parse_ms("2026-11-10T01:01:51Z").unwrap());
-        assert_eq!(layout(&r, &lanes(&r), &v, 800.0, now).len(), 2);
+        assert_eq!(v.span, FIT_LIVE_SPAN_MS, "the last hour, not the whole evening");
+        assert_eq!(layout(&r, &lanes(&r), &v, 800.0, now).len(), 1);
         let later = now + 600_000;
         v.follow(later);
         v.clamp(later);
@@ -570,7 +580,7 @@ mod tests {
         // A new call at the live edge is in view without any input.
         db.insert("c", &meta("hackrf_tg", Some(3), "2026-11-10T04:40:00Z", "2026-11-10T04:40:05Z")).unwrap();
         let r = db.all().unwrap();
-        assert_eq!(layout(&r, &lanes(&r), &v, 800.0, later).len(), 3);
+        assert_eq!(layout(&r, &lanes(&r), &v, 800.0, later).len(), 2);
         // An hour and more after the last call, Fit frames the calls instead.
         assert!(!fit(&r, later + FIT_LIVE_MS + 1).live);
     }
@@ -617,5 +627,21 @@ mod tests {
             let b = layout(&r, &l, &v, 900.0, now);
             assert!(b.iter().any(|b| b.id == call && b.x1 > 0.0 && b.x0 < 900.0), "call not in view at {at}");
         }
+    }
+
+    #[test]
+    fn a_burst_of_calls_stacks_at_most_max_subs_rows() {
+        let db = Db::open_in_memory().unwrap();
+        for k in 0..10 {
+            let t0 = format!("2026-11-10T01:17:{:02}Z", 20 + k * 3);
+            let t1 = format!("2026-11-10T01:17:{:02}Z", 22 + k * 3);
+            db.insert(&format!("c{k}"), &meta("hackrf_tg", Some(10334), &t0, &t1)).unwrap();
+        }
+        let r = db.all().unwrap();
+        let now = parse_ms("2026-11-10T04:00:00Z").unwrap();
+        let v = View::live(now, 3 * 3_600_000);
+        let b = layout(&r, &lanes(&r), &v, 900.0, now);
+        assert_eq!(b.len(), 10, "every call is still drawn");
+        assert!(b.iter().all(|b| b.sub < MAX_SUBS));
     }
 }
