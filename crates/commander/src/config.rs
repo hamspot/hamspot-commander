@@ -470,7 +470,31 @@ pub fn save_file(path: &Path, file: &ConfigFile) -> Result<(), String> {
             fs::create_dir_all(dir).map_err(|err| err.to_string())?;
         }
     }
-    fs::write(path, text).map_err(|err| format!("{}: {err}", path.display()))
+    write_atomic(path, text.as_bytes())
+}
+
+/// Write beside the file, then rename over it, so a crash or a full disk
+/// never leaves a half-written station. A symlinked station file is written
+/// through to its target, and the target keeps its permissions.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let err = |e: std::io::Error| format!("{}: {e}", path.display());
+    let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let name = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let tmp = target.with_file_name(format!(".{name}.saving-{}", std::process::id()));
+    let result = (|| {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        if let Ok(meta) = fs::metadata(&target) {
+            let _ = fs::set_permissions(&tmp, meta.permissions());
+        }
+        fs::rename(&tmp, &target)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result.map_err(err)
 }
 
 pub fn load_file(path: &Path) -> Result<ConfigFile, String> {
@@ -1697,6 +1721,47 @@ mod tests {
         assert_eq!(file.rotators[0].model, 1);
         assert_eq!(file.tune.freq_hz, 145_800_000.0);
         assert!(parse(&to_string(&file).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn a_radio_description_round_trips_and_keeps_the_rest_of_the_station() {
+        let mut original = parse(include_str!("../../../examples/Example-Satellite-EME.HSCommander")).unwrap();
+        original.units = vec![crate::units::Unit::named(42)];
+        let dir = std::env::temp_dir().join(format!("hs-unit-desc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // The station is reached through a symlink, as a checkout link might be.
+        let real = dir.join("real.HSCommander");
+        let link = dir.join("Station.HSCommander");
+        save_file(&real, &original).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let mut edited = load_file(&link).unwrap();
+        assert!(crate::units::set_description(&mut edited.units, 42, "  Engine 7 "));
+        assert!(crate::units::set_description(&mut edited.units, 9_522_067, "Car 52"));
+        save_file(&link, &edited).unwrap();
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "the link stays a link");
+        let back = load_file(&real).unwrap();
+        let named: Vec<(u32, &str)> = back.units.iter().map(|u| (u.id, u.description.as_str())).collect();
+        assert_eq!(named, vec![(42, "Engine 7"), (9_522_067, "Car 52")]);
+        // Everything else is as it was.
+        let mut rest = back.clone();
+        rest.units = original.units.clone();
+        assert_eq!(to_string(&rest).unwrap(), to_string(&original).unwrap());
+        // Clearing goes back to no description; an unknown radio isn't added empty.
+        let mut cleared = back;
+        assert!(crate::units::set_description(&mut cleared.units, 42, ""));
+        assert!(!crate::units::set_description(&mut cleared.units, 7, " "));
+        save_file(&link, &cleared).unwrap();
+        let back = load_file(&link).unwrap();
+        assert_eq!(back.units.iter().find(|u| u.id == 42).map(|u| u.description.as_str()), Some(""));
+        assert!(!back.units.iter().any(|u| u.id == 7));
+        // No temporary file left behind.
+        let left: Vec<_> = fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(left.len(), 2, "{left:?}");
+        // A save that cannot be written says why.
+        let err = save_file(&dir, &cleared).unwrap_err();
+        assert!(err.contains(&dir.display().to_string()), "{err}");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

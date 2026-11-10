@@ -279,14 +279,28 @@ impl CallUnits {
 
 /// "51007" or "51007 (+2: 42, 9)" for a call's radio IDs.
 pub fn units_text(m: &Meta) -> String {
+    units_named(m, &HashMap::new())
+}
+
+/// A radio id with its description when it has one: "Engine 7 (100)".
+pub fn unit_named(id: u32, names: &HashMap<u32, String>) -> String {
+    match names.get(&id).map(|d| d.trim()).filter(|d| !d.is_empty() && *d != id.to_string()) {
+        Some(d) => format!("{d} ({id})"),
+        None => id.to_string(),
+    }
+}
+
+/// The radios on a call, each with its description when it has one.
+pub fn units_named(m: &Meta, names: &HashMap<u32, String>) -> String {
     let ids = m.unit_ids();
     match ids.split_first() {
         None => String::new(),
-        Some((first, [])) => first.to_string(),
+        Some((first, [])) => unit_named(*first, names),
         Some((first, rest)) => format!(
-            "{first} (+{}: {})",
+            "{} (+{}: {})",
+            unit_named(*first, names),
             rest.len(),
-            rest.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(", ")
+            rest.iter().map(|u| unit_named(*u, names)).collect::<Vec<_>>().join(", ")
         ),
     }
 }
@@ -298,6 +312,11 @@ pub fn radio_lane(id: u32, names: &HashMap<u32, String>) -> String {
         Some(d) => format!("{d} ({id})"),
         None => format!("Radio {id}"),
     }
+}
+
+/// What a saved description shows as (the lane name).
+pub fn rec_radio_label(id: u32, names: &HashMap<u32, String>) -> String {
+    radio_lane(id, names)
 }
 
 /// Lane for talkgroup calls with no known radio. They are listed, not left out.
@@ -418,6 +437,10 @@ pub struct RecUi {
     player: Option<(i64, hsrec::replay::Player)>,
     play_next: bool,
     notes_edit: String,
+    /// Radio IDs dialog: the description being typed for one radio.
+    desc_edit: Option<(u32, String)>,
+    /// A description left (Enter or focus out), saved on the next frame.
+    pub(crate) desc_commit: Option<(u32, String)>,
     note: String,
     log: Vec<String>,
     undo: Option<(Recording, PathBuf, Instant)>,
@@ -591,6 +614,9 @@ impl App {
     /// Once per frame: configure the recorder for the open station, run the
     /// segmenters from the follower / scanner state, and save marks.
     pub(super) fn rec_frame(&mut self, snap: &Snapshot) {
+        if let Some((id, text)) = self.rec.desc_commit.take() {
+            self.rec_save_description(snap, id, &text);
+        }
         let path = self.config_path.clone();
         if self.rec.configured.as_deref() != Some(path.as_str()) {
             self.rec_configure(&path, false);
@@ -789,6 +815,41 @@ impl App {
             }
         }
         self.rec.carrier_open.insert(row.id, next);
+    }
+
+    /// Radio descriptions by id, as the Radio IDs page and the lanes use them.
+    pub(crate) fn unit_names(&self) -> HashMap<u32, String> {
+        self.units.iter().map(|u| (u.id, u.description.clone())).collect()
+    }
+
+    /// Save a radio's description from the Radio IDs dialog into the
+    /// station file (its `units`), the same save the Radio IDs page does.
+    /// The lanes, title and tooltips pick it up on the reload. A failed
+    /// save is shown in the status line and logged; it is never silent.
+    pub(crate) fn rec_save_description(&mut self, snap: &Snapshot, id: u32, text: &str) {
+        if !crate::units::set_description(&mut self.units, id, text) {
+            return;
+        }
+        let shown = rec_radio_label(id, &self.unit_names());
+        if self.config_path.is_empty() {
+            self.rec.note = format!("Radio {id} description NOT saved: no station file is open.");
+            eprintln!("commander: {}", self.rec.note);
+            self.rec_log(self.rec.note.clone());
+            self.rec_reload(true);
+            return;
+        }
+        self.unit_desc_dirty = true;
+        self.config_note.clear();
+        self.save_config(snap);
+        if self.config_note.is_empty() {
+            self.rec.note = format!("Saved: {shown}.");
+        } else {
+            self.unit_desc_dirty = true;
+            self.rec.note = format!("Radio {id} description NOT saved: {}", self.config_note);
+            eprintln!("commander: {}", self.rec.note);
+            self.rec_log(self.rec.note.clone());
+        }
+        self.rec_reload(true);
     }
 
     fn close_carriers(&mut self, radio: u64, recorder: &hsrec::writer::Recorder) {
@@ -1200,8 +1261,7 @@ impl App {
         let all = db.all().unwrap_or_default();
         self.rec.usage = Some(hsrec::storage::Usage::from_rows(&all, self.rec.face.cap_gb));
         if source == meta::SOURCE_RADIO_IDS {
-            let names: HashMap<u32, String> = self.units.iter().map(|u| (u.id, u.description.clone())).collect();
-            let (rows, map) = radio_rows(&all, &names);
+            let (rows, map) = radio_rows(&all, &self.unit_names());
             self.rec.rows = rows;
             self.rec.radio_map = map;
         } else {
@@ -1876,7 +1936,10 @@ impl App {
         let now = chrono::Utc::now().timestamp_millis();
         let source = self.rec_source();
         let query = self.rec.query.clone();
-        let recs: Vec<Recording> = self.rec.rows.iter().filter(|r| timeline::matches(r, &query)).cloned().collect();
+        let names = self.unit_names();
+        let q = query.trim().to_lowercase();
+        let named = |r: &Recording| !q.is_empty() && r.meta.unit_ids().iter().any(|u| names.get(u).is_some_and(|d| d.to_lowercase().contains(&q)));
+        let recs: Vec<Recording> = self.rec.rows.iter().filter(|r| timeline::matches(r, &query) || named(r)).cloned().collect();
         let lanes = timeline::lanes(&recs);
         // First look at a source frames its most recent recordings.
         let mut view = match self.rec.views.get(&source) {
@@ -2128,7 +2191,7 @@ impl App {
                     }
                     if hover.is_some_and(|p| br.expand(2.0).contains(p)) {
                         let start = chrono::DateTime::from_timestamp_millis(t0).unwrap_or_default().with_timezone(&chrono::Local);
-                        let unit = match units_text(&r.meta) { t if t.is_empty() => t, t => format!("\nRadio ID {t}") };
+                        let unit = match units_named(&r.meta, &names) { t if t.is_empty() => t, t => format!("\nRadio ID {t}") };
                         let mut tip = format!("{}\n{} ({:.1} s){unit}", r.meta.lane(), start.format("%Y-%m-%d %H:%M:%S"), r.meta.duration_ms as f64 / 1000.0);
                         if b.id < 0 {
                             let tg = r.meta.talkgroup.map(|t| t.to_string()).unwrap_or_default();
@@ -2234,7 +2297,8 @@ impl App {
         put("Site", m.site.clone());
         if let Some(tg) = m.talkgroup { put("Talkgroup", format!("{} ({tg})", m.talkgroup_name)); }
         put("Channel", m.channel_name.clone());
-        if let Some(u) = m.radio_unit_id { put("Radio unit ID", u.to_string()); }
+        let names = self.unit_names();
+        if let Some(u) = m.radio_unit_id { put("Radio unit ID", unit_named(u, &names)); }
         let hhmmss = |utc: &str| {
             chrono::DateTime::parse_from_rfc3339(utc)
                 .map(|t| t.with_timezone(&chrono::Local).format("%H:%M:%S").to_string())
@@ -2244,7 +2308,7 @@ impl App {
             "Radio IDs on call",
             m.units
                 .iter()
-                .map(|u| format!("{} (heard {}–{})", u.id, hhmmss(&u.first_utc), hhmmss(&u.last_utc)))
+                .map(|u| format!("{} (heard {}–{})", unit_named(u.id, &names), hhmmss(&u.first_utc), hhmmss(&u.last_utc)))
                 .collect::<Vec<_>>()
                 .join(", "),
         );
@@ -2429,6 +2493,45 @@ impl App {
         }
     }
 
+    /// Radio IDs dialog: Notes is the radio's description (station `units`),
+    /// shared with the Radio IDs page, the lanes and every tooltip.
+    fn rec_radio_notes(&mut self, ui: &mut egui::Ui, rec: &Recording) {
+        use rustcars::palette::PLUM;
+        let radio = rec.meta.radio_unit_id.filter(|u| *u != 0);
+        crate::group_box::group_box(ui, "Notes", PLUM, |ui| {
+            let Some(radio) = radio else {
+                ui.label("No radio was heard on this call, so there is no radio to describe.");
+                return;
+            };
+            if self.rec.desc_edit.as_ref().is_none_or(|(r, _)| *r != radio) {
+                let now = self.units.iter().find(|u| u.id == radio).map(|u| u.description.clone()).unwrap_or_default();
+                let now = if now.trim() == radio.to_string() { String::new() } else { now };
+                self.rec.desc_edit = Some((radio, now));
+            }
+            let Some((_, text)) = self.rec.desc_edit.as_mut() else { return };
+            let r = ui
+                .horizontal(|ui| {
+                    ui.label("Description");
+                    ui.add(
+                        egui::TextEdit::singleline(text)
+                            .id_salt(("rec-radio-desc", radio))
+                            .hint_text(format!("Radio {radio}"))
+                            .desired_width(f32::INFINITY),
+                    )
+                })
+                .inner;
+            let enter = r.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if r.lost_focus() || enter {
+                let text = text.clone();
+                self.rec.desc_commit = Some((radio, text));
+            }
+            ui.label(
+                egui::RichText::new(format!("Names radio {radio} everywhere: its lane, tooltips, search and the Radio IDs page. Empty shows it as Radio {radio}."))
+                    .small(),
+            );
+        });
+    }
+
     fn rec_detail(&mut self, ui: &mut egui::Ui, rec: Recording) {
         let id = rec.id;
         let local = |utc: &str| {
@@ -2482,13 +2585,14 @@ impl App {
                     ui.checkbox(&mut star, "★ Star");
                     ui.checkbox(&mut protect, "🔒 Protect").on_hover_text("Never removed by overwrite-oldest.");
                 } else {
-                    ui.label(format!("{} — this radio's part of the call. Star, notes, export and delete are on the talkgroup's tab.", rec.meta.talkgroup_name));
+                    ui.label(format!("{} — this radio's part of the call. Notes below name the radio; star, export and delete are on the talkgroup's tab.", rec.meta.talkgroup_name));
                 }
             });
             self.rec_demod_row(ui, &rec);
             self.rec_output_row(ui);
         });
         if id < 0 {
+            self.rec_radio_notes(ui, &rec);
             return;
         }
         crate::group_box::group_box(ui, "Notes", PLUM, |ui| {

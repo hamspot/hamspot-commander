@@ -60,6 +60,39 @@ impl Unit {
     }
 }
 
+/// Set radio `id`'s operator description (trimmed). An empty text clears
+/// it, so the radio shows as "Radio <id>" again. A radio not listed yet is
+/// added with only its description. `true` when the list changed.
+pub fn set_description(units: &mut Vec<Unit>, id: u32, text: &str) -> bool {
+    let text = text.trim();
+    if id == 0 {
+        return false;
+    }
+    if let Some(row) = units.iter_mut().find(|row| row.id == id) {
+        if row.description == text {
+            return false;
+        }
+        row.description = text.to_string();
+        return true;
+    }
+    if text.is_empty() {
+        return false;
+    }
+    units.push(Unit {
+        id,
+        description: text.to_string(),
+        last_tg: None,
+        peer: None,
+        emergency: false,
+        encrypted: false,
+        site: None,
+        wacn: None,
+        sys: None,
+        reg: None,
+    });
+    true
+}
+
 /// Insert `sight` or refresh the detected fields. The description is left
 /// alone. `true` means the list gained a radio or a detected field changed.
 pub fn note(units: &mut Vec<Unit>, sight: &UnitSight) -> bool {

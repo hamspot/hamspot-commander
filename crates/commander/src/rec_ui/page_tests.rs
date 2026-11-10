@@ -927,6 +927,83 @@ fn real_page_radio_ids_tab_lanes_searches_and_plays_one_radio() {
     }
 }
 
+/// Radio IDs dialog: Notes is the radio's description. Typing one saves it
+/// to the station file's `units`, and the lane, heading and TG tab use it
+/// at once; clearing it goes back to "Radio <id>". A failed save is shown.
+#[test]
+fn real_page_radio_ids_notes_edit_the_radio_description() {
+    if !in_child("real_page_radio_ids_notes_edit_the_radio_description") {
+        return;
+    }
+    install_modems();
+    let st = station(None, 0);
+    let mut h = Harness::new(&st, egui::vec2(1200.0, 900.0), false);
+    h.app.rec.face.source_tab = meta::SOURCE_RADIO_IDS.into();
+    h.app.rec.play_argv = Some(vec!["sh".into(), "-c".into(), "cat > /dev/null".into()]);
+    h.app.units = vec![crate::units::Unit::named(30003)];
+    h.settle(4);
+    let db = Db::open(&h.app.rec.db_path).unwrap();
+    let dir = h.app.rec.dir.clone();
+    let mut a = tg_rec(&db, &dir, "a", 10741, "ISP IND DISP", 12, 4_000);
+    a.radio_unit_id = Some(30003);
+    let id_a = db.insert("hackrf_tg/x/a.cs16", &a).unwrap();
+    let t = std::time::Instant::now();
+    while h.app.rec.rows.len() != 1 {
+        h.run(vec![]);
+        assert!(t.elapsed() < std::time::Duration::from_secs(5), "rows {}", h.app.rec.rows.len());
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+    let vid = h.app.rec.rows[0].id;
+    assert!(vid < 0);
+    h.app.rec_play(vid, 0);
+    let out = h.settle(4);
+    assert!(lane_label(&out, "Radio 30003").is_some(), "lane before");
+    let words: Vec<(String, egui::Rect)> = texts(&out);
+    let at = |w: &str| words.iter().find(|(t, _)| t.to_uppercase() == w).map(|(_, r)| r.top());
+    let (play, notes) = (at("PLAYBACK").expect("PLAYBACK"), at("NOTES").expect("NOTES section"));
+    assert!(notes > play, "Notes below Playback");
+    assert!(words.iter().any(|(t, _)| t.contains("Notes below name the radio")), "hint");
+    // Type into the Description field (its hint is the fallback name), then Enter.
+    let field = words.iter().find(|(t, _)| t == "Description").map(|(_, r)| *r).expect("Description");
+    let click = egui::pos2(field.right() + 60.0, field.center().y);
+    let m0 = egui::Modifiers::NONE;
+    h.run(vec![
+        egui::Event::PointerMoved(click),
+        egui::Event::PointerButton { pos: click, button: egui::PointerButton::Primary, pressed: true, modifiers: m0 },
+        egui::Event::PointerButton { pos: click, button: egui::PointerButton::Primary, pressed: false, modifiers: m0 },
+    ]);
+    h.run(vec![egui::Event::Text("Engine 7".into())]);
+    h.run(vec![egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: m0 }]);
+    let out = h.settle(4);
+    let saved = crate::config::load_file(&st).expect("station saved");
+    assert_eq!(saved.units.iter().find(|u| u.id == 30003).map(|u| u.description.as_str()), Some("Engine 7"), "in the station file");
+    assert!(lane_label(&out, "Engine 7 (30003)").is_some(), "lane renamed at once: {:?}", texts(&out).iter().map(|t| &t.0).collect::<Vec<_>>());
+    assert!(texts(&out).iter().any(|(t, _)| t == "Engine 7 (30003)" ), "dialog heading");
+    assert!(texts(&out).iter().any(|(t, _)| t.contains("Saved: Engine 7 (30003)")), "status line");
+    // The talkgroup's own recording names the radio too.
+    let real = db.get(id_a).unwrap().unwrap();
+    let rows = h.app.rec_meta_rows(&real);
+    assert!(rows.iter().any(|(k, v)| *k == "Radio unit ID" && v == "Engine 7 (30003)"), "{rows:?}");
+    if let Some(png) = std::env::var_os("HS_REC_PNG_DIR") {
+        h.png(&out, &Path::new(&png).join("rec-radio-notes-synthetic.png"));
+    }
+    // Cleared: back to "Radio 30003".
+    h.app.rec.desc_commit = Some((30003, String::new()));
+    h.app.rec.desc_edit = None;
+    let out = h.settle(4);
+    assert!(lane_label(&out, "Radio 30003").is_some(), "fallback name");
+    let saved = crate::config::load_file(&st).unwrap();
+    assert_eq!(saved.units.iter().find(|u| u.id == 30003).map(|u| u.description.as_str()), Some(""));
+    // A save that fails is said in the status line, not dropped.
+    let bad = st.parent().unwrap().join("not-a-file");
+    std::fs::create_dir_all(&bad).unwrap();
+    h.app.config_path = bad.display().to_string();
+    h.app.rec.configured = Some(h.app.config_path.clone());
+    h.app.rec.desc_commit = Some((30003, "Car 9".into()));
+    let out = h.settle(3);
+    assert!(texts(&out).iter().any(|(t, _)| t.contains("description NOT saved")), "error shown: {}", h.app.rec.note);
+}
+
 /// The Record / Playback dialog keeps Call, Playback and Notes on top, then
 /// the metadata (Source, Processing, File), then Export and Danger below File.
 #[test]
@@ -1018,4 +1095,14 @@ fn real_page_screenshots_from_a_database_copy() {
     let out = h.settle(10);
     h.png(&out, &dir.join("rec-radio-ids.png"));
     eprintln!("radio ids rows {}", h.app.rec.rows.len());
+    // One radio's playback dialog with its Notes (description) section,
+    // opened without playing; nothing is typed, so nothing is saved.
+    let pick = h.app.rec.rows.iter().filter(|r| r.meta.radio_unit_id.is_some_and(|u| u != 0)).max_by_key(|r| r.meta.start_utc.clone()).map(|r| r.id);
+    if let Some(id) = pick {
+        h.size = egui::vec2(1280.0, 900.0);
+        h.app.rec.selected = Some(id);
+        h.app.rec.detail_open = true;
+        let out = h.settle(6);
+        h.png(&out, &dir.join("rec-radio-notes.png"));
+    }
 }
