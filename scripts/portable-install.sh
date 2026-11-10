@@ -99,11 +99,12 @@ if [[ "$no_build" -eq 0 ]]; then
     command -v cargo >/dev/null 2>&1 || die "cargo is not on PATH"
     (
         cd "$root"
-        cargo build --release -p commander -p commander-voice
+        cargo build --release -p commander -p commander-voice -p hsrec --bins
     )
 fi
 [[ -x "${root}/target/release/commander" ]] || die "release binary was not produced"
 [[ -x "${root}/target/release/commander-voice" ]] || die "commander-voice was not produced"
+[[ -x "${root}/target/release/commander-rec" ]] || die "commander-rec was not produced"
 
 install -d -m 755 \
     "${prefix}/bin" \
@@ -117,6 +118,7 @@ install -d -m 755 \
 
 install -m 755 "${root}/target/release/commander" "${prefix}/bin/commander"
 install -m 755 "${root}/target/release/commander-voice" "${prefix}/bin/commander-voice"
+install -m 755 "${root}/target/release/commander-rec" "${prefix}/bin/commander-rec"
 install -m 755 "${root}/scripts/hamspot-commander.sh" "${prefix}/hamspot-commander.sh"
 install -m 644 "$icon_src" "${prefix}/hamspot-commander.png"
 install -m 644 "$icon_src" "${prefix}/share/icons/hicolor/128x128/apps/hamspot-commander.png"

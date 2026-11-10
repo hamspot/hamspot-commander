@@ -631,6 +631,32 @@ pub fn spawn(
     }
 }
 
+/// Copy the rig's demod audio into the decoder, and into REC when this
+/// radio's slot is a non-zero frequency. A read or write error ends the
+/// copy; the process group is stopped by the caller when the pipe dies.
+fn tee_rig_audio(id: u64, mut from: impl Read, mut to: impl Write) {
+    let slot = crate::rec_live::rec_hz_slot(id);
+    let mut carry = crate::rec_live::S16Carry::default();
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = match from.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        if to.write_all(&buf[..n]).is_err() {
+            break;
+        }
+        let hz = slot.load(Ordering::Relaxed);
+        let keep = crate::rec_live::tap_on() && hz != 0;
+        let samples = carry.take(&buf[..n], keep);
+        if keep && !samples.is_empty() {
+            crate::rec_live::push(id, hz, samples);
+        }
+    }
+}
+
 fn spawn_group(
     id: u64,
     speaker: &str,
@@ -687,13 +713,30 @@ fn spawn_group(
         stop_group(&mut record);
         "rx pipe process id does not fit".to_string()
     })?;
+    // The same 48 kHz mono s16le the decoder reads. A copy goes to REC when
+    // this radio is on a call. The decoder write happens first and is not
+    // gated on the recorder queue.
+    let (demod_read, demod_write) = match UnixStream::pair() {
+        Ok(pair) => pair,
+        Err(err) => {
+            stop_group(&mut record);
+            return Err(format!("rx pipe record tee: {err}"));
+        }
+    };
+    thread::spawn(move || tee_rig_audio(id, rec_out, demod_write));
 
-    let argv = command_argv(command, port.unwrap_or(VOICE_START))?;
+    let argv = match command_argv(command, port.unwrap_or(VOICE_START)) {
+        Ok(argv) => argv,
+        Err(err) => {
+            stop_group(&mut record);
+            return Err(err);
+        }
+    };
     let keep_stderr = events || identity;
     let mut filter = Command::new(&argv[0]);
     filter
         .args(&argv[1..])
-        .stdin(Stdio::from(rec_out))
+        .stdin(Stdio::from(OwnedFd::from(demod_read)))
         .stdout(Stdio::piped())
         .stderr(if keep_stderr {
             Stdio::piped()

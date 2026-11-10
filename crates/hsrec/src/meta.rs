@@ -4,8 +4,14 @@ use serde::{Deserialize, Serialize};
 
 pub const SOURCE_HACKRF_TG: &str = "hackrf_tg";
 pub const SOURCE_HACKRF_CHANNELS: &str = "hackrf_channels";
+/// Hamlib and GQRX recordings: the rig's own demod audio, one tab.
+pub const SOURCE_RIG_AUDIO: &str = "rig_audio";
 pub const KIND_RAW_IQ: &str = "raw_iq";
 pub const KIND_DEMOD_AUDIO: &str = "demod_audio";
+/// Sample rate of a rig demod recording. Matches the RX pipe's `pw-cat`.
+pub const RIG_RATE: u32 = 48_000;
+/// Chain id stored on a rig demod recording. Not an IQ discriminator chain.
+pub const RIG_CHAIN: &str = "rig-demod-s16le@48k";
 
 /// Display name for a source key (REC page tabs).
 pub fn source_label(source: &str) -> String {
@@ -28,7 +34,11 @@ pub fn source_label(source: &str) -> String {
 
 /// Built-in tabs, always shown even when empty, then any other source in the DB.
 pub fn source_tabs(in_db: &[String]) -> Vec<String> {
-    let mut out = vec![SOURCE_HACKRF_TG.to_string(), SOURCE_HACKRF_CHANNELS.to_string()];
+    let mut out = vec![
+        SOURCE_HACKRF_TG.to_string(),
+        SOURCE_HACKRF_CHANNELS.to_string(),
+        SOURCE_RIG_AUDIO.to_string(),
+    ];
     for s in in_db {
         if !out.contains(s) {
             out.push(s.clone());
@@ -208,7 +218,7 @@ mod tests {
         assert_eq!(source_label("rig_audio"), "Rig Audio");
         let tabs = source_tabs(&["rig_audio".into(), "hackrf_tg".into()]);
         assert_eq!(tabs, vec!["hackrf_tg", "hackrf_channels", "rig_audio"]);
-        assert_eq!(source_tabs(&[]).len(), 2);
+        assert_eq!(source_tabs(&[]), vec!["hackrf_tg", "hackrf_channels", "rig_audio"]);
     }
 
     #[test]

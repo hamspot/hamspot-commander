@@ -4,7 +4,8 @@
 //!
 //! HackRF sources record raw channelised IQ (32 ksps cs16) and every
 //! playback re-runs it through the current discriminator and decoder.
-//! Encrypted traffic is never recorded.
+//! Hamlib and GQRX record the rig's own 48 kHz demod audio
+//! (`source_kind = demod_audio`). Encrypted traffic is never recorded.
 use super::{caution, folder_tab, radio_key, App, KeyLamp, Snapshot};
 use crate::{cat, config};
 use eframe::egui;
@@ -24,6 +25,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+fn rig_driver(driver: cat::RadioDriver) -> bool {
+    matches!(driver, cat::RadioDriver::Hamlib | cat::RadioDriver::Gqrx)
+}
 
 pub const ROW_HOVER: &str = "Right-click: mark or unmark for recording (● REC).";
 /// Shown only as the REC page watermark on the bottom elbow bar.
@@ -476,9 +481,14 @@ impl App {
         let hang = Duration::from_millis(u64::from(self.voice_hang_ms));
         let now = Instant::now();
         let rows = self.hub.view().rows;
-        let hackrf: Vec<u64> = rows.iter().filter(|r| r.spec.driver == cat::RadioDriver::Hackrf).map(|r| r.id).collect();
-        let gone: Vec<u64> = self.rec.seg.keys().copied().filter(|id| !hackrf.contains(id) || !armed).collect();
+        let live: Vec<u64> = rows
+            .iter()
+            .filter(|r| matches!(r.spec.driver, cat::RadioDriver::Hackrf | cat::RadioDriver::Hamlib | cat::RadioDriver::Gqrx))
+            .map(|r| r.id)
+            .collect();
+        let gone: Vec<u64> = self.rec.seg.keys().copied().filter(|id| !live.contains(id) || !armed).collect();
         for id in gone {
+            crate::rec_live::set_rec_hz(id, 0);
             if let Some(mut s) = self.rec.seg.remove(&id) {
                 for a in s.stop() {
                     if let Action::Close { keep } = a {
@@ -488,15 +498,29 @@ impl App {
             }
         }
         if !armed {
+            for row in &rows {
+                if rig_driver(row.spec.driver) {
+                    crate::rec_live::set_rec_hz(row.id, 0);
+                }
+            }
             self.rec.enc.clear();
             return;
         }
-        for id in hackrf {
+        for id in live {
             let Some(row) = rows_meta(&rows, id) else { continue };
             let (want, meta) = self.rec_want(row);
+            if rig_driver(row.spec.driver) {
+                // The tee files samples only while this is the call REC wants.
+                crate::rec_live::set_rec_hz(id, want.as_ref().map(|k| k.hz).unwrap_or(0));
+            }
             // The file stays open for the whole time the follower holds this
             // call. Voice-frame lines are not what starts or ends it.
-            let enc = self.rec.enc.remove(&id);
+            let mut enc = self.rec.enc.remove(&id);
+            // A rig has no IQ tap. Air encryption still deletes the open file
+            // once, then the call stays unwanted so it is not opened again.
+            if rig_driver(row.spec.driver) && self.rig_air_encrypted(row) && self.rec.seg.get(&id).is_some_and(|s| s.recording().is_some()) {
+                enc = true;
+            }
             let max = Duration::from_secs(u64::from(
                 self.rec.face.max_segment_s.clamp(segment::MAX_SEGMENT_MIN_S, segment::MAX_SEGMENT_MAX_S),
             ));
@@ -595,8 +619,115 @@ impl App {
         p
     }
 
-    /// The call this HackRF radio should be recording now, and its metadata.
+    /// The call this radio should be recording now, and its metadata.
     fn rec_want(&self, row: &cat::RadioRow) -> (Option<CallKey>, Option<Meta>) {
+        match row.spec.driver {
+            cat::RadioDriver::Hackrf => self.rec_want_hackrf(row),
+            cat::RadioDriver::Hamlib | cat::RadioDriver::Gqrx => self.rec_want_rig(row),
+            cat::RadioDriver::Tap => (None, None),
+        }
+    }
+
+    /// True when the follower's current grant is not clear. A filled key
+    /// does not make that recordable.
+    fn rig_air_encrypted(&self, row: &cat::RadioRow) -> bool {
+        let Some(follower) = self.followers.get(&row.id) else { return false };
+        let Some(tg) = follower.active_tg() else { return false };
+        follower.heard().is_some_and(|h| h.tg == tg && h.alg != crate::follow::CLEAR_ALG)
+    }
+
+    fn rig_script<'a>(row: &'a cat::RadioRow) -> &'a str {
+        if row.rx_chain.is_empty() { &row.spec.rx_pipe } else { &row.rx_chain }
+    }
+
+    fn rig_meta(&self, row: &cat::RadioRow, hz: f64) -> Meta {
+        Meta {
+            source: meta::SOURCE_RIG_AUDIO.into(),
+            source_kind: meta::KIND_DEMOD_AUDIO.into(),
+            radio_id: row.id,
+            radio_name: row.spec.name.clone(),
+            raw_format: "s16le".into(),
+            sample_rate: meta::RIG_RATE,
+            centre_hz: hz,
+            channel_hz: hz,
+            offset_hz: 0.0,
+            bandwidth_hz: 0.0,
+            chain: meta::RIG_CHAIN.into(),
+            sw_version: format!("commander {} / {}", env!("CARGO_PKG_VERSION"), meta::sw_version()),
+            ..Default::default()
+        }
+    }
+
+    /// Hamlib / GQRX: the rig's demod audio for a held talkgroup, or for the
+    /// channel the scanner is holding. A control channel is not a recording.
+    fn rec_want_rig(&self, row: &cat::RadioRow) -> (Option<CallKey>, Option<Meta>) {
+        let face = &self.rec.face;
+        let voice = self.followers.get(&row.id).and_then(|follower| match (follower.voice_hz(), follower.active_tg()) {
+            (Some(hz), Some(tg)) if hz.is_finite() && hz > 0.0 => Some((hz, tg)),
+            _ => None,
+        });
+        if let Some((hz, tg)) = voice {
+            if face.talkgroups.armed() {
+                let found = self.talkgroups.zones.iter().flat_map(|z| z.talkgroups.iter()).find(|t| t.tg == tg);
+                let marked = found.is_some_and(|t| t.record);
+                let enc = found.is_some_and(|t| t.encrypted) || self.rig_air_encrypted(row);
+                let control = self.channels.zones.iter().flat_map(|z| z.channels.iter()).any(|c| c.control && (c.hz - hz).abs() < 1.0);
+                if segment::wanted(face.talkgroups, marked, enc) && !control {
+                    let key = CallKey { talkgroup: Some(tg), channel: String::new(), hz: hz.round() as u64, centre: hz.round() as u64 };
+                    let mut m = self.rig_meta(row, hz);
+                    m.talkgroup = Some(tg);
+                    m.talkgroup_name = found.map(|t| t.name.clone()).unwrap_or_default();
+                    m.priority = found.is_some_and(|t| t.priority);
+                    m.emergency = self.trunk_emergency.iter().any(|(_, _, t)| *t == tg);
+                    m.channel_hz = hz;
+                    if let Some(c) = self.rec.call_units.get(&row.id) {
+                        m.set_units(c.units());
+                    }
+                    let script = Self::rig_script(row);
+                    let label = crate::rx_pipe::pipeline_label(script);
+                    m.modulation = if label.is_empty() || label.contains('.') { "fm".into() } else { label.into() };
+                    m.decoder = serde_json::json!({ "script": hsrec::safepath::portable_decoder(script).unwrap_or_default() });
+                    hsrec::safepath::portable_meta(&mut m);
+                    m.decoder_params = self.rec_live_params(row, &m);
+                    if let Some(b) = self.cc_site.get(&row.id) {
+                        m.system = format!("WACN {} SYS {}", b.wacn, b.sys);
+                        m.site = format!("RFSS {} Site {}", b.rfss, b.site);
+                    }
+                    return (Some(key), Some(m));
+                }
+            }
+            // A voice grant is not also filed as a channel recording.
+            return (None, None);
+        }
+        if row.selected && face.channels.armed() {
+            if let Some((z, i)) = self.memory_scan.hold_memory() {
+                if let Some(ch) = self.channels.zones.get(z).and_then(|zone| zone.channels.get(i)) {
+                    if !ch.control && ch.hz.is_finite() && ch.hz > 0.0 && segment::wanted(face.channels, ch.record, ch.encrypted) {
+                        let hz = ch.hz;
+                        let key = CallKey { talkgroup: None, channel: ch.name.clone(), hz: hz.round() as u64, centre: hz.round() as u64 };
+                        let mut m = self.rig_meta(row, hz);
+                        m.channel_name = ch.name.clone();
+                        m.channel_hz = hz;
+                        m.modulation = if ch.vocoder.is_empty() { "fm".into() } else { ch.vocoder.clone() };
+                        let script = Self::rig_script(row);
+                        m.decoder = serde_json::json!({
+                            "script": hsrec::safepath::portable_decoder(script).unwrap_or_default(),
+                            "vocoder": ch.vocoder,
+                            "invert": ch.invert,
+                            "mode": ch.mode
+                        });
+                        hsrec::safepath::portable_meta(&mut m);
+                        m.decoder_params = self.rec_live_params(row, &m);
+                        return (Some(key), Some(m));
+                    }
+                }
+            }
+        }
+        (None, None)
+    }
+
+    /// The call this HackRF radio should be recording now, and its metadata.
+    fn rec_want_hackrf(&self, row: &cat::RadioRow) -> (Option<CallKey>, Option<Meta>) {
         let face = &self.rec.face;
         let base = |source: &str| Meta {
             source: source.into(),

@@ -204,14 +204,16 @@ command -v rustc >/dev/null 2>&1 || die "rustc is not on PATH after apt install"
 
 (
     cd "$root"
-    cargo build --release -p commander -p commander-voice
+    cargo build --release -p commander -p commander-voice -p hsrec --bins
 )
 [[ -f "${root}/target/release/commander" ]] || die "release binary was not produced"
 [[ -f "${root}/target/release/commander-voice" ]] || die "commander-voice was not produced"
+[[ -f "${root}/target/release/commander-rec" ]] || die "commander-rec was not produced"
 
 install -d -m 755 "${home_dir}/.local/bin"
 install -m 755 "${root}/target/release/commander" "$bin_path"
 install -m 755 "${root}/target/release/commander-voice" "${home_dir}/.local/bin/commander-voice"
+install -m 755 "${root}/target/release/commander-rec" "${home_dir}/.local/bin/commander-rec"
 "${root}/scripts/build-dsd-fme.sh" --upstream
 install_modems
 if p25voice_wanted; then

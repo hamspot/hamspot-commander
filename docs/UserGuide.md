@@ -118,6 +118,7 @@ The script checks `/etc/os-release` and stops on anything other than Ubuntu 26.0
 | Installed path | What it is |
 | --- | --- |
 | `~/.local/bin/commander` | The program |
+| `~/.local/bin/commander-rec` | Recording archive tool for a terminal or cron ([9.10](#s9-10)) |
 | `~/.local/bin/dsd-fme` | Digital voice decoder |
 | `~/.local/share/hamspot-commander/modems/` | Shipped pipe files (also linked into `~/.local/bin`) |
 | `~/.local/share/applications/hamspotcommander.desktop` | Desktop menu entry |
@@ -125,8 +126,6 @@ The script checks `/etc/os-release` and stops on anything other than Ubuntu 26.0
 | `~/.local/share/hamspot-commander/installed.manifest` | What this install added |
 
 You are added to `dialout` or `plugdev` only if you were not already a member. Log out and back in if a group was added. The script does not start Commander.
-
-The command-line tool `commander-rec` ([9.10](#s9-10)) is built with the program as `target/release/commander-rec`. Copy it onto your `PATH` if you want to use it from cron.
 
 ## 3.2 Removing an installed copy
 
@@ -468,7 +467,7 @@ The TG tabs and Channels have a **REC** key above LOAD and SAVE.
 | Double-click or Shift+click | amber | All traffic |
 | Click again when lit | dark | Off |
 
-The REC state is saved and comes back on the next start. A talkgroup recording starts with the call, continues through re-keys in the voice hang, and has about 250 ms of padding at each end. It keeps the raw IQ for the whole time the radio is held on that call, including a call whose voice frames are still arriving. A known control channel is never recorded as a talkgroup. A channel recording runs while the scanner holds a voice channel. A call still going at the **Max segment** length (Data dialog, default 120 s) is split into a new recording straight away, so nothing is lost; the timeline shows two blocks.
+The REC state is saved and comes back on the next start. A talkgroup recording starts with the call, continues through re-keys in the voice hang, and has about 250 ms of padding at each end. On a HackRF it keeps the raw IQ for the whole time the radio is held on that call, including a call whose voice frames are still arriving. On a hamlib or GQRX radio it keeps that radio's own demodulated audio (48 kHz mono) for the same hold. A known control channel is never recorded as a talkgroup. A channel recording runs while the scanner holds a voice channel. A call still going at the **Max segment** length (Data dialog, default 120 s) is split into a new recording straight away, so nothing is lost; the timeline shows two blocks.
 
 <!-- screenshot: rec-02 — Arming a channel for recording. -->
 
@@ -476,7 +475,7 @@ The REC state is saved and comes back on the next start. A talkgroup recording s
 
 **Detaching REC.** The rounded end at the top right of the REC page detaches the whole page into its own window, as on Config: click it to detach, click it again (in either place) to bring it back, drag it to move the window. In the detached window the timeline controls sit in a row at the top of the page; the main window shows a line saying where REC went.
 
-While REC is open, the timeline controls sit inside the tan bar at the top of the page, at its right end just before the rounded end cap. They are plain rectangular buttons, the same height as the bar. Below the bar, from top to bottom: source tabs (**HackRF TG**, **HackRF Channels**, plus any other source found; if they don't all fit, click the three-dot **more tabs** button on the tan bar above them for a list of the rest, as on the Plan page), a status line (REC state, TG, Channels, disk use), the search row, and the timeline.
+While REC is open, the timeline controls sit inside the tan bar at the top of the page, at its right end just before the rounded end cap. They are plain rectangular buttons, the same height as the bar. Below the bar, from top to bottom: source tabs (**HackRF TG**, **HackRF Channels**, **Rig Audio**, plus any other source found; if they don't all fit, click the three-dot **more tabs** button on the tan bar above them for a list of the rest, as on the Plan page), a status line (REC state, TG, Channels, disk use), the search row, and the timeline.
 
 | Control in the tan bar | What it does |
 | --- | --- |
@@ -632,7 +631,7 @@ Example crontab line:
 
 ## 9.11 Other radios
 
-Hamlib and GQRX radios give only demodulated audio, and REC does not record them yet. Recordings of that kind from elsewhere are labelled "demod audio (rig's own audio, not raw)" and play as they are.
+Hamlib and GQRX radios have no raw IQ tap. When REC is armed, a talkgroup the follower is holding, or a voice channel the scanner is holding, is recorded as that rig's own demodulated audio: 48 kHz mono, filed on the **Rig Audio** tab. The detail line says "demod audio (rig's own audio, not raw)". Playback plays that audio as it was saved. It is not run through the IQ discriminator. Encrypted traffic is still not recorded, and a control channel is still not a talkgroup recording.
 
 ---
 
