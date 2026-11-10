@@ -54,6 +54,16 @@ impl View {
         self.start -= (dx as f64 / width.max(1.0) as f64 * self.span as f64) as i64;
         self.live = false;
     }
+    /// A drag of `dx` px that also brings the view back to the present:
+    /// dragging toward the future until the right edge reaches NOW turns
+    /// live on again, so the lanes scroll with time once more.
+    pub fn pan(&mut self, dx: f32, width: f32, now: i64) {
+        self.pan_px(dx, width);
+        if dx < 0.0 && self.end() >= now {
+            self.live = true;
+            self.follow(now);
+        }
+    }
     /// The user's LIVE toggle: flips live every call. Turning it on puts the
     /// right edge on `now`; turning it off leaves the view where it is.
     pub fn toggle_live(&mut self, now: i64) {
@@ -86,9 +96,10 @@ impl View {
         self.follow(now);
         self.clamp(now);
     }
-    /// Apply [`clamp_view`] (never show the future). `live` is only ever set
-    /// by the user's toggle (and turned off by panning back, Fit or the day
-    /// buttons); reaching NOW does not turn it on. A live view stays on NOW.
+    /// Apply [`clamp_view`] (never show the future). Clamping never turns
+    /// `live` on: that is the user's toggle, a drag forward onto NOW
+    /// ([`View::pan`]) or a [`fit`] of a session still recording. A live
+    /// view stays on NOW.
     pub fn clamp(&mut self, now: i64) {
         let (start, span) = clamp_view(self.start, self.span, now);
         self.start = if self.live { now - span } else { start };
@@ -169,7 +180,8 @@ pub const FIT_BACK_MS: i64 = 6 * 3_600_000;
 
 /// View that frames the most recent recordings: from the earliest start inside
 /// the last [`FIT_BACK_MS`] to the latest end, with 5% padding each side.
-/// No recordings gives the live last hour.
+/// When the latest recording ended within [`FIT_LIVE_MS`] of `now` the view
+/// runs on to NOW and is live instead. No recordings gives the live last hour.
 pub fn fit(recs: &[Recording], now: i64) -> View {
     let spans: Vec<(i64, i64)> = recs
         .iter()
@@ -187,11 +199,21 @@ pub fn fit(recs: &[Recording], now: i64) -> View {
         return View::live(now, 3_600_000);
     };
     let first = spans.iter().map(|s| s.0).filter(|t| *t >= last - FIT_BACK_MS).min().unwrap_or(last);
+    if now.saturating_sub(last) <= FIT_LIVE_MS {
+        // Still recording (or the last call just ended): frame the same
+        // recordings but end on NOW and follow it, so new calls scroll in.
+        let raw = (now - first).max(MIN_SPAN_MS);
+        return View::live(now, (raw + raw / 20).clamp(MIN_SPAN_MS, MAX_SPAN_MS));
+    }
     let raw = (last - first).max(MIN_SPAN_MS);
     let span = (raw + raw / 10).clamp(MIN_SPAN_MS, MAX_SPAN_MS);
     let mid = first + (last - first) / 2;
     View { start: mid - span / 2, span, live: false }
 }
+
+/// A most recent recording that ended at most this long ago makes [`fit`]
+/// a live view: the session is still going on.
+pub const FIT_LIVE_MS: i64 = 3_600_000;
 
 /// Split of the timeline canvas: a fixed label column on the left and the
 /// grid to its right. They never overlap.
@@ -525,5 +547,50 @@ mod tests {
         assert_eq!(clamp_scroll(-5.0, 300.0, 100.0), 0.0);
         assert_eq!(clamp_scroll(500.0, 300.0, 100.0), 200.0);
         assert_eq!(clamp_scroll(50.0, 80.0, 100.0), 0.0);
+    }
+
+    #[test]
+    fn fit_follows_now_while_a_session_is_recording() {
+        // Calls from 20:01 to 23:29, opened at 23:31: the view frames them
+        // and ends on NOW, and it keeps following as calls come in.
+        let db = Db::open_in_memory().unwrap();
+        db.insert("a", &meta("hackrf_tg", Some(1), "2026-11-10T01:01:51Z", "2026-11-10T01:01:55Z")).unwrap();
+        db.insert("b", &meta("hackrf_tg", Some(2), "2026-11-10T04:29:49Z", "2026-11-10T04:29:50Z")).unwrap();
+        let r = db.all().unwrap();
+        let now = parse_ms("2026-11-10T04:31:00Z").unwrap();
+        let mut v = fit(&r, now);
+        assert!(v.live);
+        assert_eq!(v.end(), now);
+        assert!(v.start <= parse_ms("2026-11-10T01:01:51Z").unwrap());
+        assert_eq!(layout(&r, &lanes(&r), &v, 800.0, now).len(), 2);
+        let later = now + 600_000;
+        v.follow(later);
+        v.clamp(later);
+        assert_eq!(v.end(), later);
+        // A new call at the live edge is in view without any input.
+        db.insert("c", &meta("hackrf_tg", Some(3), "2026-11-10T04:40:00Z", "2026-11-10T04:40:05Z")).unwrap();
+        let r = db.all().unwrap();
+        assert_eq!(layout(&r, &lanes(&r), &v, 800.0, later).len(), 3);
+        // An hour and more after the last call, Fit frames the calls instead.
+        assert!(!fit(&r, later + FIT_LIVE_MS + 1).live);
+    }
+
+    #[test]
+    fn dragging_back_to_now_resumes_following() {
+        let now = 2_000_000_000;
+        let mut v = View::live(now, 60_000);
+        v.pan(60.0, 600.0, now); // look back 6 s
+        v.clamp(now);
+        assert!(!v.live && v.end() < now);
+        v.pan(-20.0, 600.0, now); // part of the way forward: still parked
+        v.clamp(now);
+        assert!(!v.live);
+        v.pan(-200.0, 600.0, now); // past NOW: following again
+        v.clamp(now);
+        assert!(v.live);
+        assert_eq!(v.end(), now);
+        v.follow(now + 5_000);
+        v.clamp(now + 5_000);
+        assert_eq!(v.end(), now + 5_000);
     }
 }

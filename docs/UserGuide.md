@@ -475,13 +475,13 @@ The REC state is saved and comes back on the next start. A talkgroup recording s
 
 **Detaching REC.** The rounded end at the top right of the REC page detaches the whole page into its own window, as on Config: click it to detach, click it again (in either place) to bring it back, drag it to move the window. In the detached window the timeline controls sit in a row at the top of the page; the main window shows a line saying where REC went.
 
-While REC is open, the timeline controls sit inside the tan bar at the top of the page, at its right end just before the rounded end cap. They are plain rectangular buttons, the same height as the bar. Below the bar, from top to bottom: source tabs (**HackRF TG**, **HackRF Channels**, **Rig Audio**, plus any other source found; if they don't all fit, click the three-dot **more tabs** button on the tan bar above them for a list of the rest, as on the Plan page), a status line (REC state, TG, Channels, disk use), the search row, and the timeline.
+While REC is open, the timeline controls sit inside the tan bar at the top of the page, at its right end just before the rounded end cap. They are plain rectangular buttons, the same height as the bar. Below the bar, from top to bottom: source tabs (**HackRF TG**, **HackRF Channels**, **Rig Audio**, plus any other source found; if they don't all fit, click the three-dot **more tabs** button on the tan bar above them for a list of the rest, as on the Plan page), the search row and the timeline. The REC state, what TG and Channels record, disk use and any warning are in the page's status strip at the bottom, where the other pages put their status.
 
 | Control in the tan bar | What it does |
 | --- | --- |
 | **◀ DAY**, **TODAY**, **DAY ▶** | Jump by day. Every click counts, so quick clicks step several days. |
 | **−**, **+** | Zoom out or in by 1.5× |
-| **FIT** | Frame the most recent recordings |
+| **FIT** | Frame the most recent recordings. While a session is still recording, the view runs on to NOW and follows it. |
 | **● LIVE** / **○ LIVE** | Follow the present (the red NOW line). ● is on, ○ is off. |
 | **● DATA** / **○ DATA** | Open or close the Data dialog ([9.6](#s9-6)) |
 | **● ▶▶** / **○ ▶▶** | Play next: when a recording finishes playing, the following one plays. ● is on, ○ is off; hover to see ON or OFF. |
@@ -507,19 +507,20 @@ One **lane** per talkgroup or channel and one **block** per recording, like a se
 
 | Mouse | Action |
 | --- | --- |
-| Wheel over the timeline | Zoom about the pointer (about 18% per notch) |
-| Wheel over the lane names | Scroll the lanes |
+| Wheel over the lanes | Scroll the lanes up and down |
+| Ctrl+wheel over the lanes, or wheel over the time axis | Zoom about the pointer (about 18% per notch) |
+| Shift+wheel over the lanes or the time axis | Move earlier or later in time |
 | Drag | Pan |
 | Click a lane name | Highlight that lane |
 | Click a block | Play from that point and open the Record / Playback dialog |
 
 The span runs from 0.5 seconds to 30 days. A recording in progress is a red block that grows.
 
-The lane names sit on a shelf over the timeline's left edge that fades out like a shadow. A long name runs on past the shelf into its lane at full brightness, drawn over the recordings, and fades out just before halfway across. Clicks, drags and the wheel on that faded text go to the timeline. When there are more lanes than fit, a thin scrollbar appears in a narrow strip right of the timeline.
+The lane names sit on a shelf over the timeline's left edge that fades out like a shadow. A long name runs on past the shelf into its lane at full brightness, drawn over the recordings, and fades out just before halfway across. Clicks, drags and the wheel on that faded text go to the timeline. When there are more lanes than fit, a thin scrollbar appears in a narrow strip right of the timeline; drag it or use the wheel over the lanes. The time axis stays at the top while the lanes scroll.
 
 The timeline never shows the future: NOW is its right edge. Zooming out, **FIT**, **TODAY** and **DAY ▶** all stop there.
 
-Only the **LIVE** toggle turns Live on or off; each click flips it. With **LIVE** on, the right edge is locked to NOW and follows it, and the mouse wheel zooms around NOW, changing only how much time is shown. Dragging the timeline back into the past turns **LIVE** off. **FIT**, **TODAY** and the day buttons also turn it off. With **LIVE** off, the wheel zooms around the mouse pointer and the view stays put as time passes, even when its right edge reaches NOW.
+The timeline opens on the most recent recordings. If the last one ended less than an hour ago, it opens with **LIVE** on: the view ends on NOW and follows it, so new calls scroll in from the right. With **LIVE** on, the right edge is locked to NOW and zooming (Ctrl+wheel, the time axis, or − and +) is around NOW, changing only how much time is shown. Dragging the timeline back into the past turns **LIVE** off and parks the view, so you can look at older calls while new ones keep recording. While it is parked, a red **LIVE ▶** key sits at the right end of the time axis. Click it, click the **LIVE** toggle, or drag the timeline forward until it reaches NOW, and the view follows the present again. **TODAY** and the day buttons also park the view. With **LIVE** off, zooming is around the mouse pointer and the view stays put as time passes.
 
 The red NOW line has a translucent red tint on its left, just wide enough for the **NOW** label. It is strongest at the line and fades to clear toward the past. Nothing right of NOW is tinted, and there is no tint when NOW is off screen. The lanes, recordings, NOW line and label all show through it. It is only paint: clicks, drags and the wheel work there as on the rest of the timeline.
 
@@ -584,7 +585,7 @@ A running job shows a progress bar and **Cancel** in the tab and in the dialog.
 
 ## 9.7 Storage cap
 
-The default cap is 20 GB. The disk meter warns in words at 80% and 95%. At the cap, recording **stops with a red warning and nothing is deleted**, unless you tick **Overwrite oldest unprotected at cap**. Archived files count at their compressed size; recordings moved to a drive don't count.
+The default cap is 20 GB. The disk meter warns in words at 80% and 95%. At the cap, recording **stops with a warning in the status strip and nothing is deleted**, unless you tick **Overwrite oldest unprotected at cap**. Archived files count at their compressed size; recordings moved to a drive don't count.
 
 If the disk falls behind, REC drops samples rather than disturb live listening, and says so. A recording cut short by a crash is repaired on the next start.
 

@@ -34,10 +34,11 @@ pub const ROW_HOVER: &str = "Right-click: mark or unmark for recording (● REC)
 /// Shown only as the REC page watermark on the bottom elbow bar.
 pub const PRIVACY: &str = "Recording radio traffic may be regulated where you are; that is your responsibility. \
 Encrypted traffic is never recorded. Nothing is uploaded.";
-/// Height kept below the timeline for the one-line usage hint. The
-/// disclaimer is a watermark on the frame's bottom bar. The selected recording's details live in the Record / Playback
-/// dialog, so nothing else is reserved.
-const TIMELINE_RESERVE: f32 = 24.0;
+/// Small gap kept below the lanes. The status strip is outside the timeline's
+/// area (the page splits it off first). The disclaimer is a watermark on the
+/// frame's bottom bar. The selected recording's details live in the Record /
+/// Playback dialog, so nothing else is reserved.
+const TIMELINE_RESERVE: f32 = 4.0;
 /// Lane rows stretch to fill spare height, up to this multiple of LANE_H.
 const LANE_GROW_MAX: f32 = 2.0;
 /// The timeline never shrinks below this many lane rows.
@@ -331,6 +332,8 @@ pub struct RecUi {
     bar_actions: Vec<BarAction>,
     /// Whether the shown view follows now, for the header bar's LIVE marker.
     bar_live: bool,
+    /// The axis LIVE key was clicked: follow NOW from the next frame.
+    go_live: bool,
     /// Why the database could not be opened or created (shown, never silent).
     db_error: Option<String>,
 }
@@ -946,6 +949,24 @@ impl App {
         }
         self.rec_poll_jobs();
         self.rec_reload(false);
+        // The page's status sits in the one status strip at the bottom of the
+        // frame, as on the tool pages, not as a row over the lanes (David).
+        let full = page_area(ui);
+        let (body, strip) = status_split(full);
+        crate::status_note::clear(ui.ctx());
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(body).id_salt("rec-body"));
+        child.set_clip_rect(body.intersect(ui.clip_rect()));
+        self.page_rec_body(&mut child);
+        let base = self.rec_status_text();
+        crate::status_note::paint_strip(ui, strip, &base);
+        ui.allocate_rect(full, egui::Sense::hover());
+        if self.rec.player.is_some() || self.rec.job.is_some() || self.rec_icon() == IconState::Writing {
+            ui.ctx().request_repaint_after(Duration::from_millis(200));
+        }
+    }
+
+    /// REC page above its status strip: source tabs, jobs, timeline.
+    fn page_rec_body(&mut self, ui: &mut egui::Ui) {
         let sources = self.rec.db.as_ref().and_then(|db| db.sources().ok()).unwrap_or_default();
         let tabs = meta::source_tabs(&sources);
         let current = self.rec_source();
@@ -965,7 +986,6 @@ impl App {
             self.rec.selected = None;
         }
         ui.add_space(4.0);
-        self.rec_status_row(ui);
         if self.rec.rows.is_empty() && self.rec.query.is_empty() {
             let (n_tg, n_ch) = self.rec_marked_counts();
             let storage = match self.rec.dir.file_name() {
@@ -973,52 +993,24 @@ impl App {
                 None => "beside the station file".into(),
             };
             let (ready, _) = self.rec_ready();
-            ui.label(empty_hint(self.rec.face.talkgroups, n_tg, self.rec.face.channels, n_ch, ready, &storage));
+            crate::status_note::note(ui, empty_hint(self.rec.face.talkgroups, n_tg, self.rec.face.channels, n_ch, ready, &storage));
+        }
+        if crate::rec_live::recorder().status.cap_hit.load(Ordering::Relaxed) {
+            crate::status_note::note(ui, "\u{26a0} DISK CAP REACHED: recording stopped. Nothing was deleted. Archive, export, or raise the cap.");
         }
         self.rec_job_row(ui);
         self.rec_data_window(ui.ctx());
         self.rec_detail_window(ui.ctx());
         self.rec_timeline(ui);
-        if self.rec.player.is_some() || self.rec.job.is_some() || self.rec_icon() == IconState::Writing {
-            ui.ctx().request_repaint_after(Duration::from_millis(200));
-        }
     }
 
-    fn rec_status_row(&mut self, ui: &mut egui::Ui) {
-        let status = &crate::rec_live::recorder().status;
-        let state = self.rec_icon();
-        ui.horizontal_wrapped(|ui| {
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
-            paint_tab_glyph(ui.painter(), rect.center(), state);
-            let (ready, err) = self.rec_ready();
-            let line = status_line(state, ready, err.as_deref());
-            if state == IconState::Error {
-                ui.label(egui::RichText::new(line).strong().color(egui::Color32::from_rgb(240, 60, 50)));
-            } else {
-                ui.label(line);
-            }
-            ui.label(format!(
-                "   TG: {}   Channels: {}",
-                self.rec.face.talkgroups.label(),
-                self.rec.face.channels.label()
-            ));
-            if let Some(u) = &self.rec.usage {
-                let text = u.text();
-                let color = match u.level() {
-                    hsrec::storage::Level::Ok => ui.visuals().text_color(),
-                    hsrec::storage::Level::Warn80 => caution(),
-                    _ => egui::Color32::from_rgb(240, 60, 50),
-                };
-                ui.label(egui::RichText::new(format!("   Disk {text}")).color(color));
-            }
-        });
-        if status.cap_hit.load(Ordering::Relaxed) {
-            ui.label(
-                egui::RichText::new("⚠ DISK CAP REACHED: recording stopped. Nothing was deleted. Archive, export, or raise the cap.")
-                    .strong()
-                    .color(egui::Color32::from_rgb(240, 60, 50)),
-            );
-        }
+    /// The REC state for the page's status strip: recorder, what records,
+    /// disk use. Plain text; the words carry any warning.
+    fn rec_status_text(&self) -> String {
+        let (ready, err) = self.rec_ready();
+        let mut line = status_line(self.rec_icon(), ready, err.as_deref());
+        line.push_str(&rec_status_tail(self.rec.face.talkgroups.label(), self.rec.face.channels.label(), self.rec.usage.as_ref().map(|u| u.text())));
+        line
     }
 
     fn rec_job_row(&mut self, ui: &mut egui::Ui) {
@@ -1502,6 +1494,9 @@ impl App {
             None if !recs.is_empty() => timeline::fit(&recs, now),
             None => View::live(now, 3_600_000),
         };
+        if std::mem::take(&mut self.rec.go_live) && !view.live {
+            view.toggle_live(now);
+        }
         view.follow(now);
         let width_all = ui.available_width();
         for action in std::mem::take(&mut self.rec.bar_actions) {
@@ -1543,7 +1538,7 @@ impl App {
         let subs: Vec<usize> = (0..lanes.len())
             .map(|l| blocks.iter().filter(|b| b.lane == l).map(|b| b.sub + 1).max().unwrap_or(1))
             .collect();
-        let viewport_h = timeline_viewport_h(ui.available_height());
+        let viewport_h = timeline_viewport_h(visible_height(ui));
         let row_h = lane_row_h(subs.iter().sum(), viewport_h);
         let lane_h: Vec<f32> = subs.iter().map(|n| *n as f32 * row_h).collect();
         let lane_top: Vec<f32> = lane_h.iter().scan(0.0, |y, h| { let top = *y; *y += *h; Some(top) }).collect();
@@ -1583,9 +1578,14 @@ impl App {
             }
             painter.text(axis.left_center() + egui::vec2(6.0, 0.0), egui::Align2::LEFT_CENTER, "Lane", egui::FontId::monospace(11.0), weak);
         }
-        // Wheel: over the opaque shelf it scrolls the lanes (the scroll area
-        // does that); over the grid, the fade, or the axis it zooms time, so
-        // take it away from the scroll area there.
+        // Parked in the past: a key on the axis goes back to following NOW.
+        if back_to_live_key(ui, axis, view.live) {
+            self.rec.go_live = true;
+            ui.ctx().request_repaint();
+        }
+        // Wheel: over the lanes a plain wheel scrolls them up and down (the
+        // scroll area does that). Ctrl+wheel zooms time and Shift+wheel moves
+        // through time there. Over the time axis a plain wheel zooms too.
         let body_view = egui::Rect::from_min_size(egui::pos2(axis.left(), axis.bottom()), egui::vec2(plot_w, viewport_h));
         let wheel_pos = ui.input(|i| i.pointer.hover_pos());
         // A REC window (Record / Playback, Data) above the timeline owns the
@@ -1593,33 +1593,12 @@ impl App {
         let own_layer = ui.layer_id();
         let layer_ctx = ui.ctx().clone();
         let ours = move |p: egui::Pos2| pointer_is_ours(layer_ctx.layer_id_at(p), own_layer);
-        let zoom_here = wheel_pos.is_some_and(|p| {
-            ours(p) && (axis.contains(p) || body_view.contains(p)) && !timeline::on_shelf(p.x - axis.left(), shelf_w)
-        });
-        let zoom_scroll = if zoom_here {
-            ui.input_mut(|i| {
-                // Raw delta, once per event: the smoothed delta repeats a
-                // notch over several frames, which zoomed tenfold per click.
-                let page = i.content_rect().height();
-                let d: f32 = i
-                    .raw
-                    .events
-                    .iter()
-                    .map(|e| match e {
-                        egui::Event::MouseWheel { unit, delta, .. } => match unit {
-                            egui::MouseWheelUnit::Point => delta.y,
-                            egui::MouseWheelUnit::Line => delta.y * NOTCH_PTS,
-                            egui::MouseWheelUnit::Page => delta.y * page,
-                        },
-                        _ => 0.0,
-                    })
-                    .sum();
-                i.smooth_scroll_delta.y = 0.0;
-                d
-            })
-        } else {
-            0.0
+        let over = match wheel_pos.filter(|p| ours(*p)) {
+            Some(p) if axis.contains(p) => WheelOver::Axis,
+            Some(p) if body_view.contains(p) => WheelOver::Lanes,
+            _ => WheelOver::Elsewhere,
         };
+        let (zoom_scroll, pan_scroll) = take_time_wheel(ui, over);
         let mut drag_dx = if axis_resp.dragged() { axis_resp.drag_delta().x } else { 0.0 };
         let mut hit: Option<(i64, u64)> = None;
         let mut want_wf = Vec::new();
@@ -1630,12 +1609,7 @@ impl App {
         let waveforms = &self.rec.waveforms;
         let no_voice = &self.rec.no_voice;
         let player = self.rec.player.as_ref().map(|(id, pl)| (*id, pl.pos_ms.load(Ordering::Relaxed) as i64));
-        egui::ScrollArea::vertical()
-            .id_salt(("rec-timeline", source.clone()))
-            .min_scrolled_height(viewport_h)
-            .max_height(viewport_h)
-            .auto_shrink([false, false])
-            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+        lane_scroll(("rec-timeline", source.clone()), viewport_h)
             .show(ui, |ui| {
                 ui.style_mut().spacing.scroll = egui::style::ScrollStyle::thin();
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(plot_w, body_h), egui::Sense::hover());
@@ -1787,7 +1761,11 @@ impl App {
             }
         }
         if drag_dx != 0.0 {
-            view.pan_px(drag_dx, width);
+            // Dragging back parks the view; dragging forward onto NOW follows again.
+            view.pan(drag_dx, width, now);
+        }
+        if pan_scroll.abs() > 0.5 {
+            view.pan(pan_scroll, width, now);
         }
         if zoom_scroll.abs() > 0.5 {
             let anchor = wheel_pos.map(|p| p.x - axis.left()).unwrap_or(width).clamp(0.0, width);
@@ -2236,6 +2214,172 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn themed_ctx() -> egui::Context {
+        let ctx = egui::Context::default();
+        rustcars::install_lcars_font(&ctx);
+        rustcars::apply_theme(&ctx, &rustcars::LcarsTheme::default());
+        ctx
+    }
+
+    /// One frame of an axis row like the timeline's, with the LIVE key.
+    fn axis_frame(ctx: &egui::Context, events: Vec<egui::Event>, live: bool) -> (bool, Option<egui::Rect>) {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 300.0));
+        let input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
+        let mut clicked = false;
+        let mut key = None;
+        let mut out = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                let (axis, _) = ui.allocate_exact_size(egui::vec2(800.0, AXIS_H), egui::Sense::click_and_drag());
+                clicked = back_to_live_key(ui, axis, live);
+                key = (!live).then(|| back_to_live_rect(axis));
+            });
+        });
+        out.textures_delta.clear();
+        (clicked, key)
+    }
+
+    fn wheel(dy: f32, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Line, delta: egui::vec2(0.0, dy), modifiers, phase: egui::TouchPhase::Move, source: egui::MouseWheelSource::Wheel }
+    }
+
+    /// One frame of an axis row and a lane viewport like the timeline's:
+    /// 40 lanes in a viewport that fits about 8. Returns the time wheel taken,
+    /// the viewport and the last lane's rect on screen.
+    fn lanes_frame(ctx: &egui::Context, events: Vec<egui::Event>, mods: egui::Modifiers) -> ((f32, f32), egui::Rect, egui::Rect) {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 300.0));
+        let _ = mods;
+        let input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
+        let mut got = ((0.0, 0.0), egui::Rect::NOTHING, egui::Rect::NOTHING);
+        let mut out = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                let (axis, _) = ui.allocate_exact_size(egui::vec2(800.0, AXIS_H), egui::Sense::click_and_drag());
+                let viewport_h = timeline_viewport_h(visible_height(ui).min(220.0));
+                let body_view = egui::Rect::from_min_size(egui::pos2(axis.left(), axis.bottom()), egui::vec2(800.0, viewport_h));
+                let over = match ui.input(|i| i.pointer.hover_pos()) {
+                    Some(p) if axis.contains(p) => WheelOver::Axis,
+                    Some(p) if body_view.contains(p) => WheelOver::Lanes,
+                    _ => WheelOver::Elsewhere,
+                };
+                let taken = take_time_wheel(ui, over);
+                let mut last = egui::Rect::NOTHING;
+                let shown = lane_scroll("test-lanes", viewport_h).show(ui, |ui| {
+                    ui.style_mut().spacing.scroll = egui::style::ScrollStyle::thin();
+                    let n = 40;
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(800.0, n as f32 * LANE_H), egui::Sense::hover());
+                    // As the real grid: one click-and-drag area over all lanes.
+                    let _ = ui.interact(rect, ui.scope_id().with("grid"), egui::Sense::click_and_drag());
+                    for i in 0..n {
+                        let r = egui::Rect::from_min_size(egui::pos2(rect.left(), rect.top() + i as f32 * LANE_H), egui::vec2(800.0, LANE_H));
+                        ui.painter().text(r.left_center(), egui::Align2::LEFT_CENTER, format!("Lane {i}"), egui::FontId::monospace(12.0), egui::Color32::WHITE);
+                        last = r;
+                    }
+                });
+                got = (taken, shown.inner_rect, last);
+            });
+        });
+        out.textures_delta.clear();
+        got
+    }
+
+    #[test]
+    fn the_wheel_scrolls_lanes_that_do_not_fit_and_ctrl_zooms_time() {
+        let ctx = themed_ctx();
+        let none = egui::Modifiers::NONE;
+        let (_, view, last) = lanes_frame(&ctx, vec![], none);
+        assert!(last.bottom() > view.bottom() + 100.0, "the last lane starts out of view");
+        let over = view.center();
+        // Ctrl+wheel over the lanes zooms time and does not move the lanes.
+        for _ in 0..5 {
+            let ((zoom, pan), _, l) = lanes_frame(&ctx, vec![egui::Event::PointerMoved(over), wheel(-3.0, egui::Modifiers::CTRL)], egui::Modifiers::CTRL);
+            assert!(zoom < 0.0 && pan == 0.0);
+            assert_eq!(l, last, "ctrl+wheel must not scroll the lanes");
+        }
+        // Shift+wheel moves through time.
+        let ((zoom, pan), _, _) = lanes_frame(&ctx, vec![egui::Event::PointerMoved(over), wheel(-1.0, egui::Modifiers::SHIFT)], egui::Modifiers::SHIFT);
+        assert!(zoom == 0.0 && pan != 0.0);
+        // A plain wheel over the lanes scrolls down until the last lane shows.
+        let mut seen = false;
+        for _ in 0..60 {
+            let ((zoom, pan), view, l) = lanes_frame(&ctx, vec![egui::Event::PointerMoved(over), wheel(-3.0, none)], none);
+            assert_eq!((zoom, pan), (0.0, 0.0), "a plain wheel over the lanes is not time");
+            if view.contains_rect(l) {
+                seen = true;
+                break;
+            }
+        }
+        for _ in 0..30 {
+            let (_, view, l) = lanes_frame(&ctx, vec![egui::Event::PointerMoved(over)], none);
+            seen |= view.contains_rect(l);
+        }
+        assert!(seen, "scrolling reveals the last lane");
+        // Over the time axis a plain wheel still zooms.
+        let ((zoom, _), _, _) = lanes_frame(&ctx, vec![egui::Event::PointerMoved(egui::pos2(400.0, 18.0)), wheel(1.0, none)], none);
+        assert!(zoom > 0.0);
+    }
+
+    #[test]
+    fn rec_status_sits_in_the_bottom_status_strip() {
+        let ctx = themed_ctx();
+        let status = format!("{}{}", status_line(IconState::Writing, true, None), rec_status_tail("all traffic", "off", Some("0.90 / 20.0 GB (4%)".into())));
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 700.0));
+        let mut strip_r = egui::Rect::NOTHING;
+        let mut frame = egui::Rect::NOTHING;
+        let mut line = String::new();
+        let mut out = egui::FullOutput::default();
+        for _ in 0..3 {
+            out = ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    // As page_rec: split, body first (it may add notes), strip last.
+                    let full = page_area(ui);
+                    let (body, strip) = status_split(full);
+                    crate::status_note::clear(ui.ctx());
+                    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(body).id_salt("rec-body"));
+                    child.label("Search");
+                    crate::status_note::note(&child, "DISK CAP note");
+                    line = crate::status_note::paint_strip(ui, strip, &status);
+                    ui.allocate_rect(full, egui::Sense::hover());
+                    strip_r = strip;
+                    frame = full;
+                });
+            });
+            out.textures_delta.clear();
+        }
+        assert!(line.starts_with("REC: recording now.   TG: all traffic   Channels: off   Disk 0.90 / 20.0 GB (4%)"), "{line}");
+        assert!(line.ends_with("DISK CAP note"));
+        assert!((strip_r.bottom() - frame.bottom()).abs() < 0.5 && (strip_r.height() - crate::status_note::STRIP_H).abs() < 0.5);
+        // The status text is painted inside the strip at the frame's bottom,
+        // and the body's first row ("Search") is at the top of the frame.
+        let texts: Vec<(String, egui::Rect)> = out.shapes.iter().filter_map(|c| match &c.shape {
+            egui::Shape::Text(t) => Some((t.galley.text().to_string(), t.visual_bounding_rect().intersect(c.clip_rect))),
+            _ => None,
+        }).collect();
+        let st = texts.iter().find(|(t, _)| t.starts_with("REC: recording now")).expect("status text painted");
+        assert!(strip_r.expand(1.0).contains_rect(st.1), "status {:?} not in strip {strip_r:?}", st.1);
+        let search = texts.iter().find(|(t, _)| t == "Search").expect("body painted");
+        assert!(search.1.top() < frame.top() + 30.0, "the body starts at the top");
+    }
+
+    #[test]
+    fn a_parked_timeline_shows_a_live_key_that_goes_back_to_now() {
+        let ctx = themed_ctx();
+        let (_, key) = axis_frame(&ctx, vec![], false);
+        let key = key.expect("parked view shows the key");
+        // Square, on the axis row's right end, and its label fits in it.
+        assert_eq!(key.height(), AXIS_H);
+        let label_w = ctx.fonts_mut(|f| f.layout_no_wrap(BACK_TO_LIVE.into(), egui::FontId::monospace(10.0), egui::Color32::WHITE).size().x);
+        assert!(label_w + 8.0 <= key.width(), "label {label_w} in key {}", key.width());
+        let at = key.center();
+        let press = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+        let (c1, _) = axis_frame(&ctx, vec![egui::Event::PointerMoved(at)], false);
+        let (c2, _) = axis_frame(&ctx, vec![press(true)], false);
+        let (c3, _) = axis_frame(&ctx, vec![press(false)], false);
+        assert!(!c1 && !c2 && c3, "click on the key reports once");
+        // Following NOW: no key, and a click there is the axis's, not the key's.
+        let (c4, k4) = axis_frame(&ctx, vec![egui::Event::PointerMoved(at), press(true)], true);
+        let (c5, _) = axis_frame(&ctx, vec![press(false)], true);
+        assert!(k4.is_none() && !c4 && !c5);
+    }
 
     #[test]
     fn call_units_grant_before_call_and_mid_call_talker() {
@@ -2776,6 +2920,139 @@ fn lane_label_job(ui: &egui::Ui, name: &str, font: &egui::FontId, ink: egui::Col
 }
 
 /// Dark red of the right-hand NOW shelf (kin to the armed REC icon's red).
+/// Label of the axis key shown while the timeline is not following NOW.
+pub const BACK_TO_LIVE: &str = "LIVE \u{25b6}";
+
+/// Where the back-to-live key sits: the right end of the axis row.
+pub fn back_to_live_rect(axis: egui::Rect) -> egui::Rect {
+    let w = 64.0f32.min(axis.width());
+    egui::Rect::from_min_max(egui::pos2(axis.right() - w, axis.top()), axis.right_bottom())
+}
+
+/// The rest of the REC status line after the recorder state.
+pub fn rec_status_tail(tg: &str, channels: &str, disk: Option<String>) -> String {
+    let mut s = format!("   TG: {tg}   Channels: {channels}");
+    if let Some(d) = disk {
+        s.push_str("   Disk ");
+        s.push_str(&d);
+    }
+    s
+}
+
+/// The page's area that is on screen (a detached page sits in an unbounded
+/// scroll area: bound it by what is visible).
+pub fn page_area(ui: &egui::Ui) -> egui::Rect {
+    let mut full = ui.available_rect_before_wrap();
+    let vis = ui.clip_rect();
+    if !full.bottom().is_finite() || full.bottom() > vis.bottom() {
+        full.max.y = vis.bottom().max(full.top() + 120.0);
+    }
+    full
+}
+
+/// Body above, status strip (the tool pages' height) at the bottom.
+pub fn status_split(full: egui::Rect) -> (egui::Rect, egui::Rect) {
+    let h = crate::status_note::STRIP_H.min(full.height());
+    let strip = egui::Rect::from_min_max(egui::pos2(full.left(), full.bottom() - h), full.max);
+    let gap = rustcars::LcarsTheme::default().frame_gap;
+    let body = egui::Rect::from_min_max(full.min, egui::pos2(full.right(), (strip.top() - gap).max(full.top())));
+    (body, strip)
+}
+
+/// Where the pointer was for this frame's wheel input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WheelOver {
+    Axis,
+    Lanes,
+    Elsewhere,
+}
+
+/// What one wheel event does on the timeline: `None` leaves it to the lane
+/// scroll area (up and down through the lanes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WheelUse {
+    Zoom,
+    Pan,
+}
+
+pub fn wheel_use(over: WheelOver, mods: egui::Modifiers) -> Option<WheelUse> {
+    match over {
+        WheelOver::Elsewhere => None,
+        WheelOver::Axis if mods.shift => Some(WheelUse::Pan),
+        WheelOver::Axis => Some(WheelUse::Zoom),
+        WheelOver::Lanes if mods.command || mods.ctrl => Some(WheelUse::Zoom),
+        WheelOver::Lanes if mods.shift => Some(WheelUse::Pan),
+        WheelOver::Lanes => None,
+    }
+}
+
+/// Take this frame's time wheel: (zoom delta, pan delta in px). Raw delta,
+/// once per event: the smoothed delta repeats a notch over several frames,
+/// which zoomed tenfold per click. A wheel used for time is taken away from
+/// the lane scroll area; a plain wheel over the lanes is left to it.
+pub fn take_time_wheel(ui: &mut egui::Ui, over: WheelOver) -> (f32, f32) {
+    if over == WheelOver::Elsewhere {
+        return (0.0, 0.0);
+    }
+    ui.input_mut(|i| {
+        let page = i.content_rect().height();
+        let (mut zoom, mut pan) = (0.0f32, 0.0f32);
+        for e in &i.raw.events {
+            let egui::Event::MouseWheel { unit, delta, modifiers, .. } = e else { continue };
+            let Some(usage) = wheel_use(over, *modifiers) else { continue };
+            // Shift may arrive as a sideways wheel.
+            let d = delta.y + delta.x;
+            let d = match unit {
+                egui::MouseWheelUnit::Point => d,
+                egui::MouseWheelUnit::Line => d * NOTCH_PTS,
+                egui::MouseWheelUnit::Page => d * page,
+            };
+            match usage {
+                WheelUse::Zoom => zoom += d,
+                WheelUse::Pan => pan += d,
+            }
+        }
+        if zoom != 0.0 || pan != 0.0 || wheel_use(over, i.modifiers).is_some() {
+            i.smooth_scroll_delta = egui::Vec2::ZERO;
+        }
+        (zoom, pan)
+    })
+}
+
+/// The lanes' vertical scroll area: `viewport_h` tall, a thin scrollbar in
+/// the gutter whenever the lanes do not fit, wheel and scrollbar both scroll.
+pub fn lane_scroll(salt: impl std::hash::Hash + std::fmt::Debug, viewport_h: f32) -> egui::ScrollArea {
+    egui::ScrollArea::vertical()
+        .id_salt(salt)
+        .min_scrolled_height(viewport_h)
+        .max_height(viewport_h)
+        .auto_shrink([false, false])
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+}
+
+/// Height left in `ui` that is on screen: a page inside an unbounded
+/// (detached) scroll area must not size its lane viewport past the window,
+/// or the last lanes sit below it with nothing to scroll.
+pub fn visible_height(ui: &egui::Ui) -> f32 {
+    let avail = ui.available_height();
+    let shown = ui.clip_rect().bottom() - ui.cursor().top();
+    if avail.is_finite() { avail.min(shown) } else { shown }
+}
+
+/// The square LIVE key on the axis, shown only while the view is parked in
+/// the past. True when it was clicked.
+pub fn back_to_live_key(ui: &mut egui::Ui, axis: egui::Rect, live: bool) -> bool {
+    if live {
+        return false;
+    }
+    let r = back_to_live_rect(axis);
+    let key = egui::Button::new(egui::RichText::new(BACK_TO_LIVE).monospace().small().strong().color(egui::Color32::WHITE))
+        .fill(NOW_SHELF)
+        .corner_radius(egui::CornerRadius::ZERO)
+        .min_size(r.size());
+    ui.put(r, key).on_hover_text("The lanes are not following the present. Click to follow NOW again.").clicked()
+}
+
 const NOW_SHELF: egui::Color32 = egui::Color32::from_rgb(120, 16, 12);
 
 /// Free strip at the right of the lane area for the lane scrollbar.
