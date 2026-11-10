@@ -437,7 +437,12 @@ impl Worker {
         // A file that never got a sample has nothing to play: a voice
         // channel opened with the capture that carried no call. It is not
         // kept, so the lanes do not fill with empty blocks.
-        let keep = seg.closing.map(|(_, k, _)| k).unwrap_or(true) && seg.values > 0;
+        let mut keep = seg.closing.map(|(_, k, _)| k).unwrap_or(true) && seg.values > 0;
+        // Starred or protected while it was still recording: never removed.
+        if !keep && self.db.as_ref().is_some_and(|db| db.get(seg.id).ok().flatten().is_some_and(|r| r.star || r.protected)) {
+            self.status.note(format!("REC: kept {} although it {}: it is starred or protected", seg.raw.display(), if seg.values == 0 { "is empty" } else { "was discarded" }));
+            keep = true;
+        }
         let _ = seg.out.flush();
         drop(seg.out);
         let db = self.db.as_ref();
@@ -578,6 +583,24 @@ mod tests {
         assert_eq!(meta.talkers[0].start_ms, 0);
         assert_eq!(meta.talkers[1].start_ms, 1_200);
         assert_eq!(meta.talkers[1].end_ms, meta.duration_ms);
+    }
+
+    #[test]
+    fn a_starred_recording_is_never_dropped() {
+        let dir = tempdir("writer-starred");
+        let mut w = worker(&dir);
+        w.command(Cmd::Open { key: 9, meta: m() });
+        let id = w.segs[&9].id;
+        w.db.as_ref().unwrap().set_flag(id, "star", true).unwrap();
+        w.command(Cmd::Close { key: 9, keep: true });
+        w.command(Cmd::Shutdown);
+        assert_eq!(w.db.as_ref().unwrap().all().unwrap().len(), 1, "empty but starred: kept");
+        w.command(Cmd::Open { key: 10, meta: m() });
+        let id = w.segs[&10].id;
+        w.db.as_ref().unwrap().set_flag(id, "protected", true).unwrap();
+        w.chunk(Chunk { key: 10, hz: 851, data: vec![2; 640] });
+        w.command(Cmd::Close { key: 10, keep: false });
+        assert_eq!(w.db.as_ref().unwrap().all().unwrap().len(), 2, "discarded but protected: kept");
     }
 
     #[test]

@@ -368,6 +368,9 @@ pub struct GrantRec {
 /// grant (at least the voice hang).
 pub const GRANT_QUIET: Duration = Duration::from_millis(2_000);
 
+/// A channel file stays open this long after its last signal block.
+pub const SIGNAL_HANG: Duration = Duration::from_millis(1_500);
+
 /// Playback demodulator key for analog FM audio (the re-demodulated
 /// discriminator, no decoder).
 pub const DEMOD_FM: &str = "fm";
@@ -715,8 +718,12 @@ impl App {
         }
     }
 
-    /// Every channel inside this HackRF capture gets its own IQ file for as
-    /// long as REC is armed. The speaker decoder is a different path.
+    /// Every channel inside this HackRF capture gets its own IQ file while
+    /// it carries an RF signal (the REC squelch, `hsrec::dsp::Squelch`, run
+    /// by the capture thread) and for `SIGNAL_HANG` after, so a pause between
+    /// words stays in one file and noise is never filed. A control channel on
+    /// the air is a signal the whole time and stays one long recording; a
+    /// silent alternate is not recorded. The speaker decoder is a different path.
     fn sync_carrier_files(&mut self, row: &cat::RadioRow, recorder: &hsrec::writer::Recorder) {
         let center = row.center_hz;
         let Some(zone) = self.channels.zones.get(self.channel_zone) else {
@@ -737,6 +744,14 @@ impl App {
             }
             let hz = channel.hz.round() as u64;
             let key = crate::rec_live::carrier_key(row.id, hz);
+            // A call the control channel granted here (followed or not) is
+            // kept whatever the squelch says: it came from control sync.
+            let granted = self.hackrf_call.get(&row.id).copied().flatten().is_some_and(|(f, _)| f.round() as u64 == hz)
+                || self.hackrf_open.get(&row.id).is_some_and(|g| g.iter().any(|g| g.hz.round() as u64 == hz));
+            let signal = granted || crate::rec_live::signal_at(row.id, hz).is_some_and(|t| t.elapsed() < SIGNAL_HANG);
+            if !signal {
+                continue;
+            }
             next.insert(key);
             if self.rec.carrier_open.get(&row.id).is_some_and(|open| open.contains(&key)) {
                 continue;

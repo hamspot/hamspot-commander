@@ -596,6 +596,97 @@ fn real_page_records_every_concurrent_call_while_one_is_heard() {
     }
 }
 
+/// Dead air: a zone channel inside the capture is filed on HACKRF CHANNELS
+/// only while the REC squelch hears a signal on it, and closes after the
+/// hang. A silent channel gets no file at all.
+#[test]
+fn real_page_channel_files_follow_the_rf_squelch() {
+    if !in_child("real_page_channel_files_follow_the_rf_squelch") {
+        return;
+    }
+    let st = station(None, 0);
+    let mut h = Harness::new(&st, egui::vec2(1200.0, 700.0), false);
+    h.app.rec.face.talkgroups = hsrec::segment::RecMode::All;
+    h.app.rec.face.source_tab = meta::SOURCE_HACKRF_CHANNELS.into();
+    let radio = 0x5EC1;
+    let center = 857_200_000.0;
+    let (a, b, c) = (856_962_500.0, 857_437_500.0, 857_712_500.0);
+    let ch = |name: &str, hz: f64| crate::channels::Channel {
+        name: name.into(),
+        hz,
+        mode: "nfm".into(),
+        control: false,
+        encrypted: false,
+        vocoder: String::new(),
+        invert: false,
+        record: false,
+    };
+    h.app.channels.zones.push(crate::channels::ChannelZone {
+        name: "Squelch".into(),
+        channels: vec![ch("Squelch A", a), ch("Squelch B", b), ch("Squelch C", c)],
+    });
+    h.app.channel_zone = h.app.channels.zones.len() - 1;
+    h.app.rec.test_rows.push(hackrf_row(radio, center));
+    h.settle(2);
+    assert!(h.app.rec.carrier_open.get(&radio).is_none_or(|o| o.is_empty()), "nothing heard yet: no channel files");
+
+    // The capture thread: A and B on the air, C silent, every channel mixed.
+    let cs8 = crate::hackrf::tests::two_calls_cs8(center, a, b, 1_627.0, 1.5);
+    let mut bank = crate::hackrf::Bank::new(center, &[]);
+    bank.set_extras(&[a as u64, b as u64, c as u64]);
+    bank.set_tap(true);
+    let mut voice = Vec::new();
+    for block in cs8.chunks(65_536) {
+        voice.clear();
+        bank.push(block, &mut voice, &mut []);
+        crate::rec_live::note_gates(radio, &bank.gates());
+        crate::hackrf::route_taps(radio, 0, bank.take_carrier_taps());
+        h.run(vec![]);
+    }
+    let key = |hz: f64| crate::rec_live::carrier_key(radio, hz as u64);
+    let open = h.app.rec.carrier_open.get(&radio).cloned().unwrap_or_default();
+    assert!(
+        open.contains(&key(a)) && open.contains(&key(b)),
+        "A and B on the air are filed: open {open:?} squelch {:?}",
+        bank.gates()
+    );
+    assert!(!open.contains(&key(c)), "silent C is not filed");
+
+    // The calls end; after the hang the files close and are kept.
+    let t0 = std::time::Instant::now();
+    while h.app.rec.carrier_open.get(&radio).is_some_and(|o| !o.is_empty()) {
+        assert!(t0.elapsed() < std::time::Duration::from_secs(4), "channel files close after the hang");
+        h.run(vec![]);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+    assert!(t0.elapsed() >= crate::rec_ui::SIGNAL_HANG / 2, "the hang holds a file through a short pause");
+    let db = Db::open(&h.app.rec.db_path).unwrap();
+    let t1 = std::time::Instant::now();
+    let rows = loop {
+        let rows: Vec<_> = db.all().unwrap().into_iter().filter(|r| r.meta.source == meta::SOURCE_HACKRF_CHANNELS).collect();
+        if rows.len() >= 2 && rows.iter().all(|r| !r.meta.end_utc.is_empty()) {
+            break rows;
+        }
+        assert!(t1.elapsed() < std::time::Duration::from_secs(5), "A and B filed: {}", rows.len());
+        h.run(vec![]);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    };
+    let hz: Vec<f64> = rows.iter().map(|r| r.meta.channel_hz).collect();
+    assert!(hz.contains(&a) && hz.contains(&b) && !hz.contains(&c), "{hz:?}");
+    for r in &rows {
+        assert!(r.meta.bytes > 100_000, "real IQ kept: {} bytes on {}", r.meta.bytes, r.meta.channel_hz);
+    }
+    // Drawn on the CHANNELS tab: blocks for A and B in their lanes.
+    h.app.rec_reload(true);
+    h.settle(2);
+    let out = h.run(vec![]);
+    let lanes = lanes_area(&out);
+    let shown: Vec<String> = texts(&out).into_iter().filter(|(_, r)| r.max.y > lanes.min.y).map(|(t, _)| t).collect();
+    let has = |n: &str| shown.iter().any(|t| t.contains(n));
+    assert!(has("Squelch A") && has("Squelch B"), "lanes for the live channels: {shown:?}");
+    assert!(!has("Squelch C"), "no lane for the silent channel: {shown:?}");
+}
+
 /// A P25 channel recording (filed as "fm" on HACKRF CHANNELS) clicked on
 /// the timeline: the Record / Playback dialog opens, the Demodulator
 /// defaults to the P25 pipe and playback runs through that decoder, not the

@@ -1164,6 +1164,8 @@ pub struct Bank {
     /// only the one being heard.
     extras: Vec<Extra>,
     tap_on: bool,
+    /// REC squelch per channel frequency (controls, voice, extras).
+    gates: std::collections::HashMap<u64, hsrec::dsp::Squelch>,
 }
 
 /// One recorded-only voice channel: a mixer for its IQ and a carrier watch.
@@ -1215,7 +1217,13 @@ impl Bank {
             control_probes: vec![hsrec::dsp::AfcProbe::default(); controls.len()],
             extras: Vec::new(),
             tap_on: false,
+            gates: std::collections::HashMap::new(),
         }
+    }
+
+    /// REC squelch of every channel with a mixer: (hz, signal, dB over floor).
+    pub fn gates(&self) -> Vec<(u64, bool, f32)> {
+        self.gates.iter().map(|(hz, g)| (*hz, g.open(), g.snr_db())).collect()
     }
 
     /// The recorded-only channels: every listed frequency inside the
@@ -1358,6 +1366,13 @@ impl Bank {
     /// The voice buffer is the same length, zeros when no voice frequency is set.
     pub fn push(&mut self, iq: &[u8], voice: &mut Vec<i16>, controls: &mut [Vec<i16>]) {
         let n = iq.len() / 2;
+        let voice_key = self.voice_hz.map(|v| v.round() as u64);
+        let control_keys: Vec<u64> = self.controls.iter().map(|d| (self.center + d.offset).round() as u64).collect();
+        let live: Vec<u64> = control_keys.iter().copied().chain(voice_key).chain(self.extras.iter().map(|e| e.hz)).collect();
+        self.gates.retain(|hz, _| live.contains(hz));
+        for hz in &live {
+            self.gates.entry(*hz).or_default();
+        }
         self.voice_steps.clear();
         for steps in &mut self.control_steps {
             steps.clear();
@@ -1368,6 +1383,11 @@ impl Bank {
             let (i, q) = self.dc.apply(i, q);
             let voice_hz = self.voice.push(i, q);
             let voice_mag = self.voice.take_mag();
+            if let (Some(mag), Some(k)) = (voice_mag, voice_key) {
+                if let Some(g) = self.gates.get_mut(&k) {
+                    g.push(mag);
+                }
+            }
             if let Some(mag) = voice_mag {
                 if self.voice_hz.is_some() {
                     self.voice_empty = self.carrier.push(mag);
@@ -1385,11 +1405,17 @@ impl Bank {
                 let _ = e.ddc.push(i, q);
                 if let Some(mag) = e.ddc.take_mag() {
                     e.empty = e.carrier.push(mag);
+                    if let Some(g) = self.gates.get_mut(&e.hz) {
+                        g.push(mag);
+                    }
                 }
             }
             for (index, ddc) in self.controls.iter_mut().enumerate() {
                 let hz = ddc.push(i, q);
                 let mag = ddc.take_mag();
+                if let (Some(m), Some(g)) = (mag, self.gates.get_mut(&control_keys[index])) {
+                    g.push(m);
+                }
                 if let Some(hz) = hz {
                     self.control_steps[index].push(hz);
                     if let Some(mag) = mag {
@@ -1984,6 +2010,7 @@ fn run_bank(
         bank.set_tap(tap);
         bank.push(&buf[..n], &mut voice_out, &mut control_out);
         crate::rec_live::note_extras(radio_id, &bank.extras());
+        crate::rec_live::note_gates(radio_id, &bank.gates());
         voice_empty.store(bank.voice_channel_empty(), Ordering::Relaxed);
         if tap {
             route_taps(radio_id, hz, bank.take_carrier_taps());
@@ -2531,6 +2558,18 @@ pub(crate) mod tests {
             }
         }
         (bank, taps)
+    }
+
+    #[test]
+    fn the_rec_squelch_opens_on_live_channels_only() {
+        let center = 857_200_000.0;
+        let (a, b, c) = (856_962_500.0, 857_437_500.0, 857_712_500.0);
+        let (bank, _) = tap_three(center, a, b, c, 1.0);
+        let gates = bank.gates();
+        let open = |hz: f64| gates.iter().find(|g| g.0 == hz as u64).map(|g| g.1);
+        assert_eq!(open(a), Some(true), "speaker's call: signal {gates:?}");
+        assert_eq!(open(b), Some(true), "second call: signal {gates:?}");
+        assert_eq!(open(c), Some(false), "silent channel: noise {gates:?}");
     }
 
     #[test]

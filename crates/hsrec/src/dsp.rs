@@ -75,6 +75,79 @@ pub const AFC_MAX_HZ: f32 = 4_000.0;
 /// Weight of each new carrier block once the tracker has locked.
 pub const AFC_WEIGHT: f32 = 0.2;
 
+/// A carrier must stand this far above the channel's learned noise floor
+/// (envelope ratio 2.0 = 6 dB) to open the REC squelch.
+pub const SQUELCH_SNR: f32 = 2.0;
+
+/// REC squelch for one channel: is there an RF signal, or only noise?
+/// Each [`AFC_BLOCK`] (100 ms) of boxcar magnitudes is judged as the AFC
+/// probe judges it (mean at least [`AFC_FLOOR`], envelope spread under
+/// [`AFC_CV`]: an FM or C4FM carrier is flat, noise is Rayleigh), and in
+/// addition at least [`SQUELCH_SNR`] above the channel's noise floor. The
+/// floor is the average of the blocks that were not a carrier: it follows
+/// a quieter block quickly and a louder one slowly, so a carrier never
+/// teaches it. A channel that has never been quiet has no floor yet and
+/// is judged by the AFC rule alone (a control channel keyed all the time).
+#[derive(Debug, Default, Clone)]
+pub struct Squelch {
+    n: u32,
+    sum: f64,
+    sum2: f64,
+    floor: Option<f32>,
+    open: bool,
+    snr_db: f32,
+}
+
+impl Squelch {
+    /// One boxcar magnitude. `Some(open)` at the end of each block.
+    pub fn push(&mut self, mag: f32) -> Option<bool> {
+        let mag = if mag.is_finite() && mag >= 0.0 { mag } else { 0.0 };
+        self.n += 1;
+        self.sum += mag as f64;
+        self.sum2 += (mag as f64) * (mag as f64);
+        if self.n < AFC_BLOCK {
+            return None;
+        }
+        let n = self.n as f64;
+        let mean = self.sum / n;
+        let var = (self.sum2 / n - mean * mean).max(0.0);
+        let cv = if mean > 1e-6 { (var.sqrt() / mean) as f32 } else { f32::MAX };
+        let mean = mean as f32;
+        self.n = 0;
+        self.sum = 0.0;
+        self.sum2 = 0.0;
+        let above = self.floor.is_none_or(|f| mean >= f * SQUELCH_SNR);
+        let carrier = mean >= AFC_FLOOR && cv < AFC_CV && above;
+        if !carrier {
+            self.floor = Some(match self.floor {
+                None => mean,
+                Some(f) if mean < f => f * 0.7 + mean * 0.3,
+                Some(f) => f * 0.98 + mean * 0.02,
+            });
+        }
+        self.snr_db = match self.floor {
+            Some(f) if f > 1e-6 && mean > 1e-6 => 20.0 * (mean / f).log10(),
+            _ => 0.0,
+        };
+        self.open = carrier;
+        Some(carrier)
+    }
+
+    /// The last finished block was a signal.
+    pub fn open(&self) -> bool {
+        self.open
+    }
+
+    /// Last block above the noise floor, in dB (0 before a floor is known).
+    pub fn snr_db(&self) -> f32 {
+        self.snr_db
+    }
+
+    pub fn floor(&self) -> Option<f32> {
+        self.floor
+    }
+}
+
 /// Statistics of one channel's discriminator over [`AFC_BLOCK`] samples.
 /// `push` returns the block's mean frequency when the block is a carrier.
 #[derive(Debug, Default, Clone)]
@@ -390,6 +463,56 @@ mod tests {
     #[test]
     fn rate_is_32k() {
         assert_eq!(REC_RATE, 32_000);
+    }
+
+    #[test]
+    fn squelch_opens_on_a_carrier_and_stays_shut_on_noise() {
+        // Noise: Rayleigh magnitudes around 0.3 (spread about 0.52).
+        let mut sq = Squelch::default();
+        let mut seed = 12345u32;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            (seed >> 8) as f32 / (1u32 << 24) as f32
+        };
+        let mut noise = |sq: &mut Squelch, blocks: u32| {
+            let mut opened = false;
+            for _ in 0..blocks * AFC_BLOCK {
+                let u = rnd().max(1e-6);
+                let m = 0.3 * (-2.0 * u.ln()).sqrt();
+                if sq.push(m) == Some(true) {
+                    opened = true;
+                }
+            }
+            opened
+        };
+        assert!(!noise(&mut sq, 20), "noise never opens it");
+        let floor = sq.floor().expect("floor learned from noise");
+        assert!((0.2..0.5).contains(&floor), "floor {floor}");
+        // A flat carrier 10 dB above the noise opens it on the next block.
+        let mut opened = false;
+        for _ in 0..AFC_BLOCK {
+            if sq.push(floor * 3.2) == Some(true) {
+                opened = true;
+            }
+        }
+        assert!(opened && sq.open());
+        assert!(sq.snr_db() > 8.0, "snr {}", sq.snr_db());
+        // A long carrier does not teach the floor.
+        for _ in 0..600 * AFC_BLOCK {
+            sq.push(floor * 3.2);
+        }
+        assert!(sq.open() && (sq.floor().unwrap() - floor).abs() < 1e-3);
+        // A flat level only 3 dB over the floor is not a signal.
+        for _ in 0..AFC_BLOCK {
+            sq.push(floor * 1.4);
+        }
+        assert!(!sq.open());
+        // A control channel keyed from the start (no floor yet) still opens.
+        let mut cc = Squelch::default();
+        for _ in 0..AFC_BLOCK {
+            cc.push(5.0);
+        }
+        assert!(cc.open());
     }
 
     #[test]

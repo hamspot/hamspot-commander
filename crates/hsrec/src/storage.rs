@@ -134,7 +134,7 @@ pub fn cap_decision(rows: &[Recording], cap_gb: f64, need: i64, overwrite_oldest
     let mut over = usage.used + need - usage.cap;
     let mut cand: Vec<&Recording> = rows
         .iter()
-        .filter(|r| !r.protected && !r.offline() && !r.missing && r.disk_bytes() > 0)
+        .filter(|r| !r.protected && !r.star && !r.offline() && !r.missing && r.disk_bytes() > 0)
         .collect();
     cand.sort_by(|a, b| a.meta.start_utc.cmp(&b.meta.start_utc));
     let mut ids = Vec::new();

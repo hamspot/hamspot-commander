@@ -3,6 +3,7 @@
 //! The UI thread opens and closes segments. Nothing here blocks.
 use hsrec::writer::{Chunk, Recorder};
 use std::collections::HashMap;
+use std::time::Instant;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -95,6 +96,29 @@ pub fn note_extras(radio: u64, extras: &[(u64, bool)]) {
 /// `Some(empty)` once the capture has a mixer on `hz`.
 pub fn extra_state(radio: u64, hz: u64) -> Option<bool> {
     grants().seen.get(&radio).and_then(|v| v.iter().find(|(h, _)| *h == hz).map(|(_, e)| *e))
+}
+
+/// REC squelch per (radio, hz): when the channel last had an RF signal
+/// and its last dB over the noise floor. Set by the capture thread.
+static GATES: OnceLock<Mutex<HashMap<(u64, u64), (Instant, f32)>>> = OnceLock::new();
+
+fn gates_map() -> std::sync::MutexGuard<'static, HashMap<(u64, u64), (Instant, f32)>> {
+    GATES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|p| p.into_inner())
+}
+
+pub fn note_gates(radio: u64, gates: &[(u64, bool, f32)]) {
+    let now = Instant::now();
+    let mut m = gates_map();
+    for (hz, open, snr) in gates {
+        if *open {
+            m.insert((radio, *hz), (now, *snr));
+        }
+    }
+}
+
+/// When channel `hz` of `radio` last had a signal above its noise floor.
+pub fn signal_at(radio: u64, hz: u64) -> Option<Instant> {
+    gates_map().get(&(radio, hz)).map(|(t, _)| *t)
 }
 
 /// One leftover byte when a read splits a little-endian sample.
