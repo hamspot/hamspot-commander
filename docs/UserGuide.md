@@ -475,7 +475,7 @@ The REC state is saved and comes back on the next start. A talkgroup recording s
 
 **Detaching REC.** The rounded end at the top right of the REC page detaches the whole page into its own window, as on Config: click it to detach, click it again (in either place) to bring it back, drag it to move the window. In the detached window the timeline controls sit in a row at the top of the page; the main window shows a line saying where REC went.
 
-While REC is open, the timeline controls sit inside the tan bar at the top of the page, at its right end just before the rounded end cap. They are plain rectangular buttons, the same height as the bar. Below the bar, from top to bottom: source tabs (**HackRF TG**, **HackRF Channels**, **Rig Audio**, plus any other source found; if they don't all fit, click the three-dot **more tabs** button on the tan bar above them for a list of the rest, as on the Plan page), the search row and the timeline. The REC state, what TG and Channels record, disk use and any warning are in the page's status strip at the bottom, where the other pages put their status.
+While REC is open, the timeline controls sit inside the tan bar at the top of the page, at its right end just before the rounded end cap. They are plain rectangular buttons, the same height as the bar. Below the bar, from top to bottom: source tabs (**HackRF TG**, **HackRF Channels**, **Rig Audio**, **Radio IDs**, plus any other source found; if they don't all fit, click the three-dot **more tabs** button on the tan bar above them for a list of the rest, as on the Plan page), the search row and the timeline. The REC state, what TG and Channels record, disk use and any warning are in the page's status strip at the bottom, where the other pages put their status.
 
 | Control in the tan bar | What it does |
 | --- | --- |
@@ -496,6 +496,8 @@ When the window is too narrow for the full controls, they shorten to symbols: **
 | --- | --- |
 | **Search** | Filter lanes by talkgroup, channel, radio ID (any radio on the call) or notes |
 | **Undo delete** | Shown for 60 s after a delete |
+
+**Radio IDs** shows the talkgroup recordings by radio: one lane per radio unit ID, named with the radio's description from the Radio IDs page when it has one (for example `Engine 7 (100)`), else `Radio 100`. Each block is one transmission by that radio, coloured by talkgroup and labelled with the talkgroup's name; hover it for the talkgroup, time and length. When several radios talk on one call, the call is split at each change of talker, so a radio's lane shows only its own transmissions. Clicking a block opens the Record / Playback dialog and plays just that radio's part of the call (it stops where the next radio starts); star, notes, export and delete stay on the talkgroup's own tab. Search matches the radio number, its name, and the talkgroup's number or name. Calls recorded before this tab existed have only the radios heard on them: each radio is shown from when it was first heard until the next radio was first heard, or the whole call when only one radio is known. Talkgroup calls with no radio at all are in the **Unknown radio** lane. The timeline works as on the other tabs (wheel zoom, Shift+wheel or the lane names scroll, LIVE).
 
 <!-- screenshot: rec-03 — The REC tab, armed and waiting. -->
 <!-- screenshot: rec-07 — Live follows the present moment when on. -->

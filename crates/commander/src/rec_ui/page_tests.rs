@@ -703,6 +703,139 @@ fn real_page_channel_recording_plays_through_p25_and_shows_the_dialog() {
     h.app.rec_close_detail();
 }
 
+fn tg_rec(db: &Db, dir: &Path, name: &str, tg: u32, tg_name: &str, ago_s: i64, dur_ms: i64) -> Meta {
+    let raw = format!("hackrf_tg/x/{name}.cs16");
+    let path = dir.join(&raw);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let iq = hsrec::dsp::synth_c4fm_cs16(0.0, dur_ms as f64 / 1000.0, 9_000.0);
+    std::fs::write(&path, iq.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+    let t0 = chrono::Utc::now() - chrono::Duration::seconds(ago_s);
+    let mut m = Meta {
+        source: meta::SOURCE_HACKRF_TG.into(),
+        source_kind: meta::KIND_RAW_IQ.into(),
+        talkgroup: Some(tg),
+        talkgroup_name: tg_name.into(),
+        raw_format: "cs16".into(),
+        sample_rate: 32_000,
+        start_utc: t0.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        end_utc: (t0 + chrono::Duration::milliseconds(dur_ms)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        duration_ms: dur_ms,
+        bytes: (iq.len() * 2) as i64,
+        modulation: "p25".into(),
+        centre_hz: 857_200_000.0,
+        channel_hz: 856_962_500.0,
+        offset_hz: -237_500.0,
+        ..Default::default()
+    };
+    m.decoder = serde_json::json!({ "script": "modems/commander-demod-p25.rxpipe", "vocoder": "p25" });
+    let _ = db;
+    m
+}
+
+/// The Radio IDs tab: talkgroup recordings cut into one block per
+/// transmission and laned by radio (alias when known), calls with no
+/// radio in "Unknown radio", search by radio, alias or talkgroup, and a
+/// click plays only that radio's span of the talkgroup recording.
+#[test]
+fn real_page_radio_ids_tab_lanes_searches_and_plays_one_radio() {
+    if !in_child("real_page_radio_ids_tab_lanes_searches_and_plays_one_radio") {
+        return;
+    }
+    install_modems();
+    let st = station(None, 0);
+    let mut h = Harness::new(&st, egui::vec2(1200.0, 760.0), false);
+    h.app.rec.face.source_tab = meta::SOURCE_RADIO_IDS.into();
+    h.app.rec.play_argv = Some(vec!["sh".into(), "-c".into(), "cat > /dev/null".into()]);
+    let mut engine = crate::units::Unit::named(100);
+    engine.description = "Engine 7".into();
+    h.app.units = vec![engine, crate::units::Unit::named(200)];
+    h.settle(4);
+    let db = Db::open(&h.app.rec.db_path).unwrap();
+    let dir = h.app.rec.dir.clone();
+    let put = |name: &str, m: &Meta| db.insert(&format!("hackrf_tg/x/{name}.cs16"), m).unwrap();
+    // A: three transmissions, 100 → 200 → 100 (new recordings carry talkers).
+    let mut a = tg_rec(&db, &dir, "a", 10119, "49-IUH-DISP — IUH Public Safety", 14, 10_000);
+    a.talkers = vec![
+        meta::Talk { id: 100, start_ms: 0, end_ms: 4_000 },
+        meta::Talk { id: 200, start_ms: 4_000, end_ms: 7_000 },
+        meta::Talk { id: 100, start_ms: 7_000, end_ms: 10_000 },
+    ];
+    a.radio_unit_id = Some(100);
+    let id_a = put("a", &a);
+    // B: an older recording with only its first radio.
+    let mut b = tg_rec(&db, &dir, "b", 10334, "30-HCLE — Law: Dispatch (Countywide)", 12, 3_000);
+    b.radio_unit_id = Some(300);
+    put("b", &b);
+    // C: no radio known.
+    let c = tg_rec(&db, &dir, "c", 10200, "Fire Main", 9, 2_000);
+    put("c", &c);
+    let lanes = |out: &egui::FullOutput| -> Vec<String> {
+        let area = lanes_area(out);
+        texts(out).into_iter().filter(|(_, r)| area.contains(r.center())).map(|(t, _)| t).collect()
+    };
+    let t = std::time::Instant::now();
+    let out = loop {
+        let out = h.run(vec![]);
+        if h.app.rec.rows.len() == 5 {
+            break h.settle(2);
+        }
+        assert!(t.elapsed() < std::time::Duration::from_secs(5), "rows: {}", h.app.rec.rows.len());
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        drop(out);
+    };
+    let names = lanes(&out);
+    for want in ["Engine 7 (100)", "Radio 200", "Radio 300", "Unknown radio"] {
+        assert!(names.iter().any(|n| n.starts_with(want)), "lane {want} in {names:?}");
+    }
+    assert!(texts(&out).iter().any(|(t, _)| t.contains("5 recordings")), "five transmissions");
+    // Search: a radio, an alias, a talkgroup name.
+    for (q, yes, no) in [("200", "Radio 200", "Engine 7"), ("engine", "Engine 7", "Radio 200"), ("HCLE", "Radio 300", "Engine 7")] {
+        h.app.rec.query = q.into();
+        let out = h.settle(2);
+        let names = lanes(&out);
+        assert!(names.iter().any(|n| n.starts_with(yes)), "{q}: {yes} in {names:?}");
+        assert!(!names.iter().any(|n| n.starts_with(no)), "{q}: no {no} in {names:?}");
+    }
+    h.app.rec.query.clear();
+    h.settle(2);
+    // Click radio 200's block: plays 4.0–7.0 s of recording A.
+    let out = h.run(vec![]);
+    let area = lanes_area(&out);
+    let lane = lane_label(&out, "Radio 200").expect("radio 200 lane");
+    let block = fills(&out, tg_colour(10119))
+        .into_iter()
+        .filter(|r| area.intersects(*r))
+        .find(|r| (r.center().y - lane.center().y).abs() < LANE_H)
+        .expect("radio 200's block, in its talkgroup's colour");
+    let at = egui::pos2(block.right() - block.width() * 0.2, block.center().y);
+    let m0 = egui::Modifiers::NONE;
+    h.run(vec![
+        egui::Event::PointerMoved(at),
+        egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: m0 },
+        egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: false, modifiers: m0 },
+    ]);
+    let out = h.settle(3);
+    let (pid, _) = h.app.rec.player.as_ref().map(|(i, p)| (*i, p.pos_ms.load(Ordering::Relaxed))).expect("plays");
+    assert_eq!(h.app.rec.radio_map.get(&pid).map(|(r, s, e)| (*r, *s, *e)), Some((id_a, 4_000, 7_000)), "radio 200's span of A");
+    assert_eq!(h.app.rec.play_base, 4_000);
+    assert_eq!(h.app.rec.play_until, Some(7_000));
+    let words: Vec<String> = texts(&out).into_iter().map(|(t, _)| t).collect();
+    assert!(words.iter().any(|t| t.to_uppercase().contains("RECORD / PLAYBACK")), "dialog shown");
+    assert!(words.iter().any(|t| t == "Demodulator"));
+    assert!(!words.iter().any(|t| t == "Delete"), "a radio block never deletes its talkgroup recording");
+    // It stops at the end of the transmission.
+    let t = std::time::Instant::now();
+    while h.app.rec.player.is_some() {
+        h.run(vec![]);
+        assert!(t.elapsed() < std::time::Duration::from_secs(8), "stops at 7.0 s");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    if let Some(dir) = std::env::var_os("HS_REC_PNG_DIR") {
+        let out = h.settle(2);
+        h.png(&out, &Path::new(&dir).join("rec-radio-ids-synthetic.png"));
+    }
+}
+
 /// Screenshots of the REC page from a copy of a real database, before and
 /// after a Shift+wheel scroll. Runs only when HS_REC_DB names the database
 /// and HS_REC_PNG_DIR the output folder.
@@ -729,4 +862,18 @@ fn real_page_screenshots_from_a_database_copy() {
     let out = h.settle(3);
     h.png(&out, &dir.join("rec-page-after-shift-wheel.png"));
     eprintln!("lanes offset {} view {:?}", h.lane_off(), h.view());
+    // The Radio IDs tab, with the radio names from a station file copy
+    // (HS_REC_STATION, read only) when given.
+    if let Some(stfile) = std::env::var_os("HS_REC_STATION") {
+        let text = std::fs::read_to_string(PathBuf::from(stfile)).unwrap_or_default();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+        if let Ok(units) = serde_json::from_value::<Vec<crate::units::Unit>>(v["units"].clone()) {
+            h.app.units = units;
+        }
+    }
+    h.app.rec.face.source_tab = meta::SOURCE_RADIO_IDS.into();
+    h.app.rec.rows_at = None;
+    let out = h.settle(10);
+    h.png(&out, &dir.join("rec-radio-ids.png"));
+    eprintln!("radio ids rows {}", h.app.rec.rows.len());
 }

@@ -299,7 +299,8 @@ pub fn matches(r: &Recording, query: &str) -> bool {
         return true;
     }
     let hay = format!(
-        "{} {} {} {} {} {}",
+        "{} {} {} {} {} {} {}",
+        r.meta.talkgroup_name,
         r.meta.lane(),
         r.meta.channel_name,
         r.meta.talkgroup.map(|t| t.to_string()).unwrap_or_default(),

@@ -223,6 +223,8 @@ pub fn utc_now() -> String {
 pub struct CallUnits {
     seen: Vec<(u32, meta::UnitSeen)>,
     call: Option<(u32, String)>,
+    /// Every sighting (tg, unit, utc), kept `UNIT_KEEP_MS`: who talked when.
+    log: Vec<(u32, u32, String)>,
 }
 
 impl CallUnits {
@@ -233,6 +235,8 @@ impl CallUnits {
         }
         let keep = utc_minus(at, UNIT_KEEP_MS);
         self.seen.retain(|(_, u)| u.last_utc >= keep);
+        self.log.retain(|(_, _, t)| *t >= keep);
+        self.log.push((tg, unit, at.to_string()));
         match self.seen.iter_mut().find(|(t, u)| *t == tg && u.id == unit) {
             Some((_, u)) => {
                 if u.last_utc.as_str() < at {
@@ -245,6 +249,22 @@ impl CallUnits {
     /// The follower moved to talkgroup `tg` (or to silence) at `at`.
     pub fn begin(&mut self, tg: Option<u32>, at: &str) {
         self.call = tg.map(|t| (t, at.to_string()));
+    }
+    /// Sightings (unit, utc) on talkgroup `tg` from `since` (UTC ISO) on.
+    pub fn sightings(&self, tg: u32, since: &str) -> Vec<(u32, String)> {
+        self.log.iter().filter(|(t, _, at)| *t == tg && at.as_str() >= since).map(|(_, u, at)| (*u, at.clone())).collect()
+    }
+    /// The current call's talkgroup and start.
+    pub fn call(&self) -> Option<(u32, String)> {
+        self.call.clone()
+    }
+    /// Units heard on `tg` from `since` on, first-heard first.
+    pub fn units_on(&self, tg: u32, since: &str) -> Vec<meta::UnitSeen> {
+        let mut v: Vec<meta::UnitSeen> = Vec::new();
+        for (u, at) in self.sightings(tg, since) {
+            meta::note_unit(&mut v, u, &at);
+        }
+        v
     }
     /// Units heard on the current call, first-heard first.
     pub fn units(&self) -> Vec<meta::UnitSeen> {
@@ -271,6 +291,70 @@ pub fn units_text(m: &Meta) -> String {
     }
 }
 
+/// Lane name for radio `id` on the Radio IDs tab: "Alias (id)" when the
+/// station has a description for it, else the number.
+pub fn radio_lane(id: u32, names: &HashMap<u32, String>) -> String {
+    match names.get(&id).map(|d| d.trim()).filter(|d| !d.is_empty() && *d != id.to_string()) {
+        Some(d) => format!("{d} ({id})"),
+        None => format!("Radio {id}"),
+    }
+}
+
+/// Lane for talkgroup calls with no known radio. They are listed, not left out.
+pub const UNKNOWN_RADIO: &str = "Unknown radio";
+
+/// The Radio IDs tab: every talkgroup recording cut into one block per
+/// transmission, laned by radio. Ids are negative so they never reach the
+/// database; the map gives each one's recording and its span in that file.
+pub fn radio_rows(all: &[Recording], names: &HashMap<u32, String>) -> (Vec<Recording>, HashMap<i64, (i64, u64, u64)>) {
+    let mut rows = Vec::new();
+    let mut map = HashMap::new();
+    for r in all.iter().filter(|r| r.meta.talkgroup.is_some() && r.meta.source != meta::SOURCE_RADIO_IDS) {
+        let live = r.meta.end_utc.is_empty();
+        let Ok(start) = chrono::DateTime::parse_from_rfc3339(&r.meta.start_utc) else { continue };
+        let start = start.with_timezone(&chrono::Utc);
+        let mut segs = r.meta.talker_segments();
+        if live {
+            // Still recording: the last radio heard so far owns the call to NOW.
+            let ids = r.meta.unit_ids();
+            segs = match ids.last() {
+                Some(id) => vec![meta::Talk { id: *id, start_ms: 0, end_ms: 0 }],
+                None => vec![meta::Talk { id: 0, start_ms: 0, end_ms: 0 }],
+            };
+        } else if segs.is_empty() {
+            segs = vec![meta::Talk { id: 0, start_ms: 0, end_ms: r.meta.duration_ms.max(1) }];
+        }
+        for (k, t) in segs.iter().enumerate() {
+            let vid = -(r.id * 1000 + k as i64 + 1);
+            let mut v = r.clone();
+            v.id = vid;
+            v.meta.lane_override = Some(if t.id == 0 { UNKNOWN_RADIO.to_string() } else { radio_lane(t.id, names) });
+            v.meta.radio_unit_id = (t.id != 0).then_some(t.id);
+            v.meta.units.retain(|u| u.id == t.id);
+            v.meta.talkers.clear();
+            let s = start + chrono::Duration::milliseconds(t.start_ms);
+            v.meta.start_utc = s.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            if live {
+                v.meta.end_utc.clear();
+            } else {
+                v.meta.duration_ms = t.end_ms - t.start_ms;
+                v.meta.end_utc = (start + chrono::Duration::milliseconds(t.end_ms)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            }
+            map.insert(vid, (r.id, t.start_ms.max(0) as u64, if live { u64::MAX } else { t.end_ms.max(0) as u64 }));
+            rows.push(v);
+        }
+    }
+    (rows, map)
+}
+
+/// Block colour for talkgroup `tg` on the Radio IDs tab: a fixed pick from
+/// a dark palette, so one talkgroup keeps its colour across radios.
+pub fn tg_colour(tg: u32) -> egui::Color32 {
+    const P: [(u8, u8, u8); 8] = [(46, 120, 70), (40, 90, 140), (130, 80, 30), (110, 50, 120), (30, 110, 110), (120, 110, 30), (140, 60, 60), (70, 70, 140)];
+    let (r, g, b) = P[(tg.wrapping_mul(2_654_435_761) >> 29) as usize % P.len()];
+    egui::Color32::from_rgb(r, g, b)
+}
+
 /// A call recorded while another is on the speaker.
 pub struct GrantRec {
     tg: u32,
@@ -294,6 +378,8 @@ pub struct RecUi {
     pub call_units: HashMap<u64, CallUnits>,
     /// Per HackRF radio: the unit list last sent to the open segment.
     units_sent: HashMap<u64, Vec<meta::UnitSeen>>,
+    /// Last radio sightings sent per recorder key.
+    talk_sent: HashMap<u64, Vec<(u32, String)>>,
     /// (unit, rows_gen, recordings) for the Radio IDs tab.
     unit_count: Option<(u32, u64, usize)>,
     pub face: config::RecFace,
@@ -358,6 +444,13 @@ pub struct RecUi {
     /// The last (tg, grant sequence) filed per (radio, hz): a grant that is
     /// still listed after its call ended is not opened again.
     grant_done: HashMap<(u64, u64), (u32, u64)>,
+    /// Radio IDs tab: each shown block's (recording, start ms, end ms) in
+    /// the talkgroup recording it was cut from.
+    radio_map: HashMap<i64, (i64, u64, u64)>,
+    /// Where the playing file started (ms into the file) and where it stops
+    /// (a radio's transmission on the Radio IDs tab).
+    play_base: u64,
+    play_until: Option<u64>,
     /// Demodulator picked in the Record / Playback dialog, per recording.
     /// Session only; absent means the recording's own default.
     demod: HashMap<i64, String>,
@@ -592,6 +685,19 @@ impl App {
                         self.rec.units_sent.remove(&id);
                     }
                 }
+            }
+            // Who talked when on the open call, for the Radio IDs tab.
+            if self.rec.seg.get(&id).is_some_and(|s| s.recording().is_some()) {
+                if let Some((tg, start)) = self.rec.call_units.get(&id).and_then(|c| c.call()) {
+                    let since = utc_minus(&start, UNIT_LOOKBACK_MS);
+                    let s = self.rec.call_units.get(&id).map(|c| c.sightings(tg, &since)).unwrap_or_default();
+                    if !s.is_empty() && self.rec.talk_sent.get(&id) != Some(&s) {
+                        self.rec.talk_sent.insert(id, s.clone());
+                        recorder.send(Cmd::Talkers { key: id, sightings: s });
+                    }
+                }
+            } else {
+                self.rec.talk_sent.remove(&id);
             }
             // Talkers who join mid-call go to the open segment as they appear.
             if self.rec.seg.get(&id).is_some_and(|s| s.recording().is_some()) {
@@ -941,14 +1047,33 @@ impl App {
             if ended {
                 let g = self.rec.grant_open.remove(&(radio, hz)).expect("open grant");
                 self.rec.grant_done.insert((radio, hz), (g.tg, g.seq));
+                self.rec.talk_sent.remove(&crate::rec_live::grant_key(radio, hz));
                 recorder.send(Cmd::Close { key: crate::rec_live::grant_key(radio, hz), keep: true });
+            }
+        }
+        // Radios heard on each recorded-only call, and who talked when.
+        let open: Vec<(u64, u32, Instant)> = self.rec.grant_open.iter().filter(|((r, _), _)| *r == radio).map(|((_, hz), g)| (*hz, g.tg, g.opened)).collect();
+        for (hz, tg, opened) in open {
+            let key = crate::rec_live::grant_key(radio, hz);
+            let ago = now.saturating_duration_since(opened).as_millis() as i64 + UNIT_LOOKBACK_MS;
+            let since = utc_minus(&utc_now(), ago);
+            let Some(cu) = self.rec.call_units.get(&radio) else { continue };
+            let s = cu.sightings(tg, &since);
+            let units = cu.units_on(tg, &since);
+            if !s.is_empty() && self.rec.talk_sent.get(&key) != Some(&s) {
+                self.rec.talk_sent.insert(key, s.clone());
+                recorder.send(Cmd::Units { key, units });
+                recorder.send(Cmd::Talkers { key, sightings: s });
             }
         }
         for (hz, tg, seq) in want {
             if self.rec.grant_open.contains_key(&(radio, hz)) || self.rec.grant_done.get(&(radio, hz)) == Some(&(tg, seq)) {
                 continue;
             }
-            let m = self.hackrf_tg_meta(row, hz as f64, tg);
+            let mut m = self.hackrf_tg_meta(row, hz as f64, tg);
+            if let Some(cu) = self.rec.call_units.get(&radio) {
+                m.set_units(cu.units_on(tg, &utc_minus(&utc_now(), UNIT_LOOKBACK_MS)));
+            }
             recorder.send(Cmd::Open { key: crate::rec_live::grant_key(radio, hz), meta: m });
             self.rec.grant_open.insert((radio, hz), GrantRec { tg, seq, opened: now, live: now });
         }
@@ -1059,7 +1184,14 @@ impl App {
         }
         let all = db.all().unwrap_or_default();
         self.rec.usage = Some(hsrec::storage::Usage::from_rows(&all, self.rec.face.cap_gb));
-        self.rec.rows = all.into_iter().filter(|r| r.meta.source == source).collect();
+        if source == meta::SOURCE_RADIO_IDS {
+            let names: HashMap<u32, String> = self.units.iter().map(|u| (u.id, u.description.clone())).collect();
+            let (rows, map) = radio_rows(&all, &names);
+            self.rec.rows = rows;
+            self.rec.radio_map = map;
+        } else {
+            self.rec.rows = all.into_iter().filter(|r| r.meta.source == source).collect();
+        }
         self.rec.rows_gen = gen;
         self.rec.rows_source = source;
         self.rec.rows_at = Some(Instant::now());
@@ -1471,6 +1603,12 @@ impl App {
                 let _ = std::fs::remove_dir_all(trash);
             }
         }
+        // A radio's transmission stops where the next radio starts.
+        if let (Some((_, p)), Some(until)) = (&self.rec.player, self.rec.play_until) {
+            if p.pos_ms.load(Ordering::Relaxed) >= until {
+                p.stop();
+            }
+        }
         if let Some((id, p)) = &self.rec.player {
             if p.finished() {
                 let id = *id;
@@ -1554,6 +1692,12 @@ impl App {
     fn rec_play(&mut self, id: i64, from_ms: u64) {
         self.rec.player = None;
         let Some(rec) = self.rec.rows.iter().find(|r| r.id == id).cloned() else { return };
+        // A radio's transmission plays its span of the talkgroup recording.
+        let (base, until) = match self.rec.radio_map.get(&id) {
+            Some((_, b, u)) => (*b, (*u != u64::MAX).then_some(*u)),
+            None => (0, None),
+        };
+        let from_ms = base + from_ms;
         let path = if rec.offline() {
             match hsrec::export::locate(&rec, &self.rec.drives) {
                 Some(p) => p,
@@ -1592,6 +1736,8 @@ impl App {
         match hsrec::replay::Player::start(&path, &play_meta, from_ms, decoder, argv) {
             Ok(p) => {
                 self.rec.player = Some((id, p));
+                self.rec.play_base = base;
+                self.rec.play_until = until;
                 // Every playback shows its controls.
                 if self.rec.selected != Some(id) {
                     self.rec.notes_edit = rec.notes.clone();
@@ -1845,7 +1991,8 @@ impl App {
         let selected_id = self.rec.selected;
         let waveforms = &self.rec.waveforms;
         let no_voice = &self.rec.no_voice;
-        let player = self.rec.player.as_ref().map(|(id, pl)| (*id, pl.pos_ms.load(Ordering::Relaxed) as i64));
+        let base = self.rec.play_base as i64;
+        let player = self.rec.player.as_ref().map(|(id, pl)| (*id, pl.pos_ms.load(Ordering::Relaxed) as i64 - base));
         let shown = lane_scroll(("rec-timeline", source.clone()), viewport_h)
             .vertical_scroll_offset(lane_off)
             .show(ui, |ui| {
@@ -1914,6 +2061,8 @@ impl App {
                         egui::Color32::from_gray(70)
                     } else if b.live {
                         LIVE_BLOCK
+                    } else if b.id < 0 {
+                        tg_colour(r.meta.talkgroup.unwrap_or(0))
                     } else if r.meta.source_kind == meta::KIND_DEMOD_AUDIO {
                         egui::Color32::from_rgb(40, 90, 120)
                     } else {
@@ -1927,7 +2076,7 @@ impl App {
                             let a = br.height() * 0.45 * (*v as f32 / 255.0);
                             gp.line_segment([egui::pos2(x, br.center().y - a), egui::pos2(x, br.center().y + a)], egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(220, 240, 220, 120)));
                         }
-                    } else if br.width() > 20.0 {
+                    } else if br.width() > 20.0 && b.id > 0 {
                         want_wf.push(b.id);
                     }
                     let mut tag = String::new();
@@ -1940,7 +2089,10 @@ impl App {
                     if r.missing { tag = format!("{tag}MISSING"); }
                     if !hsrec::dsp::in_capture(r.meta.offset_hz) && r.meta.source_kind != meta::KIND_DEMOD_AUDIO { tag = format!("{tag} OUT OF BAND"); }
                     if no_voice.contains(&b.id) { tag = format!("{tag} no voice"); }
-                    if !tag.is_empty() && br.width() > 30.0 {
+                    if b.id < 0 && br.width() > 40.0 {
+                        tag = format!("{} {tag}", r.meta.talkgroup_name.split(" — ").next().unwrap_or(""));
+                    }
+                    if !tag.trim().is_empty() && br.width() > 30.0 {
                         gp.text(br.left_center() + egui::vec2(3.0, 0.0), egui::Align2::LEFT_CENTER, tag.trim(), egui::FontId::monospace(10.0), egui::Color32::WHITE);
                     }
                     if r.meta.emergency {
@@ -1962,7 +2114,11 @@ impl App {
                     if hover.is_some_and(|p| br.expand(2.0).contains(p)) {
                         let start = chrono::DateTime::from_timestamp_millis(t0).unwrap_or_default().with_timezone(&chrono::Local);
                         let unit = match units_text(&r.meta) { t if t.is_empty() => t, t => format!("\nRadio ID {t}") };
-                        let tip = format!("{}\n{} ({:.1} s){unit}", r.meta.lane(), start.format("%Y-%m-%d %H:%M:%S"), r.meta.duration_ms as f64 / 1000.0);
+                        let mut tip = format!("{}\n{} ({:.1} s){unit}", r.meta.lane(), start.format("%Y-%m-%d %H:%M:%S"), r.meta.duration_ms as f64 / 1000.0);
+                        if b.id < 0 {
+                            let tg = r.meta.talkgroup.map(|t| t.to_string()).unwrap_or_default();
+                            tip = format!("{}\nTalkgroup: {} ({tg})\n{} ({:.1} s)", r.meta.lane(), r.meta.talkgroup_name, start.format("%Y-%m-%d %H:%M:%S"), r.meta.duration_ms as f64 / 1000.0);
+                        }
                         block_tip = Some(tip);
                     }
                     if let Some((pid, pos)) = player {
@@ -2305,12 +2461,21 @@ impl App {
                 } else if ui.button("▶ Play").on_hover_text("Re-demodulates the raw IQ now, through the current decoder.").clicked() {
                     self.rec_play(id, 0);
                 }
-                ui.checkbox(&mut star, "★ Star");
-                ui.checkbox(&mut protect, "🔒 Protect").on_hover_text("Never removed by overwrite-oldest.");
+                // A Radio IDs block is a span of a talkgroup recording: flags,
+                // notes, export and delete stay with that recording's own tab.
+                if id > 0 {
+                    ui.checkbox(&mut star, "★ Star");
+                    ui.checkbox(&mut protect, "🔒 Protect").on_hover_text("Never removed by overwrite-oldest.");
+                } else {
+                    ui.label(format!("{} — this radio's part of the call. Star, notes, export and delete are on the talkgroup's tab.", rec.meta.talkgroup_name));
+                }
             });
             self.rec_demod_row(ui, &rec);
             self.rec_output_row(ui);
         });
+        if id < 0 {
+            return;
+        }
         crate::group_box::group_box(ui, "Notes", PLUM, |ui| {
             ui.horizontal(|ui| {
                 ui.label("Notes");

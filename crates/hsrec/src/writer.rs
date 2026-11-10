@@ -37,6 +37,9 @@ pub enum Cmd {
     /// Radio units heard so far on the open call `key`. Merged into its
     /// metadata; saved when the segment finishes.
     Units { key: u64, units: Vec<crate::meta::UnitSeen> },
+    /// Every radio sighting `(unit, utc)` on the open call `key` so far.
+    /// Turned into `talkers` when the segment finishes.
+    Talkers { key: u64, sightings: Vec<(u32, String)> },
     Shutdown,
 }
 
@@ -140,6 +143,8 @@ pub(crate) struct Worker {
     overwrite: bool,
     pre: HashMap<u64, (u64, VecDeque<i16>)>,
     segs: HashMap<u64, Seg>,
+    /// Radio sightings per key for the call being recorded.
+    talk: HashMap<u64, Vec<(u32, String)>>,
 }
 
 fn values_per_sec(meta: &Meta) -> u64 {
@@ -157,6 +162,7 @@ impl Worker {
             overwrite: false,
             pre: HashMap::new(),
             segs: HashMap::new(),
+            talk: HashMap::new(),
         }
     }
 
@@ -227,6 +233,7 @@ impl Worker {
                     }
                     self.finish(key);
                 }
+                self.talk.remove(&key);
                 self.open(key, meta, 0);
             }
             Cmd::Close { key, keep } => {
@@ -247,6 +254,9 @@ impl Worker {
                     seg.meta.set_units(all);
                 }
             }
+            Cmd::Talkers { key, sightings } => {
+                self.talk.insert(key, sightings);
+            }
             Cmd::Shutdown => self.finish_all(),
         }
         self.update_writing();
@@ -264,6 +274,7 @@ impl Worker {
         let Some(db) = self.db.as_ref() else { return };
         let now = chrono::Utc::now();
         meta.part = part;
+        meta.meta_version = crate::meta::META_VERSION;
         if part == 0 {
             // Start time includes the pre-roll.
             let pre_values = self.pre.get(&key).map(|(_, q)| q.len() as u64).unwrap_or(0);
@@ -444,6 +455,9 @@ impl Worker {
         seg.meta.bytes = seg.values as i64 * 2;
         seg.meta.end_utc = (seg.started + chrono::Duration::milliseconds(ms as i64))
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        if let Some(sightings) = self.talk.get(&key) {
+            seg.meta.talkers = crate::meta::talkers_from(sightings, seg.started, ms as i64, seg.meta.part > 0);
+        }
         let _ = std::fs::write(storage::sidecar_for(&seg.raw), serde_json::to_vec_pretty(&seg.meta).unwrap_or_default());
         if let Some(db) = db {
             let _ = db.finish(seg.id, &seg.meta);
@@ -543,6 +557,27 @@ mod tests {
         w.command(Cmd::Open { key: 1, meta: m() });
         assert!(!w.status.writing.load(Ordering::Relaxed));
         assert_eq!(std::fs::read(dir.join("S.HSREC.sqlite")).unwrap(), vec![0x5au8; 8192]);
+    }
+
+    #[test]
+    fn radio_sightings_are_filed_as_transmissions() {
+        let dir = tempdir("writer-talkers");
+        let mut w = worker(&dir);
+        w.command(Cmd::Open { key: 3, meta: m() });
+        let start = chrono::DateTime::parse_from_rfc3339(&w.segs[&3].meta.start_utc).unwrap().with_timezone(&chrono::Utc);
+        let at = |ms: i64| (start + chrono::Duration::milliseconds(ms)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        // 2 s of IQ; radio 51 keys first (grant just before), 52 answers at 1.2 s.
+        w.chunk(Chunk { key: 3, hz: 851, data: vec![2; 128_000] });
+        w.command(Cmd::Talkers { key: 3, sightings: vec![(51, at(-400)), (52, at(1_200))] });
+        w.command(Cmd::Close { key: 3, keep: true });
+        w.command(Cmd::Shutdown);
+        let all = w.db.as_ref().unwrap().all().unwrap();
+        let meta = &all[0].meta;
+        assert_eq!(meta.meta_version, crate::meta::META_VERSION);
+        assert_eq!(meta.talkers.iter().map(|t| t.id).collect::<Vec<_>>(), vec![51, 52]);
+        assert_eq!(meta.talkers[0].start_ms, 0);
+        assert_eq!(meta.talkers[1].start_ms, 1_200);
+        assert_eq!(meta.talkers[1].end_ms, meta.duration_ms);
     }
 
     #[test]
