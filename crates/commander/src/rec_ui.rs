@@ -16,7 +16,7 @@ pub mod rec_params {
     pub const P25_X: &str = "HAMSPOT_P25_X";
 }
 use hsrec::meta::{self, Meta};
-use hsrec::segment::{self, Action, CallKey, Press, RecMode, Segmenter, VoiceGate};
+use hsrec::segment::{self, Action, CallKey, Press, RecMode, Segmenter};
 use hsrec::timeline::{self, View};
 use hsrec::writer::Cmd;
 use std::collections::{HashMap, HashSet};
@@ -280,8 +280,6 @@ pub struct RecUi {
     dir: PathBuf,
     db_path: PathBuf,
     seg: HashMap<u64, Segmenter>,
-    /// Per radio: talkgroup calls only record while the voice decoder speaks.
-    gate: HashMap<u64, VoiceGate>,
     /// Audio outputs listed for the replay output menu.
     sinks: Vec<hsrec::replay::Sink>,
     sinks_listed: bool,
@@ -481,7 +479,6 @@ impl App {
         let hackrf: Vec<u64> = rows.iter().filter(|r| r.spec.driver == cat::RadioDriver::Hackrf).map(|r| r.id).collect();
         let gone: Vec<u64> = self.rec.seg.keys().copied().filter(|id| !hackrf.contains(id) || !armed).collect();
         for id in gone {
-            self.rec.gate.remove(&id);
             if let Some(mut s) = self.rec.seg.remove(&id) {
                 for a in s.stop() {
                     if let Action::Close { keep } = a {
@@ -497,15 +494,8 @@ impl App {
         for id in hackrf {
             let Some(row) = rows_meta(&rows, id) else { continue };
             let (want, meta) = self.rec_want(row);
-            // The follower can keep a talkgroup call picked with nothing on
-            // the voice channel. Record only while voice frames decode.
-            let want = if want.as_ref().is_some_and(|k| k.talkgroup.is_some()) {
-                let last = self.voice_frames.get(&id).copied();
-                self.rec.gate.entry(id).or_default().pass(want, last, hang, now)
-            } else {
-                self.rec.gate.remove(&id);
-                want
-            };
+            // The file stays open for the whole time the follower holds this
+            // call. Voice-frame lines are not what starts or ends it.
             let enc = self.rec.enc.remove(&id);
             let max = Duration::from_secs(u64::from(
                 self.rec.face.max_segment_s.clamp(segment::MAX_SEGMENT_MIN_S, segment::MAX_SEGMENT_MAX_S),
@@ -1577,6 +1567,11 @@ impl App {
             view.zoom_at(wheel_zoom_factor(zoom_scroll), anchor, width, now);
         }
         view.clamp(now);
+        // The live edge is the wall clock. The next frame is what moves it.
+        // Waiting on decoder lines or a slow poll makes the grid jump.
+        if view.live {
+            ui.ctx().request_repaint();
+        }
         // Store only once there is something to frame, so the first rows fit.
         if !recs.is_empty() || self.rec.views.contains_key(&source) {
             self.rec.views.insert(source, view);

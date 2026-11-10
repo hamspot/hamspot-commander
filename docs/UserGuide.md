@@ -468,7 +468,7 @@ The TG tabs and Channels have a **REC** key above LOAD and SAVE.
 | Double-click or Shift+click | amber | All traffic |
 | Click again when lit | dark | Off |
 
-The REC state is saved and comes back on the next start. A talkgroup recording starts with the call, continues through re-keys in the voice hang, and has about 250 ms of padding at each end. A talkgroup recording only runs while the voice decoder is decoding voice: about 1 second after the last voice frame (plus the voice hang) the recording closes, even if the control channel still lists the call, and a call that shows no voice within 3 seconds isn't kept open. A known control channel is never recorded as a talkgroup. A channel recording runs while the scanner holds a voice channel. A call still going at the **Max segment** length (Data dialog, default 120 s) is split into a new recording straight away, so nothing is lost; the timeline shows two blocks.
+The REC state is saved and comes back on the next start. A talkgroup recording starts with the call, continues through re-keys in the voice hang, and has about 250 ms of padding at each end. It keeps the raw IQ for the whole time the radio is held on that call, including a call whose voice frames are still arriving. A known control channel is never recorded as a talkgroup. A channel recording runs while the scanner holds a voice channel. A call still going at the **Max segment** length (Data dialog, default 120 s) is split into a new recording straight away, so nothing is lost; the timeline shows two blocks.
 
 <!-- screenshot: rec-02 — Arming a channel for recording. -->
 
