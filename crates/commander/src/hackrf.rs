@@ -56,22 +56,6 @@ impl Dc {
     }
 }
 
-/// Control carrier nearest the capture centre. That is the channel on the
-/// sub VFO, and the audio sent to the speaker when no voice call is up.
-fn primary_control(center: f64, controls: &[f64]) -> Option<usize> {
-    controls
-        .iter()
-        .enumerate()
-        .filter(|(_, hz)| hz.is_finite())
-        .min_by(|(_, left), (_, right)| {
-            (*left - center)
-                .abs()
-                .partial_cmp(&(*right - center).abs())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .map(|(index, _)| index)
-}
-
 /// Largest run of frequencies that fits in the filter, and the midpoint.
 /// An empty list has no capture. Equal frequencies count once.
 pub fn place(freqs: &[f64]) -> Option<(f64, Vec<f64>)> {
@@ -1171,6 +1155,10 @@ pub struct Bank {
     control_steps: Vec<Vec<f32>>,
     carrier: CarrierWatch,
     voice_empty: bool,
+    /// Shared frequency error of this capture. See [`hsrec::dsp::Afc`].
+    afc: hsrec::dsp::Afc,
+    voice_probe: hsrec::dsp::AfcProbe,
+    control_probes: Vec<hsrec::dsp::AfcProbe>,
 }
 
 impl Bank {
@@ -1188,7 +1176,32 @@ impl Bank {
             control_steps: vec![Vec::new(); controls.len()],
             carrier: CarrierWatch::new(),
             voice_empty: false,
+            afc: hsrec::dsp::Afc::default(),
+            voice_probe: hsrec::dsp::AfcProbe::default(),
+            control_probes: vec![hsrec::dsp::AfcProbe::default(); controls.len()],
         }
+    }
+
+    /// Frequency error removed from every discriminator, in Hz. Zero until
+    /// a carrier has been seen.
+    pub fn afc_hz(&self) -> f32 {
+        self.afc.error_hz()
+    }
+
+    /// The control carrier that is actually on the air: the strongest one
+    /// whose last 100 ms block was a carrier. Alternates that are silent
+    /// are never picked, so the speaker never gets a dead channel's noise.
+    pub fn live_control(&self) -> Option<usize> {
+        self.control_probes
+            .iter()
+            .enumerate()
+            .filter(|(_, probe)| probe.strength > 0.0)
+            .max_by(|(_, a), (_, b)| {
+                a.strength
+                    .partial_cmp(&b.strength)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(index, _)| index)
     }
 
     /// The voice frequency has had no carrier for 500 ms.
@@ -1256,6 +1269,7 @@ impl Bank {
         self.voice.set_offset(offset);
         if changed {
             self.carrier.reset();
+            self.voice_probe.reset();
             self.voice_empty = false;
         }
     }
@@ -1272,17 +1286,31 @@ impl Bank {
             let i = iq[k * 2] as i8 as f32;
             let q = iq[k * 2 + 1] as i8 as f32;
             let (i, q) = self.dc.apply(i, q);
-            if let Some(hz) = self.voice.push(i, q) {
-                self.voice_steps.push(hz);
-            }
-            if let Some(mag) = self.voice.take_mag() {
+            let voice_hz = self.voice.push(i, q);
+            let voice_mag = self.voice.take_mag();
+            if let Some(mag) = voice_mag {
                 if self.voice_hz.is_some() {
                     self.voice_empty = self.carrier.push(mag);
                 }
             }
+            if let Some(hz) = voice_hz {
+                self.voice_steps.push(hz);
+                if let (true, Some(mag)) = (self.voice_hz.is_some(), voice_mag) {
+                    if let Some(block) = self.voice_probe.push(hz, mag) {
+                        self.afc.update(block);
+                    }
+                }
+            }
             for (index, ddc) in self.controls.iter_mut().enumerate() {
-                if let Some(hz) = ddc.push(i, q) {
+                let hz = ddc.push(i, q);
+                let mag = ddc.take_mag();
+                if let Some(hz) = hz {
                     self.control_steps[index].push(hz);
+                    if let Some(mag) = mag {
+                        if let Some(block) = self.control_probes[index].push(hz, mag) {
+                            self.afc.update(block);
+                        }
+                    }
                 }
             }
         }
@@ -1295,13 +1323,13 @@ impl Bank {
             if silent {
                 voice.extend_from_slice(&[0, 0, 0]);
             } else {
-                emit(*hz, voice);
+                emit(self.afc.correct(*hz), voice);
             }
         }
         for (index, steps) in self.control_steps.iter().enumerate() {
             if let Some(out) = controls.get_mut(index) {
                 for hz in steps {
-                    emit(*hz, out);
+                    emit(self.afc.correct(*hz), out);
                 }
             }
         }
@@ -1313,17 +1341,21 @@ struct Decoder {
     lines: Arc<Mutex<Vec<String>>>,
 }
 
-/// How many discriminator chunks may wait while dsd-fme is still starting.
-const DECODER_QUEUE: usize = 256;
+/// How many discriminator chunks may wait for a decoder. One chunk is one
+/// USB read, about 1 ms of 48 kHz audio, so this is about 8 s: room for
+/// dsd-fme to start without the capture ever waiting on it.
+const DECODER_QUEUE: usize = 8_192;
 
-/// Discriminator PCM for one decoder. A feeder thread writes the pipe.
-/// `keep` is the control channel: the capture waits, and a sample is never
-/// skipped. A skipped chunk is a hole in the symbol clock, so the control
-/// channel cannot sync. Voice may drop a whole chunk. A stuck speaker must
-/// not freeze the dongle.
+/// Discriminator PCM for one decoder. A feeder thread writes the pipe with
+/// blocking whole-sample writes, so a short write never slips the symbol
+/// clock. The USB thread never waits on a decoder: `hackrf_transfer` stops
+/// its stream when its stdout blocks. If the queue is full a whole chunk is
+/// dropped and counted, and the count is reported.
 struct PcmFeed {
     tx: SyncSender<Vec<i16>>,
-    keep: bool,
+    /// Samples dropped because the decoder fell behind.
+    dropped: Arc<AtomicU64>,
+    name: &'static str,
 }
 
 pub struct Session {
@@ -1403,7 +1435,7 @@ impl Session {
             self.speech.is_some(),
             self.key_csv.as_deref(),
         )?;
-        let feed = pcm_feed(&script, &dec, write, false);
+        let feed = pcm_feed(&script, &dec, write, "voice");
         if let Some(audio) = audio {
             if let Some(speech) = &self.speech {
                 speech.push(audio);
@@ -1451,7 +1483,7 @@ impl Session {
             self.speech.is_some(),
             next.as_deref(),
         )?;
-        let feed = pcm_feed(&script, &dec, write, false);
+        let feed = pcm_feed(&script, &dec, write, "voice");
         if let Some(audio) = audio {
             if let Some(speech) = &self.speech {
                 speech.push(audio);
@@ -1695,7 +1727,7 @@ pub fn start(
         for _ in controls {
             match spawn_decoder(script, None, false, key_csv.as_deref()) {
                 Ok((dec, write, _)) => {
-                    control_writes.push(pcm_feed(script, &dec, write, true));
+                    control_writes.push(pcm_feed(script, &dec, write, "control"));
                     decoders.push(dec);
                 }
                 Err(err) => {
@@ -1706,7 +1738,7 @@ pub fn start(
         }
         match spawn_decoder(script, site, speaker.is_some(), key_csv.as_deref()) {
             Ok((dec, write, audio)) => {
-                voice_write = Some(pcm_feed(script, &dec, write, false));
+                voice_write = Some(pcm_feed(script, &dec, write, "voice"));
                 voice_dec = Some(dec);
                 if let Some(audio) = audio {
                     if let Some(name) = speaker {
@@ -1835,7 +1867,21 @@ fn run_bank(
     let mut buf = [0u8; 16_384];
     let mut voice_out = Vec::new();
     let mut control_out: Vec<Vec<i16>> = vec![Vec::new(); control_hz.len()];
+    let mut last_report = std::time::Instant::now();
+    let mut afc_shown = 0.0f32;
     while !stop.load(Ordering::Relaxed) {
+        if last_report.elapsed() >= std::time::Duration::from_secs(5) {
+            last_report = std::time::Instant::now();
+            for feed in controls.iter().chain(voice.iter()) {
+                report_drops(feed);
+            }
+            // The crystal drifts as the dongle warms. Log each 250 Hz step.
+            let afc = bank.afc_hz();
+            if (afc - afc_shown).abs() >= 250.0 {
+                eprintln!("commander: hackrf frequency error {afc:+.0} Hz corrected");
+                afc_shown = afc;
+            }
+        }
         let n = match iq.read(&mut buf) {
             Ok(0) | Err(_) => break,
             Ok(n) => n,
@@ -1870,7 +1916,7 @@ fn run_bank(
         // replaces it. Silence is not a carrier and is not sent.
         let speaker: &[i16] = if hz != 0 {
             &voice_out
-        } else if let Some(index) = primary_control(center, control_hz) {
+        } else if let Some(index) = bank.live_control() {
             control_out.get(index).map(Vec::as_slice).unwrap_or(&[])
         } else {
             &[]
@@ -1949,7 +1995,12 @@ fn write_pcm(out: &mut impl Write, samples: &[i16]) -> std::io::Result<usize> {
     Ok(off)
 }
 
-fn pcm_feed(script: &str, dec: &Decoder, mut write: std::io::PipeWriter, keep: bool) -> PcmFeed {
+fn pcm_feed(
+    script: &str,
+    dec: &Decoder,
+    mut write: std::io::PipeWriter,
+    name: &'static str,
+) -> PcmFeed {
     let (tx, rx) = sync_channel::<Vec<i16>>(DECODER_QUEUE);
     let lines = Arc::clone(&dec.lines);
     let every = crate::rx_pipe::search_interval(script).unwrap_or(0);
@@ -1967,33 +2018,50 @@ fn pcm_feed(script: &str, dec: &Decoder, mut write: std::io::PipeWriter, keep: b
             }
         }
     });
-    PcmFeed { tx, keep }
+    PcmFeed {
+        tx,
+        dropped: Arc::new(AtomicU64::new(0)),
+        name,
+    }
 }
 
 fn write_feed(feed: &mut PcmFeed, samples: &[i16]) -> std::io::Result<()> {
-    enqueue_pcm(&feed.tx, samples, feed.keep)
+    enqueue_pcm(&feed.tx, samples, &feed.dropped)
 }
 
-/// Queue one chunk. Control (`keep`) waits until the feeder can take it.
-/// Voice drops the whole chunk when the feeder is behind. A partial sample
-/// is never written: that shifts every later symbol and P25 will not sync.
-fn enqueue_pcm(tx: &SyncSender<Vec<i16>>, samples: &[i16], keep: bool) -> std::io::Result<()> {
+/// Queue one chunk without waiting. A full queue drops the whole chunk and
+/// adds its length to `dropped`. A partial sample is never queued: that
+/// shifts every later symbol and P25 will not sync.
+fn enqueue_pcm(
+    tx: &SyncSender<Vec<i16>>,
+    samples: &[i16],
+    dropped: &AtomicU64,
+) -> std::io::Result<()> {
     if samples.is_empty() {
         return Ok(());
     }
-    let chunk = samples.to_vec();
-    if keep {
-        return tx.send(chunk).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pcm closed")
-        });
-    }
-    match tx.try_send(chunk) {
+    match tx.try_send(samples.to_vec()) {
         Ok(()) => Ok(()),
-        Err(TrySendError::Full(_)) => Ok(()),
+        Err(TrySendError::Full(chunk)) => {
+            dropped.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+            Ok(())
+        }
         Err(TrySendError::Disconnected(_)) => Err(std::io::Error::new(
             std::io::ErrorKind::BrokenPipe,
             "pcm closed",
         )),
+    }
+}
+
+/// Print any samples a decoder lost since the last report. Never silent.
+fn report_drops(feed: &PcmFeed) {
+    let lost = feed.dropped.swap(0, Ordering::Relaxed);
+    if lost > 0 {
+        eprintln!(
+            "commander: hackrf {} decoder fell behind; dropped {} ms of audio",
+            feed.name,
+            lost * 1000 / 48_000
+        );
     }
 }
 
@@ -2269,31 +2337,93 @@ fn collect(stderr: impl Read, sink: Arc<Mutex<Vec<String>>>) {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn the_idle_speaker_uses_the_control_nearest_the_centre() {
-        let center = 857_200_000.0;
-        let controls = [854_437_500.0, 857_962_500.0, 859_962_500.0];
-        assert_eq!(super::primary_control(center, &controls), Some(1));
-        assert_eq!(super::primary_control(center, &[]), None);
-    }
-
-    #[test]
-    fn a_full_control_queue_keeps_the_chunk() {
+    fn a_full_decoder_queue_drops_a_whole_chunk_and_counts_it() {
+        let dropped = std::sync::atomic::AtomicU64::new(0);
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        super::enqueue_pcm(&tx, &[1, -2], true).unwrap();
-        let tx2 = tx.clone();
-        let waiting = std::thread::spawn(move || super::enqueue_pcm(&tx2, &[3, 4], true));
-        assert_eq!(rx.recv().unwrap(), vec![1, -2]);
-        waiting.join().unwrap().unwrap();
-        assert_eq!(rx.recv().unwrap(), vec![3, 4]);
-    }
-
-    #[test]
-    fn a_full_voice_queue_drops_a_whole_chunk() {
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        super::enqueue_pcm(&tx, &[1, -2], false).unwrap();
-        super::enqueue_pcm(&tx, &[3, 4], false).unwrap();
+        super::enqueue_pcm(&tx, &[1, -2], &dropped).unwrap();
+        // The USB thread never waits: the second chunk is dropped whole.
+        super::enqueue_pcm(&tx, &[3, 4, 5], &dropped).unwrap();
         assert_eq!(rx.recv().unwrap(), vec![1, -2]);
         assert!(rx.try_recv().is_err());
+        assert_eq!(dropped.load(std::sync::atomic::Ordering::Relaxed), 3);
+        drop(rx);
+        assert!(super::enqueue_pcm(&tx, &[6], &dropped).is_err());
+    }
+
+    /// Run one synthetic capture through the bank. Control 0 carries P25-like
+    /// C4FM `err_hz` high (a warm crystal); control 1 is an idle alternate.
+    fn bank_c4fm(err_hz: f64, secs: f64) -> (super::Bank, Vec<i16>, Vec<i16>) {
+        let center = 857_200_000.0;
+        let live = 859_962_500.0;
+        let idle = 857_962_500.0;
+        let cs8 = hsrec::dsp::synth_c4fm_cs8(live - center, err_hz, secs, 60.0);
+        let mut bank = super::Bank::new(center, &[live, idle]);
+        let mut voice = Vec::new();
+        let mut outs = vec![Vec::new(), Vec::new()];
+        let mut all = vec![Vec::new(), Vec::new()];
+        for chunk in cs8.chunks(16_384) {
+            voice.clear();
+            outs[0].clear();
+            outs[1].clear();
+            bank.push(chunk, &mut voice, &mut outs);
+            all[0].extend_from_slice(&outs[0]);
+            all[1].extend_from_slice(&outs[1]);
+        }
+        let idle_out = all.pop().unwrap();
+        let live_out = all.pop().unwrap();
+        (bank, live_out, idle_out)
+    }
+
+    #[test]
+    fn the_channelizer_removes_the_crystal_offset_and_picks_the_live_control() {
+        let (bank, live, _) = bank_c4fm(1_750.0, 0.6);
+        assert!((bank.afc_hz() - 1_750.0).abs() < 120.0, "afc {}", bank.afc_hz());
+        // After the first blocks the control discriminator is centred.
+        let tail = &live[live.len() / 2..];
+        let mean = tail.iter().map(|s| *s as f64).sum::<f64>() / tail.len() as f64;
+        let mean_hz = mean * 4_000.0 / 12_000.0;
+        assert!(mean_hz.abs() < 120.0, "control still {mean_hz:.0} Hz off");
+        // The speaker gets the carrier, not the alternate nearest the centre.
+        assert_eq!(bank.live_control(), Some(0));
+    }
+
+    /// Channelizer -> shipped P25 pipe -> dsd-fme. dsd-fme loses P25 sync
+    /// between 1.2 and 1.5 kHz of offset; a warm HackRF is 1.3-2 kHz off.
+    /// Skipped (with a note) when dsd-fme is not installed.
+    #[test]
+    fn a_warm_hackrf_control_channel_still_syncs_in_the_p25_pipe() {
+        if std::process::Command::new("sh")
+            .args(["-c", "command -v dsd-fme"])
+            .output()
+            .map(|out| !out.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("skipped: dsd-fme is not on PATH");
+            return;
+        }
+        let (_, live, _) = bank_c4fm(1_750.0, 2.0);
+        let argv = crate::rx_pipe::command_argv("modems/commander-demod-p25.rxpipe")
+            .expect("p25 pipe file");
+        let mut child = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .env("HAMSPOT_CC_EVENTS", "1")
+            .env("HAMSPOT_RX_MUTE", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("p25 pipe");
+        let mut stdin = child.stdin.take().unwrap();
+        let bytes: Vec<u8> = live.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let writer = std::thread::spawn(move || {
+            use std::io::Write;
+            let _ = stdin.write_all(&bytes);
+        });
+        let out = child.wait_with_output().expect("p25 pipe output");
+        writer.join().unwrap();
+        let text = String::from_utf8_lossy(&out.stderr);
+        let syncs = text.matches("+P25p1").count();
+        assert!(syncs >= 10, "only {syncs} P25 syncs:\n{text}");
     }
 
     #[test]
