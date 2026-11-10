@@ -154,8 +154,7 @@ pub struct DecoderCmd {
     pub argv: Vec<String>,
     /// Passed to the decoder after [`safe_env`]: unsafe keys are dropped.
     pub env: Vec<(String, String)>,
-    /// Kept alive until the replay thread ends (e.g. the decoder's UDP port
-    /// reservation), then dropped, which releases it.
+    /// Kept alive until the replay thread ends, then dropped.
     pub hold: Option<Arc<Hold>>,
 }
 
@@ -593,7 +592,7 @@ impl Player {
             if let Err(err) = result {
                 *e.lock().expect("replay err") = err.to_string();
             }
-            // Release whatever the decoder held (its UDP port) before done.
+            // Drop the decoder, including anything it held, before done.
             drop(decoder);
             d.store(true, Ordering::Relaxed);
         })?;

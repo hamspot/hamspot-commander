@@ -4,7 +4,6 @@
 # Same rates as commander-demod-p25.rxpipe, Phase 1 only (-f1). stdin is
 # 48 kHz mono signed 16-bit little-endian. dsd-fme writes 8 kHz mono voice
 # on stdout. Commander plays that stream.
-# The first argument is accepted and ignored. Commander still passes a port.
 #
 # stderr is appended to the trace log and still passed to Commander.
 # A crash is caught with the same libSegFault preload catchsegv uses, and
@@ -14,15 +13,6 @@
 
 set -euo pipefail
 
-port="${1:-23469}"
-case "$port" in
-    ''|*[!0-9]*)
-        echo "commander-demod-p25-trace: port must be a number" >&2
-        exit 1
-        ;;
-esac
-# Commander still passes a port. Nothing listens on it.
-: "$port"
 if ! command -v "dsd-fme" >/dev/null 2>&1; then
     echo "commander-demod-p25-trace: dsd-fme is not on PATH" >&2
     exit 1
@@ -56,19 +46,7 @@ else
     exec 2> >(tee -a "$log" >&3)
 fi
 
-feed=""
-audio=""
-search=""
 cleanup() {
-    if [[ -n "$feed" ]]; then
-        kill "$feed" 2>/dev/null || true
-    fi
-    if [[ -n "$audio" ]]; then
-        rm -f "$audio"
-    fi
-    if [[ -n "$search" ]]; then
-        rm -f "$search"
-    fi
     if [[ -s "$segv_out" ]]; then
         cat "$segv_out" >&2
         rm -f "$segv_out"
@@ -88,65 +66,12 @@ run_decoder() {
     fi
 }
 
-if [[ "${HAMSPOT_CC_EVENTS:-}" == "1" ]]; then
-    audio="$(mktemp -u /tmp/hamspot-rxpipe-audio.XXXXXX)"
-    mkfifo -m 600 "$audio"
-    search="$(mktemp /tmp/hamspot-rxpipe-search.XXXXXX)"
-    cat >"$search" <<'PERL'
-use strict;
-use warnings;
-use IO::Handle;
-use Errno qw(EINTR);
-binmode STDIN;
-binmode STDOUT;
-STDERR->autoflush(1);
-STDOUT->autoflush(1);
-my $limit = 204000;
-my $n = 0;
-while (1) {
-    my $buf;
-    my $got = sysread(STDIN, $buf, 8192);
-    if (!defined $got) {
-        next if $! == EINTR;
-        exit 1;
-    }
-    last if $got == 0;
-    my $off = 0;
-    while ($off < $got) {
-        my $wrote = syswrite(STDOUT, $buf, $got - $off, $off);
-        if (!defined $wrote) {
-            next if $! == EINTR;
-            exit 1;
-        }
-        exit 1 if $wrote == 0;
-        $off += $wrote;
-    }
-    $n += $got;
-    while ($n >= $limit) {
-        $n -= $limit;
-        print STDERR "hamspot: search\n";
-    }
-}
-exit 0;
-PERL
-    perl "$search" <&0 >"$audio" &
-    feed=$!
-    set +e
-    run_decoder dsd-fme -f1 -i - -o - <"$audio"
-    dsd_status=$?
+set +e
+if [[ "${HAMSPOT_CC_EVENTS:-}" == "1" || "${HAMSPOT_IDENTITY:-}" == "1" ]]; then
+    run_decoder dsd-fme -f1 -i - -o -
 else
-    set +e
-    if [[ "${HAMSPOT_IDENTITY:-}" == "1" ]]; then
-        run_decoder dsd-fme -f1 -i - -o -
-    else
-        run_decoder dsd-fme -f1 -i - -o - 2>/dev/null
-    fi
-    dsd_status=$?
+    run_decoder dsd-fme -f1 -i - -o - 2>/dev/null
 fi
-status=$dsd_status
-who="decoder"
-if [[ -n "$feed" ]] && ! kill -0 "$feed" 2>/dev/null; then
-    who="search"
-fi
-echo "hamspot: pipe exit ${who} dsd=${dsd_status}" >&2
-exit "$status"
+dsd_status=$?
+echo "hamspot: pipe exit decoder dsd=${dsd_status}" >&2
+exit "$dsd_status"

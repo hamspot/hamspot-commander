@@ -47,6 +47,12 @@ pub fn set_rec_hz(id: u64, hz: u64) {
     rec_hz_slot(id).store(hz, Ordering::Relaxed);
 }
 
+/// File key for one carrier of one radio. It does not collide with the radio
+/// id the talkgroup segment uses.
+pub fn carrier_key(radio: u64, hz: u64) -> u64 {
+    radio.wrapping_shl(32) ^ hz.wrapping_mul(0x9E37_79B9)
+}
+
 /// One leftover byte when a read splits a little-endian sample.
 #[derive(Default)]
 pub struct S16Carry {

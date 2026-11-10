@@ -3,7 +3,6 @@
 #
 # stdin is 48 kHz mono signed 16-bit little-endian. stdout is dsd-fme's
 # 8 kHz voice. Commander plays it. This script does not resample.
-# The first argument is accepted and ignored. Commander still passes a port.
 #
 # ProVoice only. The decoder flag is -fp, which selects GFSK. This script does not pass -mg. Voice synthesis uses the MBE already linked into dsd-fme.
 # This script does not tune and does not pass -T. stderr is kept only when
@@ -11,16 +10,6 @@
 # exits too. The supervisor then restarts the pipe.
 
 set -euo pipefail
-
-port="${1:-23469}"
-case "$port" in
-    ''|*[!0-9]*)
-        echo "commander-demod-provoice: port must be a number" >&2
-        exit 1
-        ;;
-esac
-# Commander still passes a port. Nothing listens on it.
-: "$port"
 
 if ! command -v "dsd-fme" >/dev/null 2>&1; then
     echo "commander-demod-provoice: dsd-fme is not on PATH" >&2

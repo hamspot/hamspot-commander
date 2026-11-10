@@ -9,6 +9,85 @@ pub use rustcars::group::{
     detach_pill, group_box, group_box_slot, group_box_with, layout, layout_with_slot,
 };
 
+/// End pill of a dialog elbow. Same shape as the detach pill. A click closes.
+pub fn close_pill(ui: &mut egui::Ui, rect: egui::Rect, id: egui::Id, color: egui::Color32) -> egui::Response {
+    use egui::{CornerRadius, Sense, Stroke, StrokeKind};
+    use rustcars::group::{pill_colors, PILL_BORDER};
+    let resp = ui.interact(rect, id, Sense::click());
+    let r = (rect.height() / 2.0).clamp(0.0, 255.0) as u8;
+    let cr = CornerRadius { nw: 0, sw: 0, ne: r, se: r };
+    let (fill, outline) = pill_colors(color, false);
+    let width = if resp.hovered() { PILL_BORDER + 0.5 } else { PILL_BORDER };
+    let p = ui.painter();
+    p.rect_filled(rect, cr, fill);
+    p.rect_stroke(rect, cr, Stroke::new(width, outline), StrokeKind::Inside);
+    if resp.has_focus() {
+        p.rect_stroke(rect.expand(1.0), cr, Stroke::new(1.0, rustcars::ink_on(fill)), StrokeKind::Outside);
+    }
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Close"));
+    resp.on_hover_text("Close")
+}
+
+/// Elbow that fills the available rect. The end pill closes. Dragging the
+/// bar returns a delta the caller applies to the window position.
+pub fn elbow_dialog<R>(
+    ui: &mut egui::Ui,
+    title: &str,
+    color: egui::Color32,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> (R, bool, egui::Vec2) {
+    use egui::{Align2, FontId, Sense, Shape, UiBuilder, pos2};
+    use rustcars::group::{chrome_shapes, detach_pill_width, layout_with_slot};
+    use rustcars::ink_on;
+    let mut m = Metrics::default();
+    m.cap_w = detach_pill_width(ui, &m);
+    m.cap_min_width = 0.0;
+    let bg = ui.visuals().panel_fill;
+    let slot = ui.painter().add(Shape::Noop);
+    let avail = ui.available_rect_before_wrap();
+    let (left, top, width) = (avail.left(), avail.top(), ui.available_width());
+    let probe = layout_with_slot(left, top, width, 0.0, &m, 0.0);
+    let bottom_inset = (probe.outer.bottom() - probe.inner.bottom()).max(0.0);
+    let fill_h = if avail.bottom().is_finite() {
+        (avail.bottom() - bottom_inset - probe.inner.top()).max(0.0)
+    } else {
+        0.0
+    };
+    let max = egui::Rect::from_min_max(probe.inner.min, pos2(probe.inner.right(), probe.inner.top() + fill_h));
+    let mut child = ui.new_child(UiBuilder::new().max_rect(max).layout(*ui.layout()));
+    child.set_clip_rect(max.intersect(ui.clip_rect()));
+    let value = add(&mut child);
+    let l = layout_with_slot(left, top, width, fill_h, &m, 0.0);
+    let _ = ui.allocate_rect(l.outer, Sense::hover());
+    let mut chrome = l;
+    chrome.cap = None;
+    // The elbow is only the bars. Fill the plate or the page shows through.
+    let mut plate = vec![Shape::rect_filled(l.outer, 0.0, bg)];
+    plate.extend(chrome_shapes(&chrome, &m, color, bg));
+    ui.painter().set(slot, Shape::Vec(plate));
+    if l.title.width() > 0.0 {
+        ui.painter().with_clip_rect(l.title).text(
+            pos2(l.title.left(), l.title.center().y),
+            Align2::LEFT_CENTER,
+            title.to_uppercase(),
+            FontId::proportional(m.title_size),
+            ink_on(color),
+        );
+    }
+    let closed = l.cap.is_some_and(|cap| {
+        close_pill(ui, cap, ui.scope_id().with(("elbow-close", title)), color).clicked()
+    });
+    let drag = if let Some(bar) = Some(l.bar).filter(|b| b.width() > 0.0) {
+        let resp = ui.interact(bar, ui.scope_id().with(("elbow-drag", title)), Sense::drag());
+        resp.on_hover_cursor(egui::CursorIcon::Grab)
+            .on_hover_text("Drag to move")
+            .drag_delta()
+    } else {
+        egui::Vec2::ZERO
+    };
+    (value, closed, drag)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,6 +217,88 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn close_pill_click_closes() {
+        let ctx = egui::Context::default();
+        let rect = Rect::from_min_size(pos2(20.0, 20.0), vec2(46.0, 16.0));
+        let center = rect.center();
+        let button = |pressed| egui::Event::PointerButton {
+            pos: center,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        let frames = [
+            vec![egui::Event::PointerMoved(center)],
+            vec![button(true)],
+            vec![button(false)],
+            vec![],
+        ];
+        let mut clicked = false;
+        for events in frames {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(200.0, 80.0))),
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| {
+                if close_pill(ui, rect, egui::Id::unique("close-test"), rustcars::palette::TAN).clicked() {
+                    clicked = true;
+                }
+            });
+            out.textures_delta.clear();
+        }
+        assert!(clicked, "a click on the end pill closes");
+    }
+
+    #[test]
+    fn elbow_dialog_paints_the_title_and_fills() {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(520.0, 360.0))),
+            ..Default::default()
+        };
+        let mut saw = false;
+        let mut out = ctx.run_ui(input, |ui| {
+            let bounds = Rect::from_min_size(pos2(0.0, 0.0), vec2(480.0, 320.0));
+            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(bounds));
+            let (h, closed, drag) = elbow_dialog(&mut child, "Record / Playback", rustcars::palette::TAN, |ui| {
+                ui.label("body");
+                ui.min_rect().height()
+            });
+            assert!(!closed);
+            assert_eq!(drag, egui::Vec2::ZERO);
+            assert!(h >= 0.0);
+        });
+        for c in &out.shapes {
+            if let egui::Shape::Text(t) = &c.shape {
+                if t.galley.text().contains("RECORD / PLAYBACK") {
+                    saw = true;
+                }
+            }
+        }
+        let mut filled = false;
+        fn walk(shape: &egui::Shape, filled: &mut bool) {
+            match shape {
+                egui::Shape::Vec(v) => {
+                    for s in v {
+                        walk(s, filled);
+                    }
+                }
+                egui::Shape::Rect(r) if r.fill.a() == 255 && r.rect.width() > 200.0 && r.rect.height() > 100.0 => {
+                    *filled = true;
+                }
+                _ => {}
+            }
+        }
+        for c in &out.shapes {
+            walk(&c.shape, &mut filled);
+        }
+        out.textures_delta.clear();
+        assert!(saw, "elbow title is painted");
+        assert!(filled, "dialog plate is opaque");
     }
 
     #[test]

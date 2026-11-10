@@ -3,8 +3,7 @@
 #
 # stdin is 48 kHz mono signed 16-bit little-endian. dsd-fme writes 8 kHz
 # stereo voice on stdout (-o -), one slot on each channel. Commander plays
-# that stream and sums the slots. The first argument is accepted and ignored.
-# Commander still passes a port.
+# that stream and sums the slots.
 #
 # P25 Phase 2 only. The decoder flag is -f2. This is not a control channel
 # and is not a trunk pipe. Voice synthesis uses the MBE already linked into
@@ -18,15 +17,6 @@
 
 set -euo pipefail
 
-port="${1:-23469}"
-case "$port" in
-    ''|*[!0-9]*)
-        echo "commander-demod-p25p2: port must be a number" >&2
-        exit 1
-        ;;
-esac
-# Commander still passes a port. Nothing listens on it.
-: "$port"
 if ! command -v "dsd-fme" >/dev/null 2>&1; then
     echo "commander-demod-p25p2: dsd-fme is not on PATH" >&2
     exit 1

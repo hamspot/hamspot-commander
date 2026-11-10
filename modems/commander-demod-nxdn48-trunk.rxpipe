@@ -3,30 +3,19 @@
 #
 # stdin is 48 kHz mono signed 16-bit little-endian. stdout is dsd-fme's
 # 8 kHz voice. Commander plays it. This script does not resample.
-# The first argument is accepted and ignored. Commander still passes a port.
 #
-# The decoder flag is -fi. HAMSPOT_INVERT=1 appends -xn. Voice synthesis uses the MBE already linked into dsd-fme. The search count is 408000 bytes: -fi sets samples per symbol to 20, and this pipe is 48 kHz.
+# The decoder flag is -fi. HAMSPOT_INVERT=1 appends -xn. Voice synthesis uses the MBE already linked into dsd-fme. Commander writes `hamspot: search` every 408000 bytes it sends: -fi sets samples per symbol to 20, and this pipe is 48 kHz.
 # This script does not pass -T. Commander tunes. The identifier table lives
 # in this dsd-fme, so a hop must not restart it.
 #
-# HAMSPOT_CC_EVENTS=1 keeps dsd-fme stderr for the trunk follower and counts
-# one decoder search. dsd-fme prints "Sync: no sync" only after a carrier
-# has already been seen, so a control channel that never locks is silent.
-# The byte count below is that search of 48 kHz audio. There is no sleep.
-# HAMSPOT_IDENTITY=1 keeps stderr and does not count searches.
+# HAMSPOT_CC_EVENTS=1 keeps dsd-fme stderr for the trunk follower.
+# dsd-fme prints "Sync: no sync" only after a carrier has already been seen,
+# so a control channel that never locks is silent. Commander writes
+# `hamspot: search` for that case. There is no sleep.
+# HAMSPOT_IDENTITY=1 keeps stderr and does not write search lines.
 # If the decoder exits, this script exits too.
 
 set -euo pipefail
-
-port="${1:-23469}"
-case "$port" in
-    ''|*[!0-9]*)
-        echo "commander-demod-nxdn48-trunk: port must be a number" >&2
-        exit 1
-        ;;
-esac
-# Commander still passes a port. Nothing listens on it.
-: "$port"
 
 if ! command -v "dsd-fme" >/dev/null 2>&1; then
     echo "commander-demod-nxdn48-trunk: dsd-fme is not on PATH" >&2
@@ -38,67 +27,7 @@ if [[ "${HAMSPOT_INVERT:-}" == "1" ]]; then
     extra+=(-xn)
 fi
 
-feed=""
-audio=""
-search=""
-cleanup() {
-    if [[ -n "$feed" ]]; then
-        kill "$feed" 2>/dev/null || true
-    fi
-    if [[ -n "$audio" ]]; then
-        rm -f "$audio"
-    fi
-    if [[ -n "$search" ]]; then
-        rm -f "$search"
-    fi
-}
-trap cleanup EXIT
-
-if [[ "${HAMSPOT_CC_EVENTS:-}" == "1" ]]; then
-    audio="$(mktemp -u /tmp/hamspot-rxpipe-audio.XXXXXX)"
-    mkfifo -m 600 "$audio"
-    search="$(mktemp /tmp/hamspot-rxpipe-search.XXXXXX)"
-    cat >"$search" <<'PERL'
-use strict;
-use warnings;
-use IO::Handle;
-use Errno qw(EINTR);
-binmode STDIN;
-binmode STDOUT;
-STDERR->autoflush(1);
-STDOUT->autoflush(1);
-my $limit = 408000;
-my $n = 0;
-while (1) {
-    my $buf;
-    my $got = sysread(STDIN, $buf, 8192);
-    if (!defined $got) {
-        next if $! == EINTR;
-        exit 1;
-    }
-    last if $got == 0;
-    my $off = 0;
-    while ($off < $got) {
-        my $wrote = syswrite(STDOUT, $buf, $got - $off, $off);
-        if (!defined $wrote) {
-            next if $! == EINTR;
-            exit 1;
-        }
-        exit 1 if $wrote == 0;
-        $off += $wrote;
-    }
-    $n += $got;
-    while ($n >= $limit) {
-        $n -= $limit;
-        print STDERR "hamspot: search\n";
-    }
-}
-exit 0;
-PERL
-    perl "$search" <&0 >"$audio" &
-    feed=$!
-    dsd-fme "${extra[@]}" -fi -i - -o - <"$audio"
-elif [[ "${HAMSPOT_IDENTITY:-}" == "1" ]]; then
+if [[ "${HAMSPOT_CC_EVENTS:-}" == "1" || "${HAMSPOT_IDENTITY:-}" == "1" ]]; then
     dsd-fme "${extra[@]}" -fi -i - -o -
 else
     dsd-fme "${extra[@]}" -fi -i - -o - 2>/dev/null

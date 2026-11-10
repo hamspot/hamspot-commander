@@ -285,6 +285,9 @@ pub struct RecUi {
     dir: PathBuf,
     db_path: PathBuf,
     seg: HashMap<u64, Segmenter>,
+    /// Carrier files open for each HackRF radio. Every channel in the capture
+    /// records at once. The key is `rec_live::carrier_key`.
+    carrier_open: HashMap<u64, HashSet<u64>>,
     /// Audio outputs listed for the replay output menu.
     sinks: Vec<hsrec::replay::Sink>,
     sinks_listed: bool,
@@ -489,6 +492,7 @@ impl App {
         let gone: Vec<u64> = self.rec.seg.keys().copied().filter(|id| !live.contains(id) || !armed).collect();
         for id in gone {
             crate::rec_live::set_rec_hz(id, 0);
+            self.close_carriers(id, &recorder);
             if let Some(mut s) = self.rec.seg.remove(&id) {
                 for a in s.stop() {
                     if let Action::Close { keep } = a {
@@ -502,6 +506,7 @@ impl App {
                 if rig_driver(row.spec.driver) {
                     crate::rec_live::set_rec_hz(row.id, 0);
                 }
+                self.close_carriers(row.id, &recorder);
             }
             self.rec.enc.clear();
             return;
@@ -550,6 +555,78 @@ impl App {
                         recorder.send(Cmd::Units { key: id, units: m.units.clone() });
                     }
                 }
+            }
+            if row.spec.driver == cat::RadioDriver::Hackrf {
+                self.sync_carrier_files(row, &recorder);
+            }
+        }
+    }
+
+    /// Every channel inside this HackRF capture gets its own IQ file for as
+    /// long as REC is armed. The speaker decoder is a different path.
+    fn sync_carrier_files(&mut self, row: &cat::RadioRow, recorder: &hsrec::writer::Recorder) {
+        let center = row.center_hz;
+        let Some(zone) = self.channels.zones.get(self.channel_zone) else {
+            self.close_carriers(row.id, recorder);
+            return;
+        };
+        if !center.is_finite() || center <= 0.0 {
+            self.close_carriers(row.id, recorder);
+            return;
+        }
+        let mut next = HashSet::new();
+        for channel in &zone.channels {
+            if !channel.hz.is_finite() || channel.hz <= 0.0 {
+                continue;
+            }
+            if channel.encrypted || !hsrec::dsp::in_capture(channel.hz - center) {
+                continue;
+            }
+            let hz = channel.hz.round() as u64;
+            let key = crate::rec_live::carrier_key(row.id, hz);
+            next.insert(key);
+            if self.rec.carrier_open.get(&row.id).is_some_and(|open| open.contains(&key)) {
+                continue;
+            }
+            let mut meta = Meta {
+                source: meta::SOURCE_HACKRF_CHANNELS.into(),
+                source_kind: meta::KIND_RAW_IQ.into(),
+                radio_id: row.id,
+                radio_name: row.spec.name.clone(),
+                raw_format: "cs16".into(),
+                sample_rate: hsrec::dsp::REC_RATE,
+                centre_hz: center,
+                channel_hz: channel.hz,
+                offset_hz: channel.hz - center,
+                bandwidth_hz: hsrec::dsp::REC_RATE as f64,
+                channel_name: channel.name.clone(),
+                chain: hsrec::dsp::CHAIN_ID.into(),
+                sw_version: format!("commander {} / {}", env!("CARGO_PKG_VERSION"), meta::sw_version()),
+                modulation: if channel.vocoder.is_empty() { "fm".into() } else { channel.vocoder.clone() },
+                ..Default::default()
+            };
+            meta.decoder = serde_json::json!({
+                "script": hsrec::safepath::portable_decoder(&row.spec.rx_pipe),
+                "vocoder": channel.vocoder,
+                "invert": channel.invert,
+                "mode": channel.mode
+            });
+            hsrec::safepath::portable_meta(&mut meta);
+            meta.decoder_params = self.rec_live_params(row, &meta);
+            recorder.send(Cmd::Open { key, meta });
+        }
+        if let Some(prev) = self.rec.carrier_open.get(&row.id) {
+            for key in prev.difference(&next) {
+                recorder.send(Cmd::Close { key: *key, keep: true });
+            }
+        }
+        self.rec.carrier_open.insert(row.id, next);
+    }
+
+    fn close_carriers(&mut self, radio: u64, recorder: &hsrec::writer::Recorder) {
+        if let Some(open) = self.rec.carrier_open.remove(&radio) {
+            for key in open {
+                recorder.send(Cmd::Close { key, keep: true });
             }
         }
     }
@@ -1353,14 +1430,10 @@ impl App {
             .as_ref()
             .map(|path| hsrec::replay::script_pcm(&path.display().to_string()))
             .unwrap_or((hsrec::replay::OUT_RATE, 1));
-        let decoder = script.and_then(|script| {
-            // The script accepts this port and does not listen. The reservation
-            // rides with the player and is released when its thread ends
-            // (finish, stop, or a new selection).
-            let port = crate::rx_pipe::VoicePort::claim().ok()?;
-            let argv = vec![script.display().to_string(), port.port().to_string()];
+        let decoder = script.map(|script| {
+            let argv = vec![script.display().to_string()];
             let env = hsrec::replay::decoder_env(&rec.meta, &fallback);
-            Some(hsrec::replay::DecoderCmd { argv, env, hold: Some(std::sync::Arc::new(hsrec::replay::Hold(Box::new(port)))) })
+            hsrec::replay::DecoderCmd { argv, env, hold: None }
         });
         if !self.rec.face.output.is_empty() || !self.rec.sinks_listed {
             self.rec.sinks = hsrec::replay::list_sinks();
@@ -1856,7 +1929,15 @@ impl App {
         }
     }
 
+    /// Status text for this dialog. The no-voice replay sentence stays off it:
+    /// the timeline already tags that recording, and the sentence is logged.
+    fn detail_note(note: &str) -> bool {
+        !note.is_empty() && !note.starts_with("No voice decoded")
+    }
+
     /// Record / Playback dialog: follows the selection, one at a time.
+    /// The frame is an elbow. Its end pill closes. Call, Playback and Notes
+    /// stay put; everything under them scrolls.
     fn rec_detail_window(&mut self, ctx: &egui::Context) {
         if !self.rec.detail_open {
             return;
@@ -1870,19 +1951,41 @@ impl App {
             self.rec.detail_open = false;
             return;
         };
-        let mut open = true;
-        // Fixed title = fixed id: egui keeps its position for the session while the
-        // contents follow the selection.
-        egui::Window::new("Record / Playback")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(true)
-            .default_width(480.0)
-            .show(ctx, |ui| {
-                ui.set_max_height(ctx.content_rect().height() * 0.8);
-                self.rec_detail(ui, rec);
-            });
-        if !open {
+        let win_id = egui::Id::unique("rec-playback-window");
+        let pos_id = win_id.with("pos");
+        let stored = ctx.data_mut(|d| d.get_persisted::<egui::Pos2>(pos_id));
+        let mut area = egui::Area::new(win_id).order(egui::Order::Middle).constrain(true);
+        if let Some(p) = stored {
+            area = area.fixed_pos(p);
+        } else {
+            let size = egui::vec2(520.0, 640.0);
+            area = area.default_pos(ctx.content_rect().center() - size * 0.5);
+        }
+        let mut drag = egui::Vec2::ZERO;
+        let mut close = false;
+        let shown = area.show(ctx, |ui| {
+            let screen = ui.ctx().content_rect().size();
+            egui::Resize::default()
+                .id(win_id.with("resize"))
+                .default_size(egui::vec2(520.0, 640.0))
+                .min_size(egui::vec2(400.0, 360.0))
+                .max_size(screen * 0.92)
+                .with_stroke(false)
+                .show(ui, |ui| {
+                    let (_, closed, delta) = crate::group_box::elbow_dialog(ui, "Record / Playback", rustcars::palette::TAN, |ui| {
+                        self.rec_detail(ui, rec);
+                    });
+                    close = closed;
+                    drag = delta;
+                });
+        });
+        let mut pos = shown.response.rect.min;
+        if drag != egui::Vec2::ZERO {
+            pos += drag;
+            ctx.request_repaint();
+        }
+        ctx.data_mut(|d| d.insert_persisted(pos_id, pos));
+        if close {
             self.rec.detail_open = false;
         }
     }
@@ -1912,16 +2015,15 @@ impl App {
                 if !hsrec::dsp::in_capture(rec.meta.offset_hz) && rec.meta.source_kind != meta::KIND_DEMOD_AUDIO {
                     ui.label(egui::RichText::new("OUT OF BAND").small().strong().color(red));
                 }
-                if self.rec.no_voice.contains(&id) {
-                    ui.label(egui::RichText::new("no voice").small().strong().color(caution()));
-                }
                 if rec.meta.emergency { ui.label(egui::RichText::new("EMERGENCY").small().strong().color(red)); }
                 if rec.meta.priority { ui.label(egui::RichText::new("PRIORITY").small()); }
                 if rec.archived { ui.label(egui::RichText::new("archived (zst)").small()); }
                 if rec.offline() { ui.label(egui::RichText::new("offline").small()); }
                 if rec.missing { ui.label(egui::RichText::new("MISSING").small().color(red)); }
             });
-            if !self.rec.note.is_empty() {
+            // "No voice decoded…" is a timeline tag and a log line. It does not
+            // belong in this dialog. Other notes (playback failed, export) stay.
+            if Self::detail_note(&self.rec.note) {
                 ui.label(egui::RichText::new(&self.rec.note).color(caution()));
             }
         });
@@ -1952,6 +2054,14 @@ impl App {
                 }
             });
         });
+        // Call, Playback and Notes stay above. Export, Danger and metadata scroll.
+        let rest_h = ui.available_height();
+        let rest_h = if rest_h.is_finite() { rest_h.max(0.0) } else { 240.0 };
+        egui::ScrollArea::vertical()
+            .id_salt(("rec-detail-rest", id))
+            .auto_shrink([false, false])
+            .max_height(rest_h)
+            .show(ui, |ui| {
         crate::group_box::group_box(ui, "Export", TEXT, |ui| {
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Export WAV…").on_hover_text("Demodulates now and writes a WAV. The WAV is not kept by REC.").clicked() {
@@ -1981,8 +2091,6 @@ impl App {
                 }
             });
         });
-        // Metadata scrolls on its own so the groups above never leave view.
-        egui::ScrollArea::vertical().id_salt(("rec-meta-scroll", id)).auto_shrink([false, true]).show(ui, |ui| {
         let rows = self.rec_meta_rows(&rec);
         ui.horizontal(|ui| {
             ui.strong("Metadata");

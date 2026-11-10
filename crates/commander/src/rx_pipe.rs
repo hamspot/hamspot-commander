@@ -10,9 +10,7 @@
 //! mono capture, which here is the USB microphone. The recorder asks for one
 //! FL channel, does not autoconnect, and is wired to `monitor_FL`.
 
-use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
-use std::net::UdpSocket;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
@@ -40,9 +38,6 @@ pub struct Running {
     /// The raw RX stream has no speaker wire. A snapshot can miss the wire
     /// that was just created, so this is set from a live `pw-link` listing.
     pub raw_muted: bool,
-    /// UDP port passed to a script. `None` for a shell command that does not
-    /// take one. Released after the process group is gone.
-    pub port: Option<u16>,
     /// Wires this pipe owns. The receive pipe records `monitor_FL`. The
     /// transmit pipe records the microphone and plays into `input.hamspot_*_tx`.
     pub links: Vec<(String, String)>,
@@ -376,67 +371,59 @@ pub fn choice_text(command: &str, scripts: &[ModemScript]) -> String {
     command.to_string()
 }
 
-/// First UDP port handed to an RX pipe script. The P25 script's own default
-/// is the same number, for a manual run. Each live pipe takes the next free one.
-const VOICE_START: u16 = 23469;
-const VOICE_TRIES: u16 = 64;
-
-/// Ports a live pipe has reserved. The probe socket is dropped so the script
-/// can bind, and the set keeps the next pipe from taking it during that gap.
-static VOICE_PORTS: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
-
-/// Program and arguments for a station pipe value. Only a `modems/<name>`
-/// pipe file found by [`resolve_pipe`] runs; it gets `port` as its first
-/// argument. A shell command or any other path is refused, never run.
-pub fn command_argv(command: &str, port: u16) -> Result<Vec<String>, String> {
+/// Program for a station pipe value. Only a `modems/<name>` pipe file found
+/// by [`resolve_pipe`] runs, with no arguments. A shell command or any other
+/// path is refused, never run.
+pub fn command_argv(command: &str) -> Result<Vec<String>, String> {
     let path = resolve_pipe(command)?;
-    Ok(vec![path.to_string_lossy().into_owned(), port.to_string()])
+    Ok(vec![path.to_string_lossy().into_owned()])
 }
 
-/// Next localhost UDP port at or above [`VOICE_START`] that this process can
-/// bind. The reservation stays until [`release_voice_port`].
-pub fn claim_voice_port() -> Result<u16, String> {
-    let mut claimed = VOICE_PORTS.lock().expect("voice ports");
-    let last = VOICE_START.saturating_add(VOICE_TRIES - 1);
-    for port in VOICE_START..=last {
-        if claimed.contains(&port) {
-            continue;
+/// Bytes of 48 kHz mono s16le between `hamspot: search` lines.
+///
+/// dsd-fme prints "Sync: no sync" only after it has seen a carrier, so a
+/// control channel that never locks is silent. The trunk follower treats
+/// `hamspot: search` as that missing report. NXDN48's `-fi` uses 20 samples
+/// per symbol, so its interval is twice the 10-sample modes.
+pub fn search_interval(command: &str) -> Option<usize> {
+    match Path::new(command)
+        .file_name()
+        .and_then(|name| name.to_str())
+    {
+        Some("commander-demod-nxdn48-trunk.rxpipe") => Some(408_000),
+        Some(
+            "commander-demod-p25.rxpipe"
+            | "commander-demod-p25-trace.rxpipe"
+            | "commander-demod-dmr.rxpipe"
+            | "commander-demod-nxdn96-trunk.rxpipe",
+        ) => Some(204_000),
+        _ => None,
+    }
+}
+
+/// Count bytes actually written to a decoder and push one search line each
+/// time `every` is crossed. A zero write does not move the count. The queue
+/// keeps the same 400-line cap as decoder stderr.
+pub fn note_search(lines: &Mutex<Vec<String>>, counted: &mut usize, written: usize, every: usize) {
+    if every == 0 || written == 0 {
+        return;
+    }
+    *counted = counted.saturating_add(written);
+    let mut ticks = 0usize;
+    while *counted >= every {
+        *counted -= every;
+        ticks += 1;
+    }
+    if ticks == 0 {
+        return;
+    }
+    let mut queue = lines.lock().expect("search lines");
+    for _ in 0..ticks {
+        if queue.len() >= EVENT_CAP {
+            let drop_n = queue.len() - EVENT_CAP + 1;
+            queue.drain(0..drop_n);
         }
-        // `0.0.0.0` fails when the port is already bound. The rxpipes do not
-        // listen. The bind still keeps two pipes from being handed the same number.
-        if UdpSocket::bind(("0.0.0.0", port)).is_ok() {
-            claimed.insert(port);
-            return Ok(port);
-        }
-    }
-    Err(format!(
-        "no free UDP port from {VOICE_START} through {last}"
-    ))
-}
-
-pub fn release_voice_port(port: u16) {
-    VOICE_PORTS.lock().expect("voice ports").remove(&port);
-}
-
-/// A voice port reservation that lasts as long as this value. REC replay
-/// keeps one for the whole playback. The rxpipe accepts the number and does
-/// not listen on it. A live decoder that starts mid-replay still gets the
-/// next number.
-#[derive(Debug)]
-pub struct VoicePort(u16);
-
-impl VoicePort {
-    pub fn claim() -> Result<Self, String> {
-        claim_voice_port().map(VoicePort)
-    }
-    pub fn port(&self) -> u16 {
-        self.0
-    }
-}
-
-impl Drop for VoicePort {
-    fn drop(&mut self) {
-        release_voice_port(self.0);
+        queue.push("hamspot: search".to_string());
     }
 }
 
@@ -613,30 +600,27 @@ pub fn spawn(
     source: Option<(&str, &str)>,
     key_csv: Option<&str>,
 ) -> Result<Running, String> {
-    let port = if resolve_pipe(command).is_ok() {
-        Some(claim_voice_port()?)
-    } else {
-        None
-    };
-    match spawn_group(
-        id, speaker, command, port, events, identity, invert, on_line, source, key_csv,
-    ) {
-        Ok(running) => Ok(running),
-        Err(err) => {
-            if let Some(port) = port {
-                release_voice_port(port);
-            }
-            Err(err)
-        }
-    }
+    spawn_group(
+        id, speaker, command, events, identity, invert, on_line, source, key_csv,
+    )
 }
 
 /// Copy the rig's demod audio into the decoder, and into REC when this
 /// radio's slot is a non-zero frequency. A read or write error ends the
 /// copy; the process group is stopped by the caller when the pipe dies.
-fn tee_rig_audio(id: u64, mut from: impl Read, mut to: impl Write) {
+///
+/// `lines` receives `hamspot: search` every `every` bytes that reached the
+/// decoder. Both are absent unless this pipe is a trunk control decoder.
+fn tee_rig_audio(
+    id: u64,
+    mut from: impl Read,
+    mut to: impl Write,
+    lines: Option<Arc<Mutex<Vec<String>>>>,
+    every: Option<usize>,
+) {
     let slot = crate::rec_live::rec_hz_slot(id);
     let mut carry = crate::rec_live::S16Carry::default();
+    let mut counted = 0usize;
     let mut buf = [0u8; 4096];
     loop {
         let n = match from.read(&mut buf) {
@@ -647,6 +631,9 @@ fn tee_rig_audio(id: u64, mut from: impl Read, mut to: impl Write) {
         };
         if to.write_all(&buf[..n]).is_err() {
             break;
+        }
+        if let (Some(lines), Some(every)) = (&lines, every) {
+            note_search(lines, &mut counted, n, every);
         }
         let hz = slot.load(Ordering::Relaxed);
         let keep = crate::rec_live::tap_on() && hz != 0;
@@ -661,7 +648,6 @@ fn spawn_group(
     id: u64,
     speaker: &str,
     command: &str,
-    port: Option<u16>,
     events: bool,
     identity: bool,
     invert: bool,
@@ -715,7 +701,14 @@ fn spawn_group(
     })?;
     // The same 48 kHz mono s16le the decoder reads. A copy goes to REC when
     // this radio is on a call. The decoder write happens first and is not
-    // gated on the recorder queue.
+    // gated on the recorder queue. Search lines share the stderr queue so
+    // the follower sees them in the same drain.
+    let event_log = if events || identity {
+        Some(Arc::new(Mutex::new(Vec::new())))
+    } else {
+        None
+    };
+    let search_every = if events { search_interval(command) } else { None };
     let (demod_read, demod_write) = match UnixStream::pair() {
         Ok(pair) => pair,
         Err(err) => {
@@ -723,9 +716,14 @@ fn spawn_group(
             return Err(format!("rx pipe record tee: {err}"));
         }
     };
-    thread::spawn(move || tee_rig_audio(id, rec_out, demod_write));
+    let tee_log = if search_every.is_some() {
+        event_log.clone()
+    } else {
+        None
+    };
+    thread::spawn(move || tee_rig_audio(id, rec_out, demod_write, tee_log, search_every));
 
-    let argv = match command_argv(command, port.unwrap_or(VOICE_START)) {
+    let argv = match command_argv(command) {
         Ok(argv) => argv,
         Err(err) => {
             stop_group(&mut record);
@@ -745,9 +743,9 @@ fn spawn_group(
         })
         .process_group(group);
     if events {
-        // The script keeps dsd-fme stderr and starts the hunt counter only
-        // when this is set. Identity uses a different variable so a vocoder
-        // cannot feed the follower.
+        // The script keeps dsd-fme stderr only when this is set. The search
+        // line is written by the tee, not by the script. Identity uses a
+        // different variable so a vocoder cannot feed the follower.
         filter.env("HAMSPOT_CC_EVENTS", "1");
     } else if identity {
         filter.env("HAMSPOT_IDENTITY", "1");
@@ -785,7 +783,7 @@ fn spawn_group(
         let voice = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&voice);
         thread::spawn(move || gate_voice(filt_out, gate_side, flag));
-        let log = Arc::new(Mutex::new(Vec::new()));
+        let log = event_log.clone().expect("trunk event log");
         if let Some(stderr) = filter.stderr.take() {
             let sink = Arc::clone(&log);
             thread::spawn(move || collect_events(stderr, sink, on_line));
@@ -794,7 +792,7 @@ fn spawn_group(
     } else if identity {
         // Same stderr capture as a trunk pipe. The speaker is not gated,
         // and the lines go to the identity log rather than the follower.
-        let log = Arc::new(Mutex::new(Vec::new()));
+        let log = event_log.clone().expect("identity log");
         if let Some(stderr) = filter.stderr.take() {
             let sink = Arc::clone(&log);
             thread::spawn(move || collect_events(stderr, sink, on_line));
@@ -828,7 +826,6 @@ fn spawn_group(
         source: source_text,
         diverted: false,
         raw_muted: false,
-        port,
         links,
         tapped,
         events,
@@ -923,28 +920,7 @@ pub fn spawn_tx(
     if play_ports.is_empty() {
         return Err("tx pipe has no transmit input".into());
     }
-    let port = if resolve_pipe(command).is_ok() {
-        Some(claim_voice_port()?)
-    } else {
-        None
-    };
-    match spawn_tx_group(
-        id,
-        source,
-        capture_port,
-        channel_map,
-        play_ports,
-        command,
-        port,
-    ) {
-        Ok(running) => Ok(running),
-        Err(err) => {
-            if let Some(port) = port {
-                release_voice_port(port);
-            }
-            Err(err)
-        }
-    }
+    spawn_tx_group(id, source, capture_port, channel_map, play_ports, command)
 }
 
 fn spawn_tx_group(
@@ -954,7 +930,6 @@ fn spawn_tx_group(
     channel_map: &str,
     play_ports: &[String],
     command: &str,
-    port: Option<u16>,
 ) -> Result<Running, String> {
     let record_node = tx_record_node(id);
     let play_node = tx_play_node(id);
@@ -980,7 +955,7 @@ fn spawn_tx_group(
         stop_group(&mut record);
         "tx pipe process id does not fit".to_string()
     })?;
-    let argv = command_argv(command, port.unwrap_or(VOICE_START))?;
+    let argv = command_argv(command)?;
     let mut filter = Command::new(&argv[0]);
     filter
         .args(&argv[1..])
@@ -1046,7 +1021,6 @@ fn spawn_tx_group(
         source: source.to_string(),
         diverted: false,
         raw_muted: false,
-        port,
         links,
         tapped,
         events: false,
@@ -1398,41 +1372,28 @@ mod tests {
     }
 
     #[test]
-    fn a_script_path_receives_its_own_udp_port() {
-        // Only a resolved pipe file runs, with the port as its argument.
-        let argv = command_argv("modems/commander-demod-p25.rxpipe", 23470).expect("installed p25 pipe");
+    fn a_script_path_is_the_only_argument() {
+        let argv = command_argv("modems/commander-demod-p25.rxpipe").expect("installed p25 pipe");
+        assert_eq!(argv.len(), 1);
         assert!(argv[0].ends_with("/commander-demod-p25.rxpipe") && Path::new(&argv[0]).is_absolute());
-        assert_eq!(argv[1], "23470");
         for refused in ["/opt/modems/commander-demod-p25.rxpipe", "dsd-fme -f1 -i -", "sh -c 'x'", "modems/../x.rxpipe"] {
-            assert!(command_argv(refused, 23470).is_err(), "{refused}");
+            assert!(command_argv(refused).is_err(), "{refused}");
         }
-        let first = claim_voice_port().expect("first voice port");
-        let second = claim_voice_port().expect("second voice port");
-        assert_ne!(first, second);
-        let occupied = first.saturating_add(1);
-        let held = UdpSocket::bind(("0.0.0.0", occupied)).ok();
-        if held.is_some() {
-            let third = claim_voice_port().expect("third voice port");
-            assert_ne!(third, first);
-            assert_ne!(third, second);
-            assert_ne!(third, occupied);
-            release_voice_port(third);
-        }
-        release_voice_port(first);
-        release_voice_port(second);
     }
 
     #[test]
-    fn held_voice_port_is_not_reused_until_dropped() {
-        let held = VoicePort::claim().expect("replay port");
-        let port = held.port();
-        for _ in 0..3 {
-            let other = claim_voice_port().expect("live port");
-            assert_ne!(other, port);
-            release_voice_port(other);
-        }
-        assert!(VOICE_PORTS.lock().unwrap().contains(&port));
-        drop(held);
-        assert!(!VOICE_PORTS.lock().unwrap().contains(&port));
+    fn search_lines_follow_bytes_written() {
+        assert_eq!(search_interval("modems/commander-demod-p25.rxpipe"), Some(204_000));
+        assert_eq!(search_interval("commander-demod-nxdn48-trunk.rxpipe"), Some(408_000));
+        assert_eq!(search_interval("modems/commander-demod-dstar.rxpipe"), None);
+        let lines = Mutex::new(Vec::new());
+        let mut counted = 0usize;
+        note_search(&lines, &mut counted, 203_999, 204_000);
+        assert!(lines.lock().unwrap().is_empty());
+        note_search(&lines, &mut counted, 1, 204_000);
+        assert_eq!(lines.lock().unwrap().as_slice(), ["hamspot: search"]);
+        assert_eq!(counted, 0);
+        note_search(&lines, &mut counted, 408_000, 204_000);
+        assert_eq!(lines.lock().unwrap().len(), 3);
     }
 }

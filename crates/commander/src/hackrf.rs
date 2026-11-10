@@ -13,6 +13,7 @@ use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
@@ -53,6 +54,22 @@ impl Dc {
         self.q += DC_ALPHA * (q - self.q);
         (i - self.i, q - self.q)
     }
+}
+
+/// Control carrier nearest the capture centre. That is the channel on the
+/// sub VFO, and the audio sent to the speaker when no voice call is up.
+fn primary_control(center: f64, controls: &[f64]) -> Option<usize> {
+    controls
+        .iter()
+        .enumerate()
+        .filter(|(_, hz)| hz.is_finite())
+        .min_by(|(_, left), (_, right)| {
+            (*left - center)
+                .abs()
+                .partial_cmp(&(*right - center).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(index, _)| index)
 }
 
 /// Largest run of frequencies that fits in the filter, and the midpoint.
@@ -1183,17 +1200,48 @@ impl Bank {
         (self.dc.i, self.dc.q)
     }
 
-    /// Turn the REC tap on the voice mixer on or off.
+    /// Turn the REC tap on every carrier mixer.
     pub fn set_tap(&mut self, on: bool) {
         self.voice.tap_on = on;
+        for ddc in &mut self.controls {
+            ddc.tap_on = on;
+        }
         if !on {
             self.voice.tap_out.clear();
+            for ddc in &mut self.controls {
+                ddc.tap_out.clear();
+            }
         }
     }
 
     /// Channelised IQ since the last call (32 ksps cs16 at the voice frequency).
     pub fn take_tap(&mut self) -> Vec<i16> {
         std::mem::take(&mut self.voice.tap_out)
+    }
+
+    /// Channelised IQ for every carrier, voice included when it is not already
+    /// one of the control carriers. Each buffer is 32 ksps cs16.
+    pub fn take_carrier_taps(&mut self) -> Vec<(u64, Vec<i16>)> {
+        let mut out = Vec::new();
+        for ddc in &mut self.controls {
+            let data = std::mem::take(&mut ddc.tap_out);
+            if data.is_empty() {
+                continue;
+            }
+            let hz = (self.center + ddc.offset).round() as u64;
+            out.push((hz, data));
+        }
+        if let Some(hz) = self.voice_hz {
+            let hz = hz.round() as u64;
+            let data = std::mem::take(&mut self.voice.tap_out);
+            let same = out.iter().any(|(have, _)| have.abs_diff(hz) < 1);
+            if !data.is_empty() && !same {
+                out.push((hz, data));
+            }
+        } else {
+            self.voice.tap_out.clear();
+        }
+        out
     }
 
     pub fn set_voice(&mut self, hz: Option<f64>) {
@@ -1262,8 +1310,20 @@ impl Bank {
 
 struct Decoder {
     child: Child,
-    port: u16,
     lines: Arc<Mutex<Vec<String>>>,
+}
+
+/// How many discriminator chunks may wait while dsd-fme is still starting.
+const DECODER_QUEUE: usize = 256;
+
+/// Discriminator PCM for one decoder. A feeder thread writes the pipe.
+/// `keep` is the control channel: the capture waits, and a sample is never
+/// skipped. A skipped chunk is a hole in the symbol clock, so the control
+/// channel cannot sync. Voice may drop a whole chunk. A stuck speaker must
+/// not freeze the dongle.
+struct PcmFeed {
+    tx: SyncSender<Vec<i16>>,
+    keep: bool,
 }
 
 pub struct Session {
@@ -1281,7 +1341,7 @@ pub struct Session {
     voice_retired: Vec<Decoder>,
     /// Next voice-decoder stdin. The worker takes this after the previous
     /// pipe closes. Closing that pipe must not stop the USB capture.
-    voice_next: Arc<Mutex<Option<std::io::PipeWriter>>>,
+    voice_next: Arc<Mutex<Option<PcmFeed>>>,
     /// Trunk script path. Empty when this capture has no control list.
     script: Option<String>,
     /// Site word already given to the voice decoder. A repeat is not a restart.
@@ -1343,6 +1403,7 @@ impl Session {
             self.speech.is_some(),
             self.key_csv.as_deref(),
         )?;
+        let feed = pcm_feed(&script, &dec, write, false);
         if let Some(audio) = audio {
             if let Some(speech) = &self.speech {
                 speech.push(audio);
@@ -1352,7 +1413,7 @@ impl Session {
         }
         {
             let mut pending = self.voice_next.lock().expect("hackrf voice");
-            drop(pending.replace(write));
+            drop(pending.replace(feed));
         }
         if let Some(mut old) = self.voice_dec.take() {
             signal(&mut old.child);
@@ -1390,6 +1451,7 @@ impl Session {
             self.speech.is_some(),
             next.as_deref(),
         )?;
+        let feed = pcm_feed(&script, &dec, write, false);
         if let Some(audio) = audio {
             if let Some(speech) = &self.speech {
                 speech.push(audio);
@@ -1399,7 +1461,7 @@ impl Session {
         }
         {
             let mut pending = self.voice_next.lock().expect("hackrf voice");
-            drop(pending.replace(write));
+            drop(pending.replace(feed));
         }
         if let Some(mut old) = self.voice_dec.take() {
             signal(&mut old.child);
@@ -1415,7 +1477,7 @@ impl Session {
         for mut dec in self.voice_retired.drain(..) {
             match dec.child.try_wait() {
                 Ok(None) => still.push(dec),
-                _ => crate::rx_pipe::release_voice_port(dec.port),
+                _ => {}
             }
         }
         self.voice_retired = still;
@@ -1506,15 +1568,12 @@ impl Session {
         }
         for dec in &mut self.controls {
             wait_child(&mut dec.child);
-            crate::rx_pipe::release_voice_port(dec.port);
         }
         if let Some(dec) = &mut self.voice_dec {
             wait_child(&mut dec.child);
-            crate::rx_pipe::release_voice_port(dec.port);
         }
         for dec in &mut self.voice_retired {
             wait_child(&mut dec.child);
-            crate::rx_pipe::release_voice_port(dec.port);
         }
         if let Some(reader) = self.transfer_reader.take() {
             let _ = reader.join();
@@ -1636,8 +1695,8 @@ pub fn start(
         for _ in controls {
             match spawn_decoder(script, None, false, key_csv.as_deref()) {
                 Ok((dec, write, _)) => {
+                    control_writes.push(pcm_feed(script, &dec, write, true));
                     decoders.push(dec);
-                    control_writes.push(write);
                 }
                 Err(err) => {
                     fail_partial(&mut transfer, play.as_mut(), &mut decoders);
@@ -1647,8 +1706,8 @@ pub fn start(
         }
         match spawn_decoder(script, site, speaker.is_some(), key_csv.as_deref()) {
             Ok((dec, write, audio)) => {
+                voice_write = Some(pcm_feed(script, &dec, write, false));
                 voice_dec = Some(dec);
-                voice_write = Some(write);
                 if let Some(audio) = audio {
                     if let Some(name) = speaker {
                         let argv = crate::rx_pipe::speaker_play_argv(name, script);
@@ -1748,16 +1807,15 @@ fn fail_partial(transfer: &mut Child, mut play: Option<&mut Child>, decoders: &m
     }
     for dec in decoders.iter_mut() {
         wait_child(&mut dec.child);
-        crate::rx_pipe::release_voice_port(dec.port);
     }
 }
 
 fn run_bank(
     mut iq: impl Read,
     mut play: Option<std::io::PipeWriter>,
-    mut controls: Vec<std::io::PipeWriter>,
-    mut voice: Option<std::io::PipeWriter>,
-    voice_next: Arc<Mutex<Option<std::io::PipeWriter>>>,
+    mut controls: Vec<PcmFeed>,
+    mut voice: Option<PcmFeed>,
+    voice_next: Arc<Mutex<Option<PcmFeed>>>,
     center: f64,
     control_hz: &[f64],
     voice_hz: Arc<AtomicU64>,
@@ -1774,12 +1832,6 @@ fn run_bank(
     if let Some(play) = play.as_ref() {
         unblock(play);
     }
-    if let Some(write) = voice.as_ref() {
-        unblock(write);
-    }
-    for write in &controls {
-        unblock(write);
-    }
     let mut buf = [0u8; 16_384];
     let mut voice_out = Vec::new();
     let mut control_out: Vec<Vec<i16>> = vec![Vec::new(); control_hz.len()];
@@ -1794,39 +1846,57 @@ fn run_bank(
         for out in &mut control_out {
             out.clear();
         }
-        let tap = hz != 0 && crate::rec_live::tap_on();
+        let tap = crate::rec_live::tap_on();
         bank.set_tap(tap);
         bank.push(&buf[..n], &mut voice_out, &mut control_out);
         voice_empty.store(bank.voice_channel_empty(), Ordering::Relaxed);
         if tap {
-            let data = bank.take_tap();
-            if !data.is_empty() {
-                crate::rec_live::push(rec_key.load(Ordering::Relaxed), hz, data);
+            let radio = rec_key.load(Ordering::Relaxed);
+            for (ch, data) in bank.take_carrier_taps() {
+                if data.is_empty() {
+                    continue;
+                }
+                // The talkgroup file still uses the radio id. Every carrier
+                // also has its own file, open for the whole capture.
+                if hz != 0 && ch == hz {
+                    crate::rec_live::push(radio, ch, data.clone());
+                }
+                crate::rec_live::push(crate::rec_live::carrier_key(radio, ch), ch, data);
             }
         }
         let (mean_i, mean_q) = bank.dc_mean();
         spec.push(&buf[..n], center, mean_i, mean_q);
+        // No voice call: the control channel is the audio. A voice grant
+        // replaces it. Silence is not a carrier and is not sent.
+        let speaker: &[i16] = if hz != 0 {
+            &voice_out
+        } else if let Some(index) = primary_control(center, control_hz) {
+            control_out.get(index).map(Vec::as_slice).unwrap_or(&[])
+        } else {
+            &[]
+        };
         if let Some(play) = play.as_mut() {
-            if write_pcm(play, &voice_out).is_err() {
+            if write_pcm(play, speaker).is_err() {
                 break;
             }
         }
         // A closed voice pipe is the site-word replace. The control pipes
         // and the USB capture stay up. The identifier table lives there.
-        if let Some(write) = voice.as_mut() {
-            if write_pcm(write, &voice_out).is_err() {
-                voice = None;
+        if hz != 0 {
+            if let Some(feed) = voice.as_mut() {
+                if write_feed(feed, &voice_out).is_err() {
+                    voice = None;
+                }
             }
         }
         if voice.is_none() {
             if let Some(next) = voice_next.lock().expect("hackrf voice").take() {
-                unblock(&next);
                 voice = Some(next);
             }
         }
         let mut broken = false;
-        for (write, samples) in controls.iter_mut().zip(control_out.iter()) {
-            if write_pcm(write, samples).is_err() {
+        for (feed, samples) in controls.iter_mut().zip(control_out.iter()) {
+            if write_feed(feed, samples).is_err() {
                 broken = true;
                 break;
             }
@@ -1850,11 +1920,12 @@ fn unblock(writer: &impl AsFd) {
     }
 }
 
-/// Write one PCM chunk. `WouldBlock` drops the chunk and leaves the capture
-/// running. A closed pipe is still a failure.
-fn write_pcm(out: &mut impl Write, samples: &[i16]) -> std::io::Result<()> {
+/// Write one PCM chunk. The count is bytes that left this process.
+/// `WouldBlock` drops the rest of the chunk and leaves the capture running.
+/// A closed pipe is still a failure.
+fn write_pcm(out: &mut impl Write, samples: &[i16]) -> std::io::Result<usize> {
     if samples.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
     let mut bytes = Vec::with_capacity(samples.len() * 2);
     for sample in samples {
@@ -1871,11 +1942,72 @@ fn write_pcm(out: &mut impl Write, samples: &[i16]) -> std::io::Result<()> {
             }
             Ok(n) => off += n,
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(off),
             Err(err) => return Err(err),
         }
     }
-    Ok(())
+    Ok(off)
+}
+
+fn pcm_feed(script: &str, dec: &Decoder, mut write: std::io::PipeWriter, keep: bool) -> PcmFeed {
+    let (tx, rx) = sync_channel::<Vec<i16>>(DECODER_QUEUE);
+    let lines = Arc::clone(&dec.lines);
+    let every = crate::rx_pipe::search_interval(script).unwrap_or(0);
+    thread::spawn(move || {
+        let mut counted = 0usize;
+        while let Ok(samples) = rx.recv() {
+            // Blocking write of whole samples. A short write would slip the
+            // symbol clock and the control channel would never sync.
+            let n = match write_all_pcm(&mut write, &samples) {
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            if every > 0 {
+                crate::rx_pipe::note_search(&lines, &mut counted, n, every);
+            }
+        }
+    });
+    PcmFeed { tx, keep }
+}
+
+fn write_feed(feed: &mut PcmFeed, samples: &[i16]) -> std::io::Result<()> {
+    enqueue_pcm(&feed.tx, samples, feed.keep)
+}
+
+/// Queue one chunk. Control (`keep`) waits until the feeder can take it.
+/// Voice drops the whole chunk when the feeder is behind. A partial sample
+/// is never written: that shifts every later symbol and P25 will not sync.
+fn enqueue_pcm(tx: &SyncSender<Vec<i16>>, samples: &[i16], keep: bool) -> std::io::Result<()> {
+    if samples.is_empty() {
+        return Ok(());
+    }
+    let chunk = samples.to_vec();
+    if keep {
+        return tx.send(chunk).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pcm closed")
+        });
+    }
+    match tx.try_send(chunk) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(_)) => Ok(()),
+        Err(TrySendError::Disconnected(_)) => Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "pcm closed",
+        )),
+    }
+}
+
+/// Write every sample. The fd is blocking. `WouldBlock` is not a drop.
+fn write_all_pcm(out: &mut impl Write, samples: &[i16]) -> std::io::Result<usize> {
+    if samples.is_empty() {
+        return Ok(0);
+    }
+    let mut bytes = Vec::with_capacity(samples.len() * 2);
+    for sample in samples {
+        bytes.extend_from_slice(&sample.to_le_bytes());
+    }
+    out.write_all(&bytes)?;
+    Ok(bytes.len())
 }
 
 fn spawn_decoder(
@@ -1884,20 +2016,13 @@ fn spawn_decoder(
     capture_audio: bool,
     key_csv: Option<&str>,
 ) -> Result<(Decoder, std::io::PipeWriter, Option<ChildStdout>), String> {
-    let port = crate::rx_pipe::claim_voice_port()?;
     let (read, write) = match std::io::pipe() {
         Ok(pair) => pair,
-        Err(err) => {
-            crate::rx_pipe::release_voice_port(port);
-            return Err(format!("hackrf decoder: {err}"));
-        }
+        Err(err) => return Err(format!("hackrf decoder: {err}")),
     };
-    let argv = match crate::rx_pipe::command_argv(script, port) {
+    let argv = match crate::rx_pipe::command_argv(script) {
         Ok(argv) => argv,
-        Err(err) => {
-            crate::rx_pipe::release_voice_port(port);
-            return Err(format!("hackrf decoder: {err}"));
-        }
+        Err(err) => return Err(format!("hackrf decoder: {err}")),
     };
     let lines = Arc::new(Mutex::new(Vec::new()));
     let mut cmd = Command::new(&argv[0]);
@@ -1911,6 +2036,11 @@ fn spawn_decoder(
         })
         .stderr(Stdio::piped())
         .process_group(0);
+    if !capture_audio {
+        // Control channel. The script uses -o null so voice audio cannot
+        // fill a pipe and stall the process that prints the site banner.
+        cmd.env("HAMSPOT_RX_MUTE", "1");
+    }
     if let Some(site) = site {
         // dsd-fme -X. WACN, system id, and NAC. Not a key. Control
         // decoders pass None so a later site can still update them.
@@ -1921,10 +2051,7 @@ fn spawn_decoder(
     }
     let mut child = match cmd.spawn() {
         Ok(child) => child,
-        Err(err) => {
-            crate::rx_pipe::release_voice_port(port);
-            return Err(format!("hackrf decoder: {err}"));
-        }
+        Err(err) => return Err(format!("hackrf decoder: {err}")),
     };
     if let Some(stderr) = child.stderr.take() {
         let sink = Arc::clone(&lines);
@@ -1938,7 +2065,6 @@ fn spawn_decoder(
                 // means the pipe was not created. Leave no orphan decoder.
                 signal(&mut child);
                 wait_child(&mut child);
-                crate::rx_pipe::release_voice_port(port);
                 return Err("hackrf voice has no stdout".into());
             }
         }
@@ -1946,11 +2072,7 @@ fn spawn_decoder(
         None
     };
     Ok((
-        Decoder {
-            child,
-            port,
-            lines,
-        },
+        Decoder { child, lines },
         write,
         audio,
     ))
@@ -2041,6 +2163,10 @@ fn pump_speech(
     stop: Arc<AtomicBool>,
     slot: Arc<SpeechSlot>,
 ) {
+    // A blocked speaker must not stop this read. dsd-fme writes voice and
+    // prints the trunk lines on the same thread; a full stdout pipe stalls
+    // both. Dropping speaker audio keeps the decoder moving.
+    unblock(&write);
     let mut current: Option<ChildStdout> = None;
     // A closed speaker must not close the decoder pipe. Dropping that pipe
     // makes commander-voice exit, and the voice script exits with it.
@@ -2071,10 +2197,38 @@ fn pump_speech(
                 if !live || voice_hz.load(Ordering::Relaxed) == 0 {
                     continue;
                 }
-                if write.write_all(&buf[..n]).is_err() {
+                if write_dropping(&mut write, &buf[..n]).is_err() {
                     live = false;
                 }
             }
+        }
+    }
+}
+
+/// One non-blocking write. `WouldBlock` drops the rest of this chunk and
+/// returns Ok: the speaker fell behind, and the bytes were already taken
+/// from dsd-fme. A closed pipe is an error so the caller stops trying.
+fn write_dropping(out: &mut impl Write, bytes: &[u8]) -> std::io::Result<()> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    // At most PIPE_BUF. A WouldBlock then stored nothing, so the speaker
+    // stays on a sample boundary. A short success drops the tail of this
+    // chunk; the next chunk starts on a frame, and one glitch is the cost
+    // of not blocking the decoder.
+    let n = bytes.len().min(4096);
+    loop {
+        match out.write(&bytes[..n]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "speaker closed",
+                ));
+            }
+            Ok(_) => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+            Err(err) => return Err(err),
         }
     }
 }
@@ -2114,6 +2268,34 @@ fn collect(stderr: impl Read, sink: Arc<Mutex<Vec<String>>>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_idle_speaker_uses_the_control_nearest_the_centre() {
+        let center = 857_200_000.0;
+        let controls = [854_437_500.0, 857_962_500.0, 859_962_500.0];
+        assert_eq!(super::primary_control(center, &controls), Some(1));
+        assert_eq!(super::primary_control(center, &[]), None);
+    }
+
+    #[test]
+    fn a_full_control_queue_keeps_the_chunk() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        super::enqueue_pcm(&tx, &[1, -2], true).unwrap();
+        let tx2 = tx.clone();
+        let waiting = std::thread::spawn(move || super::enqueue_pcm(&tx2, &[3, 4], true));
+        assert_eq!(rx.recv().unwrap(), vec![1, -2]);
+        waiting.join().unwrap().unwrap();
+        assert_eq!(rx.recv().unwrap(), vec![3, 4]);
+    }
+
+    #[test]
+    fn a_full_voice_queue_drops_a_whole_chunk() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        super::enqueue_pcm(&tx, &[1, -2], false).unwrap();
+        super::enqueue_pcm(&tx, &[3, 4], false).unwrap();
+        assert_eq!(rx.recv().unwrap(), vec![1, -2]);
+        assert!(rx.try_recv().is_err());
+    }
+
     #[test]
     fn rec_tap_replays_like_live_voice() {
         // Synthetic FM 1 kHz tone, 2.5 kHz deviation, 60 kHz above centre.

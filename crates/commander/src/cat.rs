@@ -3407,8 +3407,6 @@ fn service_rx_pipe(
             slot.rx_pipe_retry_at = None;
             if slot.rx_pipe_owned.is_some() {
                 set_rx_pipe_status(slot, &status);
-            } else if let Some(port) = slot.rx_pipe.as_ref().and_then(|pipe| pipe.port) {
-                set_rx_pipe_status(slot, &format!("{what} starting · udp {port}"));
             } else {
                 set_rx_pipe_status(slot, &format!("{what} starting"));
             }
@@ -3485,12 +3483,9 @@ fn divert_rx_pipe(slot: &mut Slot, graph: &crate::audio::AudioGraph) {
     }
 }
 
-fn rx_pipe_live_status(pipe: &crate::rx_pipe::Running, vocoder: bool) -> String {
+fn rx_pipe_live_status(_pipe: &crate::rx_pipe::Running, vocoder: bool) -> String {
     let name = if vocoder { "vocoder" } else { "rx pipe" };
-    match pipe.port {
-        Some(port) => format!("{name} {} · udp {port}", crate::rx_pipe::FORMAT),
-        None => format!("{name} {}", crate::rx_pipe::FORMAT),
-    }
+    format!("{name} {}", crate::rx_pipe::FORMAT)
 }
 
 fn release_rx_pipe(slot: &mut Slot) {
@@ -3502,14 +3497,10 @@ fn release_rx_pipe(slot: &mut Slot) {
 /// pipe still owns it. A crash passes false and leaves the wire taken.
 fn halt_rx_pipe(slot: &mut Slot, restore: bool) {
     if let Some(pipe) = slot.rx_pipe.take() {
-        let port = pipe.port;
         if pipe.diverted {
             slot.rx_pipe_owned = Some(pipe.output.clone());
         }
         crate::rx_pipe::shutdown(pipe);
-        if let Some(port) = port {
-            crate::rx_pipe::release_voice_port(port);
-        }
     }
     if !restore {
         return;
@@ -3671,8 +3662,6 @@ fn service_tx_pipe(slot: &mut Slot, graph: &crate::audio::AudioGraph, now: Insta
             slot.tx_pipe_retry_at = None;
             if slot.tx_pipe_owned.is_some() {
                 set_tx_pipe_status(slot, &status);
-            } else if let Some(port) = slot.tx_pipe.as_ref().and_then(|pipe| pipe.port) {
-                set_tx_pipe_status(slot, &format!("tx pipe starting · udp {port}"));
             } else {
                 set_tx_pipe_status(slot, "tx pipe starting");
             }
@@ -3731,11 +3720,8 @@ fn divert_tx_pipe(slot: &mut Slot, graph: &crate::audio::AudioGraph) {
     }
 }
 
-fn tx_pipe_live_status(pipe: &crate::rx_pipe::Running) -> String {
-    match pipe.port {
-        Some(port) => format!("tx pipe {} · udp {port}", crate::rx_pipe::FORMAT),
-        None => format!("tx pipe {}", crate::rx_pipe::FORMAT),
-    }
+fn tx_pipe_live_status(_pipe: &crate::rx_pipe::Running) -> String {
+    format!("tx pipe {}", crate::rx_pipe::FORMAT)
 }
 
 fn release_tx_pipe(slot: &mut Slot) {
@@ -3762,14 +3748,10 @@ fn halt_tx_pipe(slot: &mut Slot, restore: bool) {
         slot.tx_pipe_owned = None;
     }
     if let Some(pipe) = slot.tx_pipe.take() {
-        let port = pipe.port;
         if pipe.diverted && !restore {
             slot.tx_pipe_owned = Some(pipe.source.clone());
         }
         crate::rx_pipe::shutdown(pipe);
-        if let Some(port) = port {
-            crate::rx_pipe::release_voice_port(port);
-        }
     }
 }
 
