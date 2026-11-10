@@ -51,7 +51,8 @@ pub(crate) const CONFIG_GROUPS: [(&str, egui::Color32); 11] = {
         ("Display", TEXT_MUTED),
         ("Radio", SLATE),
         ("Rotator", OLIVE),
-        ("Amplifier", BRICK),
+        // Not BRICK: red is only for a group whose buttons delete or discard.
+        ("Amplifier", TEXT),
         ("Trunking", PLUM),
         ("Audio patch", TEAL),
         ("Automation patch", PLUM),
@@ -12655,24 +12656,33 @@ impl App {
     }
 
     fn sliders(&mut self, ui: &mut egui::Ui, snap: &Snapshot) {
-        ui.label(egui::RichText::new("Levels").strong());
-        self.level_slider(ui, snap, "AF", "AF gain (main)");
-        self.level_slider(ui, snap, "RF", "RF gain (main)");
-        self.agc(ui, snap);
-        self.level_slider(ui, snap, "RFPOWER", "RF power");
-        ui.add_space(6.0);
-        fixed_slider(ui, "AF gain (sub)", 0.10);
-        fixed_slider(ui, "RF gain (sub)", 1.0);
-        ui.add_enabled(false, egui::Button::new("AGC (sub): Auto Fast"));
-        self.level_slider(ui, snap, "NR", "Noise reduction");
-        ui.add_space(6.0);
-        self.level_slider(ui, snap, "IF", "IF shift");
-        self.width_slider(ui, snap);
-        ui.add_enabled(false, egui::Button::new("Contour: 20 Hz"));
-        ui.add_space(6.0);
-        self.level_slider(ui, snap, "MICGAIN", "Mic gain");
-        self.level_slider(ui, snap, "VOXDELAY", "VOX delay");
-        self.level_slider(ui, snap, "VOXGAIN", "VOX gain");
+        use rustcars::palette::{OLIVE, PLUM, SLATE, TAN, TEAL};
+        // Same controls as before, one titled group each. Nothing is wired
+        // or removed here; inert rows stay inert (#151).
+        crate::group_box::group_box(ui, "Receive", TAN, |ui| {
+            self.level_slider(ui, snap, "AF", "AF gain (main)");
+            self.level_slider(ui, snap, "RF", "RF gain (main)");
+            self.agc(ui, snap);
+        });
+        crate::group_box::group_box(ui, "Filter", TEAL, |ui| {
+            self.width_slider(ui, snap);
+            self.level_slider(ui, snap, "IF", "IF shift");
+            self.level_slider(ui, snap, "NR", "Noise reduction");
+            ui.add_enabled(false, egui::Button::new("Contour: 20 Hz"));
+        });
+        crate::group_box::group_box(ui, "Transmit", OLIVE, |ui| {
+            self.level_slider(ui, snap, "RFPOWER", "RF power");
+            self.level_slider(ui, snap, "MICGAIN", "Mic gain");
+        });
+        crate::group_box::group_box(ui, "VOX", PLUM, |ui| {
+            self.level_slider(ui, snap, "VOXGAIN", "VOX gain");
+            self.level_slider(ui, snap, "VOXDELAY", "VOX delay");
+        });
+        crate::group_box::group_box(ui, "Sub receiver", SLATE, |ui| {
+            fixed_slider(ui, "AF gain (sub)", 0.10);
+            fixed_slider(ui, "RF gain (sub)", 1.0);
+            ui.add_enabled(false, egui::Button::new("AGC (sub): Auto Fast"));
+        });
     }
 
     fn level_slider(&mut self, ui: &mut egui::Ui, snap: &Snapshot, name: &str, label: &str) {

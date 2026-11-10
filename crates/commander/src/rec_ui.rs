@@ -976,83 +976,60 @@ impl App {
     }
 
     fn rec_data_body(&mut self, ui: &mut egui::Ui) {
+        use rustcars::palette::{SLATE, TAN, TEAL};
         let mut cap_changed = false;
-        ui.label(egui::RichText::new("Storage").strong());
-        if let Some(u) = &self.rec.usage {
-            let color = match u.level() {
-                hsrec::storage::Level::Ok => ui.visuals().text_color(),
-                hsrec::storage::Level::Warn80 => caution(),
-                _ => egui::Color32::from_rgb(240, 60, 50),
-            };
-            // text() carries the warning words, so colour is never the only cue.
-            ui.label(egui::RichText::new(format!("Disk {}", u.text())).color(color));
+        if self.rec.archive_days <= 0.0 {
+            self.rec.archive_days = 7.0;
         }
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Cap GB");
-            if ui.add(egui::DragValue::new(&mut self.rec.face.cap_gb).range(0.1..=100_000.0).speed(0.5)).changed() {
-                cap_changed = true;
-            }
-            if ui
-                .checkbox(&mut self.rec.face.overwrite_oldest, "Overwrite oldest unprotected at cap")
-                .on_hover_text("Off (default): stop recording at the cap and warn. Protected recordings are never overwritten.")
-                .changed()
-            {
-                cap_changed = true;
-            }
-        });
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Max segment");
-            let r = ui
-                .add(
-                    egui::DragValue::new(&mut self.rec.face.max_segment_s)
-                        .range(segment::MAX_SEGMENT_MIN_S..=segment::MAX_SEGMENT_MAX_S)
-                        .speed(1.0)
-                        .suffix(" s"),
-                )
-                .on_hover_text("A call still going at this length is split into a new recording, so nothing is lost. Default 120 s.");
-            if r.changed() {
-                self.rec.face_dirty = true;
-            }
-        });
-        ui.add_space(6.0);
-        ui.label(egui::RichText::new("Archive").strong());
-        ui.horizontal_wrapped(|ui| {
-            let busy = self.rec.job.is_some();
-            if self.rec.archive_days <= 0.0 {
-                self.rec.archive_days = 7.0;
-            }
-            if ui.add_enabled(!busy, egui::Button::new("Archive older than")).on_hover_text("zstd compress, verify by sha256, then replace. Archived recordings still play.").clicked() {
-                let rows = self.rec.db.as_ref().and_then(|d| d.all().ok()).unwrap_or_default();
-                let todo: Vec<Recording> = hsrec::archive::older_than(&rows, self.rec.archive_days, chrono::Utc::now()).into_iter().cloned().collect();
-                self.rec_start_archive(todo);
-            }
-            ui.add(egui::DragValue::new(&mut self.rec.archive_days).range(0.0..=3650.0).suffix(" d"));
-            if ui.add_enabled(!busy, egui::Button::new("Rescan")).on_hover_text("Re-add recordings from sidecars on disk; flag missing files.").clicked() {
-                if let Some(db) = &self.rec.db {
-                    match db.rescan(&self.rec.dir) {
-                        Ok((a, m)) => self.rec.note = format!("Rescan: {a} added, {m} missing."),
-                        Err(e) => self.rec.note = format!("Rescan failed: {e}"),
-                    }
-                    self.rec_reload(true);
-                }
-            }
-            if ui.add_enabled(!busy, egui::Button::new("Clear cache")).on_hover_text("Waveform thumbnails are rebuilt from raw IQ. Nothing is lost.").clicked() {
-                if let Some(db) = &self.rec.db {
-                    let _ = hsrec::cache::clear(db, &self.rec.dir);
-                }
-                self.rec.waveforms.clear();
-                self.rec.wf_asked.clear();
-            }
-        });
-        // Export / move to a removable drive.
+        // No mount event is wired into this dialog. Refresh the removable-drive
+        // list on a short interval while it is open, same five seconds as before.
         if self.rec.drives_at.is_none_or(|t| t.elapsed() > Duration::from_secs(5)) {
             self.rec.drives = hsrec::export::removable_drives();
             self.rec.drives_at = Some(Instant::now());
         }
-        ui.add_space(6.0);
-        ui.label(egui::RichText::new("Drive").strong());
-        ui.horizontal_wrapped(|ui| {
-            if self.rec.drives.is_empty() {
+        let has_drive = !self.rec.drives.is_empty();
+        crate::group_box::group_box(ui, "Storage", TAN, |ui| {
+            if let Some(u) = &self.rec.usage {
+                let color = match u.level() {
+                    hsrec::storage::Level::Ok => ui.visuals().text_color(),
+                    hsrec::storage::Level::Warn80 => caution(),
+                    _ => egui::Color32::from_rgb(240, 60, 50),
+                };
+                // text() carries the warning words, so colour is never the only cue.
+                ui.label(egui::RichText::new(format!("Disk {}", u.text())).color(color));
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Cap GB");
+                if ui.add(egui::DragValue::new(&mut self.rec.face.cap_gb).range(0.1..=100_000.0).speed(0.5)).changed() {
+                    cap_changed = true;
+                }
+                if ui
+                    .checkbox(&mut self.rec.face.overwrite_oldest, "Overwrite oldest unprotected at cap")
+                    .on_hover_text("Off (default): stop recording at the cap and warn. Protected recordings are never overwritten.")
+                    .changed()
+                {
+                    cap_changed = true;
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Max segment");
+                let r = ui
+                    .add(
+                        egui::DragValue::new(&mut self.rec.face.max_segment_s)
+                            .range(segment::MAX_SEGMENT_MIN_S..=segment::MAX_SEGMENT_MAX_S)
+                            .speed(1.0)
+                            .suffix(" s"),
+                    )
+                    .on_hover_text("A call still going at this length is split into a new recording, so nothing is lost. Default 120 s.");
+                if r.changed() {
+                    self.rec.face_dirty = true;
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Older than");
+                ui.add(egui::DragValue::new(&mut self.rec.archive_days).range(0.0..=3650.0).suffix(" d"));
+            });
+            if !has_drive {
                 ui.label(egui::RichText::new("no removable drive under /media or /run/media").weak());
             } else {
                 if self.rec.drive_pick >= self.rec.drives.len() {
@@ -1065,27 +1042,67 @@ impl App {
                         ui.selectable_value(&mut self.rec.drive_pick, i, format!("{} ({:.1} GB free)", d.label, d.free as f64 / 1e9));
                     }
                 });
-                let busy = self.rec.job.is_some();
-                let sel = self.rec.selected;
-                if ui.add_enabled(!busy && sel.is_some(), egui::Button::new("Copy selected")).clicked() {
-                    self.rec_start_export(sel, false);
+            }
+        });
+        crate::group_box::group_box(ui, "Library", SLATE, |ui| {
+            let busy = self.rec.job.is_some();
+            ui.horizontal_wrapped(|ui| {
+                if ui.add_enabled(!busy, egui::Button::new("Rescan")).on_hover_text("Re-add recordings from sidecars on disk; flag missing files.").clicked() {
+                    if let Some(db) = &self.rec.db {
+                        match db.rescan(&self.rec.dir) {
+                            Ok((a, m)) => self.rec.note = format!("Rescan: {a} added, {m} missing."),
+                            Err(e) => self.rec.note = format!("Rescan failed: {e}"),
+                        }
+                        self.rec_reload(true);
+                    }
                 }
-                if ui.add_enabled(!busy && sel.is_some(), egui::Button::new("Move selected")).on_hover_text("The local copy is deleted only after the copy on the drive verifies.").clicked() {
-                    self.rec_start_export(sel, true);
-                }
-                if ui.add_enabled(!busy, egui::Button::new(format!("Copy older than {:.0} d", self.rec.archive_days))).clicked() {
-                    self.rec_start_export(None, false);
-                }
-                if ui.add_enabled(!busy, egui::Button::new(format!("Move older than {:.0} d", self.rec.archive_days))).clicked() {
-                    self.rec_start_export(None, true);
-                }
-                if ui.add_enabled(!busy, egui::Button::new("Re-attach")).on_hover_text("Copy recordings that were moved to this drive back, verified by sha256.").clicked() {
+                if has_drive && ui.add_enabled(!busy, egui::Button::new("Re-attach")).on_hover_text("Copy recordings that were moved to this drive back, verified by sha256.").clicked() {
                     self.rec_start_reattach();
                 }
-                if ui.add_enabled(!busy, egui::Button::new("Import")).on_hover_text("Import another Commander's export (HamSpot-REC/index.json) from this drive.").clicked() {
+                if has_drive && ui.add_enabled(!busy, egui::Button::new("Import")).on_hover_text("Import another Commander's export (HamSpot-REC/index.json) from this drive.").clicked() {
                     self.rec_start_import();
                 }
-            }
+            });
+        });
+        if has_drive {
+            crate::group_box::group_box(ui, "Move & copy", TEAL, |ui| {
+                let busy = self.rec.job.is_some();
+                let sel = self.rec.selected;
+                ui.horizontal_wrapped(|ui| {
+                    if ui.add_enabled(!busy && sel.is_some(), egui::Button::new("Copy selected")).clicked() {
+                        self.rec_start_export(sel, false);
+                    }
+                    if ui.add_enabled(!busy, egui::Button::new(format!("Copy older than {:.0} d", self.rec.archive_days))).clicked() {
+                        self.rec_start_export(None, false);
+                    }
+                });
+            });
+        }
+        // Archive and Move remove the local file after a verified copy. Clear cache drops thumbnails.
+        // Copy stays in Move & copy. The days field those buttons read is in Storage.
+        crate::group_box::group_box(ui, "Danger", crate::estop::DANGER, |ui| {
+            let busy = self.rec.job.is_some();
+            let sel = self.rec.selected;
+            ui.horizontal_wrapped(|ui| {
+                if ui.add_enabled(!busy, egui::Button::new("Archive older than")).on_hover_text("zstd compress, verify by sha256, then replace. Archived recordings still play.").clicked() {
+                    let rows = self.rec.db.as_ref().and_then(|d| d.all().ok()).unwrap_or_default();
+                    let todo: Vec<Recording> = hsrec::archive::older_than(&rows, self.rec.archive_days, chrono::Utc::now()).into_iter().cloned().collect();
+                    self.rec_start_archive(todo);
+                }
+                if has_drive && ui.add_enabled(!busy && sel.is_some(), egui::Button::new("Move selected")).on_hover_text("The local copy is deleted only after the copy on the drive verifies.").clicked() {
+                    self.rec_start_export(sel, true);
+                }
+                if has_drive && ui.add_enabled(!busy, egui::Button::new(format!("Move older than {:.0} d", self.rec.archive_days))).clicked() {
+                    self.rec_start_export(None, true);
+                }
+                if ui.add_enabled(!busy, egui::Button::new("Clear cache")).on_hover_text("Waveform thumbnails are rebuilt from raw IQ. Nothing is lost.").clicked() {
+                    if let Some(db) = &self.rec.db {
+                        let _ = hsrec::cache::clear(db, &self.rec.dir);
+                    }
+                    self.rec.waveforms.clear();
+                    self.rec.wf_asked.clear();
+                }
+            });
         });
         self.rec_job_row(ui);
         if cap_changed {
@@ -1871,88 +1888,94 @@ impl App {
                 .map(|t| t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string())
                 .unwrap_or_else(|_| if utc.is_empty() { "recording…".into() } else { utc.to_string() })
         };
-        // Header
-        ui.heading(rec.meta.lane());
-        ui.label(format!(
-            "{} → {}   {:.1} s",
-            local(&rec.meta.start_utc),
-            local(&rec.meta.end_utc),
-            rec.meta.duration_ms as f64 / 1000.0
-        ));
-        ui.separator();
-        // Playback
-        ui.strong("Playback");
+        use rustcars::palette::{PLUM, SLATE, TAN, TEAL, TEXT};
         let mut star = rec.star;
         let mut protect = rec.protected;
-        ui.horizontal_wrapped(|ui| {
-            let playing = self.rec.player.as_ref().is_some_and(|(pid, _)| *pid == id);
-            if playing {
-                if ui.button("■ Stop").clicked() {
-                    self.rec.player = None;
-                }
-            } else if ui.button("▶ Play").on_hover_text("Re-demodulates the raw IQ now, through the current decoder.").clicked() {
-                self.rec_play(id, 0);
-            }
-            ui.checkbox(&mut star, "★ Star");
-            ui.checkbox(&mut protect, "🔒 Protect").on_hover_text("Never removed by overwrite-oldest.");
-        });
-        self.rec_output_row(ui);
-        ui.horizontal_wrapped(|ui| {
-            let red = egui::Color32::from_rgb(240, 60, 50);
-            if !hsrec::dsp::in_capture(rec.meta.offset_hz) && rec.meta.source_kind != meta::KIND_DEMOD_AUDIO {
-                ui.label(egui::RichText::new("OUT OF BAND").small().strong().color(red));
-            }
-            if self.rec.no_voice.contains(&id) {
-                ui.label(egui::RichText::new("no voice").small().strong().color(caution()));
-            }
-            if rec.meta.emergency { ui.label(egui::RichText::new("EMERGENCY").small().strong().color(red)); }
-            if rec.meta.priority { ui.label(egui::RichText::new("PRIORITY").small()); }
-            if rec.archived { ui.label(egui::RichText::new("archived (zst)").small()); }
-            if rec.offline() { ui.label(egui::RichText::new("offline").small()); }
-            if rec.missing { ui.label(egui::RichText::new("MISSING").small().color(red)); }
-        });
-        // One status line: the latest transport / action message.
-        if !self.rec.note.is_empty() {
-            ui.label(egui::RichText::new(&self.rec.note).color(caution()));
-        }
-        ui.separator();
-        ui.horizontal(|ui| {
-            ui.label("Notes");
-            let r = ui.add(egui::TextEdit::singleline(&mut self.rec.notes_edit).desired_width(f32::INFINITY));
-            if r.lost_focus() && self.rec.notes_edit != rec.notes {
-                if let Some(db) = &self.rec.db {
-                    let _ = db.set_notes(id, &self.rec.notes_edit);
-                }
-                self.rec_reload(true);
-            }
-        });
         let mut delete = false;
-        ui.horizontal_wrapped(|ui| {
-            if ui.button("Export WAV…").on_hover_text("Demodulates now and writes a WAV. The WAV is not kept by REC.").clicked() {
-                self.rec_export_wav(&rec);
+        // Timeline and find stay on the REC page. This dialog groups the fields that are already here.
+        crate::group_box::group_box(ui, "Call", TAN, |ui| {
+            ui.heading(rec.meta.lane());
+            ui.label(format!(
+                "{} → {}   {:.1} s",
+                local(&rec.meta.start_utc),
+                local(&rec.meta.end_utc),
+                rec.meta.duration_ms as f64 / 1000.0
+            ));
+            ui.horizontal_wrapped(|ui| {
+                let red = egui::Color32::from_rgb(240, 60, 50);
+                if !hsrec::dsp::in_capture(rec.meta.offset_hz) && rec.meta.source_kind != meta::KIND_DEMOD_AUDIO {
+                    ui.label(egui::RichText::new("OUT OF BAND").small().strong().color(red));
+                }
+                if self.rec.no_voice.contains(&id) {
+                    ui.label(egui::RichText::new("no voice").small().strong().color(caution()));
+                }
+                if rec.meta.emergency { ui.label(egui::RichText::new("EMERGENCY").small().strong().color(red)); }
+                if rec.meta.priority { ui.label(egui::RichText::new("PRIORITY").small()); }
+                if rec.archived { ui.label(egui::RichText::new("archived (zst)").small()); }
+                if rec.offline() { ui.label(egui::RichText::new("offline").small()); }
+                if rec.missing { ui.label(egui::RichText::new("MISSING").small().color(red)); }
+            });
+            if !self.rec.note.is_empty() {
+                ui.label(egui::RichText::new(&self.rec.note).color(caution()));
             }
-            if ui.button("Export raw…").on_hover_text("Raw IQ (or archive) plus the JSON sidecar.").clicked() {
-                self.rec_export_raw(&rec);
-            }
-            if rec.archived {
-                if ui.add_enabled(self.rec.job.is_none(), egui::Button::new("Unarchive")).clicked() {
+        });
+        crate::group_box::group_box(ui, "Playback", TEAL, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                let playing = self.rec.player.as_ref().is_some_and(|(pid, _)| *pid == id);
+                if playing {
+                    if ui.button("■ Stop").clicked() {
+                        self.rec.player = None;
+                    }
+                } else if ui.button("▶ Play").on_hover_text("Re-demodulates the raw IQ now, through the current decoder.").clicked() {
+                    self.rec_play(id, 0);
+                }
+                ui.checkbox(&mut star, "★ Star");
+                ui.checkbox(&mut protect, "🔒 Protect").on_hover_text("Never removed by overwrite-oldest.");
+            });
+            self.rec_output_row(ui);
+        });
+        crate::group_box::group_box(ui, "Notes", PLUM, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Notes");
+                let r = ui.add(egui::TextEdit::singleline(&mut self.rec.notes_edit).desired_width(f32::INFINITY));
+                if r.lost_focus() && self.rec.notes_edit != rec.notes {
+                    if let Some(db) = &self.rec.db {
+                        let _ = db.set_notes(id, &self.rec.notes_edit);
+                    }
+                    self.rec_reload(true);
+                }
+            });
+        });
+        crate::group_box::group_box(ui, "Export", TEXT, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Export WAV…").on_hover_text("Demodulates now and writes a WAV. The WAV is not kept by REC.").clicked() {
+                    self.rec_export_wav(&rec);
+                }
+                if ui.button("Export raw…").on_hover_text("Raw IQ (or archive) plus the JSON sidecar.").clicked() {
+                    self.rec_export_raw(&rec);
+                }
+                // Unarchive restores a file. It is not a discard, so it stays out of Danger.
+                if rec.archived && ui.add_enabled(self.rec.job.is_none(), egui::Button::new("Unarchive")).clicked() {
                     let dir = self.rec.dir.clone();
                     let one = rec.clone();
                     self.rec_job("Unarchiving", move |db, st, _| {
                         let r = hsrec::archive::unarchive_one(&db, &dir, &one);
                         st.lock().expect("job").lines.push(r.err().unwrap_or_else(|| "Unarchived.".into()));
                     });
-                    return;
                 }
-            } else if ui.add_enabled(self.rec.job.is_none() && !rec.meta.end_utc.is_empty(), egui::Button::new("Archive")).clicked() {
-                self.rec_start_archive(vec![rec.clone()]);
-            }
-            if ui.button("Delete").on_hover_text("Removes the raw file, its row, and its cache. Undo for 60 s.").clicked() {
-                delete = true;
-            }
+            });
         });
-        ui.separator();
-        // Metadata scrolls on its own so the block above never leaves view.
+        crate::group_box::group_box(ui, "Danger", crate::estop::DANGER, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                if !rec.archived && ui.add_enabled(self.rec.job.is_none() && !rec.meta.end_utc.is_empty(), egui::Button::new("Archive")).clicked() {
+                    self.rec_start_archive(vec![rec.clone()]);
+                }
+                if ui.button("Delete").on_hover_text("Removes the raw file, its row, and its cache. Undo for 60 s.").clicked() {
+                    delete = true;
+                }
+            });
+        });
+        // Metadata scrolls on its own so the groups above never leave view.
         egui::ScrollArea::vertical().id_salt(("rec-meta-scroll", id)).auto_shrink([false, true]).show(ui, |ui| {
         let rows = self.rec_meta_rows(&rec);
         ui.horizontal(|ui| {
@@ -1964,13 +1987,25 @@ impl App {
                 ui.ctx().copy_text(text.join("\n"));
             }
         });
-        egui::Grid::new(("rec-meta", id)).num_columns(2).striped(true).spacing([12.0, 2.0]).show(ui, |ui| {
-            for (k, v) in &rows {
-                ui.label(egui::RichText::new(*k).weak());
-                ui.add(egui::Label::new(v).wrap());
-                ui.end_row();
+        for (title, colour, keys) in [
+            ("Source", TAN, &["Source kind", "Source tab", "Radio", "Frequency", "Capture centre", "Bandwidth", "System", "Site", "Talkgroup", "Channel", "Radio unit ID", "Radio IDs on call", "Sample rate / format", "Gains", "Dropped samples"][..]),
+            ("Processing", SLATE, &["Modulation", "Chain", "Decoder", "Software"][..]),
+            ("File", TEAL, &["Start", "End", "Duration", "File", "Size", "Archive", "Location", "SHA-256", "Part"][..]),
+        ] {
+            let part: Vec<_> = rows.iter().filter(|(k, _)| keys.contains(k)).cloned().collect();
+            if part.is_empty() {
+                continue;
             }
-        });
+            crate::group_box::group_box(ui, title, colour, |ui| {
+                egui::Grid::new(("rec-meta", id, title)).num_columns(2).striped(true).spacing([12.0, 2.0]).show(ui, |ui| {
+                    for (k, v) in &part {
+                        ui.label(egui::RichText::new(*k).weak());
+                        ui.add(egui::Label::new(v).wrap());
+                        ui.end_row();
+                    }
+                });
+            });
+        }
         if !rec.meta.decoder_params.is_empty() {
             egui::CollapsingHeader::new(format!("Decoder parameters ({})", rec.meta.decoder_params.len()))
                 .id_salt("rec-decoder-params")

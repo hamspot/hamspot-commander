@@ -1175,47 +1175,50 @@ impl NanoVna {
     }
 
     fn controls(&mut self, ui: &mut Ui, theme: &LcarsTheme, live: &device::Live) {
-        ui.add(
-            egui::Label::new(egui::RichText::new(&live.status).color(palette::TEXT_MUTED)).wrap(),
-        );
-        ui.horizontal(|ui| {
-            if action_button(ui, theme, "Ports", vec2(88.0, 32.0)).clicked() {
-                self.ports = device::list_ports();
-            }
-            if action_button(ui, theme, "Connect", vec2(100.0, 32.0)).clicked() {
-                self.user_closed = false;
-                if !self.face.port.is_empty() {
-                    self.session.connect(self.face.port.clone());
+        crate::group_box::group_box(ui, "Device", palette::SLATE, |ui| {
+            ui.add(
+                egui::Label::new(egui::RichText::new(&live.status).color(palette::TEXT_MUTED)).wrap(),
+            );
+            ui.horizontal(|ui| {
+                if action_button(ui, theme, "Ports", vec2(88.0, 32.0)).clicked() {
+                    self.ports = device::list_ports();
                 }
+                if action_button(ui, theme, "Connect", vec2(100.0, 32.0)).clicked() {
+                    self.user_closed = false;
+                    if !self.face.port.is_empty() {
+                        self.session.connect(self.face.port.clone());
+                    }
+                }
+                if action_button(ui, theme, "Close", vec2(80.0, 32.0)).clicked() {
+                    self.user_closed = true;
+                    self.arm_connect = false;
+                    self.run = false;
+                    self.run_state = Run::Idle;
+                    self.session.disconnect();
+                }
+            });
+            if self.ports.is_empty() {
+                ui.label(
+                    egui::RichText::new("No USB serial ports.").color(palette::TEXT_MUTED),
+                );
             }
-            if action_button(ui, theme, "Close", vec2(80.0, 32.0)).clicked() {
-                self.user_closed = true;
-                self.arm_connect = false;
-                self.run = false;
-                self.run_state = Run::Idle;
-                self.session.disconnect();
+            for port in &self.ports.clone() {
+                let title = if port.nanovna {
+                    format!("{}  V2", port.name)
+                } else {
+                    port.name.clone()
+                };
+                if ui.selectable_label(self.face.port == port.name, title).clicked() {
+                    self.face.port = port.name.clone();
+                    self.dirty = true;
+                }
             }
         });
         self.control_body(ui, theme, live);
     }
 
     fn control_body(&mut self, ui: &mut Ui, theme: &LcarsTheme, live: &device::Live) {
-        if self.ports.is_empty() {
-            ui.label(
-                egui::RichText::new("No USB serial ports.").color(palette::TEXT_MUTED),
-            );
-        }
-        for port in &self.ports.clone() {
-            let title = if port.nanovna {
-                format!("{}  V2", port.name)
-            } else {
-                port.name.clone()
-            };
-            if ui.selectable_label(self.face.port == port.name, title).clicked() {
-                self.face.port = port.name.clone();
-                self.dirty = true;
-            }
-        }
+        crate::group_box::group_box(ui, "Sweep", palette::TEAL, |ui| {
         self.edit(ui, "Start Hz", Edit::Start);
         self.edit(ui, "Stop Hz", Edit::Stop);
         self.edit(ui, "Points", Edit::Points);
@@ -1231,21 +1234,6 @@ impl NanoVna {
             }
         });
         self.edit(ui, "Z0", Edit::Z0);
-        ui.label(
-            egui::RichText::new("Each zone is calibrated from the Cal tab.")
-                .color(palette::TEXT_MUTED),
-        );
-        ui.horizontal(|ui| {
-            if action_button(ui, theme, "Clear cal", vec2(100.0, 32.0)).clicked() {
-                self.clear_cal(live);
-            }
-            if action_button(ui, theme, "Backup", vec2(100.0, 32.0)).clicked() {
-                self.backup_cal();
-            }
-            if action_button(ui, theme, "Restore", vec2(100.0, 32.0)).clicked() {
-                self.restore_cal();
-            }
-        });
         self.edit(ui, "VF", Edit::Velocity);
         self.edit(ui, "Extension m", Edit::Extension);
         self.edit(ui, "Host avg", Edit::HostAvg);
@@ -1284,43 +1272,70 @@ impl NanoVna {
                 false,
             );
         }
-        ui.horizontal(|ui| {
-            if action_button(ui, theme, "Memory", vec2(88.0, 32.0)).clicked() {
-                if let Some(trace) = self.display_trace(live) {
-                    self.mems[self.mem_sel] = Some(trace);
-                    self.show_memory = true;
+        });
+        crate::group_box::group_box(ui, "Calibration", palette::PLUM, |ui| {
+            ui.label(
+                egui::RichText::new("Each zone is calibrated from the Cal tab.")
+                    .color(palette::TEXT_MUTED),
+            );
+            ui.horizontal(|ui| {
+                if action_button(ui, theme, "Backup", vec2(100.0, 32.0)).clicked() {
+                    self.backup_cal();
                 }
-            }
-            if action_button(ui, theme, "Mem on", vec2(80.0, 32.0)).clicked() {
-                self.show_memory = !self.show_memory;
-            }
-            if action_button(ui, theme, "Math", vec2(70.0, 32.0)).clicked() {
-                self.math = next_math(self.math);
+                if action_button(ui, theme, "Restore", vec2(100.0, 32.0)).clicked() {
+                    self.restore_cal();
+                }
+            });
+        });
+        // Clear cal erases the zone. Backup and Restore stay in Calibration.
+        crate::group_box::group_box(ui, "Danger", crate::estop::DANGER, |ui| {
+            if action_button(ui, theme, "Clear cal", vec2(100.0, 32.0)).clicked() {
+                self.clear_cal(live);
             }
         });
-        ui.horizontal(|ui| {
-            if action_button(ui, theme, "CSV", vec2(64.0, 32.0)).clicked() {
-                self.export_text(live, "csv", "nanovna.csv", true);
+        crate::group_box::group_box(ui, "Memory & math", palette::OLIVE, |ui| {
+            ui.horizontal(|ui| {
+                if action_button(ui, theme, "Memory", vec2(88.0, 32.0)).clicked() {
+                    if let Some(trace) = self.display_trace(live) {
+                        self.mems[self.mem_sel] = Some(trace);
+                        self.show_memory = true;
+                    }
+                }
+                if action_button(ui, theme, "Mem on", vec2(80.0, 32.0)).clicked() {
+                    self.show_memory = !self.show_memory;
+                }
+                if action_button(ui, theme, "Math", vec2(70.0, 32.0)).clicked() {
+                    self.math = next_math(self.math);
+                }
+            });
+        });
+        crate::group_box::group_box(ui, "Export", palette::TEXT, |ui| {
+            ui.horizontal(|ui| {
+                if action_button(ui, theme, "CSV", vec2(64.0, 32.0)).clicked() {
+                    self.export_text(live, "csv", "nanovna.csv", true);
+                }
+                if action_button(ui, theme, "s1p", vec2(64.0, 32.0)).clicked() {
+                    self.export_text(live, "s1p", "nanovna.s1p", false);
+                }
+                if action_button(ui, theme, "s2p", vec2(64.0, 32.0)).clicked() {
+                    self.export_text(live, "s2p", "nanovna.s2p", false);
+                }
+                if action_button(ui, theme, "PNG", vec2(64.0, 32.0)).clicked() {
+                    self.export_png(live);
+                }
+                if action_button(ui, theme, "Screen", vec2(80.0, 32.0)).clicked() {
+                    self.session.capture();
+                }
+            });
+        });
+        crate::group_box::group_box(ui, "Status", palette::TEXT_MUTED, |ui| {
+            if !self.note.is_empty() {
+                readout(ui, theme, &self.note, true);
             }
-            if action_button(ui, theme, "s1p", vec2(64.0, 32.0)).clicked() {
-                self.export_text(live, "s1p", "nanovna.s1p", false);
-            }
-            if action_button(ui, theme, "s2p", vec2(64.0, 32.0)).clicked() {
-                self.export_text(live, "s2p", "nanovna.s2p", false);
-            }
-            if action_button(ui, theme, "PNG", vec2(64.0, 32.0)).clicked() {
-                self.export_png(live);
-            }
-            if action_button(ui, theme, "Screen", vec2(80.0, 32.0)).clicked() {
-                self.session.capture();
+            if let Some(samples) = self.display_trace(live) {
+                self.finder_readout(ui, theme, &samples);
             }
         });
-        if !self.note.is_empty() {
-            readout(ui, theme, &self.note, true);
-        }
-        if let Some(samples) = self.display_trace(live) {
-            self.finder_readout(ui, theme, &samples);
-        }
     }
 
     fn face_caption(&self, live: &device::Live, samples: Option<&[Sample]>) -> String {
@@ -2212,7 +2227,8 @@ impl NanoVna {
         let col3 = ((width - 16.0) / 3.0).floor();
         let col4 = ((width - 24.0) / 4.0).floor();
 
-        key_caption(ui, theme, "SWEEP · CAL", width);
+        // Elbow groups replace the silkscreen captions. Key names and keys.rs hints stay.
+        crate::group_box::group_box(ui, "Sweep", palette::TEAL, |ui| {
         let mut scan = false;
         let mut mode: Option<u8> = None;
         ui.horizontal(|ui| {
@@ -2254,8 +2270,9 @@ impl NanoVna {
             None => {}
         }
         self.sweep_panel(ui, theme, live, width, col4);
+        });
 
-        key_caption(ui, theme, "LAYOUT · TRACE", width);
+        crate::group_box::group_box(ui, "Traces & display", palette::TAN, |ui| {
         let mut lay: Option<(u8, u8)> = None;
         ui.horizontal(|ui| {
             // LAYOUT: single = choose, double = swap pane order, triple = default four-pane set.
@@ -2381,8 +2398,9 @@ impl NanoVna {
                 self.couple = !self.couple;
             }
         });
+        });
 
-        key_caption(ui, theme, "FORMAT", width);
+        crate::group_box::group_box(ui, "Format", palette::SLATE, |ui| {
         // Parameter first; only the formats valid for it are offered. Issue 64.
         let s21 = uses_s21(self.view);
         let mut pick_param = None;
@@ -2427,8 +2445,9 @@ impl NanoVna {
                 );
             });
         }
+        });
 
-        key_caption(ui, theme, "DISPLAY", width);
+        crate::group_box::group_box(ui, "Memory & math", palette::OLIVE, |ui| {
         ui.horizontal(|ui| {
             // STORE: single = store, double = toggle memory display, triple = cycle math.
             let resp = softkey_response(ui, theme, "Store", false, col4, samples.is_some())
@@ -2467,11 +2486,9 @@ impl NanoVna {
         });
         let mut import = false;
         let mut save = false;
-        let mut clear = false;
         ui.horizontal(|ui| {
             import = softkey(ui, theme, "Import", false, col4);
             save = softkey_enabled(ui, theme, "Save mem", false, col4, self.memory().is_some());
-            clear = softkey_enabled(ui, theme, "Clr mem", false, col4, self.memory().is_some());
         });
         if import {
             self.import_memory();
@@ -2482,11 +2499,15 @@ impl NanoVna {
                 self.save_bytes("Save memory", &format!("nanovna-mem{}.s2p", self.mem_sel + 1), text.as_bytes());
             }
         }
-        if clear {
-            self.mems[self.mem_sel] = None;
-        }
+        });
+        // Clr mem discards the stored trace. It does not share the Memory title colour.
+        crate::group_box::group_box(ui, "Danger", crate::estop::DANGER, |ui| {
+            if softkey_enabled(ui, theme, "Clr mem", false, col4, self.memory().is_some()) {
+                self.mems[self.mem_sel] = None;
+            }
+        });
 
-        key_caption(ui, theme, "SCALE", width);
+        crate::group_box::group_box(ui, "Scale", palette::PLUM, |ui| {
         let cart = !is_disk(self.view);
         let shown = self.shown_scale(samples);
         let manual = shown.is_some_and(|s| s.2);
@@ -2555,8 +2576,9 @@ impl NanoVna {
             Some(12) => self.edit_scale(samples, |m| m),
             _ => {}
         }
+        });
 
-        key_caption(ui, theme, "LIMITS", width);
+        crate::group_box::group_box(ui, "Limits", palette::TEAL, |ui| {
         let cart_lim = !is_disk(self.view) && self.view != View::Tdr;
         let key = self.key();
         let lim_on = self.face.limits.get(&key).is_some_and(|s| s.on);
@@ -2598,8 +2620,9 @@ impl NanoVna {
             Some(4) => self.limit_preset(2.0),
             _ => {}
         }
+        });
 
-        key_caption(ui, theme, "MARKER", width);
+        crate::group_box::group_box(ui, "Markers", palette::TAN, |ui| {
         for row in [[0usize, 1, 2, 3], [4, 5, 6, 7]] {
             ui.horizontal(|ui| {
                 for slot in row {
@@ -2614,9 +2637,6 @@ impl NanoVna {
         ui.horizontal(|ui| {
             if softkey(ui, theme, "Ref R", self.marker_on == markers::REF, col4) {
                 self.marker_on = markers::REF;
-            }
-            if softkey(ui, theme, "Clr all", false, col4) {
-                self.markers = [None; markers::SLOTS];
             }
             // Typed exact frequency for the active marker. Enter applies it.
             let resp = ui.add_sized(
@@ -2635,7 +2655,7 @@ impl NanoVna {
                 }
             }
         });
-        key_caption(ui, theme, "MKR READOUT", width);
+        // Readout stays with the markers. The old MKR READOUT caption is this group's second block.
         for row in markers::READOUTS.chunks(4) {
             ui.horizontal(|ui| {
                 for (fmt, label) in row {
@@ -2648,9 +2668,8 @@ impl NanoVna {
         let mut search: Option<u8> = None;
         ui.horizontal(|ui| {
             let ok = samples.is_some();
-            for (code, label) in [(0u8, "Max"), (1, "Min"), (2, "Next pk"), (3, "Clear")] {
-                let enabled = ok || code == 3;
-                if softkey_enabled(ui, theme, label, false, col4, enabled) {
+            for (code, label) in [(0u8, "Max"), (1, "Min"), (2, "Next pk")] {
+                if softkey_enabled(ui, theme, label, false, col4, ok) {
                     search = Some(code);
                 }
             }
@@ -2706,6 +2725,18 @@ impl NanoVna {
             if softkey(ui, theme, "SWR BW", self.swr_bw_on, col4) {
                 self.swr_bw_on = !self.swr_bw_on;
             }
+        });
+        });
+        // Clr all and Clear drop markers. They stay out of the Markers title.
+        crate::group_box::group_box(ui, "Danger", crate::estop::DANGER, |ui| {
+            ui.horizontal(|ui| {
+                if softkey(ui, theme, "Clr all", false, col4) {
+                    self.markers = [None; markers::SLOTS];
+                }
+                if softkey(ui, theme, "Clear", false, col4) {
+                    self.marker_search(3, samples);
+                }
+            });
         });
     }
 
