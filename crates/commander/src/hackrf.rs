@@ -3067,6 +3067,43 @@ pub(crate) mod tests {
         assert!(picked.away.is_none());
     }
 
+    /// A voice grant on a frequency in the control list (the site moved its
+    /// control channel) is played like any grant inside the window. Every
+    /// control decoder stays, the old control included, for the hunt.
+    #[test]
+    fn a_grant_on_a_listed_control_frequency_is_played() {
+        let old = 857_962_500.0;
+        let live = 859_962_500.0;
+        let (center, controls) = place(&[854_437_500.0, old, 858_512_500.0, live]).expect("cluster");
+        assert!(controls.iter().any(|hz| (*hz - old).abs() < 1.0));
+        let picked = follow_capture(
+            center,
+            &controls,
+            None,
+            true,
+            true,
+            Vec::new(),
+            0,
+            None,
+            &[(old, 12_753)],
+            None,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert!(!picked.left);
+        assert_eq!(picked.controls, controls);
+        assert_eq!(picked.voice_hz, old.round() as u64);
+        assert_eq!(picked.call, Some((old, 12_753)));
+        // The speaker's mixer runs on the control frequency, and the
+        // capture's channel taps carry it once.
+        let mut bank = Bank::new(center, &controls);
+        bank.set_voice(Some(old));
+        bank.set_extras(&[old as u64]);
+        assert!(bank.extras().is_empty(), "no second mixer on a control frequency");
+    }
+
     #[test]
     fn a_far_grant_drops_the_control_channel_until_the_call_ends() {
         let (center, controls) = cluster();

@@ -2769,6 +2769,38 @@ mod tests {
         assert_eq!(follow.voice_hz(), None);
     }
 
+    /// The site moved its control channel and hands the old one out for voice.
+    /// The Control mark keeps that frequency on the hunt list; it does not
+    /// stop the follower taking a voice grant there.
+    #[test]
+    fn a_voice_grant_on_a_marked_control_is_followed_and_the_mark_still_hunts() {
+        let live = 859_962_500.0;
+        let old = 857_962_500.0;
+        let mut follow = Follower::new(vec![live, old]);
+        follow.note_sent(live);
+        follow.push(CcEvent::Iden);
+        follow.push(clear(old, 12_753));
+        assert_eq!(follow.target_hz(), Some(old), "{}", follow.status());
+        follow.note_sent(old);
+        assert_eq!(follow.role(), Role::Voice);
+        assert_eq!(follow.voice_hz(), Some(old));
+        assert_eq!(follow.active_tg(), Some(12_753));
+        assert_eq!(follow.control_hz(), Some(live));
+        // The call ends: back to the control that was left.
+        follow.push(CcEvent::End);
+        follow.tick(std::time::Instant::now() + std::time::Duration::from_secs(60));
+        assert_eq!(follow.voice_hz(), None);
+        assert_eq!(follow.target_hz(), Some(live));
+        // Control lost there: the hunt still tries the frequency marked
+        // Control that just carried voice.
+        follow.note_sent(live);
+        follow.push(CcEvent::Search);
+        follow.push(CcEvent::Search);
+        assert_eq!(follow.control_hz(), Some(old));
+        assert_eq!(follow.target_hz(), Some(old));
+        assert_eq!(follow.status(), "next control channel");
+    }
+
     #[test]
     fn control_sync_loss_stays_after_a_lock() {
         let start = std::time::Instant::now();

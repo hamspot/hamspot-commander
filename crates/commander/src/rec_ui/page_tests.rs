@@ -596,6 +596,102 @@ fn real_page_records_every_concurrent_call_while_one_is_heard() {
     }
 }
 
+/// The site moved its control channel and now grants voice on the old one.
+/// A Control mark only says where to hunt for control: the call on the
+/// speaker and a second call, both on frequencies marked Control, are each
+/// filed as HACKRF TALKGROUPS recordings with their raw IQ.
+#[test]
+fn real_page_files_calls_granted_on_channels_marked_control() {
+    if !in_child("real_page_files_calls_granted_on_channels_marked_control") {
+        return;
+    }
+    let st = station(None, 0);
+    let mut h = Harness::new(&st, egui::vec2(1200.0, 700.0), false);
+    h.app.rec.face.talkgroups = hsrec::segment::RecMode::All;
+    h.app.rec.face.source_tab = meta::SOURCE_HACKRF_TG.into();
+    let radio = 0xC07A;
+    let center = 857_200_000.0;
+    // Both frequencies are marked Control in the zone.
+    let (a, b) = (857_962_500.0, 856_962_500.0);
+    let (tg_a, tg_b) = (12_753u32, 10_741u32);
+    let ch = |name: &str, hz: f64| crate::channels::Channel {
+        name: name.into(),
+        hz,
+        mode: "nfm".into(),
+        control: true,
+        encrypted: false,
+        vocoder: String::new(),
+        invert: false,
+        record: false,
+    };
+    h.app.channels.zones.push(crate::channels::ChannelZone {
+        name: "Moved control".into(),
+        channels: vec![ch("Old control A", a), ch("Old control B", b)],
+    });
+    h.app.channel_zone = h.app.channels.zones.len() - 1;
+    // The air, made before the calls are granted.
+    let cs8 = crate::hackrf::tests::two_calls_cs8(center, a, b, 1_627.0, 2.0);
+    h.app.rec.test_rows.push(hackrf_row(radio, center));
+    h.app.hackrf_call.insert(radio, Some((a, tg_a)));
+    h.app.hackrf_open.insert(
+        radio,
+        vec![crate::HeardGrant { hz: a, tg: tg_a, seq: 1 }, crate::HeardGrant { hz: b, tg: tg_b, seq: 2 }],
+    );
+    h.settle(2);
+    assert_eq!(crate::rec_live::grant_taps(radio), vec![b as u64], "the second call on a Control-marked channel is recorded too");
+
+    // The capture thread: both marked channels have their control mixers, the
+    // speaker is tuned to A. Same routing as the USB thread.
+    let mut bank = crate::hackrf::Bank::new(center, &[a, b]);
+    bank.set_voice(Some(a));
+    let mut voice = Vec::new();
+    let mut controls = vec![Vec::new(), Vec::new()];
+    for block in cs8.chunks(262_144) {
+        bank.set_extras(&crate::rec_live::grant_taps(radio));
+        bank.set_tap(true);
+        voice.clear();
+        for c in &mut controls {
+            c.clear();
+        }
+        bank.push(block, &mut voice, &mut controls);
+        crate::rec_live::note_extras(radio, &bank.extras());
+        crate::rec_live::note_gates(radio, &bank.gates());
+        crate::hackrf::route_taps(radio, a as u64, bank.take_carrier_taps());
+        h.run(vec![]);
+    }
+    assert!(!voice.is_empty(), "the speaker's decoder is fed on a Control-marked channel");
+    h.run(vec![]);
+    assert!(
+        h.app.rec.grant_open.keys().any(|(_, hz)| *hz == b as u64),
+        "B is still open while it has signal: gates {:?} signal {:?} done {:?}",
+        bank.gates(),
+        crate::rec_live::signal_at(radio, b as u64).map(|t| t.elapsed()),
+        h.app.rec.grant_done
+    );
+
+    // The calls end.
+    h.app.hackrf_call.insert(radio, None);
+    h.app.hackrf_open.insert(radio, Vec::new());
+    h.settle(2);
+    let db = Db::open(&h.app.rec.db_path).unwrap();
+    let t1 = std::time::Instant::now();
+    let filed = |tg: u32| db.by_talkgroup(tg).unwrap().into_iter().find(|r| !r.meta.end_utc.is_empty() && r.meta.bytes > 0);
+    let (rec_a, rec_b) = loop {
+        if let (Some(ra), Some(rb)) = (filed(tg_a), filed(tg_b)) {
+            break (ra, rb);
+        }
+        assert!(t1.elapsed() < std::time::Duration::from_secs(5), "both calls were filed: {:?} {:?}", filed(tg_a), filed(tg_b));
+        h.run(vec![]);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    };
+    for (r, hz) in [(&rec_a, a), (&rec_b, b)] {
+        assert_eq!(r.meta.source, meta::SOURCE_HACKRF_TG);
+        assert_eq!(r.meta.raw_format, "cs16");
+        assert_eq!(r.meta.channel_hz, hz);
+        assert!(r.meta.bytes >= 200_000, "about 2 s of raw IQ: {} bytes", r.meta.bytes);
+    }
+}
+
 /// Dead air: a zone channel inside the capture is filed on HACKRF CHANNELS
 /// only while the REC squelch hears a signal on it, and closes after the
 /// hang. A silent channel gets no file at all.

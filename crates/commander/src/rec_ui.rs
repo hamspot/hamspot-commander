@@ -386,6 +386,9 @@ pub struct GrantRec {
 /// A recorded-only call ends after this long with no carrier and no renewed
 /// grant (at least the voice hang).
 pub const GRANT_QUIET: Duration = Duration::from_millis(2_000);
+/// A grant with no mixer of its own counts as live while its REC squelch
+/// heard a signal this recently.
+pub const GRANT_SIGNAL_FRESH: Duration = Duration::from_millis(500);
 
 /// How long the status strip leads with the last result note.
 pub const NOTE_SHOWN: Duration = Duration::from_secs(60);
@@ -985,7 +988,9 @@ impl App {
     }
 
     /// Hamlib / GQRX: the rig's demod audio for a held talkgroup, or for the
-    /// channel the scanner is holding. A control channel is not a recording.
+    /// channel the scanner is holding. A scan held on a control memory is not
+    /// a channel recording, but a voice grant is a call on any frequency, one
+    /// marked control included: the mark only says where to hunt for control.
     fn rec_want_rig(&self, row: &cat::RadioRow) -> (Option<CallKey>, Option<Meta>) {
         let face = &self.rec.face;
         let voice = self.followers.get(&row.id).and_then(|follower| match (follower.voice_hz(), follower.active_tg()) {
@@ -997,8 +1002,7 @@ impl App {
                 let found = self.talkgroups.zones.iter().flat_map(|z| z.talkgroups.iter()).find(|t| t.tg == tg);
                 let marked = found.is_some_and(|t| t.record);
                 let enc = found.is_some_and(|t| t.encrypted) || self.rig_air_encrypted(row);
-                let control = self.channels.zones.iter().flat_map(|z| z.channels.iter()).any(|c| c.control && (c.hz - hz).abs() < 1.0);
-                if segment::wanted(face.talkgroups, marked, enc) && !control {
+                if segment::wanted(face.talkgroups, marked, enc) {
                     let key = CallKey { talkgroup: Some(tg), channel: String::new(), hz: hz.round() as u64, centre: hz.round() as u64 };
                     let mut m = self.rig_meta(row, hz);
                     m.talkgroup = Some(tg);
@@ -1104,9 +1108,8 @@ impl App {
             if heard == Some(hz) || out.iter().any(|(h, _, _)| *h == hz) {
                 continue;
             }
-            if self.channels.zones.iter().flat_map(|z| z.channels.iter()).any(|c| c.control && (c.hz - g.hz).abs() < 1.0) {
-                continue;
-            }
+            // A grant on a frequency marked control is still a call: the site
+            // moves its control channel and hands the old one out for voice.
             let found = self.talkgroups.zones.iter().flat_map(|z| z.talkgroups.iter()).find(|t| t.tg == g.tg);
             if segment::wanted(face.talkgroups, found.is_some_and(|t| t.record), found.is_some_and(|t| t.encrypted)) {
                 out.push((hz, g.tg, g.seq));
@@ -1130,8 +1133,12 @@ impl App {
                     g.live = now;
                 }
             }
-            if crate::rec_live::extra_state(radio, hz) == Some(false) {
-                g.live = now;
+            match crate::rec_live::extra_state(radio, hz) {
+                Some(false) => g.live = now,
+                // No mixer of its own: a frequency marked control is already
+                // mixed by its control decoder. Its REC squelch says it is live.
+                None if crate::rec_live::signal_at(radio, hz).is_some_and(|at| now.saturating_duration_since(at) < GRANT_SIGNAL_FRESH) => g.live = now,
+                _ => {}
             }
             let ended = same.is_none() || (now.duration_since(g.live) > quiet && now.duration_since(g.opened) > GRANT_QUIET);
             if ended {
@@ -1211,10 +1218,8 @@ impl App {
                     if !hsrec::dsp::in_capture(hz - row.center_hz) {
                         return (None, None);
                     }
-                    // A known control channel is not a talkgroup call.
-                    if self.channels.zones.iter().flat_map(|z| z.channels.iter()).any(|c| c.control && (c.hz - hz).abs() < 1.0) {
-                        return (None, None);
-                    }
+                    // The grant names the voice channel. A Control mark there is
+                    // only where to hunt for control; it does not refuse the call.
                     let key = CallKey { talkgroup: Some(tg), channel: String::new(), hz: hz.round() as u64, centre: row.center_hz.round() as u64 };
                     let mut m = self.hackrf_tg_meta(row, hz, tg);
                     if let Some(c) = self.rec.call_units.get(&row.id) {
