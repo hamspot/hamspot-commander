@@ -2488,7 +2488,7 @@ impl App {
                 }
             });
         });
-        // Call, Playback and Notes stay above. Export, Danger and metadata scroll.
+        // Call, Playback and Notes stay above. Metadata, Export and Danger scroll.
         let rest_h = ui.available_height();
         let rest_h = if rest_h.is_finite() { rest_h.max(0.0) } else { 240.0 };
         egui::ScrollArea::vertical()
@@ -2496,35 +2496,6 @@ impl App {
             .auto_shrink([false, false])
             .max_height(rest_h)
             .show(ui, |ui| {
-        crate::group_box::group_box(ui, "Export", TEXT, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("Export WAV…").on_hover_text("Demodulates now and writes a WAV. The WAV is not kept by REC.").clicked() {
-                    self.rec_export_wav(&rec);
-                }
-                if ui.button("Export raw…").on_hover_text("Raw IQ (or archive) plus the JSON sidecar.").clicked() {
-                    self.rec_export_raw(&rec);
-                }
-                // Unarchive restores a file. It is not a discard, so it stays out of Danger.
-                if rec.archived && ui.add_enabled(self.rec.job.is_none(), egui::Button::new("Unarchive")).clicked() {
-                    let dir = self.rec.dir.clone();
-                    let one = rec.clone();
-                    self.rec_job("Unarchiving", move |db, st, _| {
-                        let r = hsrec::archive::unarchive_one(&db, &dir, &one);
-                        st.lock().expect("job").lines.push(r.err().unwrap_or_else(|| "Unarchived.".into()));
-                    });
-                }
-            });
-        });
-        crate::group_box::group_box(ui, "Danger", crate::estop::DANGER, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                if !rec.archived && ui.add_enabled(self.rec.job.is_none() && !rec.meta.end_utc.is_empty(), egui::Button::new("Archive")).clicked() {
-                    self.rec_start_archive(vec![rec.clone()]);
-                }
-                if ui.button("Delete").on_hover_text("Removes the raw file, its row, and its cache. Undo for 60 s.").clicked() {
-                    delete = true;
-                }
-            });
-        });
         let rows = self.rec_meta_rows(&rec);
         ui.horizontal(|ui| {
             ui.strong("Metadata");
@@ -2554,6 +2525,36 @@ impl App {
                 });
             });
         }
+        // Export and Danger sit below the File section (David).
+        crate::group_box::group_box(ui, "Export", TEXT, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Export WAV…").on_hover_text("Demodulates now and writes a WAV. The WAV is not kept by REC.").clicked() {
+                    self.rec_export_wav(&rec);
+                }
+                if ui.button("Export raw…").on_hover_text("Raw IQ (or archive) plus the JSON sidecar.").clicked() {
+                    self.rec_export_raw(&rec);
+                }
+                // Unarchive restores a file. It is not a discard, so it stays out of Danger.
+                if rec.archived && ui.add_enabled(self.rec.job.is_none(), egui::Button::new("Unarchive")).clicked() {
+                    let dir = self.rec.dir.clone();
+                    let one = rec.clone();
+                    self.rec_job("Unarchiving", move |db, st, _| {
+                        let r = hsrec::archive::unarchive_one(&db, &dir, &one);
+                        st.lock().expect("job").lines.push(r.err().unwrap_or_else(|| "Unarchived.".into()));
+                    });
+                }
+            });
+        });
+        crate::group_box::group_box(ui, "Danger", crate::estop::DANGER, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                if !rec.archived && ui.add_enabled(self.rec.job.is_none() && !rec.meta.end_utc.is_empty(), egui::Button::new("Archive")).clicked() {
+                    self.rec_start_archive(vec![rec.clone()]);
+                }
+                if ui.button("Delete").on_hover_text("Removes the raw file, its row, and its cache. Undo for 60 s.").clicked() {
+                    delete = true;
+                }
+            });
+        });
         if !rec.meta.decoder_params.is_empty() {
             egui::CollapsingHeader::new(format!("Decoder parameters ({})", rec.meta.decoder_params.len()))
                 .id_salt("rec-decoder-params")

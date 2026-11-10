@@ -836,6 +836,57 @@ fn real_page_radio_ids_tab_lanes_searches_and_plays_one_radio() {
     }
 }
 
+/// The Record / Playback dialog keeps Call, Playback and Notes on top, then
+/// the metadata (Source, Processing, File), then Export and Danger below File.
+#[test]
+fn real_dialog_puts_export_and_danger_below_the_file_section() {
+    if !in_child("real_dialog_puts_export_and_danger_below_the_file_section") {
+        return;
+    }
+    install_modems();
+    let st = station(None, 0);
+    let mut h = Harness::new(&st, egui::vec2(1400.0, 1500.0), false);
+    h.app.rec.play_argv = Some(vec!["sh".into(), "-c".into(), "cat > /dev/null".into()]);
+    h.settle(4);
+    let db = Db::open(&h.app.rec.db_path).unwrap();
+    let dir = h.app.rec.dir.clone();
+    let mut m = tg_rec(&db, &dir, "d", 10741, "ISP IND DISP — District 52 - Indianapolis Dispatch", 10, 4_000);
+    m.radio_unit_id = Some(9522067);
+    let id = db.insert("hackrf_tg/x/d.cs16", &m).unwrap();
+    let t = std::time::Instant::now();
+    while !h.app.rec.rows.iter().any(|r| r.id == id) {
+        h.run(vec![]);
+        assert!(t.elapsed() < std::time::Duration::from_secs(5));
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+    h.app.rec_play(id, 0);
+    let out = h.settle(4);
+    // Drag the dialog's resize corner down so every section is in view.
+    assert!(texts(&out).iter().any(|(t, _)| t.to_uppercase() == "RECORD / PLAYBACK"), "dialog shown");
+    let corner = egui::pos2(700.0 + 260.0 - 2.0, 750.0 + 320.0 - 2.0);
+    let to = egui::pos2(1250.0, 1440.0);
+    let m0 = egui::Modifiers::NONE;
+    h.run(vec![egui::Event::PointerMoved(corner)]);
+    h.run(vec![egui::Event::PointerButton { pos: corner, button: egui::PointerButton::Primary, pressed: true, modifiers: m0 }]);
+    for k in 1..=10 {
+        let p = corner + (to - corner) * (k as f32 / 10.0);
+        h.run(vec![egui::Event::PointerMoved(p)]);
+    }
+    h.run(vec![egui::Event::PointerButton { pos: to, button: egui::PointerButton::Primary, pressed: false, modifiers: m0 }]);
+    let out = h.settle(4);
+    let y = |name: &str| -> f32 {
+        texts(&out).into_iter().find(|(t, _)| t == name).map(|(_, r)| r.center().y).unwrap_or_else(|| panic!("{name} not drawn"))
+    };
+    let order = ["CALL", "PLAYBACK", "NOTES", "SOURCE", "FILE", "EXPORT", "DANGER"];
+    for w in order.windows(2) {
+        assert!(y(w[0]) < y(w[1]), "{} above {}", w[0], w[1]);
+    }
+    if let Some(dir) = std::env::var_os("HS_REC_PNG_DIR") {
+        h.png(&out, &Path::new(&dir).join("rec-playback-dialog.png"));
+    }
+    h.app.rec_close_detail();
+}
+
 /// Screenshots of the REC page from a copy of a real database, before and
 /// after a Shift+wheel scroll. Runs only when HS_REC_DB names the database
 /// and HS_REC_PNG_DIR the output folder.
