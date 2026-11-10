@@ -465,7 +465,7 @@ pub struct LoadedVna {
 }
 
 pub fn load_beside(station: &Path, face: &mut Face) -> Result<LoadedVna, String> {
-    let path = path_beside(station);
+    let path = hsrec::hsdata::vna_cal_path(station);
     let mut note = None;
     let mut archive = match load_file(&path) {
         Ok(file) => file,

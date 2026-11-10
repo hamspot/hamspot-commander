@@ -27,6 +27,10 @@ under_home() {
 remove_path() {
     local path="$1"
     under_home "$path"
+    # Station data is not an installed file. Never delete a *.HSData folder or anything inside one.
+    case "$path" in
+        *.HSData|*.HSData/*) die "refusing to remove station data: ${path}" ;;
+    esac
     if [[ -e "$path" || -L "$path" ]]; then
         rm -f "$path"
         echo "Removed ${path}"
@@ -142,4 +146,4 @@ fi
 rm -f "$manifest"
 rmdir "$state_dir" 2>/dev/null || true
 refresh_caches
-echo "Uninstalled. Apt packages were left installed."
+echo "Uninstalled. Apt packages, station files, and *.HSData folders were left in place."

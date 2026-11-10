@@ -1,5 +1,6 @@
-//! Encryption keys for one station. The bytes live in `NAME.HSKeys` beside
-//! the station file, mode 0600. They are not a field of the station JSON.
+//! Encryption keys for one station. The bytes live in `NAME.HSKeys` (or
+//! `NAME.HSData/keys/` after Move), mode 0600. They are not a field of the
+//! station JSON. The path is `hsrec::hsdata::keys_path`.
 //!
 //! A row with empty text is a placeholder. The decoder named that key id
 //! and Commander has no key for it. A placeholder is saved and is not passed
@@ -8,7 +9,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -53,11 +54,6 @@ pub fn empty() -> KeyFile {
         version: 1,
         keys: Vec::new(),
     }
-}
-
-/// `SAFE-T.HSCommander` keeps its keys in `SAFE-T.HSKeys`.
-pub fn path_beside(station: &Path) -> PathBuf {
-    station.with_extension("HSKeys")
 }
 
 pub fn alg_label(alg: &str) -> String {

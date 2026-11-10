@@ -1,6 +1,6 @@
 # Station data layout: `Foo.HSCommander` + `Foo.HSData/`
 
-Status: proposal (design only, nothing implemented). Based on main `6d5949c`.
+Status: layout 1 is in the tree. `Foo.HSData/VNA/` scans were already stored there. Opening a station that still has flat files asks Move or Later (Later is the default; nothing is moved until Move). Same-disk Move renames. A copy keeps the originals. `migration/0001-flat-to-v1.json` and Restore put a rename back. Not in this pass: Save As copy prompt, per-station thumb-drive folder, trace-log rotation, runtime key CSV under `HSData/tmp`. Waveform cache stays at `rec/files/.cache`.
 
 ## Goal
 

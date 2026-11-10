@@ -13,7 +13,9 @@ const USAGE: &str = "usage: commander-rec <archive|unarchive|list|verify|stats|e
   verify    [--archived-only]
   stats     [--cap-gb 20]
   export    --to DIR [--label NAME] [--move] [--older-than AGE] [--dry-run]
+  --hsdata DIR    use this HSData folder instead of the one beside the station
   render-wav RAW OUT.wav [--decoder SCRIPT] [--param HAMSPOT_K=V]...   (no --station; re-demod one file)
+Old flat files (Name.recordings, Name.HSREC.sqlite) stay in use until Commander moves them.
 example crontab:
   15 3 * * * nice -n 19 ionice -c3 commander-rec archive --older-than 7d --station ~/stations/SAFE-T.HSCommander";
 
@@ -21,6 +23,7 @@ example crontab:
 struct Args {
     cmd: String,
     station: Option<PathBuf>,
+    hsdata: Option<PathBuf>,
     older: Option<f64>,
     level: i32,
     nice: bool,
@@ -41,6 +44,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         let mut val = || it.next().cloned().ok_or(format!("{x} needs a value"));
         match x.as_str() {
             "--station" => a.station = Some(PathBuf::from(expand(&val()?))),
+            "--hsdata" => a.hsdata = Some(PathBuf::from(expand(&val()?))),
             "--older-than" => a.older = Some(archive::parse_age(&val()?).ok_or("bad --older-than (e.g. 7d)")?),
             "--level" => a.level = val()?.parse::<i32>().map_err(|_| "bad --level")?.clamp(1, 19),
             "--nice" => a.nice = true,
@@ -164,8 +168,14 @@ fn run(a: Args) -> u8 {
             libc::syscall(libc::SYS_ioprio_set, 1, 0, 3 << 13);
         }
     }
-    let db_path = hsrec::db::db_path_beside(&station);
-    let dir = storage::recordings_dir_beside(&station);
+    // Flat files stay readable and writable until Commander is asked to move them.
+    if a.hsdata.is_none() && hsrec::hsdata::needs_prompt(&station) {
+        eprintln!("commander-rec: old station files are still beside the station. Run Commander once to migrate.");
+    }
+    let (db_path, dir) = match &a.hsdata {
+        Some(root) => (root.join("rec").join("rec.sqlite"), root.join("rec").join("files")),
+        None => (hsrec::hsdata::db_path(&station), hsrec::hsdata::recordings_dir(&station)),
+    };
     // A missing database is created quietly, but only beside a real station.
     if !db_path.exists() && !station.exists() {
         eprintln!("commander-rec: no station file at {}", station.display());

@@ -148,3 +148,4 @@ fi
 
 echo "Portable tree ${prefix}"
 echo "Launch ${prefix}/hamspot-commander.sh"
+echo "Station files and Name.HSData folders are not part of this tree and were not changed."

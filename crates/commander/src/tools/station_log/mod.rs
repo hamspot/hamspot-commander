@@ -368,7 +368,7 @@ impl StationLog {
             self.note.clear();
             return;
         }
-        let path = std::path::Path::new(station).with_extension("HSLog");
+        let path = hsrec::hsdata::log_path(std::path::Path::new(station));
         if self.open_path.as_ref() == Some(&path) && self.diary.is_some() {
             return;
         }

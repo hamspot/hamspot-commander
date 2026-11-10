@@ -729,6 +729,10 @@ struct App {
     /// Last folder chosen in the config browser. Absent means the working directory.
     config_dir: Option<PathBuf>,
     config_note: String,
+    /// Flat station files are waiting for Move or Later. Later is the default.
+    hsdata_prompt: bool,
+    /// Layout 1 was just written. Restore is offered until the window is closed.
+    hsdata_restore: bool,
     /// Rendering mode saved for the next start, and what this run uses.
     render_mode: render::Mode,
     render_note: String,
@@ -2705,6 +2709,8 @@ impl App {
             config_path: String::new(),
             config_dir,
             config_note: String::new(),
+            hsdata_prompt: false,
+            hsdata_restore: false,
             render_mode: render::load().0.mode,
             render_note: {
                 let renderer = cc.gl.as_ref().map(|gl| {
@@ -3305,6 +3311,7 @@ impl eframe::App for App {
         );
         self.hub.set_spectrum_watched(redraw::spectrum_wanted(view));
         let (mut snap, live_gen, poll_gen) = self.snap_gen();
+        self.hsdata_window(ui.ctx(), &snap);
         self.overlay_hackrf(&mut snap);
         self.clear_stale_channel_note(&snap);
         self.maybe_push_loaded(&snap, live_gen);
@@ -7511,7 +7518,63 @@ impl App {
             }
             Err(err) => self.config_note = err,
         }
+        self.hsdata_prompt = hsrec::hsdata::needs_prompt(Path::new(&self.config_path));
         self.load_keys();
+    }
+
+    /// Move / Later. Later does not write anything. Move is never the default.
+    fn hsdata_window(&mut self, ctx: &egui::Context, snap: &Snapshot) {
+        if !self.hsdata_prompt && !self.hsdata_restore {
+            return;
+        }
+        let mut open = true;
+        let asking = self.hsdata_prompt;
+        egui::Window::new("Station data")
+            .collapsible(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                if asking {
+                    ui.label("Move keys, the logbook, VNA calibration, the recordings index, and the recordings into Name.HSData? Scans already in Name.HSData/VNA stay where they are. Later leaves the old files in use.");
+                    ui.horizontal(|ui| {
+                        if ui.button("Later").clicked() {
+                            let _ = hsrec::hsdata::apply(Path::new(&self.config_path), hsrec::hsdata::DEFAULT_CHOICE);
+                            self.hsdata_prompt = false;
+                        }
+                        if ui.button("Move").clicked() {
+                            let path = self.config_path.clone();
+                            self.rec_retarget("");
+                            match hsrec::hsdata::apply(Path::new(&path), hsrec::hsdata::Choice::Move) {
+                                Ok(note) => {
+                                    self.config_note = note;
+                                    self.load_config(snap);
+                                    self.rec_retarget(&path);
+                                    self.hsdata_prompt = false;
+                                    self.hsdata_restore = true;
+                                }
+                                Err(err) => {
+                                    self.config_note = err;
+                                    self.rec_retarget(&path);
+                                }
+                            }
+                        }
+                    });
+                } else if ui.button("Restore old layout").clicked() {
+                    match hsrec::hsdata::restore(Path::new(&self.config_path)) {
+                        Ok(note) => {
+                            self.config_note = note;
+                            self.hsdata_restore = false;
+                            let path = self.config_path.clone();
+                            self.load_config(snap);
+                            self.rec_retarget(&path);
+                        }
+                        Err(err) => self.config_note = err,
+                    }
+                }
+            });
+        if !open {
+            self.hsdata_prompt = false;
+            self.hsdata_restore = false;
+        }
     }
 
     fn load_keys(&mut self) {
@@ -7521,7 +7584,7 @@ impl App {
             self.sync_key_csv();
             return;
         }
-        match keys::load_file(&keys::path_beside(Path::new(&self.config_path))) {
+        match keys::load_file(&hsrec::hsdata::keys_path(Path::new(&self.config_path))) {
             Ok(file) => {
                 self.keys = file;
                 self.key_note.clear();
@@ -7543,7 +7606,7 @@ impl App {
             self.sync_key_csv();
             return;
         }
-        let path = keys::path_beside(Path::new(&self.config_path));
+        let path = hsrec::hsdata::keys_path(Path::new(&self.config_path));
         match keys::save_file(&path, &self.keys) {
             Ok(()) => self.key_note.clear(),
             Err(err) => self.key_note = err,
@@ -7609,14 +7672,15 @@ impl App {
         self.save_vna();
     }
 
-    /// Calibration and zone scans. The station file keeps the port and the
-    /// sweep settings. This file is `Name.HSVNA` beside that station.
+    /// Calibration. The station file keeps the port and the sweep settings.
+    /// Layout 0 stores `Name.HSVNA` beside the station. Layout 1 stores
+    /// `Name.HSData/vna/calibration.HSVNA`. Scans stay in `Name.HSData/VNA/`.
     fn save_vna(&mut self) {
         if self.config_path.is_empty() {
             return;
         }
         let archive = self.tools.lock().expect("tools").vna_archive();
-        let path = crate::tools::nanovna::path_beside(Path::new(&self.config_path));
+        let path = hsrec::hsdata::vna_cal_path(Path::new(&self.config_path));
         if let Err(err) = crate::tools::nanovna::save_file(&path, &archive) {
             self.config_note = err;
             self.tools.lock().expect("tools").mark_vna_dirty();
@@ -11041,7 +11105,7 @@ impl App {
             ui.label("The station has not been saved.");
             return;
         }
-        ui.label(keys::path_beside(Path::new(&self.config_path)).display().to_string());
+        ui.label(hsrec::hsdata::keys_path(Path::new(&self.config_path)).display().to_string());
         if !self.key_note.is_empty() {
             ui.label(
                 egui::RichText::new(&self.key_note).color(caution()),

@@ -11,7 +11,7 @@ Brief record of decisions and why. Dated when recorded here (2026-10-27) unless 
 - **Commander starts and stops its own `rigctld`/`gqrx`/`rotctld`/`ampctld`**; it never attaches to ones it didn't start.
 - **Amplifiers:** never sent Operate on load or restart; patch bay is visual only; boxes bind to the amplifier's fixed random id, never its name. Antenna switching, PTT/ALC and automatic operate are not planned without a separate decision.
 - **Layout reference:** the Tune face loosely follows the Ham Radio Deluxe 5.21 rig screen (behaviour only; no icons, bitmaps or text copied).
-- **Data layout (proposal, not built):** `Foo.HSCommander` plus a `Foo.HSData/` folder; see `docs/design/data-layout.md` on branch `design-data-layout` and epic #148.
+- **Data layout (#148):** `Foo.HSCommander` plus `Foo.HSData/`. Scans stay in `Foo.HSData/VNA/`. Other station files move only when the operator chooses Move. See `docs/design/data-layout.md`.
 - **Manual style (2026-10-27):** operator-only content, second person, tables for reference, screenshot placeholders as HTML comments with #149 ids.
 
 ## Trunk VFO readout (2026-11-07)

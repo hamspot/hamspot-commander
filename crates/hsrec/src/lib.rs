@@ -7,6 +7,7 @@ pub mod cache;
 pub mod db;
 pub mod dsp;
 pub mod export;
+pub mod hsdata;
 pub mod lock;
 pub mod meta;
 pub mod replay;

@@ -46,7 +46,7 @@ Commander puts the controls of one or more radios in one dark, LCARS-style windo
 - **Automation**: Hamlib rotators and amplifiers, and an RF patch drawing of your station.
 - **Tools**: a NanoVNA V2 vector network analyzer screen, a Smith chart, RF and general calculators, a hex viewer, a logbook and a rotator display. The **Timers** page has station clocks, an ID timer, a countdown and a stopwatch.
 
-Everything about a station (radios, band plan, channels, talkgroups, levels, layout) is kept in one **station file**, `Name.HSCommander`. Key material, VNA calibration, the logbook and recordings are kept in separate files beside it ([chapter 15](#ch15)).
+Everything about a station (radios, band plan, channels, talkgroups, levels, layout) is kept in one **station file**, `Name.HSCommander`. Key material, VNA calibration, the logbook and recordings are kept beside it, or in `Name.HSData/` after you choose Move ([chapter 15](#ch15)).
 
 ## 1.2 What it does not do
 
@@ -720,7 +720,7 @@ The groups only separate the page visually. Every setting works as before.
 
 - Opening a station replaces the plan, channels, talkgroups and Tune settings. If the radio is already online, Commander then sends the frequency, mode, split, RIT and levels. It never keys the transmitter or puts an amplifier in Operate.
 - A file with a field Commander doesn't know is refused, and the window carries on unchanged.
-- Key text, VNA calibration, the logbook and recordings are never in the station file; they're beside it.
+- Key text, VNA calibration, the logbook and recordings are never in the station file. They sit beside it until you choose Move, which puts them in `Name.HSData/`. Scans are already in `Name.HSData/VNA/`.
 
 <!-- screenshot: station-01 — Opening a station file (.HSCommander). -->
 <!-- screenshot: station-02 — Commander asks before discarding unsaved station changes. -->
@@ -1247,17 +1247,20 @@ Moved recordings stay on the timeline as `offline`. Attach the drive to play the
 
 ## 15.1 Station files
 
-Everything a station produces sits in the same folder as its station file, named after it:
+Everything a station produces sits beside its station file. The first time Commander opens a station that still uses the older flat names, it asks **Move** or **Later**. Later keeps using the flat names. Move puts them in `Name.HSData/` (a rename on the same disk). Scans are already in `Name.HSData/VNA/` and are not moved again. Uninstall does not delete `Name.HSData`.
 
 | File | Contents |
 | --- | --- |
 | `Name.HSCommander` | The station: plan, channels, talkgroups, radios, audio wiring, levels, layout, RF patch. JSON. |
-| `Name.HSKeys` | Encryption keys (mode 0600) |
-| `Name.HSVNA` | NanoVNA calibration and last scan per zone. A damaged file is kept as `Name.HSVNA.corrupt-<date>`. |
-| `Name.HSLog` | Logbook |
-| `Name.HSREC.sqlite` | Recording index |
-| `Name.recordings/<source>/<YYYY-MM-DD>/` | Recordings (`.cs16` or archived `.zst`) with a `.json` sidecar each |
-| `Name.recordings/.cache/` | Waveform thumbnails; safe to delete |
+| `Name.HSKeys` or `Name.HSData/keys/Name.HSKeys` | Encryption keys (mode 0600) |
+| `Name.HSVNA` or `Name.HSData/vna/calibration.HSVNA` | NanoVNA calibration. A damaged file is kept aside with `corrupt` in the name. |
+| `Name.HSData/VNA/` | VNA scans, one folder per device. This folder is not part of Move. |
+| `Name.HSLog` or `Name.HSData/log/logbook.HSLog` | Logbook |
+| `Name.HSREC.sqlite` or `Name.HSData/rec/rec.sqlite` | Recording index |
+| `Name.recordings/` or `Name.HSData/rec/files/` | Recordings (`.cs16`, `.s16`, or archived `.zst`) with a `.json` sidecar each |
+| `…/.cache/` inside the recordings folder | Waveform thumbnails; safe to delete |
+
+`Name.HSData/migration/0001-flat-to-v1.json` lists what Move did. **Restore old layout** on that same question puts a rename back. A copy is not deleted.
 
 The sidecars are the source of truth for recordings: **Rescan** rebuilds the index from them.
 

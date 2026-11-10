@@ -554,6 +554,12 @@ impl App {
         }
     }
 
+    /// Drop the open index and point REC at wherever the station data lives now.
+    pub(crate) fn rec_retarget(&mut self, path: &str) {
+        self.rec.db = None;
+        self.rec_configure(path, true);
+    }
+
     fn rec_configure(&mut self, path: &str, force: bool) {
         self.rec.configured = Some(path.to_string());
         self.rec.db = None;
@@ -567,8 +573,8 @@ impl App {
             return;
         }
         let station = Path::new(path);
-        self.rec.dir = hsrec::storage::recordings_dir_beside(station);
-        self.rec.db_path = hsrec::db::db_path_beside(station);
+        self.rec.dir = hsrec::hsdata::recordings_dir(station);
+        self.rec.db_path = hsrec::hsdata::db_path(station);
         // The UI only opens the database (and creates it) once REC was
         // used: armed, or the file already exists.
         // `force`: REC armed or the REC page opened; a missing (or empty)

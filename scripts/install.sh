@@ -252,6 +252,7 @@ fi
 refresh_caches
 
 echo "Installed ${bin_path}"
+echo "Station files and Name.HSData folders are not part of the install and were not changed."
 echo "Desktop entry ${desktop_path}"
 if [[ "$added_dialout" == yes || "$added_plugdev" == yes ]]; then
     echo "Log in again so dialout and plugdev membership applies to this seat."

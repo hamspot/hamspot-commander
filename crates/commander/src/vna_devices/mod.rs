@@ -249,7 +249,7 @@ pub const EXT: &str = "HSVNAScan";
 /// `Foo.HSCommander` → `Foo.HSData/VNA`. Derived from the station file name
 /// only; nothing stored refers to this path.
 pub fn vna_dir(station: &Path) -> PathBuf {
-    station.with_extension("HSData").join("VNA")
+    hsrec::hsdata::root(station).join("VNA")
 }
 
 fn check_uid(uid: &str) -> Result<(), String> {
