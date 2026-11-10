@@ -2560,6 +2560,49 @@ pub(crate) mod tests {
         (bank, taps)
     }
 
+    /// The REC squelch only decides which channels get files. The decoders
+    /// (control channels and the speaker's voice channel) get every sample,
+    /// signal or noise, exactly as with no squelch at all.
+    #[test]
+    fn the_rec_squelch_never_gates_the_decoder_feed() {
+        let center = 857_200_000.0;
+        let (cc, quiet) = (856_962_500.0, 857_712_500.0);
+        // A control channel on the air plus a voice channel with only noise.
+        let mut seed = 99u32;
+        let cs8: Vec<u8> = hsrec::dsp::synth_c4fm_cs8(cc - center, 0.0, 1.0, 50.0)
+            .into_iter()
+            .map(|b| {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                let n = ((seed >> 16) % 7) as i16 - 3;
+                ((b as i8 as i16 + n).clamp(-127, 127) as i8) as u8
+            })
+            .collect();
+        let run = |squelch_on: bool| {
+            let mut bank = Bank::new(center, &[cc]);
+            bank.set_voice(Some(quiet));
+            bank.set_tap(squelch_on);
+            let (mut voice, mut controls) = (Vec::new(), vec![Vec::new()]);
+            let (mut v_all, mut c_all) = (Vec::new(), Vec::new());
+            for block in cs8.chunks(16_384) {
+                voice.clear();
+                controls[0].clear();
+                bank.push(block, &mut voice, &mut controls);
+                v_all.extend_from_slice(&voice);
+                c_all.extend_from_slice(&controls[0]);
+            }
+            (v_all, c_all, bank.gates())
+        };
+        let (voice, control, gates) = run(true);
+        let shut = |hz: f64| gates.iter().find(|g| g.0 == hz as u64).map(|g| !g.1);
+        assert_eq!(shut(quiet), Some(true), "noise-only voice channel: squelch shut {gates:?}");
+        assert_eq!(shut(cc), Some(false), "control channel: squelch open {gates:?}");
+        // 1 s at 48 kHz to each decoder, squelch or not.
+        assert!(voice.len() > 40_000 && control.len() > 40_000, "voice {} control {}", voice.len(), control.len());
+        let (voice2, control2, _) = run(false);
+        assert_eq!(voice, voice2, "voice decoder feed identical with the squelch shut");
+        assert_eq!(control, control2, "control decoder feed identical");
+    }
+
     #[test]
     fn the_rec_squelch_opens_on_live_channels_only() {
         let center = 857_200_000.0;
