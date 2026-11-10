@@ -1159,7 +1159,41 @@ pub struct Bank {
     afc: hsrec::dsp::Afc,
     voice_probe: hsrec::dsp::AfcProbe,
     control_probes: Vec<hsrec::dsp::AfcProbe>,
+    /// Other calls granted inside the capture at the same time as the one
+    /// on the speaker. Each gets its own mixer so REC files every call, not
+    /// only the one being heard.
+    extras: Vec<Extra>,
+    tap_on: bool,
 }
+
+/// One recorded-only voice channel: a mixer for its IQ and a carrier watch.
+struct Extra {
+    hz: u64,
+    ddc: Ddc,
+    carrier: CarrierWatch,
+    empty: bool,
+}
+
+/// Send each channel's REC tap to its files. The call on the speaker
+/// (`voice_hz`, 0 for none) goes to the radio's talkgroup file, every other
+/// granted call to its own talkgroup file, and every carrier also to its
+/// whole-capture channel file.
+pub fn route_taps(radio: u64, voice_hz: u64, taps: Vec<(u64, Vec<i16>)>) {
+    for (ch, data) in taps {
+        if data.is_empty() {
+            continue;
+        }
+        if voice_hz != 0 && ch == voice_hz {
+            crate::rec_live::push(radio, ch, data.clone());
+        } else if crate::rec_live::is_grant_tap(radio, ch) {
+            crate::rec_live::push(crate::rec_live::grant_key(radio, ch), ch, data.clone());
+        }
+        crate::rec_live::push(crate::rec_live::carrier_key(radio, ch), ch, data);
+    }
+}
+
+/// Most calls recorded at once besides the one on the speaker.
+pub const MAX_EXTRAS: usize = 12;
 
 impl Bank {
     pub fn new(center: f64, controls: &[f64]) -> Self {
@@ -1179,7 +1213,37 @@ impl Bank {
             afc: hsrec::dsp::Afc::default(),
             voice_probe: hsrec::dsp::AfcProbe::default(),
             control_probes: vec![hsrec::dsp::AfcProbe::default(); controls.len()],
+            extras: Vec::new(),
+            tap_on: false,
         }
+    }
+
+    /// The recorded-only channels: every listed frequency inside the
+    /// capture that is not the speaker's voice or a control carrier.
+    pub fn set_extras(&mut self, hzs: &[u64]) {
+        let mut want: Vec<u64> = hzs
+            .iter()
+            .copied()
+            .filter(|hz| inside(self.center, *hz as f64))
+            .filter(|hz| self.voice_hz.is_none_or(|v| (v.round() as u64).abs_diff(*hz) > 1))
+            .filter(|hz| !self.controls.iter().any(|d| ((self.center + d.offset).round() as u64).abs_diff(*hz) <= 1))
+            .collect();
+        want.sort_unstable();
+        want.dedup();
+        want.truncate(MAX_EXTRAS);
+        self.extras.retain(|e| want.contains(&e.hz));
+        for hz in want {
+            if !self.extras.iter().any(|e| e.hz == hz) {
+                let mut ddc = Ddc::new(hz as f64 - self.center);
+                ddc.tap_on = self.tap_on;
+                self.extras.push(Extra { hz, ddc, carrier: CarrierWatch::new(), empty: false });
+            }
+        }
+    }
+
+    /// Recorded-only channels and whether each has been empty for 500 ms.
+    pub fn extras(&self) -> Vec<(u64, bool)> {
+        self.extras.iter().map(|e| (e.hz, e.empty)).collect()
     }
 
     /// Frequency error removed from every discriminator, in Hz. Zero until
@@ -1215,14 +1279,21 @@ impl Bank {
 
     /// Turn the REC tap on every carrier mixer.
     pub fn set_tap(&mut self, on: bool) {
+        self.tap_on = on;
         self.voice.tap_on = on;
         for ddc in &mut self.controls {
             ddc.tap_on = on;
+        }
+        for e in &mut self.extras {
+            e.ddc.tap_on = on;
         }
         if !on {
             self.voice.tap_out.clear();
             for ddc in &mut self.controls {
                 ddc.tap_out.clear();
+            }
+            for e in &mut self.extras {
+                e.ddc.tap_out.clear();
             }
         }
     }
@@ -1243,6 +1314,12 @@ impl Bank {
             }
             let hz = (self.center + ddc.offset).round() as u64;
             out.push((hz, data));
+        }
+        for e in &mut self.extras {
+            let data = std::mem::take(&mut e.ddc.tap_out);
+            if !data.is_empty() {
+                out.push((e.hz, data));
+            }
         }
         if let Some(hz) = self.voice_hz {
             let hz = hz.round() as u64;
@@ -1265,6 +1342,9 @@ impl Bank {
             _ => true,
         };
         self.voice_hz = next;
+        if let Some(v) = next {
+            self.extras.retain(|e| (v.round() as u64).abs_diff(e.hz) > 1);
+        }
         let offset = self.voice_hz.unwrap_or(self.center) - self.center;
         self.voice.set_offset(offset);
         if changed {
@@ -1299,6 +1379,12 @@ impl Bank {
                     if let Some(block) = self.voice_probe.push(hz, mag) {
                         self.afc.update(block);
                     }
+                }
+            }
+            for e in &mut self.extras {
+                let _ = e.ddc.push(i, q);
+                if let Some(mag) = e.ddc.take_mag() {
+                    e.empty = e.carrier.push(mag);
                 }
             }
             for (index, ddc) in self.controls.iter_mut().enumerate() {
@@ -1893,22 +1979,14 @@ fn run_bank(
             out.clear();
         }
         let tap = crate::rec_live::tap_on();
+        let radio_id = rec_key.load(Ordering::Relaxed);
+        bank.set_extras(&crate::rec_live::grant_taps(radio_id));
         bank.set_tap(tap);
         bank.push(&buf[..n], &mut voice_out, &mut control_out);
+        crate::rec_live::note_extras(radio_id, &bank.extras());
         voice_empty.store(bank.voice_channel_empty(), Ordering::Relaxed);
         if tap {
-            let radio = rec_key.load(Ordering::Relaxed);
-            for (ch, data) in bank.take_carrier_taps() {
-                if data.is_empty() {
-                    continue;
-                }
-                // The talkgroup file still uses the radio id. Every carrier
-                // also has its own file, open for the whole capture.
-                if hz != 0 && ch == hz {
-                    crate::rec_live::push(radio, ch, data.clone());
-                }
-                crate::rec_live::push(crate::rec_live::carrier_key(radio, ch), ch, data);
-            }
+            route_taps(radio_id, hz, bank.take_carrier_taps());
         }
         let (mean_i, mean_q) = bank.dc_mean();
         spec.push(&buf[..n], center, mean_i, mean_q);
@@ -2335,7 +2413,7 @@ fn collect(stderr: impl Read, sink: Arc<Mutex<Vec<String>>>) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #[test]
     fn a_full_decoder_queue_drops_a_whole_chunk_and_counts_it() {
         let dropped = std::sync::atomic::AtomicU64::new(0);
@@ -2424,6 +2502,97 @@ mod tests {
         let text = String::from_utf8_lossy(&out.stderr);
         let syncs = text.matches("+P25p1").count();
         assert!(syncs >= 10, "only {syncs} P25 syncs:\n{text}");
+    }
+
+    /// Two C4FM calls inside one capture, summed as the HackRF sees them.
+    pub(crate) fn two_calls_cs8(center: f64, a: f64, b: f64, err_hz: f64, secs: f64) -> Vec<u8> {
+        let x = hsrec::dsp::synth_c4fm_cs8(a - center, err_hz, secs, 50.0);
+        let y = hsrec::dsp::synth_c4fm_cs8(b - center, err_hz, secs, 50.0);
+        x.iter().zip(&y).map(|(p, q)| ((*p as i8 as i16 + *q as i8 as i16).clamp(-127, 127) as i8) as u8).collect()
+    }
+
+    /// The speaker follows call A; B and a silent C are recorded too.
+    pub(crate) fn tap_three(center: f64, a: f64, b: f64, c: f64, secs: f64) -> (Bank, Vec<(u64, Vec<i16>)>) {
+        let cs8 = two_calls_cs8(center, a, b, 1_627.0, secs);
+        let mut bank = Bank::new(center, &[]);
+        bank.set_voice(Some(a));
+        bank.set_extras(&[a as u64, b as u64, c as u64]);
+        bank.set_tap(true);
+        let mut taps: Vec<(u64, Vec<i16>)> = Vec::new();
+        let mut voice = Vec::new();
+        for block in cs8.chunks(16_384) {
+            voice.clear();
+            bank.push(block, &mut voice, &mut []);
+            for (hz, data) in bank.take_carrier_taps() {
+                match taps.iter_mut().find(|(h, _)| *h == hz) {
+                    Some((_, all)) => all.extend(data),
+                    None => taps.push((hz, data)),
+                }
+            }
+        }
+        (bank, taps)
+    }
+
+    #[test]
+    fn calls_not_on_the_speaker_get_their_own_mixer_and_tap() {
+        let center = 857_200_000.0;
+        let (a, b, c) = (856_962_500.0, 857_437_500.0, 857_712_500.0);
+        let (bank, taps) = tap_three(center, a, b, c, 1.0);
+        // The speaker's channel is not doubled as an extra.
+        let extras = bank.extras();
+        assert_eq!(extras.len(), 2, "{extras:?}");
+        assert_eq!(extras.iter().find(|(h, _)| *h == b as u64).map(|e| e.1), Some(false), "B is on the air");
+        assert_eq!(extras.iter().find(|(h, _)| *h == c as u64).map(|e| e.1), Some(true), "C is silent");
+        // A, B and C each have 1 s of 32 ksps cs16.
+        for hz in [a, b, c] {
+            let n = taps.iter().find(|(h, _)| *h == hz as u64).map(|(_, d)| d.len() / 2).unwrap_or(0);
+            assert!((31_000..=33_000).contains(&n), "{hz}: {n} samples");
+        }
+        // A channel outside the capture or on the voice is never an extra.
+        let mut bank = Bank::new(center, &[]);
+        bank.set_voice(Some(a));
+        bank.set_extras(&[a as u64, (center + 5_000_000.0) as u64]);
+        assert!(bank.extras().is_empty());
+    }
+
+    #[test]
+    fn a_call_not_on_the_speaker_replays_as_p25() {
+        if std::process::Command::new("sh")
+            .args(["-c", "command -v dsd-fme"])
+            .output()
+            .map(|out| !out.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("skipped: dsd-fme is not on PATH");
+            return;
+        }
+        let center = 857_200_000.0;
+        let (a, b, c) = (856_962_500.0, 857_437_500.0, 857_712_500.0);
+        let (_, taps) = tap_three(center, a, b, c, 2.0);
+        let tap = taps.into_iter().find(|(h, _)| *h == b as u64).unwrap().1;
+        let mut disc = Vec::new();
+        hsrec::dsp::Replayer::default().push(&tap, &mut disc);
+        let argv = crate::rx_pipe::command_argv("modems/commander-demod-p25.rxpipe").expect("p25 pipe file");
+        let mut child = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .env("HAMSPOT_CC_EVENTS", "1")
+            .env("HAMSPOT_RX_MUTE", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("p25 pipe");
+        let mut stdin = child.stdin.take().unwrap();
+        let bytes: Vec<u8> = disc.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let writer = std::thread::spawn(move || {
+            use std::io::Write;
+            let _ = stdin.write_all(&bytes);
+        });
+        let out = child.wait_with_output().expect("p25 pipe output");
+        writer.join().unwrap();
+        let text = String::from_utf8_lossy(&out.stderr);
+        let syncs = text.matches("+P25p1").count();
+        assert!(syncs >= 10, "only {syncs} P25 syncs from call B:\n{text}");
     }
 
     #[test]

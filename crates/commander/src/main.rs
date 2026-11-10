@@ -10048,7 +10048,10 @@ impl App {
             .filter(|(_, row)| row.spec.driver == cat::RadioDriver::Hackrf)
             .map(|(index, row)| (index, row.id, row.spec.follow))
             .collect();
-        let ids: Vec<u64> = direct.iter().map(|row| row.1).collect();
+        #[allow(unused_mut)]
+        let mut ids: Vec<u64> = direct.iter().map(|row| row.1).collect();
+        #[cfg(test)]
+        ids.extend(self.rec.test_rows.iter().map(|r| r.id));
         self.hackrf_open.retain(|id, _| ids.contains(id));
         self.hackrf_call.retain(|id, _| ids.contains(id));
         self.hackrf_last_voice.retain(|id, _| ids.contains(id));

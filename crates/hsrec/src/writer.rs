@@ -423,7 +423,10 @@ impl Worker {
 
     fn finish(&mut self, key: u64) {
         let Some(mut seg) = self.segs.remove(&key) else { return };
-        let keep = seg.closing.map(|(_, k, _)| k).unwrap_or(true);
+        // A file that never got a sample has nothing to play: a voice
+        // channel opened with the capture that carried no call. It is not
+        // kept, so the lanes do not fill with empty blocks.
+        let keep = seg.closing.map(|(_, k, _)| k).unwrap_or(true) && seg.values > 0;
         let _ = seg.out.flush();
         drop(seg.out);
         let db = self.db.as_ref();
@@ -540,6 +543,21 @@ mod tests {
         w.command(Cmd::Open { key: 1, meta: m() });
         assert!(!w.status.writing.load(Ordering::Relaxed));
         assert_eq!(std::fs::read(dir.join("S.HSREC.sqlite")).unwrap(), vec![0x5au8; 8192]);
+    }
+
+    #[test]
+    fn a_recording_that_got_no_samples_is_not_kept() {
+        let dir = tempdir("writer-empty");
+        let mut w = worker(&dir);
+        w.command(Cmd::Open { key: 7, meta: m() });
+        w.command(Cmd::Close { key: 7, keep: true });
+        w.command(Cmd::Shutdown);
+        assert!(w.db.as_ref().unwrap().all().unwrap().is_empty());
+        w.command(Cmd::Open { key: 8, meta: m() });
+        w.chunk(Chunk { key: 8, hz: 851, data: vec![2; 640] });
+        w.command(Cmd::Close { key: 8, keep: true });
+        w.command(Cmd::Shutdown);
+        assert_eq!(w.db.as_ref().unwrap().all().unwrap().len(), 1);
     }
 
     #[test]

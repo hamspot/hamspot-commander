@@ -53,6 +53,50 @@ pub fn carrier_key(radio: u64, hz: u64) -> u64 {
     radio.wrapping_shl(32) ^ hz.wrapping_mul(0x9E37_79B9)
 }
 
+/// File key for a talkgroup call recorded on `hz` while another call is on
+/// the speaker. It collides with neither the radio id nor a carrier key.
+pub fn grant_key(radio: u64, hz: u64) -> u64 {
+    carrier_key(radio, hz) ^ 0xA5A5_0000_0000_0001
+}
+
+/// Per radio: the voice frequencies REC wants channelised besides the one on
+/// the speaker (set by the UI), and what the capture reports back for each:
+/// (hz, empty for 500 ms).
+#[derive(Default)]
+struct Grants {
+    want: HashMap<u64, Vec<u64>>,
+    seen: HashMap<u64, Vec<(u64, bool)>>,
+}
+
+static GRANTS: OnceLock<Mutex<Grants>> = OnceLock::new();
+
+fn grants() -> std::sync::MutexGuard<'static, Grants> {
+    GRANTS.get_or_init(|| Mutex::new(Grants::default())).lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
+pub fn set_grant_taps(radio: u64, hz: Vec<u64>) {
+    grants().want.insert(radio, hz);
+}
+
+pub fn grant_taps(radio: u64) -> Vec<u64> {
+    grants().want.get(&radio).cloned().unwrap_or_default()
+}
+
+pub fn is_grant_tap(radio: u64, hz: u64) -> bool {
+    grants().want.get(&radio).is_some_and(|v| v.contains(&hz))
+}
+
+/// From the capture thread: the recorded-only channels it has and whether
+/// each is empty.
+pub fn note_extras(radio: u64, extras: &[(u64, bool)]) {
+    grants().seen.insert(radio, extras.to_vec());
+}
+
+/// `Some(empty)` once the capture has a mixer on `hz`.
+pub fn extra_state(radio: u64, hz: u64) -> Option<bool> {
+    grants().seen.get(&radio).and_then(|v| v.iter().find(|(h, _)| *h == hz).map(|(_, e)| *e))
+}
+
 /// One leftover byte when a read splits a little-endian sample.
 #[derive(Default)]
 pub struct S16Carry {

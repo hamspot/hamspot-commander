@@ -407,6 +407,8 @@ fn real_page_draws_a_live_call_within_a_second_and_keeps_it() {
     assert!(lane_label(&out, "ISP IND DISP").is_some(), "its lane is listed");
     eprintln!("live call drawn after {after:?} at {block:?}");
     // It ends: still there, now as a finished call.
+    // It carries signal (an empty recording is not kept), then ends.
+    crate::rec_live::push(key, 856_962_500, vec![100i16; 32_000]);
     std::thread::sleep(std::time::Duration::from_millis(300));
     crate::rec_live::recorder().send(Cmd::Close { key, keep: true });
     let t1 = std::time::Instant::now();
@@ -422,6 +424,283 @@ fn real_page_draws_a_live_call_within_a_second_and_keeps_it() {
         std::thread::sleep(std::time::Duration::from_millis(30));
     }
     assert!(kept, "the finished call stays in its lane");
+}
+
+/// A HackRF row for the tests: no hardware, the P25 pipe as its decoder.
+fn hackrf_row(id: u64, center: f64) -> cat::RadioRow {
+    let mut spec = cat::RadioSpec::dummy();
+    spec.driver = cat::RadioDriver::Hackrf;
+    spec.name = "HackRF".into();
+    spec.rx_pipe = "modems/commander-demod-p25.rxpipe".into();
+    cat::RadioRow {
+        id,
+        spec,
+        port: None,
+        status: String::new(),
+        selected: false,
+        make: String::new(),
+        model_label: String::new(),
+        audio_status: String::new(),
+        rx_pipe_status: String::new(),
+        rx_chain: String::new(),
+        rx_pipe_diverted: false,
+        tx_pipe_status: String::new(),
+        tx_pipe_diverted: false,
+        center_hz: center,
+        voice_empty: false,
+    }
+}
+
+fn install_modems() {
+    use std::os::unix::fs::PermissionsExt;
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../modems");
+    let dst = crate::rx_pipe::installed_modem_dirs().into_iter().next().expect("data home");
+    std::fs::create_dir_all(&dst).unwrap();
+    for e in std::fs::read_dir(&src).unwrap().flatten() {
+        if e.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            let to = dst.join(e.file_name());
+            std::fs::copy(e.path(), &to).unwrap();
+            let mode = std::fs::metadata(e.path()).unwrap().permissions().mode() & 0o755;
+            std::fs::set_permissions(&to, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+    }
+    let mut d = dst.as_path();
+    for _ in 0..2 {
+        std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        d = d.parent().unwrap();
+    }
+}
+
+fn p25_syncs(disc: &[i16]) -> usize {
+    let argv = crate::rx_pipe::command_argv("modems/commander-demod-p25.rxpipe").expect("p25 pipe file");
+    let mut child = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .env("HAMSPOT_CC_EVENTS", "1")
+        .env("HAMSPOT_RX_MUTE", "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("p25 pipe");
+    let mut stdin = child.stdin.take().unwrap();
+    let bytes: Vec<u8> = disc.iter().flat_map(|s| s.to_le_bytes()).collect();
+    let writer = std::thread::spawn(move || {
+        use std::io::Write;
+        let _ = stdin.write_all(&bytes);
+    });
+    let out = child.wait_with_output().expect("p25 pipe output");
+    writer.join().unwrap();
+    String::from_utf8_lossy(&out.stderr).matches("+P25p1").count()
+}
+
+/// Three calls granted at once inside one HackRF capture. The speaker
+/// follows A (priority); B and C are recorded at the same time in their own
+/// talkgroup files, drawn live in their lanes, and B replays from REC.
+#[test]
+fn real_page_records_every_concurrent_call_while_one_is_heard() {
+    if !in_child("real_page_records_every_concurrent_call_while_one_is_heard") {
+        return;
+    }
+    // The child has a private HOME: install the repo's modems there, owner
+    // writable only, as an installed copy has them.
+    install_modems();
+    let st = station(None, 0);
+    let mut h = Harness::new(&st, egui::vec2(1200.0, 700.0), false);
+    h.app.rec.face.talkgroups = hsrec::segment::RecMode::All;
+    h.app.rec.face.source_tab = meta::SOURCE_HACKRF_TG.into();
+    h.settle(8);
+    let radio = 0x4ACC;
+    let center = 857_200_000.0;
+    let (a, b, c) = (856_962_500.0, 857_437_500.0, 857_712_500.0);
+    let (tg_a, tg_b, tg_c) = (10_119u32, 10_741u32, 10_334u32);
+    h.app.rec.test_rows.push(hackrf_row(radio, center));
+    h.app.hackrf_call.insert(radio, Some((a, tg_a)));
+    h.app.hackrf_open.insert(
+        radio,
+        vec![
+            crate::HeardGrant { hz: a, tg: tg_a, seq: 1 },
+            crate::HeardGrant { hz: b, tg: tg_b, seq: 2 },
+            crate::HeardGrant { hz: c, tg: tg_c, seq: 3 },
+        ],
+    );
+    h.settle(2);
+    let mut taps = crate::rec_live::grant_taps(radio);
+    taps.sort_unstable();
+    assert_eq!(taps, vec![b as u64, c as u64], "B and C are channelised besides the speaker's A");
+    let open: Vec<u64> = h.app.rec.grant_open.keys().map(|(_, hz)| *hz).collect();
+    assert_eq!(open.len(), 2, "two talkgroup files open beside the speaker's call: {open:?}");
+
+    // The capture: A and B on the air, C silent. Same routing as the USB thread.
+    let cs8 = crate::hackrf::tests::two_calls_cs8(center, a, b, 1_627.0, 2.0);
+    let mut bank = crate::hackrf::Bank::new(center, &[]);
+    bank.set_voice(Some(a));
+    let mut voice = Vec::new();
+    let mut most_live = 0;
+    for (k, block) in cs8.chunks(262_144).enumerate() {
+        bank.set_extras(&crate::rec_live::grant_taps(radio));
+        bank.set_tap(true);
+        voice.clear();
+        bank.push(block, &mut voice, &mut []);
+        crate::rec_live::note_extras(radio, &bank.extras());
+        crate::hackrf::route_taps(radio, a as u64, bank.take_carrier_taps());
+        if k % 4 == 0 {
+            let out = h.run(vec![]);
+            let area = lanes_area(&out);
+            most_live = most_live.max(fills(&out, LIVE_BLOCK).into_iter().filter(|r| area.intersects(*r)).count());
+        }
+    }
+    let t0 = std::time::Instant::now();
+    while most_live < 2 && t0.elapsed() < std::time::Duration::from_secs(2) {
+        let out = h.run(vec![]);
+        let area = lanes_area(&out);
+        most_live = most_live.max(fills(&out, LIVE_BLOCK).into_iter().filter(|r| area.intersects(*r)).count());
+        std::thread::sleep(std::time::Duration::from_millis(16));
+    }
+    assert!(most_live >= 2, "concurrent calls drawn live in their own lanes at once ({most_live})");
+
+    // The calls end: their grants leave the list.
+    h.app.hackrf_call.insert(radio, None);
+    h.app.hackrf_open.insert(radio, Vec::new());
+    h.settle(2);
+    assert!(h.app.rec.grant_open.is_empty());
+    assert!(crate::rec_live::grant_taps(radio).is_empty());
+    let db = Db::open(&h.app.rec.db_path).unwrap();
+    let t1 = std::time::Instant::now();
+    let rec_b = loop {
+        let r = db.by_talkgroup(tg_b).unwrap().into_iter().find(|r| !r.meta.end_utc.is_empty() && r.meta.bytes > 0);
+        if let Some(r) = r {
+            break r;
+        }
+        assert!(t1.elapsed() < std::time::Duration::from_secs(5), "B was filed");
+        h.run(vec![]);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    };
+    assert_eq!(rec_b.meta.source, meta::SOURCE_HACKRF_TG);
+    assert_eq!(rec_b.meta.raw_format, "cs16");
+    assert_eq!(rec_b.meta.channel_hz, b);
+    assert!(rec_b.meta.bytes >= 200_000, "about 2 s of raw IQ: {} bytes", rec_b.meta.bytes);
+    let path = h.app.rec.dir.join(&rec_b.raw_path);
+    assert!(std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) >= 200_000, "raw IQ on disk");
+    // C was granted and filed too (it was silent, so only noise).
+    assert!(!db.by_talkgroup(tg_c).unwrap().is_empty(), "C has its own file");
+    // Played from REC: the same decoder and re-demodulation REC playback uses.
+    let decoder = h.app.rec_decoder(&rec_b.meta);
+    assert!(decoder.as_ref().is_some_and(|d| d.argv[0].ends_with("commander-demod-p25.rxpipe")), "{decoder:?} {}", h.app.rec.note);
+    let disc = hsrec::replay::decode_all(&path, &rec_b.meta).unwrap();
+    assert!(disc.len() > 60_000, "replay re-demodulates B ({} samples)", disc.len());
+    if std::process::Command::new("sh").args(["-c", "command -v dsd-fme"]).output().map(|o| o.status.success()).unwrap_or(false) {
+        let syncs = p25_syncs(&disc);
+        assert!(syncs >= 10, "B's replay decodes as P25: {syncs} syncs");
+    } else {
+        eprintln!("dsd-fme not on PATH: P25 decode of B skipped");
+    }
+}
+
+/// A P25 channel recording (filed as "fm" on HACKRF CHANNELS) clicked on
+/// the timeline: the Record / Playback dialog opens, the Demodulator
+/// defaults to the P25 pipe and playback runs through that decoder, not the
+/// raw discriminator. FM audio can be picked instead. Closing the dialog
+/// stops playback.
+#[test]
+fn real_page_channel_recording_plays_through_p25_and_shows_the_dialog() {
+    if !in_child("real_page_channel_recording_plays_through_p25_and_shows_the_dialog") {
+        return;
+    }
+    install_modems();
+    let st = station(None, 0);
+    let mut h = Harness::new(&st, egui::vec2(1200.0, 760.0), false);
+    h.app.rec.face.talkgroups = hsrec::segment::RecMode::All;
+    h.app.rec.face.source_tab = meta::SOURCE_HACKRF_CHANNELS.into();
+    h.app.rec.play_argv = Some(vec!["sh".into(), "-c".into(), "cat > /dev/null".into()]);
+    h.settle(4);
+    let raw = "hackrf_channels/x/856_9625.cs16";
+    let path = h.app.rec.dir.join(raw);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let iq = hsrec::dsp::synth_c4fm_cs16(1_627.0, 3.0, 9_000.0);
+    std::fs::write(&path, iq.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+    let t0 = chrono::Utc::now() - chrono::Duration::seconds(8);
+    let mut m = Meta {
+        source: meta::SOURCE_HACKRF_CHANNELS.into(),
+        source_kind: meta::KIND_RAW_IQ.into(),
+        channel_name: "856.9625".into(),
+        raw_format: "cs16".into(),
+        sample_rate: 32_000,
+        start_utc: t0.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        end_utc: (t0 + chrono::Duration::seconds(3)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        duration_ms: 3000,
+        bytes: (iq.len() * 2) as i64,
+        modulation: "fm".into(),
+        centre_hz: 857_200_000.0,
+        channel_hz: 856_962_500.0,
+        offset_hz: -237_500.0,
+        ..Default::default()
+    };
+    m.decoder = serde_json::json!({ "script": "modems/commander-demod-p25.rxpipe", "vocoder": "", "mode": "FM", "invert": false });
+    let id = Db::open(&h.app.rec.db_path).unwrap().insert(raw, &m).unwrap();
+    let t = std::time::Instant::now();
+    let block = loop {
+        let out = h.run(vec![]);
+        let area = lanes_area(&out);
+        if let Some(r) = fills(&out, egui::Color32::from_rgb(46, 120, 70)).into_iter().find(|r| area.intersects(*r)) {
+            break r;
+        }
+        assert!(t.elapsed() < std::time::Duration::from_secs(5), "the channel recording is drawn");
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    };
+    if let Some(dir) = std::env::var_os("HS_REC_PNG_DIR") {
+        let out = h.run(vec![]);
+        h.png(&out, &Path::new(&dir).join("rec-channel-before-click.png"));
+    }
+    let rec = h.app.rec.rows.iter().find(|r| r.id == id).cloned().expect("row loaded");
+    // Default: the P25 pipe, through the decoder.
+    assert_eq!(h.app.rec_demod(&rec), "modems/commander-demod-p25.rxpipe");
+    let (dec, pm) = h.app.rec_play_plan(&rec, &h.app.rec_demod(&rec));
+    assert!(dec.as_ref().is_some_and(|d| d.argv[0].ends_with("commander-demod-p25.rxpipe")), "{dec:?} {}", h.app.rec.note);
+    assert!(pm.is_digital(), "played as digital, not the raw discriminator");
+    let (dec, pm) = h.app.rec_play_plan(&rec, DEMOD_FM);
+    assert!(dec.is_none() && !pm.is_digital(), "FM audio is the discriminator");
+    assert!(h.app.rec_demod_options().iter().any(|(k, _)| k == DEMOD_FM));
+
+    // A click on the block plays it and opens the dialog. The view follows
+    // NOW, so the block is found again in the frame just before the click.
+    h.app.rec.detail_open = false;
+    let m0 = egui::Modifiers::NONE;
+    let out = h.run(vec![]);
+    let area = lanes_area(&out);
+    let block = fills(&out, egui::Color32::from_rgb(46, 120, 70)).into_iter().find(|r| area.intersects(*r)).expect("block");
+    // Right part: the left of a block can sit under the lane-name shelf.
+    let at = egui::pos2(block.right() - block.width() * 0.2, block.center().y);
+    h.run(vec![
+        egui::Event::PointerMoved(at),
+        egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: m0 },
+        egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: false, modifiers: m0 },
+    ]);
+    let out = h.settle(3);
+    assert!(h.app.rec.player.as_ref().is_some_and(|(pid, _)| *pid == id), "clicked recording plays: selected {:?} open {} note {:?} block {block:?}", h.app.rec.selected, h.app.rec.detail_open, h.app.rec.note);
+    assert!(h.app.rec.detail_open);
+    let words: Vec<String> = texts(&out).into_iter().map(|(t, _)| t).collect();
+    assert!(words.iter().any(|t| t.to_uppercase().contains("RECORD / PLAYBACK")), "dialog shown: {words:?}");
+    assert!(words.iter().any(|t| t == "Demodulator"), "demodulator selector shown");
+    assert!(words.iter().any(|t| t.starts_with("P25")), "P25 is the default: {words:?}");
+    let t = std::time::Instant::now();
+    while !h.app.rec.player.as_ref().is_some_and(|(_, p)| p.decoder_ran.load(Ordering::Relaxed)) {
+        assert!(t.elapsed() < std::time::Duration::from_secs(3), "playback runs the P25 decoder");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // FM audio picked: restarts without a decoder.
+    h.app.rec_pick_demod(id, DEMOD_FM.into());
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(h.app.rec.player.as_ref().is_some_and(|(_, p)| !p.decoder_ran.load(Ordering::Relaxed)), "FM audio has no decoder");
+    // Closing the dialog stops playback.
+    h.app.rec_close_detail();
+    assert!(h.app.rec.player.is_none() && !h.app.rec.detail_open);
+    // Playback started any other way (play-next, keys) also shows the dialog.
+    h.app.rec.demod.remove(&id);
+    h.app.rec.selected = None;
+    h.app.rec_play(id, 0);
+    h.settle(2);
+    assert!(h.app.rec.detail_open && h.app.rec.selected == Some(id));
+    h.app.rec_close_detail();
 }
 
 /// Screenshots of the REC page from a copy of a real database, before and

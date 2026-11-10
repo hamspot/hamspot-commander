@@ -271,6 +271,23 @@ pub fn units_text(m: &Meta) -> String {
     }
 }
 
+/// A call recorded while another is on the speaker.
+pub struct GrantRec {
+    tg: u32,
+    seq: u64,
+    opened: Instant,
+    /// Last time the grant was renewed or its carrier was on the air.
+    live: Instant,
+}
+
+/// A recorded-only call ends after this long with no carrier and no renewed
+/// grant (at least the voice hang).
+pub const GRANT_QUIET: Duration = Duration::from_millis(2_000);
+
+/// Playback demodulator key for analog FM audio (the re-demodulated
+/// discriminator, no decoder).
+pub const DEMOD_FM: &str = "fm";
+
 #[derive(Default)]
 pub struct RecUi {
     /// Per HackRF radio: units heard on its calls (#162).
@@ -336,6 +353,20 @@ pub struct RecUi {
     go_live: bool,
     /// Lane list scroll offset (points from the top), per source tab.
     lane_off: HashMap<String, f32>,
+    /// Calls recorded but not on the speaker, by (radio, hz).
+    grant_open: HashMap<(u64, u64), GrantRec>,
+    /// The last (tg, grant sequence) filed per (radio, hz): a grant that is
+    /// still listed after its call ended is not opened again.
+    grant_done: HashMap<(u64, u64), (u32, u64)>,
+    /// Demodulator picked in the Record / Playback dialog, per recording.
+    /// Session only; absent means the recording's own default.
+    demod: HashMap<i64, String>,
+    /// Tests play into this command instead of the speaker.
+    #[cfg(test)]
+    pub(crate) play_argv: Option<Vec<String>>,
+    /// Radios the tests add to the hub's list (a HackRF without hardware).
+    #[cfg(test)]
+    pub(crate) test_rows: Vec<cat::RadioRow>,
     /// Why the database could not be opened or created (shown, never silent).
     db_error: Option<String>,
 }
@@ -488,16 +519,25 @@ impl App {
         }
         let hang = Duration::from_millis(u64::from(self.voice_hang_ms));
         let now = Instant::now();
-        let rows = self.hub.view().rows;
+        #[allow(unused_mut)]
+        let mut rows = self.hub.view().rows;
+        #[cfg(test)]
+        rows.extend(self.rec.test_rows.iter().cloned());
         let live: Vec<u64> = rows
             .iter()
             .filter(|r| matches!(r.spec.driver, cat::RadioDriver::Hackrf | cat::RadioDriver::Hamlib | cat::RadioDriver::Gqrx))
             .map(|r| r.id)
             .collect();
-        let gone: Vec<u64> = self.rec.seg.keys().copied().filter(|id| !live.contains(id) || !armed).collect();
+        let mut gone: Vec<u64> = self.rec.seg.keys().copied().filter(|id| !live.contains(id) || !armed).collect();
+        for (radio, _) in self.rec.grant_open.keys() {
+            if (!live.contains(radio) || !armed) && !gone.contains(radio) {
+                gone.push(*radio);
+            }
+        }
         for id in gone {
             crate::rec_live::set_rec_hz(id, 0);
             self.close_carriers(id, &recorder);
+            self.close_grants(id, &recorder);
             if let Some(mut s) = self.rec.seg.remove(&id) {
                 for a in s.stop() {
                     if let Action::Close { keep } = a {
@@ -512,6 +552,7 @@ impl App {
                     crate::rec_live::set_rec_hz(row.id, 0);
                 }
                 self.close_carriers(row.id, &recorder);
+                self.close_grants(row.id, &recorder);
             }
             self.rec.enc.clear();
             return;
@@ -563,6 +604,7 @@ impl App {
             }
             if row.spec.driver == cat::RadioDriver::Hackrf {
                 self.sync_carrier_files(row, &recorder);
+                self.sync_grant_files(row, &recorder, now);
             }
         }
     }
@@ -814,6 +856,117 @@ impl App {
         (None, None)
     }
 
+    /// Metadata of a HackRF talkgroup call on `hz`.
+    fn hackrf_tg_meta(&self, row: &cat::RadioRow, hz: f64, tg: u32) -> Meta {
+        let found = self.talkgroups.zones.iter().flat_map(|z| z.talkgroups.iter()).find(|t| t.tg == tg);
+        let mut m = Meta {
+            source: meta::SOURCE_HACKRF_TG.into(),
+            source_kind: meta::KIND_RAW_IQ.into(),
+            radio_id: row.id,
+            radio_name: row.spec.name.clone(),
+            raw_format: "cs16".into(),
+            sample_rate: hsrec::dsp::REC_RATE,
+            centre_hz: row.center_hz,
+            bandwidth_hz: hsrec::dsp::REC_RATE as f64,
+            chain: hsrec::dsp::CHAIN_ID.into(),
+            sw_version: format!("commander {} / {}", env!("CARGO_PKG_VERSION"), meta::sw_version()),
+            ..Default::default()
+        };
+        m.talkgroup = Some(tg);
+        m.talkgroup_name = found.map(|t| t.name.clone()).unwrap_or_default();
+        m.priority = found.is_some_and(|t| t.priority);
+        m.emergency = self.trunk_emergency.iter().any(|(_, _, t)| *t == tg);
+        m.channel_hz = hz;
+        m.offset_hz = hz - row.center_hz;
+        m.modulation = "p25".into();
+        m.decoder = serde_json::json!({ "script": hsrec::safepath::portable_decoder(&row.spec.rx_pipe), "vocoder": "p25" });
+        hsrec::safepath::portable_meta(&mut m);
+        m.decoder_params = self.rec_live_params(row, &m);
+        if let Some(b) = self.cc_site.get(&row.id) {
+            m.system = format!("WACN {} SYS {}", b.wacn, b.sys);
+            m.site = format!("RFSS {} Site {}", b.rfss, b.site);
+        }
+        m
+    }
+
+    /// Calls granted inside this HackRF capture that are not on the
+    /// speaker. Each is recorded in its own file at the same time, so a call
+    /// missed because another had priority can be played from REC later.
+    /// (hz, tg, grant sequence).
+    fn hackrf_other_grants(&self, row: &cat::RadioRow) -> Vec<(u64, u32, u64)> {
+        let face = &self.rec.face;
+        if !face.talkgroups.armed() || !row.center_hz.is_finite() {
+            return Vec::new();
+        }
+        let heard = self.hackrf_call.get(&row.id).copied().flatten().map(|(hz, _)| hz.round() as u64);
+        let mut out: Vec<(u64, u32, u64)> = Vec::new();
+        for g in self.hackrf_open.get(&row.id).map(Vec::as_slice).unwrap_or(&[]) {
+            if !g.hz.is_finite() || g.hz <= 0.0 || !hsrec::dsp::in_capture(g.hz - row.center_hz) {
+                continue;
+            }
+            let hz = g.hz.round() as u64;
+            if heard == Some(hz) || out.iter().any(|(h, _, _)| *h == hz) {
+                continue;
+            }
+            if self.channels.zones.iter().flat_map(|z| z.channels.iter()).any(|c| c.control && (c.hz - g.hz).abs() < 1.0) {
+                continue;
+            }
+            let found = self.talkgroups.zones.iter().flat_map(|z| z.talkgroups.iter()).find(|t| t.tg == g.tg);
+            if segment::wanted(face.talkgroups, found.is_some_and(|t| t.record), found.is_some_and(|t| t.encrypted)) {
+                out.push((hz, g.tg, g.seq));
+            }
+        }
+        out
+    }
+
+    /// Open, keep and close the files of the calls not on the speaker.
+    fn sync_grant_files(&mut self, row: &cat::RadioRow, recorder: &hsrec::writer::Recorder, now: Instant) {
+        let radio = row.id;
+        let want = self.hackrf_other_grants(row);
+        let quiet = Duration::from_millis(u64::from(self.voice_hang_ms)).max(GRANT_QUIET);
+        let open: Vec<u64> = self.rec.grant_open.iter().filter(|((r, _), _)| *r == radio).map(|((_, hz), _)| *hz).collect();
+        for hz in open {
+            let Some(g) = self.rec.grant_open.get_mut(&(radio, hz)) else { continue };
+            let same = want.iter().find(|(h, tg, _)| *h == hz && *tg == g.tg);
+            if let Some((_, _, seq)) = same {
+                if *seq != g.seq {
+                    g.seq = *seq;
+                    g.live = now;
+                }
+            }
+            if crate::rec_live::extra_state(radio, hz) == Some(false) {
+                g.live = now;
+            }
+            let ended = same.is_none() || (now.duration_since(g.live) > quiet && now.duration_since(g.opened) > GRANT_QUIET);
+            if ended {
+                let g = self.rec.grant_open.remove(&(radio, hz)).expect("open grant");
+                self.rec.grant_done.insert((radio, hz), (g.tg, g.seq));
+                recorder.send(Cmd::Close { key: crate::rec_live::grant_key(radio, hz), keep: true });
+            }
+        }
+        for (hz, tg, seq) in want {
+            if self.rec.grant_open.contains_key(&(radio, hz)) || self.rec.grant_done.get(&(radio, hz)) == Some(&(tg, seq)) {
+                continue;
+            }
+            let m = self.hackrf_tg_meta(row, hz as f64, tg);
+            recorder.send(Cmd::Open { key: crate::rec_live::grant_key(radio, hz), meta: m });
+            self.rec.grant_open.insert((radio, hz), GrantRec { tg, seq, opened: now, live: now });
+        }
+        let taps: Vec<u64> = self.rec.grant_open.keys().filter(|(r, _)| *r == radio).map(|(_, hz)| *hz).collect();
+        crate::rec_live::set_grant_taps(radio, taps);
+    }
+
+    fn close_grants(&mut self, radio: u64, recorder: &hsrec::writer::Recorder) {
+        let keys: Vec<(u64, u64)> = self.rec.grant_open.keys().filter(|(r, _)| *r == radio).copied().collect();
+        for k in keys {
+            if let Some(g) = self.rec.grant_open.remove(&k) {
+                self.rec.grant_done.insert(k, (g.tg, g.seq));
+            }
+            recorder.send(Cmd::Close { key: crate::rec_live::grant_key(k.0, k.1), keep: true });
+        }
+        crate::rec_live::set_grant_taps(radio, Vec::new());
+    }
+
     /// The call this HackRF radio should be recording now, and its metadata.
     fn rec_want_hackrf(&self, row: &cat::RadioRow) -> (Option<CallKey>, Option<Meta>) {
         let face = &self.rec.face;
@@ -847,23 +1000,9 @@ impl App {
                         return (None, None);
                     }
                     let key = CallKey { talkgroup: Some(tg), channel: String::new(), hz: hz.round() as u64, centre: row.center_hz.round() as u64 };
-                    let mut m = base(meta::SOURCE_HACKRF_TG);
-                    m.talkgroup = Some(tg);
-                    m.talkgroup_name = found.map(|t| t.name.clone()).unwrap_or_default();
-                    m.priority = found.is_some_and(|t| t.priority);
-                    m.emergency = self.trunk_emergency.iter().any(|(_, _, t)| *t == tg);
-                    m.channel_hz = hz;
-                    m.offset_hz = hz - row.center_hz;
+                    let mut m = self.hackrf_tg_meta(row, hz, tg);
                     if let Some(c) = self.rec.call_units.get(&row.id) {
                         m.set_units(c.units());
-                    }
-                    m.modulation = "p25".into();
-                    m.decoder = serde_json::json!({ "script": hsrec::safepath::portable_decoder(&row.spec.rx_pipe), "vocoder": "p25" });
-                    hsrec::safepath::portable_meta(&mut m);
-                    m.decoder_params = self.rec_live_params(row, &m);
-                    if let Some(b) = self.cc_site.get(&row.id) {
-                        m.system = format!("WACN {} SYS {}", b.wacn, b.sys);
-                        m.site = format!("RFSS {} Site {}", b.rfss, b.site);
                     }
                     return (Some(key), Some(m));
                 }
@@ -1389,6 +1528,29 @@ impl App {
         self.rec.wf_rx = Some(rx);
     }
 
+    /// The decoder REC replays a recording through. The recording names it
+    /// only as `modems/<file>`; Commander resolves it in its own modems
+    /// folders and never runs a stored path.
+    pub(super) fn rec_decoder(&mut self, rec_meta: &Meta) -> Option<hsrec::replay::DecoderCmd> {
+        let fallback = self.rec_param_fallback(rec_meta);
+        let mut meta = rec_meta.clone();
+        hsrec::safepath::portable_meta(&mut meta);
+        let stored = meta.decoder.get("script").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if stored.is_empty() {
+            return None;
+        }
+        let script = match hsrec::safepath::resolve_decoder(&stored, &crate::rx_pipe::modem_dirs()) {
+            Ok(p) => p,
+            Err(e) => {
+                self.rec.note = e;
+                return None;
+            }
+        };
+        let argv = vec![script.display().to_string()];
+        let env = hsrec::replay::decoder_env(rec_meta, &fallback);
+        Some(hsrec::replay::DecoderCmd { argv, env, hold: None })
+    }
+
     fn rec_play(&mut self, id: i64, from_ms: u64) {
         self.rec.player = None;
         let Some(rec) = self.rec.rows.iter().find(|r| r.id == id).cloned() else { return };
@@ -1403,42 +1565,107 @@ impl App {
         } else {
             self.rec.dir.join(&rec.raw_path)
         };
-        let fallback = self.rec_param_fallback(&rec.meta);
-        // The recording names its decoder only as `modems/<file>`; Commander
-        // resolves it in its own modems folders and never runs a stored path.
-        let mut meta = rec.meta.clone();
-        hsrec::safepath::portable_meta(&mut meta);
-        let stored = meta.decoder.get("script").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let script = if stored.is_empty() {
-            None
-        } else {
-            match hsrec::safepath::resolve_decoder(&stored, &crate::rx_pipe::modem_dirs()) {
-                Ok(p) => Some(p),
-                Err(e) => {
-                    self.rec.note = e;
-                    None
-                }
-            }
-        };
-        let (rate, channels) = script
+        let demod = self.rec_demod(&rec);
+        let (decoder, play_meta) = self.rec_play_plan(&rec, &demod);
+        if decoder.is_none() && play_meta.is_digital() && play_meta.source_kind != meta::KIND_DEMOD_AUDIO {
+            // Not the raw discriminator instead: say why nothing plays.
+            self.rec.selected = Some(id);
+            self.rec.detail_open = true;
+            self.rec_log(format!("Playback: {}", self.rec.note));
+            return;
+        }
+        let (rate, channels) = decoder
             .as_ref()
-            .map(|path| hsrec::replay::script_pcm(&path.display().to_string()))
+            .map(|d| hsrec::replay::script_pcm(&d.argv[0]))
             .unwrap_or((hsrec::replay::OUT_RATE, 1));
-        let decoder = script.map(|script| {
-            let argv = vec![script.display().to_string()];
-            let env = hsrec::replay::decoder_env(&rec.meta, &fallback);
-            hsrec::replay::DecoderCmd { argv, env, hold: None }
-        });
         if !self.rec.face.output.is_empty() || !self.rec.sinks_listed {
             self.rec.sinks = hsrec::replay::list_sinks();
             self.rec.sinks_listed = true;
         }
-        let (argv, missing) = hsrec::replay::pick_output(&self.rec.face.output, &self.rec.sinks, rate, channels);
+        #[allow(unused_mut)]
+        let (mut argv, missing) = hsrec::replay::pick_output(&self.rec.face.output, &self.rec.sinks, rate, channels);
+        #[cfg(test)]
+        if let Some(a) = &self.rec.play_argv {
+            argv = a.clone();
+        }
         self.rec.output_note = missing.unwrap_or_default();
-        match hsrec::replay::Player::start(&path, &rec.meta, from_ms, decoder, argv) {
-            Ok(p) => self.rec.player = Some((id, p)),
+        match hsrec::replay::Player::start(&path, &play_meta, from_ms, decoder, argv) {
+            Ok(p) => {
+                self.rec.player = Some((id, p));
+                // Every playback shows its controls.
+                if self.rec.selected != Some(id) {
+                    self.rec.notes_edit = rec.notes.clone();
+                }
+                self.rec.selected = Some(id);
+                self.rec.detail_open = true;
+            }
             Err(e) => self.rec.note = format!("Playback: {e}"),
         }
+    }
+
+    /// Demodulators the Record / Playback dialog offers: every modem pipe
+    /// Commander has, then analog FM audio. (key, label)
+    pub(super) fn rec_demod_options(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        for m in crate::rx_pipe::modem_scripts() {
+            if out.iter().any(|(k, _)| *k == m.command) {
+                continue;
+            }
+            let kind = m.name.trim_end_matches(".rxpipe").trim_start_matches("commander-demod-").to_uppercase();
+            out.push((m.command.clone(), format!("{kind} ({})", m.name)));
+        }
+        out.push((DEMOD_FM.into(), "FM audio (analog)".into()));
+        out
+    }
+
+    /// The demodulator a recording plays through: the one picked for it, else
+    /// its own decoder pipe (the pipe the radio was decoding with, so a P25
+    /// channel recording is decoded, never played as a raw discriminator),
+    /// else analog FM audio.
+    pub(super) fn rec_demod(&self, rec: &Recording) -> String {
+        if let Some(d) = self.rec.demod.get(&rec.id) {
+            return d.clone();
+        }
+        if rec.meta.source_kind == meta::KIND_DEMOD_AUDIO {
+            return DEMOD_FM.into();
+        }
+        let mut m = rec.meta.clone();
+        hsrec::safepath::portable_meta(&mut m);
+        match m.decoder.get("script").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            Some(script) => script.to_string(),
+            None => DEMOD_FM.into(),
+        }
+    }
+
+    /// Decoder and the metadata playback runs with for `demod`.
+    pub(super) fn rec_play_plan(&mut self, rec: &Recording, demod: &str) -> (Option<hsrec::replay::DecoderCmd>, Meta) {
+        let mut m = rec.meta.clone();
+        if demod == DEMOD_FM || rec.meta.source_kind == meta::KIND_DEMOD_AUDIO {
+            if rec.meta.source_kind != meta::KIND_DEMOD_AUDIO {
+                m.modulation = "fm".into();
+            }
+            return (None, m);
+        }
+        m.decoder["script"] = serde_json::Value::String(demod.to_string());
+        if !m.is_digital() {
+            // A channel recording is filed as "fm"; the pipe decides.
+            let kind = demod.trim_start_matches("modems/").trim_end_matches(".rxpipe").trim_start_matches("commander-demod-");
+            m.modulation = if kind.is_empty() || kind == "fm" { "digital".into() } else { kind.to_string() };
+        }
+        let decoder = self.rec_decoder(&m);
+        if decoder.is_none() {
+            // Never fall back silently to the raw discriminator for a digital pick.
+            if self.rec.note.is_empty() {
+                self.rec.note = format!("Demodulator {demod} not found.");
+            }
+        }
+        (decoder, m)
+    }
+
+    /// Close the Record / Playback dialog. Closing it stops playback.
+    pub(super) fn rec_close_detail(&mut self) {
+        self.rec.detail_open = false;
+        self.rec.player = None;
     }
 
     /// The REC view controls, drawn as a run of LCARS segments at the right
@@ -1870,6 +2097,43 @@ impl App {
     }
 
     /// Replay output: which sink pw-cat plays to, shown as text.
+    /// Demodulator for this recording. A change while it plays restarts it
+    /// from the same point.
+    fn rec_demod_row(&mut self, ui: &mut egui::Ui, rec: &Recording) {
+        let current = self.rec_demod(rec);
+        let options = self.rec_demod_options();
+        let label = options.iter().find(|(k, _)| *k == current).map(|(_, l)| l.clone()).unwrap_or_else(|| format!("{current} (not found)"));
+        let mut pick = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Demodulator");
+            egui::ComboBox::from_id_salt("rec_demod")
+                .selected_text(label)
+                .width(260.0)
+                .show_ui(ui, |ui| {
+                    for (k, l) in &options {
+                        if ui.selectable_label(*k == current, l).clicked() {
+                            pick = Some(k.clone());
+                        }
+                    }
+                })
+                .response
+                .on_hover_text("How playback turns this recording's raw IQ into sound. Defaults to the decoder the radio used.");
+        });
+        if let Some(k) = pick.filter(|k| *k != current) {
+            self.rec_pick_demod(rec.id, k);
+        }
+    }
+
+    pub(super) fn rec_pick_demod(&mut self, id: i64, demod: String) {
+        self.rec.demod.insert(id, demod);
+        if let Some((pid, p)) = &self.rec.player {
+            if *pid == id {
+                let at = p.pos_ms.load(Ordering::Relaxed);
+                self.rec_play(id, at);
+            }
+        }
+    }
+
     fn rec_output_row(&mut self, ui: &mut egui::Ui) {
         if !self.rec.sinks_listed {
             self.rec.sinks = hsrec::replay::list_sinks();
@@ -1935,6 +2199,14 @@ impl App {
     /// The frame is an elbow. Its end pill closes. Call, Playback and Notes
     /// stay put; everything under them scrolls.
     fn rec_detail_window(&mut self, ctx: &egui::Context) {
+        // Playback from anywhere shows its controls.
+        if let Some((pid, _)) = &self.rec.player {
+            let pid = *pid;
+            self.rec.detail_open = true;
+            if self.rec.selected != Some(pid) && self.rec.rows.iter().any(|r| r.id == pid) {
+                self.rec.selected = Some(pid);
+            }
+        }
         if !self.rec.detail_open {
             return;
         }
@@ -1982,7 +2254,7 @@ impl App {
         }
         ctx.data_mut(|d| d.insert_persisted(pos_id, pos));
         if close {
-            self.rec.detail_open = false;
+            self.rec_close_detail();
         }
     }
 
@@ -2036,6 +2308,7 @@ impl App {
                 ui.checkbox(&mut star, "★ Star");
                 ui.checkbox(&mut protect, "🔒 Protect").on_hover_text("Never removed by overwrite-oldest.");
             });
+            self.rec_demod_row(ui, &rec);
             self.rec_output_row(ui);
         });
         crate::group_box::group_box(ui, "Notes", PLUM, |ui| {
