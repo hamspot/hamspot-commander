@@ -1418,8 +1418,13 @@ impl Bank {
             for (index, ddc) in self.controls.iter_mut().enumerate() {
                 let hz = ddc.push(i, q);
                 let mag = ddc.take_mag();
-                if let (Some(m), Some(g)) = (mag, self.gates.get_mut(&control_keys[index])) {
-                    g.push(m);
+                // Only once per boxcar: a map lookup on every 8 Msps sample
+                // for every control starved the decoders (the capture fell
+                // behind the air and dropped samples).
+                if let Some(m) = mag {
+                    if let Some(g) = self.gates.get_mut(&control_keys[index]) {
+                        g.push(m);
+                    }
                 }
                 if let Some(hz) = hz {
                     self.control_steps[index].push(hz);
@@ -3444,12 +3449,15 @@ Board ID Number: 4 (HackRF Jawbreaker)
         assert!(control > 600.0 && control < 1_400.0, "control {control}");
     }
 
+
     #[test]
     fn the_bank_keeps_up_with_the_sample_rate() {
         let center = 859_000_000.0;
         let controls: Vec<f64> = (0..8).map(|i| center - 2_000_000.0 + i as f64 * 500_000.0).collect();
         let mut bank = Bank::new(center, &controls);
         bank.set_voice(Some(center + 25_000.0));
+        // REC on: every mixer taps and runs its squelch, as live.
+        bank.set_tap(true);
         let n = 400_000;
         let iq = vec![10u8; n * 2];
         let mut voice = Vec::new();
@@ -3459,6 +3467,7 @@ Board ID Number: 4 (HackRF Jawbreaker)
         let elapsed = start.elapsed();
         // Debug builds are not the running radio. The capture stalls when this
         // block takes longer than the air time. DC tracking sits in the same loop.
+        // Run in release: `cargo test --release -p commander the_bank_keeps_up`.
         if cfg!(debug_assertions) {
             return;
         }
