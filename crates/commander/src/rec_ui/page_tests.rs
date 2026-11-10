@@ -1004,6 +1004,59 @@ fn real_page_radio_ids_notes_edit_the_radio_description() {
     assert!(texts(&out).iter().any(|(t, _)| t.contains("description NOT saved")), "error shown: {}", h.app.rec.note);
 }
 
+/// A replay that decodes no voice reports it in the playback dialog's
+/// Playback section and the page's status line, never in the Data dialog.
+#[test]
+fn real_page_no_voice_notice_stays_out_of_the_data_dialog() {
+    if !in_child("real_page_no_voice_notice_stays_out_of_the_data_dialog") {
+        return;
+    }
+    install_modems();
+    let st = station(None, 0);
+    let mut h = Harness::new(&st, egui::vec2(1400.0, 1000.0), false);
+    // A decoder that swallows everything: P25 replay with no audio out.
+    h.app.rec.play_argv = Some(vec!["sh".into(), "-c".into(), "cat > /dev/null".into()]);
+    h.settle(4);
+    let db = Db::open(&h.app.rec.db_path).unwrap();
+    let dir = h.app.rec.dir.clone();
+    let m = tg_rec(&db, &dir, "nv", 10741, "ISP IND DISP", 10, 1_500);
+    let id = db.insert("hackrf_tg/x/nv.cs16", &m).unwrap();
+    let t = std::time::Instant::now();
+    while !h.app.rec.rows.iter().any(|r| r.id == id) {
+        h.run(vec![]);
+        assert!(t.elapsed() < std::time::Duration::from_secs(5));
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+    h.app.rec_play(id, 0);
+    let t = std::time::Instant::now();
+    while h.app.rec.player.is_some() {
+        h.run(vec![]);
+        assert!(t.elapsed() < std::time::Duration::from_secs(10), "replay ends");
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+    assert!(h.app.rec.note.starts_with("No voice decoded"), "note: {}", h.app.rec.note);
+    let nv = |out: &egui::FullOutput| -> Vec<egui::Rect> { texts(out).into_iter().filter(|(t, _)| t.contains("No voice decoded")).map(|(_, r)| r).collect() };
+    // Playback dialog: under the PLAYBACK heading; and the status line.
+    let out = h.settle(3);
+    let play = texts(&out).into_iter().find(|(t, _)| t.to_uppercase() == "PLAYBACK").map(|(_, r)| r).expect("playback dialog");
+    let shown = nv(&out);
+    assert!(shown.iter().any(|r| r.top() > play.top() && (r.left() - play.left()).abs() < 200.0), "in the Playback section: {shown:?}");
+    let lowest = shown.iter().map(|r| r.bottom()).fold(0.0, f32::max);
+    assert!(lowest > 900.0, "in the bottom status line: {shown:?}");
+    // The Data dialog: storage results only.
+    h.app.rec_close_detail();
+    h.app.rec.data_open = true;
+    let out = h.settle(3);
+    let all = texts(&out);
+    let storage = all.iter().find(|(t, _)| t.eq_ignore_ascii_case("Storage")).map(|(_, r)| *r).unwrap_or_else(|| panic!("Data dialog open: {:?}", all.iter().map(|t| &t.0).collect::<Vec<_>>()));
+    let shown = nv(&out);
+    assert_eq!(shown.len(), 1, "only the status line keeps it: {shown:?}");
+    assert!(shown[0].top() > 900.0 && shown[0].top() > storage.bottom() + 100.0, "not in the Data dialog: {shown:?}");
+    if let Some(png) = std::env::var_os("HS_REC_PNG_DIR") {
+        h.png(&out, &Path::new(&png).join("rec-data-dialog-no-voice.png"));
+    }
+}
+
 /// The Record / Playback dialog keeps Call, Playback and Notes on top, then
 /// the metadata (Source, Processing, File), then Export and Danger below File.
 #[test]

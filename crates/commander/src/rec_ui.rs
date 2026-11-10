@@ -387,6 +387,9 @@ pub struct GrantRec {
 /// grant (at least the voice hang).
 pub const GRANT_QUIET: Duration = Duration::from_millis(2_000);
 
+/// How long the status strip leads with the last result note.
+pub const NOTE_SHOWN: Duration = Duration::from_secs(60);
+
 /// A channel file stays open this long after its last signal block.
 pub const SIGNAL_HANG: Duration = Duration::from_millis(1_500);
 
@@ -437,6 +440,15 @@ pub struct RecUi {
     player: Option<(i64, hsrec::replay::Player)>,
     play_next: bool,
     notes_edit: String,
+    /// Result of the last Data dialog action (rescan, archive, export, move);
+    /// the Data dialog shows only this.
+    data_note: String,
+    /// The last result note and when it first showed; the status strip
+    /// leads with it for `NOTE_SHOWN`.
+    note_seen: Option<(String, Instant)>,
+    /// Result of the last playback (decoder, no voice, failure); shown in
+    /// the playback dialog's Playback section.
+    play_note: String,
     /// Radio IDs dialog: the description being typed for one radio.
     desc_edit: Option<(u32, String)>,
     /// A description left (Enter or focus out), saved on the next frame.
@@ -1305,7 +1317,17 @@ impl App {
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(body).id_salt("rec-body"));
         child.set_clip_rect(body.intersect(ui.clip_rect()));
         self.page_rec_body(&mut child);
-        let base = self.rec_status_text();
+        let mut base = self.rec_status_text();
+        // The last action's result (playback, save, data) leads the strip for a while.
+        if self.rec.note_seen.as_ref().is_none_or(|(n, _)| *n != self.rec.note) {
+            self.rec.note_seen = Some((self.rec.note.clone(), Instant::now()));
+        }
+        if let Some((n, at)) = &self.rec.note_seen {
+            if !n.is_empty() && at.elapsed() < NOTE_SHOWN {
+                base = format!("{n}   {base}");
+                ui.ctx().request_repaint_after(NOTE_SHOWN);
+            }
+        }
         crate::status_note::paint_strip(ui, strip, &base);
         ui.allocate_rect(full, egui::Sense::hover());
         if self.rec.player.is_some() || self.rec.job.is_some() || self.rec_icon() == IconState::Writing {
@@ -1388,9 +1410,11 @@ impl App {
             .default_width(420.0)
             .show(ctx, |ui| {
                 self.rec_data_body(ui);
-                if !self.rec.note.is_empty() {
+                // Only storage, library, move/copy and archive results here;
+                // playback results belong to the playback dialog.
+                if !self.rec.data_note.is_empty() {
                     ui.separator();
-                    ui.label(egui::RichText::new(&self.rec.note).color(caution()));
+                    ui.label(egui::RichText::new(&self.rec.data_note).color(caution()));
                 }
             });
         if !open {
@@ -1473,8 +1497,8 @@ impl App {
                 if ui.add_enabled(!busy, egui::Button::new("Rescan")).on_hover_text("Re-add recordings from sidecars on disk; flag missing files.").clicked() {
                     if let Some(db) = &self.rec.db {
                         match db.rescan(&self.rec.dir) {
-                            Ok((a, m)) => self.rec.note = format!("Rescan: {a} added, {m} missing."),
-                            Err(e) => self.rec.note = format!("Rescan failed: {e}"),
+                            Ok((a, m)) => { self.rec.note = format!("Rescan: {a} added, {m} missing."); self.rec.data_note = self.rec.note.clone(); }
+                            Err(e) => { self.rec.note = format!("Rescan failed: {e}"); self.rec.data_note = self.rec.note.clone(); }
                         }
                         self.rec_reload(true);
                     }
@@ -1541,10 +1565,12 @@ impl App {
             Ok(Some(l)) => l,
             Ok(None) => {
                 self.rec.note = "Another archive or export run (commander-rec) holds the lock; try later.".into();
+                self.rec.data_note = self.rec.note.clone();
                 return;
             }
             Err(e) => {
                 self.rec.note = format!("REC lock: {e}");
+                self.rec.data_note = self.rec.note.clone();
                 return;
             }
         };
@@ -1570,6 +1596,7 @@ impl App {
     fn rec_start_archive(&mut self, todo: Vec<Recording>) {
         if todo.is_empty() {
             self.rec.note = "Nothing to archive.".into();
+            self.rec.data_note = self.rec.note.clone();
             return;
         }
         let dir = self.rec.dir.clone();
@@ -1607,6 +1634,7 @@ impl App {
         };
         if todo.is_empty() {
             self.rec.note = "Nothing to export.".into();
+            self.rec.data_note = self.rec.note.clone();
             return;
         }
         if self.rec.player.as_ref().is_some_and(|(id, _)| todo.iter().any(|r| r.id == *id)) {
@@ -1660,6 +1688,7 @@ impl App {
                 let lines = std::mem::take(&mut job.state.lock().expect("job").lines);
                 if let Some(last) = lines.last() {
                     self.rec.note = last.clone();
+                    self.rec.data_note = self.rec.note.clone();
                 }
                 for l in lines {
                     self.rec_log(l);
@@ -1693,6 +1722,7 @@ impl App {
                 let rec = self.rec.rows.iter().find(|r| r.id == id).cloned();
                 if !err.is_empty() {
                     self.rec.note = format!("Playback failed: {err}");
+                    self.rec.play_note = self.rec.note.clone();
                     self.rec_log(self.rec.note.clone());
                 } else if let (Some(msg), Some(rec)) = (outcome.no_voice_text(), rec.as_ref()) {
                     self.rec.no_voice.insert(id);
@@ -1702,6 +1732,7 @@ impl App {
                         format!(" The channel was {:.3} MHz from the capture centre, outside the HackRF's usable 6 MHz, so the call is not in this recording.", rec.meta.offset_hz / 1e6)
                     };
                     self.rec.note = format!("{msg}{band}");
+                    self.rec.play_note = self.rec.note.clone();
                     self.rec_log(self.rec.note.clone());
                 } else if self.rec.play_next {
                     if let Some(next) = timeline::next_after(&self.rec.rows, id) {
@@ -1756,6 +1787,7 @@ impl App {
             Ok(p) => p,
             Err(e) => {
                 self.rec.note = e;
+                self.rec.play_note = self.rec.note.clone();
                 return None;
             }
         };
@@ -1766,6 +1798,7 @@ impl App {
 
     fn rec_play(&mut self, id: i64, from_ms: u64) {
         self.rec.player = None;
+        self.rec.play_note.clear();
         let Some(rec) = self.rec.rows.iter().find(|r| r.id == id).cloned() else { return };
         // A radio's transmission plays its span of the talkgroup recording.
         let (base, until) = match self.rec.radio_map.get(&id) {
@@ -1778,6 +1811,7 @@ impl App {
                 Some(p) => p,
                 None => {
                     self.rec.note = format!("This recording is on drive {}; attach it to play.", rec.location.trim_start_matches("offline:"));
+                    self.rec.play_note = self.rec.note.clone();
                     return;
                 }
             }
@@ -1820,7 +1854,7 @@ impl App {
                 self.rec.selected = Some(id);
                 self.rec.detail_open = true;
             }
-            Err(e) => self.rec.note = format!("Playback: {e}"),
+            Err(e) => { self.rec.note = format!("Playback: {e}"); self.rec.play_note = self.rec.note.clone(); }
         }
     }
 
@@ -1878,6 +1912,7 @@ impl App {
             // Never fall back silently to the raw discriminator for a digital pick.
             if self.rec.note.is_empty() {
                 self.rec.note = format!("Demodulator {demod} not found.");
+                self.rec.play_note = self.rec.note.clone();
             }
         }
         (decoder, m)
@@ -1886,6 +1921,7 @@ impl App {
     /// Close the Record / Playback dialog. Closing it stops playback.
     pub(super) fn rec_close_detail(&mut self) {
         self.rec.detail_open = false;
+        self.rec.play_note.clear();
         self.rec.player = None;
     }
 
@@ -2564,8 +2600,8 @@ impl App {
                 if rec.missing { ui.label(egui::RichText::new("MISSING").small().color(red)); }
             });
             // "No voice decoded…" is a timeline tag and a log line. It does not
-            // belong in this dialog. Other notes (playback failed, export) stay.
-            if Self::detail_note(&self.rec.note) {
+            // belong in the Call section; playback results show under Playback.
+            if Self::detail_note(&self.rec.note) && self.rec.note != self.rec.play_note && self.rec.note != self.rec.data_note {
                 ui.label(egui::RichText::new(&self.rec.note).color(caution()));
             }
         });
@@ -2588,6 +2624,10 @@ impl App {
                     ui.label(format!("{} — this radio's part of the call. Notes below name the radio; star, export and delete are on the talkgroup's tab.", rec.meta.talkgroup_name));
                 }
             });
+            // The last playback's result (for example "No voice decoded…").
+            if !self.rec.play_note.is_empty() {
+                ui.label(egui::RichText::new(&self.rec.play_note).color(caution()));
+            }
             self.rec_demod_row(ui, &rec);
             self.rec_output_row(ui);
         });
