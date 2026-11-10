@@ -116,6 +116,21 @@ pub fn note_gates(radio: u64, gates: &[(u64, bool, f32)]) {
     }
 }
 
+/// The live AFC frequency error per HackRF radio (Hz), for new recordings.
+static AFC: OnceLock<Mutex<HashMap<u64, f32>>> = OnceLock::new();
+
+pub fn note_afc(radio: u64, hz: f32) {
+    if hz.is_finite() {
+        AFC.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|p| p.into_inner()).insert(radio, hz);
+    }
+}
+
+/// The frequency error the capture is correcting now; None before the
+/// AFC has heard a carrier or for a radio without one.
+pub fn afc_hz(radio: u64) -> Option<f32> {
+    AFC.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|p| p.into_inner()).get(&radio).copied()
+}
+
 /// When channel `hz` of `radio` last had a signal above its noise floor.
 pub fn signal_at(radio: u64, hz: u64) -> Option<Instant> {
     gates_map().get(&(radio, hz)).map(|(t, _)| *t)

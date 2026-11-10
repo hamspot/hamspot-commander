@@ -713,8 +713,9 @@ impl App {
             for a in actions {
                 match a {
                     Action::Open(_) => {
-                        if let Some(m) = meta.clone() {
+                        if let Some(mut m) = meta.clone() {
                             self.rec.units_sent.insert(id, m.units.clone());
+                            m.afc_hz = crate::rec_live::afc_hz(id);
                             recorder.send(Cmd::Open { key: id, meta: m });
                         }
                     }
@@ -819,6 +820,7 @@ impl App {
             });
             hsrec::safepath::portable_meta(&mut meta);
             meta.decoder_params = self.rec_live_params(row, &meta);
+            meta.afc_hz = crate::rec_live::afc_hz(row.id);
             recorder.send(Cmd::Open { key, meta });
         }
         if let Some(prev) = self.rec.carrier_open.get(&row.id) {
@@ -1162,6 +1164,7 @@ impl App {
             if let Some(cu) = self.rec.call_units.get(&radio) {
                 m.set_units(cu.units_on(tg, &utc_minus(&utc_now(), UNIT_LOOKBACK_MS)));
             }
+            m.afc_hz = crate::rec_live::afc_hz(radio);
             recorder.send(Cmd::Open { key: crate::rec_live::grant_key(radio, hz), meta: m });
             self.rec.grant_open.insert((radio, hz), GrantRec { tg, seq, opened: now, live: now });
         }

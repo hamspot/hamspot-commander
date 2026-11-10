@@ -208,6 +208,16 @@ pub struct Afc {
 }
 
 impl Afc {
+    /// Already locked at `err_hz` (the error recorded with a capture); later
+    /// carrier blocks keep refining it. Out-of-range values are ignored.
+    pub fn seeded(err_hz: f32) -> Self {
+        if err_hz.is_finite() && err_hz.abs() <= AFC_MAX_HZ {
+            Self { err_hz, locked: true }
+        } else {
+            Self::default()
+        }
+    }
+
     /// Fold in one carrier block's mean frequency.
     pub fn update(&mut self, block_mean_hz: f32) {
         if !block_mean_hz.is_finite() || block_mean_hz.abs() > AFC_MAX_HZ {
@@ -295,6 +305,18 @@ pub struct Replayer {
 }
 
 impl Replayer {
+    /// Start from the frequency error recorded with the capture, so the
+    /// first 100 ms (and a call too weak or short to learn from) is
+    /// corrected too. Without one it learns from the recording alone.
+    pub fn seeded(err_hz: Option<f32>) -> Self {
+        Self { afc: err_hz.map(Afc::seeded).unwrap_or_default(), ..Default::default() }
+    }
+
+    /// The frequency error has been learned or was recorded.
+    pub fn afc_locked(&self) -> bool {
+        self.afc.locked()
+    }
+
     /// `iq` is interleaved I,Q at 32 ksps.
     pub fn push(&mut self, iq: &[i16], out: &mut Vec<i16>) {
         for pair in iq.chunks_exact(2) {
@@ -464,6 +486,29 @@ mod tests {
     fn rate_is_32k() {
         assert_eq!(REC_RATE, 32_000);
     }
+
+    #[test]
+    fn replay_starts_from_the_recorded_frequency_error() {
+        let iq = synth_c4fm_cs16(2_000.0, 0.5, 9_000.0);
+        let first = |r: &mut Replayer| {
+            let mut out = Vec::new();
+            r.push(&iq, &mut out);
+            // Mean of the first 100 ms of discriminator, in Hz.
+            let n = (OUT_RATE_TEST / 10) as usize;
+            out[..n].iter().map(|v| *v as f64).sum::<f64>() / n as f64 / (SCALE_I16 / SCALE_HZ) as f64
+        };
+        let learned = first(&mut Replayer::default());
+        let seeded = first(&mut Replayer::seeded(Some(2_000.0)));
+        assert!((learned - 2_000.0).abs() < 300.0, "first block before AFC learns: {learned:.0} Hz");
+        assert!(seeded.abs() < 300.0, "recorded error removes it from the start: {seeded:.0} Hz");
+        let mut r = Replayer::seeded(Some(9_999.0));
+        assert!(!r.afc_locked(), "an impossible stored error is ignored");
+        let mut out = Vec::new();
+        r.push(&iq, &mut out);
+        assert!(r.afc_locked() && (r.afc_hz() - 2_000.0).abs() < 150.0, "then learned: {}", r.afc_hz());
+    }
+
+    const OUT_RATE_TEST: u32 = 48_000;
 
     #[test]
     fn squelch_opens_on_a_carrier_and_stays_shut_on_noise() {

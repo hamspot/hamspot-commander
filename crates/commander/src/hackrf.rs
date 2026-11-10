@@ -1254,6 +1254,11 @@ impl Bank {
         self.extras.iter().map(|e| (e.hz, e.empty)).collect()
     }
 
+    /// A carrier has been seen, so `afc_hz` is a measurement.
+    pub fn afc_locked(&self) -> bool {
+        self.afc.locked()
+    }
+
     /// Frequency error removed from every discriminator, in Hz. Zero until
     /// a carrier has been seen.
     pub fn afc_hz(&self) -> f32 {
@@ -2011,6 +2016,9 @@ fn run_bank(
         bank.push(&buf[..n], &mut voice_out, &mut control_out);
         crate::rec_live::note_extras(radio_id, &bank.extras());
         crate::rec_live::note_gates(radio_id, &bank.gates());
+        if bank.afc_locked() {
+            crate::rec_live::note_afc(radio_id, bank.afc_hz());
+        }
         voice_empty.store(bank.voice_channel_empty(), Ordering::Relaxed);
         if tap {
             route_taps(radio_id, hz, bank.take_carrier_taps());

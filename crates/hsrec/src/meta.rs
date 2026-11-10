@@ -11,7 +11,7 @@ pub const SOURCE_RIG_AUDIO: &str = "rig_audio";
 pub const SOURCE_RADIO_IDS: &str = "radio_ids";
 /// Version of the metadata written to the sidecar and `meta_json`.
 /// 0 (absent): before versions. 2: adds `talkers`.
-pub const META_VERSION: u32 = 2;
+pub const META_VERSION: u32 = 3;
 pub const KIND_RAW_IQ: &str = "raw_iq";
 pub const KIND_DEMOD_AUDIO: &str = "demod_audio";
 /// Sample rate of a rig demod recording. Matches the RX pipe's `pw-cat`.
@@ -129,6 +129,11 @@ pub struct Meta {
     /// the start of the recording. Absent before `meta_version` 2.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub talkers: Vec<Talk>,
+    /// HackRF frequency error (Hz, positive: carriers read high) the live
+    /// AFC had when this recording opened. Replay starts from it and keeps
+    /// learning. Absent before `meta_version` 3 and for non-HackRF radios.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub afc_hz: Option<f32>,
     /// [`META_VERSION`] when written; 0 for older recordings.
     #[serde(default)]
     pub meta_version: u32,

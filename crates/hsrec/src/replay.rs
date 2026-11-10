@@ -35,7 +35,7 @@ impl Stream {
     pub fn open(path: &Path, meta: &Meta) -> std::io::Result<Self> {
         Ok(Self {
             reader: open_raw(path)?,
-            replayer: Replayer::default(),
+            replayer: Replayer::seeded(meta.afc_hz),
             raw: meta.source_kind != KIND_DEMOD_AUDIO,
             eight_bit: meta.raw_format == "cs8",
             buf: vec![0u8; 64 * 1024],
@@ -56,6 +56,11 @@ impl Stream {
             left -= n as u64;
         }
         Ok(true)
+    }
+
+    /// Frequency error being removed, when one is known.
+    pub fn afc_hz(&self) -> Option<f32> {
+        (self.raw && self.replayer.afc_locked()).then(|| self.replayer.afc_hz())
     }
 
     /// Next block of 48 kHz audio; empty at end.
@@ -439,6 +444,8 @@ pub struct Player {
     pub decoder_status: Arc<std::sync::Mutex<Option<i32>>>,
     pub decoder_stderr: Arc<std::sync::Mutex<String>>,
     pub played_ms: Arc<AtomicU64>,
+    /// Frequency error removed (f32 bits); NaN when none was found.
+    pub afc_bits: Arc<std::sync::atomic::AtomicU32>,
 }
 
 /// What a finished playback produced, for the REC status line.
@@ -448,6 +455,8 @@ pub struct Outcome {
     pub heard_bytes: u64,
     pub heard_peak: u64,
     pub played_ms: u64,
+    /// Frequency error the replay removed; None when no carrier was found.
+    pub afc_hz: Option<f32>,
     pub decoder_status: Option<i32>,
     pub decoder_stderr: String,
 }
@@ -466,6 +475,12 @@ impl Outcome {
         if let Some(code) = self.decoder_status.filter(|c| *c != 0) {
             t.push_str(&format!(" Decoder exit {code}."));
         }
+        if self.decoder_ran {
+            match self.afc_hz {
+                Some(hz) => t.push_str(&format!(" HackRF frequency error removed: {hz:+.0} Hz.")),
+                None => t.push_str(" No steady carrier was found in the recording, so no frequency correction was applied."),
+            }
+        }
         if let Some(line) = self.decoder_stderr.lines().rev().find(|l| !l.trim().is_empty() && !l.contains("exiting on signal")) {
             t.push_str(&format!(" Last decoder message: {}", line.trim()));
         }
@@ -480,6 +495,7 @@ impl Player {
             heard_bytes: self.heard_bytes.load(Ordering::Relaxed),
             heard_peak: self.heard_peak.load(Ordering::Relaxed),
             played_ms: self.played_ms.load(Ordering::Relaxed),
+            afc_hz: Some(f32::from_bits(self.afc_bits.load(Ordering::Relaxed))).filter(|v| v.is_finite()),
             decoder_status: *self.decoder_status.lock().expect("status"),
             decoder_stderr: self.decoder_stderr.lock().expect("stderr").clone(),
         }
@@ -500,6 +516,8 @@ impl Player {
         let decoder_status = Arc::new(std::sync::Mutex::new(None));
         let decoder_stderr = Arc::new(std::sync::Mutex::new(String::new()));
         let played_ms = Arc::new(AtomicU64::new(0));
+        let afc_bits = Arc::new(std::sync::atomic::AtomicU32::new(f32::NAN.to_bits()));
+        let ab = afc_bits.clone();
         let (hb, hp, dr, ds, dse, pm) = (heard_bytes.clone(), heard_peak.clone(), decoder_ran.clone(), decoder_status.clone(), decoder_stderr.clone(), played_ms.clone());
         let (s, d, p, e) = (stop.clone(), done.clone(), pos.clone(), error.clone());
         std::thread::Builder::new().name("rec-replay".into()).spawn(move || {
@@ -568,6 +586,9 @@ impl Player {
                         break;
                     }
                     sent += block.len() as u64;
+                    if let Some(hz) = stream.afc_hz() {
+                        ab.store(hz.to_bits(), Ordering::Relaxed);
+                    }
                     let ahead_ms = sent * 1000 / OUT_RATE as u64;
                     pm.store(ahead_ms, Ordering::Relaxed);
                     p.store(from_ms + ahead_ms, Ordering::Relaxed);
@@ -596,7 +617,7 @@ impl Player {
             drop(decoder);
             d.store(true, Ordering::Relaxed);
         })?;
-        Ok(Self { stop, done, pos_ms: pos, error, heard_bytes, heard_peak, decoder_ran, decoder_status, decoder_stderr, played_ms })
+        Ok(Self { stop, done, pos_ms: pos, error, heard_bytes, heard_peak, decoder_ran, decoder_status, decoder_stderr, played_ms, afc_bits })
     }
 
     pub fn stop(&self) {
@@ -627,6 +648,31 @@ fn kill(child: &mut Child) {
 
 #[cfg(test)]
 pub(crate) mod tests_support {
+    /// Diagnostic: replay a real recording through the real P25 script.
+    /// `HS_REPLAY_FILE` (raw) and `HS_REPLAY_META` (sidecar JSON), both
+    /// copies; run with `--ignored`.
+    #[test]
+    #[ignore]
+    fn diagnose_a_real_recording() {
+        let (Some(file), Some(meta)) = (std::env::var_os("HS_REPLAY_FILE"), std::env::var_os("HS_REPLAY_META")) else { return };
+        let meta: Meta = serde_json::from_str(&std::fs::read_to_string(meta).unwrap()).unwrap();
+        let path = std::path::PathBuf::from(file);
+        let disc = decode_all(&path, &meta).unwrap();
+        let mean = disc.iter().map(|v| *v as f64).sum::<f64>() / disc.len().max(1) as f64;
+        eprintln!("disc {} samples, mean {:.0} (= {:.0} Hz)", disc.len(), mean, mean / 3.0);
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../modems/commander-demod-p25.rxpipe");
+        let cmd = DecoderCmd { argv: vec![script.display().to_string()], env: decoder_env(&meta, &[]), hold: None };
+        let r = render(&path, &meta, Some(&cmd)).unwrap();
+        eprintln!("audio {} samples, peak {}, status {:?}, stderr {}", r.audio.len(), peak(&r.audio), r.decoder_status, r.decoder_stderr);
+        // The REC page's real-time player, speaker replaced by a sink.
+        let cmd = DecoderCmd { argv: vec![script.display().to_string()], env: decoder_env(&meta, &[]), hold: None };
+        let p = Player::start(&path, &meta, 0, Some(cmd), vec!["sh".into(), "-c".into(), "cat > /dev/null".into()]).unwrap();
+        while !p.finished() {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        eprintln!("player outcome {:?} error {:?} no_voice {:?}", p.outcome(), p.error.lock().unwrap(), p.outcome().no_voice_text());
+    }
+
     use super::*;
     use crate::dsp::*;
     use crate::meta::*;

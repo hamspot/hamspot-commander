@@ -1004,6 +1004,81 @@ fn real_page_radio_ids_notes_edit_the_radio_description() {
     assert!(texts(&out).iter().any(|(t, _)| t.contains("description NOT saved")), "error shown: {}", h.app.rec.note);
 }
 
+/// A HackRF recording 2 kHz off (the crystal error): replay removes it,
+/// from the error recorded with the capture when there is one, else learned
+/// from the recording, on the TG tab and on Radio IDs. The decoder finds
+/// P25 on the corrected stream and the dialog says what was removed.
+#[test]
+fn real_page_replay_removes_the_hackrf_frequency_error() {
+    if !in_child("real_page_replay_removes_the_hackrf_frequency_error") {
+        return;
+    }
+    install_modems();
+    let st = station(None, 0);
+    let mut h = Harness::new(&st, egui::vec2(1400.0, 1000.0), false);
+    h.app.rec.play_argv = Some(vec!["sh".into(), "-c".into(), "cat > /dev/null".into()]);
+    h.settle(4);
+    let db = Db::open(&h.app.rec.db_path).unwrap();
+    let dir = h.app.rec.dir.clone();
+    let off = |name: &str, afc: Option<f32>, unit: u32| {
+        let mut m = tg_rec(&db, &dir, name, 10119, "49-IUH-DISP", 20, 3_000);
+        let iq = hsrec::dsp::synth_c4fm_cs16(2_000.0, 3.0, 9_000.0);
+        std::fs::write(dir.join(format!("hackrf_tg/x/{name}.cs16")), iq.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+        m.afc_hz = afc;
+        m.radio_unit_id = Some(unit);
+        let id = db.insert(&format!("hackrf_tg/x/{name}.cs16"), &m).unwrap();
+        (id, db.get(id).unwrap().unwrap())
+    };
+    let (id_new, new) = off("new", Some(2_000.0), 41);
+    let (id_old, old) = off("old", None, 42);
+    let t = std::time::Instant::now();
+    while h.app.rec.rows.len() < 2 {
+        h.run(vec![]);
+        assert!(t.elapsed() < std::time::Duration::from_secs(5));
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+    let play = |h: &mut Harness, id: i64| -> String {
+        h.app.rec_play(id, 0);
+        assert!(h.app.rec.player.is_some(), "plays: {}", h.app.rec.note);
+        let t = std::time::Instant::now();
+        while h.app.rec.player.is_some() {
+            h.run(vec![]);
+            assert!(t.elapsed() < std::time::Duration::from_secs(15), "replay ends");
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        h.settle(2);
+        h.app.rec.play_note.clone()
+    };
+    // The synthetic signal is P25 framing without IMBE voice, so the result
+    // is "no voice", and it names the error that was removed.
+    let removed = |n: &str| -> f32 { n.split("removed: ").nth(1).and_then(|r| r.split(" Hz").next()).and_then(|v| v.parse().ok()).unwrap_or(0.0) };
+    let n = play(&mut h, id_new);
+    assert!((removed(&n) - 2_000.0).abs() < 50.0, "recorded error used: {n}");
+    let n = play(&mut h, id_old);
+    assert!((removed(&n) - 2_000.0).abs() < 150.0, "learned from the recording: {n}");
+    // Radio IDs plays the same file through the same correction.
+    h.app.rec.face.source_tab = meta::SOURCE_RADIO_IDS.into();
+    h.app.rec_reload(true);
+    let vid = h.app.rec.radio_map.iter().find(|(_, (real, _, _))| *real == id_new).map(|(v, _)| *v).expect("radio block");
+    let n = play(&mut h, vid);
+    assert!((removed(&n) - 2_000.0).abs() < 50.0, "Radio IDs: {n}");
+    // What the decoder is fed (also what WAV export renders) is centred.
+    let first = |rec: &Recording| {
+        let disc = hsrec::replay::decode_all(&dir.join(&rec.raw_path), &rec.meta).unwrap();
+        disc[..4_800].iter().map(|v| *v as f64).sum::<f64>() / 4_800.0 / 3.0
+    };
+    assert!(first(&new).abs() < 300.0, "recorded error: centred from the first 100 ms ({:.0} Hz)", first(&new));
+    assert!((first(&old) - 2_000.0).abs() < 300.0, "learned: the first 100 ms is still off ({:.0} Hz)", first(&old));
+    for rec in [&new, &old] {
+        let disc = hsrec::replay::decode_all(&dir.join(&rec.raw_path), &rec.meta).unwrap();
+        let mean = disc[16_000..].iter().map(|v| *v as f64).sum::<f64>() / (disc.len() - 16_000) as f64 / 3.0;
+        assert!(mean.abs() < 200.0, "centred after the first block: {mean:.0} Hz");
+        if std::process::Command::new("sh").args(["-c", "command -v dsd-fme"]).output().map(|o| o.status.success()).unwrap_or(false) {
+            assert!(p25_syncs(&disc) >= 10, "P25 found on the corrected replay");
+        }
+    }
+}
+
 /// A replay that decodes no voice reports it in the playback dialog's
 /// Playback section and the page's status line, never in the Data dialog.
 #[test]
