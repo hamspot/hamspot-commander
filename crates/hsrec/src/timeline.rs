@@ -593,4 +593,29 @@ mod tests {
         v.clamp(now + 5_000);
         assert_eq!(v.end(), now + 5_000);
     }
+
+    #[test]
+    fn a_call_right_after_a_restart_is_in_the_opening_view() {
+        // 2026-11-09: Commander restarted at 23:51:56 EST, the newest
+        // recording ended 23:38:18, and TG 10741 was recorded 23:52:12-15.
+        // The opening view used to frame only the old calls and stand still,
+        // so the new call was recorded but never shown.
+        let db = Db::open_in_memory().unwrap();
+        db.insert("a", &meta("hackrf_tg", Some(10035), "2026-11-10T01:01:51Z", "2026-11-10T01:01:55Z")).unwrap();
+        db.insert("b", &meta("hackrf_tg", Some(10359), "2026-11-10T04:38:17Z", "2026-11-10T04:38:18Z")).unwrap();
+        let opened = parse_ms("2026-11-10T04:51:57Z").unwrap();
+        let mut v = fit(&db.all().unwrap(), opened);
+        assert!(v.live);
+        db.insert("call", &meta("hackrf_tg", Some(10741), "2026-11-10T04:52:12Z", "")).unwrap();
+        for at in ["2026-11-10T04:52:13Z", "2026-11-10T04:52:16Z", "2026-11-10T04:53:00Z"] {
+            let now = parse_ms(at).unwrap();
+            v.follow(now);
+            v.clamp(now);
+            let r = db.all().unwrap();
+            let l = lanes(&r);
+            let call = r.iter().find(|r| r.meta.talkgroup == Some(10741)).unwrap().id;
+            let b = layout(&r, &l, &v, 900.0, now);
+            assert!(b.iter().any(|b| b.id == call && b.x1 > 0.0 && b.x0 < 900.0), "call not in view at {at}");
+        }
+    }
 }
