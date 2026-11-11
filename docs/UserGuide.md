@@ -66,7 +66,7 @@ Everything about a station (radios, band plan, channels, talkgroups, levels, lay
 | `pw-loopback`, `pw-cat`, `pw-dump` | Package `pipewire-bin`. |
 | `helvum` | Optional PipeWire patchbay, opened from the Audio frame. |
 | `dsd-fme`, `commander-voice` | Shipped digital decoders, and the PipeWire player for their voice. The installer builds both. `sox` is only for a filter you write yourself. |
-| `hackrf_transfer` | Package `hackrf`, for HackRF rows. |
+| `libhackrf.so.0`, `hackrf_info` | Packages `libhackrf0` and `hackrf`, for HackRF rows. Commander reads the HackRF through the library itself; if the library is missing it uses `hackrf_transfer` from the same `hackrf` package instead. |
 
 Supported test equipment is the **NanoVNA V2** (V2.2, USB id `04b4:0008`). Supported SDR hardware for raw capture and REC is the **HackRF**.
 
@@ -653,6 +653,16 @@ The Meters page shows the S-meter for the current VFO, then ALC, SWR and power.
 - `Busy`, `Mic Eq` and `PLL unlock` are drawn but not yet connected to the radio.
 - The pill at the top right of the page opens the meters in their own window (click it again to bring them back), and the lock button stops them being rearranged.
 
+**HackRF meters.** With a HackRF row selected, five more meters show how the dongle is doing. They update once a second. A reading Commander doesn't have shows `--` with a blue lamp, never a made-up zero.
+
+- **AFC** is the frequency error Commander removes from every channel, in Hz. The HackRF has no temperature-compensated crystal, so this moves as the board warms. It shows `--` until a carrier has been heard.
+- **ppm** is the same error in parts per million of the capture frequency.
+- **DROP** is the audio the computer lost, in milliseconds since the capture started: decoders that fell behind, plus any samples the computer could not take from USB in time. It should stay at 0.
+- **USB** is the number of times the HackRF itself had to wait for the computer (its own overrun count). Older HackRF firmware doesn't report it, and then it shows `--`.
+- **DIE** is the temperature of the HackRF's receive chip. It is off by default, so it shows `--`; see [11.5](#s11-5).
+
+The status line under the meters says how the HackRF is connected and why any reading is empty. Every 10 seconds the same readings are added to a log in **`<station>.HSData/hackrf/drift-YYYY-MM-DD.jsonl`** (one file per UTC day) beside your station file, so you can compare drift with time of day and temperature. A failed write is shown in that status line.
+
 <!-- screenshot: meter-01 — The Meters page. -->
 
 ## 10.2 Levels
@@ -768,9 +778,13 @@ GQRX is receive-only here: one VFO, no transmit, RIT or split.
 
 <!-- screenshot: cfg-04 — Adding a GQRX receiver. -->
 
+<a id="s11-5"></a>
+
 ## 11.5 Adding a HackRF or an audio tap
 
 - **Add HackRF** adds a HackRF, read directly by Commander. Leave the device as **only HackRF** if you have one; otherwise pick its serial. **Refresh** rescans. HackRF rows are receive-only and feed the trunk follower and REC.
+  - Commander opens the HackRF once and keeps it open. Following a call to another frequency and changing the LNA or VGA gain happen on the running capture: the control-channel decoders keep running and keep what they learned. About 80 ms of air is skipped after each frequency change. If the HackRF library isn't installed, Commander uses `hackrf_transfer` instead, and then each frequency or gain change restarts the capture as before.
+  - Two settings are read from the environment when Commander starts. `HAMSPOT_HACKRF_TRANSFER=1` uses `hackrf_transfer` even when the library is there. `HAMSPOT_HACKRF_DIE_TEMP=1` turns on the receive-chip temperature reading on the Meters page. It is off by default because it writes to the chip while it is receiving and hasn't been tested on a bench yet. It only runs on a HackRF One older than r9, whose receive chip has the sensor; on other boards the meter stays at `--`. Some firmware may not return a real reading; Commander then shows `--` and says so in the status line.
 - **Add audio tap** takes a sound-card input (for example a scanner's discriminator output) and runs a decoder pipe on it. It doesn't tune anything.
 
 <!-- screenshot: cfg-05 — Adding a HackRF. -->
@@ -950,7 +964,7 @@ An RX pipe sits between a radio's audio and the speaker. A TX pipe sits between 
 
 A station file names a pipe only as `modems/<name>`, for example `modems/commander-demod-p25.rxpipe`. It never holds an absolute path, a shell command, arguments or anything else Commander would have to pass to a shell. Commander looks the name up in its own folders and runs the file it finds there, with nothing added except the arguments and environment described below. A station file or recording that someone hands you therefore can't make Commander run an arbitrary program. If you need a custom command, put it in a pipe file yourself. Creating that file is the explicit step that allows it to run.
 
-The same rule covers REC decoders ([chapter 9](#ch9)) and the HackRF trunk decoder. Fixed tools that Commander runs itself, such as `pw-cat`, `rigctld`, `hackrf_transfer` and `gqrx`, aren't pipes.
+The same rule covers REC decoders ([chapter 9](#ch9)) and the HackRF trunk decoder. Fixed tools that Commander runs itself, such as `pw-cat`, `rigctld`, `hackrf_transfer` (when the HackRF library is missing) and `gqrx`, aren't pipes.
 
 <a id="s13-2"></a>
 

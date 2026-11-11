@@ -1222,7 +1222,8 @@ impl Hub {
         self.send(HubCmd::SetKeyCsv(path.to_string()));
     }
 
-    /// Store LNA and VGA on a HackRF radio. The capture restarts once.
+    /// Store LNA and VGA on a HackRF radio. A libhackrf capture changes
+    /// them on the open stream; `hackrf_transfer` restarts once.
     pub fn hackrf_gain(&self, id: u64, lna_db: u32, vga_db: u32) {
         self.send(HubCmd::HackrfGain(id, lna_db, vga_db));
     }
@@ -2018,7 +2019,7 @@ fn tick_hackrf(
             let mut dead = slot.hackrf.take().expect("hackrf session");
             let printed = dead.stop();
             let err = if printed.trim().is_empty() {
-                "hackrf_transfer exited".to_string()
+                "HackRF capture stopped".to_string()
             } else {
                 printed
             };
@@ -2051,22 +2052,35 @@ fn tick_hackrf(
         (dial, Vec::new())
     };
     let gain = resolved_rx_gain(&slot.spec);
-    let running = slot.hackrf.as_ref().map(|session| {
-        (
-            session.center,
-            session.control_hz.clone(),
-            session.serial.clone(),
-            session.gain,
-        )
-    });
     let wanted_serial = slot.spec.device.trim();
-    let same = running.as_ref().is_some_and(|(have, have_controls, have_serial, have_gain)| {
-        (have - center).abs() < 1.0
-            && same_hz(have_controls, &controls)
-            && (wanted_serial.is_empty() || have_serial == wanted_serial)
-            && *have_gain == gain
-            && slot.hackrf.as_ref().is_some_and(|session| session.playing()) == play_ready
+    let change = slot.hackrf.as_ref().map(|session| {
+        let have_controls = session.control_hz.clone();
+        let have = crate::hackrf::CaptureWant {
+            center: session.center,
+            controls: &have_controls,
+            serial: &session.serial,
+            gain: session.gain,
+            playing: session.playing(),
+        };
+        let want = crate::hackrf::CaptureWant {
+            center,
+            controls: &controls,
+            serial: wanted_serial,
+            gain,
+            playing: play_ready,
+        };
+        crate::hackrf::plan_change(&have, session.decoder_hz(), session.live(), &want)
     });
+    // libhackrf retunes and changes gain on the open stream: the control
+    // decoders keep running and keep their tables. A refusal restarts.
+    let mut same = matches!(change, Some(crate::hackrf::Change::Same));
+    if let (Some(crate::hackrf::Change::Live { retune, gain: regain }), Some(session)) =
+        (change, slot.hackrf.as_mut())
+    {
+        let moved = !retune || session.retune(center, &controls).is_ok();
+        let gained = !regain || session.set_gain(gain).is_ok();
+        same = moved && gained;
+    }
     if same {
         if let Some(session) = &slot.hackrf {
             session.set_voice(slot.hackrf_voice);

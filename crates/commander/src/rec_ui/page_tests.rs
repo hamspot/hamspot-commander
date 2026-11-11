@@ -1330,3 +1330,63 @@ fn real_page_screenshots_from_a_database_copy() {
         h.png(&out, &dir.join("rec-radio-notes.png"));
     }
 }
+
+/// The Meters page with a HackRF selected shows what its capture thread
+/// measured: frequency error in Hz and ppm, software drops, and an honest
+/// dash for USB overruns and die temperature it could not read.
+#[test]
+fn real_meters_page_shows_the_hackrf_readings() {
+    if !in_child("real_meters_page_shows_the_hackrf_readings") {
+        return;
+    }
+    let st = station(None, 0);
+    let mut h = Harness::new(&st, egui::vec2(1280.0, 720.0), false);
+    h.app.page = crate::Page::Meters;
+    let radio = 0x3E7E;
+    let center = 857_200_000.0;
+    let mut row = hackrf_row(radio, center);
+    row.selected = true;
+    h.app.rec.test_rows.push(row);
+    crate::radio_meter::note(
+        radio,
+        crate::radio_meter::RadioMeter {
+            backend: "libhackrf".into(),
+            radio: String::new(),
+            serial: "test".into(),
+            center_hz: center,
+            afc_hz: 2370.0,
+            afc_locked: true,
+            // 100 ms of 48 kHz decoder audio.
+            decoder_dropped: 4_800,
+            iq_dropped: 0,
+            usb_overruns: None,
+            temp: crate::libhackrf::DieTemp {
+                src: "off".into(),
+                note: "off for the test".into(),
+                ..Default::default()
+            },
+            log_error: String::new(),
+        },
+    );
+    let out = h.settle(6);
+    let shown: Vec<String> = texts(&out).into_iter().map(|(t, _)| t).collect();
+    for want in ["AFC +2370 Hz", "+2.76 ppm", "DROP 100 ms", "USB --", "DIE -- \u{b0}C"] {
+        assert!(shown.iter().any(|t| t == want), "{want:?} not on the page: {shown:?}");
+    }
+    assert!(
+        shown.iter().any(|t| t.starts_with("HackRF via libhackrf")),
+        "status line missing: {shown:?}"
+    );
+
+    // The same radio once the die is read and USB reports.
+    let mut m = crate::radio_meter::get(radio).unwrap();
+    m.usb_overruns = Some(2);
+    m.temp = crate::libhackrf::DieTemp { code: Some(15), c: Some(25.0), src: "max2837-die".into(), note: String::new() };
+    crate::radio_meter::note(radio, m);
+    let out = h.settle(4);
+    let shown: Vec<String> = texts(&out).into_iter().map(|(t, _)| t).collect();
+    for want in ["USB 2", "DIE 25.0 \u{b0}C"] {
+        assert!(shown.iter().any(|t| t == want), "{want:?} not on the page: {shown:?}");
+    }
+    crate::radio_meter::forget(radio);
+}

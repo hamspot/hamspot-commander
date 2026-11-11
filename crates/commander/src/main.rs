@@ -16,6 +16,8 @@ mod exit_watch;
 mod follow;
 mod gpredict_hw;
 mod hackrf;
+mod libhackrf;
+mod radio_meter;
 mod keys;
 mod plan;
 mod patchbay;
@@ -9294,16 +9296,25 @@ impl App {
     }
 
     fn page_meters(&mut self, ui: &mut egui::Ui, snap: &Snapshot) {
-        let radio = self
-            .hub
-            .view()
-            .rows
-            .iter()
-            .find(|row| row.selected)
-            .map(|row| row.spec.name.clone());
+        #[allow(unused_mut)]
+        let mut rows = self.hub.view().rows;
+        // Tests: their radios ahead of the dummy rig the App starts.
+        #[cfg(test)]
+        {
+            let hub = std::mem::take(&mut rows);
+            rows = self.rec.test_rows.clone();
+            rows.extend(hub);
+        }
+        let row = rows.iter().find(|row| row.selected);
+        let radio = row.map(|row| row.spec.name.clone());
+        // A HackRF capture's own readings (frequency error, drops, USB,
+        // die temperature). Absent until its capture thread has reported.
+        let hackrf = row
+            .filter(|row| row.spec.driver == cat::RadioDriver::Hackrf)
+            .and_then(|row| radio_meter::get(row.id));
         let mut meters = self.meters.lock().expect("meters");
         // Detached: the page frame shows the stub; the window draws this.
-        paint_meter_page(ui, snap, radio.as_deref(), &mut meters, &self.system_clock);
+        paint_meter_page(ui, snap, radio.as_deref(), hackrf.as_ref(), &mut meters, &self.system_clock);
     }
 
     fn refresh_tools(&mut self, ctx: &egui::Context, snap: &Snapshot) {
@@ -10041,6 +10052,11 @@ impl App {
     /// the control cluster returns. A control-only receiver never leaves.
     /// A control channel's terminator does not end the call.
     fn service_hackrf(&mut self, snap: &Snapshot) {
+        // HackRF drift log: NAME.HSData/hackrf beside the open station file.
+        radio_meter::set_drift_dir(
+            (!self.config_path.is_empty())
+                .then(|| hsrec::hsdata::root(std::path::Path::new(&self.config_path)).join("hackrf")),
+        );
         let rows = self.hub.view().rows;
         let direct: Vec<(usize, u64, bool)> = rows
             .iter()
@@ -11830,6 +11846,7 @@ fn paint_meter_page(
     ui: &mut egui::Ui,
     snap: &Snapshot,
     radio: Option<&str>,
+    hackrf: Option<&radio_meter::RadioMeter>,
     meters: &mut MeterState,
     clock: &clock::SystemClock,
 ) {
@@ -11844,13 +11861,18 @@ fn paint_meter_page(
         .iter()
         .map(|(name, value)| (name.as_str(), *value))
         .collect();
-    let faces = meter_faces(
+    let mut faces = meter_faces(
         &offers,
         &values,
         snap.strength_db,
         snap.ptt,
         snap.model == "GQRX",
     );
+    if let Some(m) = hackrf {
+        faces.extend(dial::hackrf_faces(m));
+        // The capture thread updates these once a second.
+        ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+    }
     let now_ms = clock::unix_now_ms();
     let readout = clock.face_at(now_ms);
     let mut order = order_with_clock(&meters.order, &faces, readout.is_some());
@@ -11882,6 +11904,35 @@ fn paint_meter_page(
             meters.order = merge_meter_order(&meters.order, &order);
         }
     });
+    if let Some(m) = hackrf {
+        let (text, warn) = hackrf_meter_status(m);
+        ui.add_space(4.0);
+        tune_style::status_line(ui, &text, warn);
+    }
+}
+
+/// The Meters page status line for a HackRF: which radio path is in use,
+/// why a reading is empty, and any drift-log failure.
+fn hackrf_meter_status(m: &radio_meter::RadioMeter) -> (String, bool) {
+    let mut parts = vec![if m.radio.is_empty() {
+        format!("HackRF via {}", m.backend)
+    } else {
+        format!("HackRF via {}: {}", m.backend, m.radio)
+    }];
+    if !m.afc_locked {
+        parts.push("frequency error: waiting for a carrier".into());
+    }
+    if m.usb_overruns.is_none() {
+        parts.push("USB overruns: not reported by this radio path or firmware".into());
+    }
+    if m.temp.c.is_none() && !m.temp.note.is_empty() {
+        parts.push(format!("die temperature: {}", m.temp.note));
+    }
+    let warn = !m.log_error.is_empty();
+    if warn {
+        parts.push(m.log_error.clone());
+    }
+    (parts.join(" \u{b7} "), warn)
 }
 
 /// The grid inside the Meters frame. A locked grid ignores the pointer.
@@ -13600,7 +13651,7 @@ mod detached_fit_tests {
         for size in sizes(detach_opts(Page::Meters).min_size) {
             let out = frame(&ctx, Page::Meters, size, &mut |ui| {
                 egui::ScrollArea::vertical().id_salt("meter-window").auto_shrink([false, false])
-                    .show(ui, |ui| paint_meter_page(ui, &snap, None, &mut meters, &clock));
+                    .show(ui, |ui| paint_meter_page(ui, &snap, None, None, &mut meters, &clock));
             });
             let view = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
             let below = out.shapes.iter().filter(|c| {

@@ -1149,6 +1149,10 @@ pub struct Bank {
     center: f64,
     dc: Dc,
     controls: Vec<Ddc>,
+    /// Per control mixer: inside the capture after the last retune. An
+    /// idle mixer does no work and sends its decoder nothing, so that
+    /// decoder keeps its tables until the capture comes back.
+    control_on: Vec<bool>,
     voice: Ddc,
     voice_hz: Option<f64>,
     voice_steps: Vec<f32>,
@@ -1206,6 +1210,7 @@ impl Bank {
                 .iter()
                 .map(|hz| Ddc::new(hz - center))
                 .collect(),
+            control_on: vec![true; controls.len()],
             voice: Ddc::new(0.0),
             voice_hz: None,
             voice_steps: Vec::new(),
@@ -1221,6 +1226,43 @@ impl Bank {
         }
     }
 
+    /// Move the capture to `center` on the same stream. `slots` gives each
+    /// control mixer its new frequency, or `None` to idle it. The mixer
+    /// count never changes, so each decoder keeps its own pipe. Voice,
+    /// extras, gates and carrier watches start over; the frequency error
+    /// is the crystal's, so AFC is kept.
+    pub fn retune(&mut self, center: f64, slots: &[Option<f64>]) {
+        self.center = center;
+        for (index, ddc) in self.controls.iter_mut().enumerate() {
+            let target = slots
+                .get(index)
+                .copied()
+                .flatten()
+                .filter(|hz| inside(center, *hz));
+            let tap = ddc.tap_on;
+            *ddc = Ddc::new(target.unwrap_or(center) - center);
+            ddc.tap_on = tap;
+            self.control_on[index] = target.is_some();
+            self.control_steps[index].clear();
+            self.control_probes[index].reset();
+        }
+        let tap = self.voice.tap_on;
+        self.voice = Ddc::new(0.0);
+        self.voice.tap_on = tap;
+        self.voice_hz = None;
+        self.voice_steps.clear();
+        self.carrier.reset();
+        self.voice_probe.reset();
+        self.voice_empty = false;
+        self.extras.clear();
+        self.gates.clear();
+    }
+
+    #[cfg(test)]
+    pub fn center(&self) -> f64 {
+        self.center
+    }
+
     /// REC squelch of every channel with a mixer: (hz, signal, dB over floor).
     pub fn gates(&self) -> Vec<(u64, bool, f32)> {
         self.gates.iter().map(|(hz, g)| (*hz, g.open(), g.snr_db())).collect()
@@ -1234,7 +1276,13 @@ impl Bank {
             .copied()
             .filter(|hz| inside(self.center, *hz as f64))
             .filter(|hz| self.voice_hz.is_none_or(|v| (v.round() as u64).abs_diff(*hz) > 1))
-            .filter(|hz| !self.controls.iter().any(|d| ((self.center + d.offset).round() as u64).abs_diff(*hz) <= 1))
+            .filter(|hz| {
+                !self
+                    .controls
+                    .iter()
+                    .zip(&self.control_on)
+                    .any(|(d, on)| *on && ((self.center + d.offset).round() as u64).abs_diff(*hz) <= 1)
+            })
             .collect();
         want.sort_unstable();
         want.dedup();
@@ -1320,9 +1368,9 @@ impl Bank {
     /// one of the control carriers. Each buffer is 32 ksps cs16.
     pub fn take_carrier_taps(&mut self) -> Vec<(u64, Vec<i16>)> {
         let mut out = Vec::new();
-        for ddc in &mut self.controls {
+        for (ddc, on) in self.controls.iter_mut().zip(&self.control_on) {
             let data = std::mem::take(&mut ddc.tap_out);
-            if data.is_empty() {
+            if data.is_empty() || !on {
                 continue;
             }
             let hz = (self.center + ddc.offset).round() as u64;
@@ -1373,7 +1421,12 @@ impl Bank {
         let n = iq.len() / 2;
         let voice_key = self.voice_hz.map(|v| v.round() as u64);
         let control_keys: Vec<u64> = self.controls.iter().map(|d| (self.center + d.offset).round() as u64).collect();
-        let live: Vec<u64> = control_keys.iter().copied().chain(voice_key).chain(self.extras.iter().map(|e| e.hz)).collect();
+        let live: Vec<u64> = control_keys
+            .iter()
+            .zip(&self.control_on)
+            .filter(|(_, on)| **on)
+            .map(|(hz, _)| *hz)
+            .chain(voice_key).chain(self.extras.iter().map(|e| e.hz)).collect();
         self.gates.retain(|hz, _| live.contains(hz));
         for hz in &live {
             self.gates.entry(*hz).or_default();
@@ -1416,6 +1469,9 @@ impl Bank {
                 }
             }
             for (index, ddc) in self.controls.iter_mut().enumerate() {
+                if !self.control_on[index] {
+                    continue;
+                }
                 let hz = ddc.push(i, q);
                 let mag = ddc.take_mag();
                 // Only once per boxcar: a map lookup on every 8 Msps sample
@@ -1481,7 +1537,8 @@ struct PcmFeed {
 }
 
 pub struct Session {
-    transfer: Child,
+    /// The dongle: libhackrf in this process, or `hackrf_transfer`.
+    radio: Radio,
     /// Absent until the radio's receive node is in the graph. The capture
     /// still runs, so a control channel can be read before the speaker is up.
     play: Option<Child>,
@@ -1512,8 +1569,15 @@ pub struct Session {
     stop: Arc<AtomicBool>,
     failed: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
+    /// What the radio printed (`hackrf_transfer` stderr) or the error that
+    /// stopped a libhackrf capture.
     transfer_log: Arc<Mutex<Vec<String>>>,
     transfer_reader: Option<JoinHandle<()>>,
+    /// A retune for the worker to apply on the same stream.
+    retune: Arc<Mutex<Option<Retune>>>,
+    /// The frequency each control decoder was started for. Fixed for the
+    /// session: a retune maps the wanted controls onto these.
+    decoder_hz: Vec<f64>,
     pub center: f64,
     pub control_hz: Vec<f64>,
     pub serial: String,
@@ -1663,7 +1727,7 @@ impl Session {
     }
 
     pub fn child_ids(&self) -> Vec<u32> {
-        let mut ids = vec![self.transfer.id()];
+        let mut ids: Vec<u32> = self.radio.id().into_iter().collect();
         if let Some(play) = &self.play {
             ids.push(play.id());
         }
@@ -1687,7 +1751,47 @@ impl Session {
         if self.failed.load(Ordering::Relaxed) {
             return false;
         }
-        matches!(self.transfer.try_wait(), Ok(None))
+        self.radio.alive()
+    }
+
+    /// The capture can retune and change gain on the open stream.
+    pub fn live(&self) -> bool {
+        match self.radio {
+            Radio::Lib(_) => true,
+            Radio::Tool(_) => false,
+            #[cfg(test)]
+            Radio::Fake(_) => true,
+        }
+    }
+
+    pub fn decoder_hz(&self) -> &[f64] {
+        &self.decoder_hz
+    }
+
+    /// Move the capture without restarting it. The decoders keep running.
+    /// `Err` means this capture cannot do it; the caller restarts.
+    pub fn retune(&mut self, center: f64, controls: &[f64]) -> Result<(), String> {
+        if !self.live() {
+            return Err("hackrf_transfer cannot retune".into());
+        }
+        let slots = retune_slots(&self.decoder_hz, center, controls)
+            .ok_or_else(|| "those controls need other decoders".to_string())?;
+        *self.retune.lock().expect("hackrf retune") = Some(Retune { center, slots });
+        self.center = center;
+        self.control_hz = controls.to_vec();
+        Ok(())
+    }
+
+    /// Change LNA, VGA and amp on the open stream.
+    pub fn set_gain(&mut self, gain: RxGain) -> Result<(), String> {
+        match &self.radio {
+            Radio::Lib(dev) => dev.set_gains(lib_gains(gain))?,
+            Radio::Tool(_) => return Err("hackrf_transfer cannot change gain".into()),
+            #[cfg(test)]
+            Radio::Fake(calls) => calls.lock().expect("fake radio").push(format!("gain {:?}", lib_gains(gain))),
+        }
+        self.gain = gain;
+        Ok(())
     }
 
     /// Stop the capture. The returned text is what `hackrf_transfer` printed.
@@ -1696,7 +1800,7 @@ impl Session {
         if let Some(speech) = &self.speech {
             speech.wake();
         }
-        signal(&mut self.transfer);
+        self.radio.signal();
         if let Some(play) = &mut self.play {
             signal(play);
         }
@@ -1716,7 +1820,8 @@ impl Session {
             let _ = worker.join();
         }
         drop(self.voice_next.lock().expect("hackrf voice").take());
-        wait_child(&mut self.transfer);
+        self.radio.wait();
+        crate::radio_meter::forget(self.rec_key.load(Ordering::Relaxed));
         if let Some(play) = &mut self.play {
             wait_child(play);
         }
@@ -1774,29 +1879,17 @@ pub fn start(
     if !center.is_finite() || center < 1_000_000.0 {
         return Err("tune a frequency".into());
     }
-    let args = transfer_args(serial, center, gain);
-    let mut transfer_cmd = Command::new("hackrf_transfer");
-    transfer_cmd
-        .args(&args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0);
-    let mut transfer = transfer_cmd
-        .spawn()
-        .map_err(|err| format!("hackrf_transfer: {err}"))?;
-    let iq = match transfer.stdout.take() {
-        Some(iq) => iq,
-        None => {
-            fail_transfer(&mut transfer);
-            return Err("hackrf_transfer has no stdout".into());
-        }
-    };
     let transfer_log = Arc::new(Mutex::new(Vec::new()));
-    let transfer_reader = transfer.stderr.take().map(|stderr| {
-        let sink = Arc::clone(&transfer_log);
-        thread::spawn(move || collect(stderr, sink))
-    });
+    let (mut transfer, iq, transfer_reader) = open_radio(serial, center, gain, &transfer_log)?;
+    let ctl: Arc<dyn RadioCtl> = match &transfer {
+        Radio::Lib(dev) => Arc::new(LibCtl {
+            dev: Arc::clone(dev),
+            temp_on: die_temp_enabled(),
+        }),
+        Radio::Tool(_) => Arc::new(ToolCtl),
+        #[cfg(test)]
+        Radio::Fake(_) => Arc::new(ToolCtl),
+    };
 
     let mut play = None;
     let mut play_write = None;
@@ -1898,9 +1991,17 @@ pub fn start(
     let voice_slot = Arc::clone(&voice_next);
     let rec_key = Arc::new(AtomicU64::new(0));
     let rec_flag = Arc::clone(&rec_key);
+    let retune = Arc::new(Mutex::new(None));
+    let live = Live {
+        ctl,
+        retune: Arc::clone(&retune),
+        serial: serial.trim().to_string(),
+        log: Arc::clone(&transfer_log),
+    };
     let worker = thread::spawn(move || {
         run_bank(
             iq,
+            live,
             play_write,
             control_writes,
             voice_write,
@@ -1916,7 +2017,7 @@ pub fn start(
         )
     });
     Ok(Session {
-        transfer,
+        radio: transfer,
         play,
         speech,
         controls: decoders,
@@ -1934,6 +2035,8 @@ pub fn start(
         worker: Some(worker),
         transfer_log,
         transfer_reader,
+        retune,
+        decoder_hz: controls.to_vec(),
         center,
         control_hz: controls.to_vec(),
         serial: serial.trim().to_string(),
@@ -1942,20 +2045,450 @@ pub fn start(
     })
 }
 
-fn fail_transfer(transfer: &mut Child) {
-    signal(transfer);
-    wait_child(transfer);
+/// The dongle under one capture.
+enum Radio {
+    /// `hackrf_transfer -r -`: the fallback when libhackrf cannot be loaded.
+    Tool(Child),
+    /// libhackrf in this process: retune, gain and readings on one handle.
+    Lib(Arc<crate::libhackrf::Device>),
+    /// Tests: a live radio that records its control calls.
+    #[cfg(test)]
+    Fake(Arc<Mutex<Vec<String>>>),
 }
 
-fn fail_partial(transfer: &mut Child, mut play: Option<&mut Child>, decoders: &mut [Decoder]) {
-    signal(transfer);
+impl Radio {
+    fn id(&self) -> Option<u32> {
+        match self {
+            Radio::Tool(child) => Some(child.id()),
+            Radio::Lib(_) => None,
+            #[cfg(test)]
+            Radio::Fake(_) => None,
+        }
+    }
+
+    fn alive(&mut self) -> bool {
+        match self {
+            Radio::Tool(child) => matches!(child.try_wait(), Ok(None)),
+            Radio::Lib(dev) => dev.streaming(),
+            #[cfg(test)]
+            Radio::Fake(_) => true,
+        }
+    }
+
+    fn signal(&mut self) {
+        match self {
+            Radio::Tool(child) => signal(child),
+            Radio::Lib(dev) => dev.close(),
+            #[cfg(test)]
+            Radio::Fake(calls) => calls.lock().expect("fake radio").push("close".into()),
+        }
+    }
+
+    fn wait(&mut self) {
+        if let Radio::Tool(child) = self {
+            wait_child(child);
+        }
+    }
+}
+
+/// Set to `1` to use `hackrf_transfer` even when libhackrf is installed.
+pub const TOOL_ENV: &str = "HAMSPOT_HACKRF_TRANSFER";
+/// Set to `1` to read the MAX2837 die temperature (register writes during
+/// receive; decisions.md, "HackRF die temperature"). Off by default.
+pub const DIE_TEMP_ENV: &str = "HAMSPOT_HACKRF_DIE_TEMP";
+
+fn env_on(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| v.trim() == "1")
+}
+
+fn die_temp_enabled() -> bool {
+    env_on(DIE_TEMP_ENV)
+}
+
+/// Effective gains. An unset stage gets the value `hackrf_transfer` uses
+/// (LNA 8 dB, VGA 20 dB); an unset amp is left alone at open and off on a
+/// live change, its power-on state.
+fn lib_gains(gain: RxGain) -> crate::libhackrf::Gains {
+    crate::libhackrf::Gains {
+        amp: gain.amp,
+        lna_db: Some(gain.lna_db.unwrap_or(8)),
+        vga_db: Some(gain.vga_db.unwrap_or(20)),
+    }
+}
+
+/// libhackrf first. A missing library falls back to `hackrf_transfer`;
+/// a busy or missing dongle is an error either way.
+fn open_radio(
+    serial: &str,
+    center: f64,
+    gain: RxGain,
+    log: &Arc<Mutex<Vec<String>>>,
+) -> Result<(Radio, Box<dyn IqSource>, Option<JoinHandle<()>>), String> {
+    if !env_on(TOOL_ENV) {
+        match crate::libhackrf::loaded() {
+            Ok(()) => {
+                let (dev, reader) = crate::libhackrf::Device::open(
+                    serial,
+                    SAMPLE_RATE as f64,
+                    FILTER_HZ.round() as u32,
+                    center.round() as u64,
+                    lib_gains(gain),
+                )?;
+                return Ok((Radio::Lib(dev), Box::new(reader), None));
+            }
+            Err(err) => {
+                eprintln!("commander: {err}; using hackrf_transfer");
+            }
+        }
+    }
+    let args = transfer_args(serial, center, gain);
+    let mut transfer_cmd = Command::new("hackrf_transfer");
+    transfer_cmd
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut transfer = transfer_cmd
+        .spawn()
+        .map_err(|err| format!("hackrf_transfer: {err}"))?;
+    let Some(iq) = transfer.stdout.take() else {
+        let mut radio = Radio::Tool(transfer);
+        fail_transfer(&mut radio);
+        return Err("hackrf_transfer has no stdout".into());
+    };
+    let reader = transfer.stderr.take().map(|stderr| {
+        let sink = Arc::clone(log);
+        thread::spawn(move || collect(stderr, sink))
+    });
+    Ok((Radio::Tool(transfer), Box::new(iq), reader))
+}
+
+/// Raw IQ in `hackrf_transfer`'s stdout format.
+pub trait IqSource: Read + Send {
+    /// Skip samples that arrived before `at`. A pipe cannot tell.
+    fn drop_before(&mut self, _at: std::time::Instant) {}
+}
+
+impl IqSource for ChildStdout {}
+
+impl IqSource for crate::libhackrf::RxReader {
+    fn drop_before(&mut self, at: std::time::Instant) {
+        crate::libhackrf::RxReader::drop_before(self, at);
+    }
+}
+
+impl<T: IqSource + ?Sized> IqSource for Box<T> {
+    fn drop_before(&mut self, at: std::time::Instant) {
+        (**self).drop_before(at);
+    }
+}
+
+/// Control of the dongle from the capture thread.
+pub trait RadioCtl: Send + Sync {
+    fn backend(&self) -> &'static str;
+    fn retune(&self, hz: f64) -> Result<(), String>;
+    /// IQ samples lost between USB and the channelizer, total.
+    fn handoff_dropped(&self) -> u64 {
+        0
+    }
+    /// USB shortfalls reported by the radio. `None`: not reported.
+    fn usb_overruns(&self) -> Option<u64> {
+        None
+    }
+    fn die_temp(&self) -> crate::libhackrf::DieTemp;
+    /// Board and firmware, for the Meters status line. Empty when unknown.
+    fn describe(&self) -> String {
+        String::new()
+    }
+}
+
+struct LibCtl {
+    dev: Arc<crate::libhackrf::Device>,
+    temp_on: bool,
+}
+
+impl RadioCtl for LibCtl {
+    fn backend(&self) -> &'static str {
+        "libhackrf"
+    }
+
+    fn retune(&self, hz: f64) -> Result<(), String> {
+        self.dev.set_freq(hz.round() as u64)
+    }
+
+    fn handoff_dropped(&self) -> u64 {
+        self.dev.handoff_dropped()
+    }
+
+    fn describe(&self) -> String {
+        let api = self
+            .dev
+            .usb_api
+            .map_or("USB API unknown".to_string(), |v| format!("USB API {v:#06x}"));
+        format!("board id {} ({:?}), {api}", self.dev.board_id, self.dev.chip())
+    }
+
+    fn usb_overruns(&self) -> Option<u64> {
+        self.dev.usb_overruns()
+    }
+
+    fn die_temp(&self) -> crate::libhackrf::DieTemp {
+        if !self.temp_on {
+            return crate::libhackrf::DieTemp {
+                src: "off".into(),
+                note: format!("die temperature is off ({DIE_TEMP_ENV}=1 turns it on)"),
+                ..Default::default()
+            };
+        }
+        self.dev.die_temp()
+    }
+}
+
+struct ToolCtl;
+
+impl RadioCtl for ToolCtl {
+    fn backend(&self) -> &'static str {
+        "hackrf_transfer"
+    }
+
+    fn retune(&self, _hz: f64) -> Result<(), String> {
+        Err("hackrf_transfer cannot retune".into())
+    }
+
+    fn die_temp(&self) -> crate::libhackrf::DieTemp {
+        crate::libhackrf::DieTemp {
+            src: "none".into(),
+            note: "hackrf_transfer cannot read the radio".into(),
+            ..Default::default()
+        }
+    }
+}
+
+/// What the capture thread needs besides the samples.
+pub struct Live {
+    pub ctl: Arc<dyn RadioCtl>,
+    pub retune: Arc<Mutex<Option<Retune>>>,
+    pub serial: String,
+    pub log: Arc<Mutex<Vec<String>>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Retune {
+    pub center: f64,
+    /// New frequency per control decoder, `None` to idle it.
+    pub slots: Vec<Option<f64>>,
+}
+
+/// Samples dropped after a retune: the synthesizers lock in well under a
+/// millisecond, but up to four 256 KiB USB transfers (about 65 ms) were
+/// already filled at the old frequency.
+pub const RETUNE_SETTLE: std::time::Duration = std::time::Duration::from_millis(80);
+
+/// Map the wanted controls onto the decoders this capture was started
+/// with. `None` when that needs a decoder the capture does not have.
+///
+/// - Same list, any order: each decoder keeps its own tower. Decoders not
+///   wanted idle.
+/// - A voice trip (`[center]`, not one of the decoders): the first decoder
+///   follows the voice channel, as the restarted capture's only decoder
+///   used to; the others idle and keep their tables.
+/// - No decoders and none wanted: a plain dial retune.
+pub fn retune_slots(decoders: &[f64], center: f64, controls: &[f64]) -> Option<Vec<Option<f64>>> {
+    if decoders.is_empty() {
+        return controls.is_empty().then(Vec::new);
+    }
+    if controls.is_empty() {
+        return None;
+    }
+    let matched = |hz: f64| decoders.iter().position(|d| (d - hz).abs() < 1.0);
+    if controls.len() == 1 && (controls[0] - center).abs() < 1.0 && matched(controls[0]).is_none() {
+        let mut slots = vec![None; decoders.len()];
+        slots[0] = Some(controls[0]);
+        return Some(slots);
+    }
+    let mut slots = vec![None; decoders.len()];
+    for hz in controls {
+        let index = matched(*hz)?;
+        if slots[index].is_some() {
+            return None;
+        }
+        slots[index] = Some(decoders[index]);
+    }
+    Some(slots)
+}
+
+/// One running or wanted capture, for [`plan_change`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct CaptureWant<'a> {
+    pub center: f64,
+    pub controls: &'a [f64],
+    pub serial: &'a str,
+    pub gain: RxGain,
+    pub playing: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Change {
+    Same,
+    /// On the open stream: retune and/or gain. No decoder restarts.
+    Live { retune: bool, gain: bool },
+    Restart,
+}
+
+/// How to get from the running capture to the wanted one. Only a
+/// libhackrf capture (`live`) changes on the open stream.
+pub fn plan_change(have: &CaptureWant, decoders: &[f64], live: bool, want: &CaptureWant) -> Change {
+    let serial_ok = want.serial.trim().is_empty() || have.serial == want.serial.trim();
+    if !serial_ok || have.playing != want.playing {
+        return Change::Restart;
+    }
+    let moved = (have.center - want.center).abs() >= 1.0 || !same_hz_list(have.controls, want.controls);
+    let gain = have.gain != want.gain;
+    if !moved && !gain {
+        return Change::Same;
+    }
+    if !live {
+        return Change::Restart;
+    }
+    if moved && retune_slots(decoders, want.center, want.controls).is_none() {
+        return Change::Restart;
+    }
+    Change::Live { retune: moved, gain }
+}
+
+fn same_hz_list(a: &[f64], b: &[f64]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1.0)
+}
+
+/// Meter and drift-log cadence on the capture thread: readings every
+/// second, radio polls and one log line every 10 s. Never in the sample loop.
+struct MeterClock {
+    meter: crate::radio_meter::RadioMeter,
+    last: std::time::Instant,
+    last_poll: std::time::Instant,
+    afc_shown: f32,
+    iq_shown: u64,
+    usb_shown: Option<u64>,
+    log_err: String,
+}
+
+pub const METER_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+pub const DRIFT_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+
+impl MeterClock {
+    fn new(live: &Live, center: f64) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            meter: crate::radio_meter::RadioMeter {
+                backend: live.ctl.backend().into(),
+                radio: live.ctl.describe(),
+                serial: live.serial.clone(),
+                center_hz: center,
+                temp: crate::libhackrf::DieTemp {
+                    src: "unread".into(),
+                    note: "first reading after 10 s".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            last: now,
+            last_poll: now,
+            afc_shown: 0.0,
+            iq_shown: 0,
+            usb_shown: None,
+            log_err: String::new(),
+        }
+    }
+
+    fn tick(
+        &mut self,
+        live: &Live,
+        bank: &Bank,
+        controls: &[PcmFeed],
+        voice: Option<&PcmFeed>,
+        center: f64,
+        radio_id: u64,
+    ) {
+        if self.last.elapsed() < METER_EVERY {
+            return;
+        }
+        self.last = std::time::Instant::now();
+        for feed in controls.iter().chain(voice) {
+            self.meter.decoder_dropped += report_drops(feed);
+        }
+        // The crystal drifts as the dongle warms. Log each 250 Hz step.
+        let afc = bank.afc_hz();
+        if (afc - self.afc_shown).abs() >= 250.0 {
+            eprintln!("commander: hackrf frequency error {afc:+.0} Hz corrected");
+            self.afc_shown = afc;
+        }
+        let iq = live.ctl.handoff_dropped();
+        if iq > self.iq_shown {
+            eprintln!(
+                "commander: hackrf channelizer fell behind USB; dropped {} ms of IQ",
+                (iq - self.iq_shown) * 1000 / SAMPLE_RATE as u64
+            );
+            self.iq_shown = iq;
+        }
+        self.meter.iq_dropped = iq;
+        self.meter.center_hz = center;
+        self.meter.afc_hz = afc;
+        self.meter.afc_locked = bank.afc_locked();
+        let poll = self.last_poll.elapsed() >= DRIFT_LOG_EVERY;
+        if poll {
+            self.last_poll = self.last;
+            let usb = live.ctl.usb_overruns();
+            if let (Some(now), Some(was)) = (usb, self.usb_shown) {
+                if now > was {
+                    eprintln!("commander: hackrf USB overruns {} (+{})", now, now - was);
+                }
+            }
+            self.usb_shown = usb;
+            self.meter.usb_overruns = usb;
+            self.meter.temp = live.ctl.die_temp();
+            self.write_log();
+        }
+        if radio_id != 0 {
+            crate::radio_meter::note(radio_id, self.meter.clone());
+        }
+    }
+
+    fn write_log(&mut self) {
+        let Some(dir) = crate::radio_meter::drift_dir() else {
+            return;
+        };
+        match crate::radio_meter::append_drift(&dir, &self.meter, chrono::Utc::now()) {
+            Ok(()) => {
+                self.log_err.clear();
+                self.meter.log_error.clear();
+            }
+            Err(err) => {
+                let text = format!("hackrf drift log: {err}");
+                if text != self.log_err {
+                    eprintln!("commander: {text}");
+                    self.log_err = text.clone();
+                }
+                self.meter.log_error = text;
+            }
+        }
+    }
+}
+
+fn fail_transfer(transfer: &mut Radio) {
+    transfer.signal();
+    transfer.wait();
+}
+
+fn fail_partial(transfer: &mut Radio, mut play: Option<&mut Child>, decoders: &mut [Decoder]) {
+    transfer.signal();
     if let Some(play) = play.as_mut() {
         signal(play);
     }
     for dec in decoders.iter_mut() {
         signal(&mut dec.child);
     }
-    wait_child(transfer);
+    transfer.wait();
     if let Some(play) = play {
         wait_child(play);
     }
@@ -1965,12 +2498,13 @@ fn fail_partial(transfer: &mut Child, mut play: Option<&mut Child>, decoders: &m
 }
 
 fn run_bank(
-    mut iq: impl Read,
+    mut iq: impl IqSource,
+    live: Live,
     mut play: Option<std::io::PipeWriter>,
     mut controls: Vec<PcmFeed>,
     mut voice: Option<PcmFeed>,
     voice_next: Arc<Mutex<Option<PcmFeed>>>,
-    center: f64,
+    mut center: f64,
     control_hz: &[f64],
     voice_hz: Arc<AtomicU64>,
     voice_empty: Arc<AtomicBool>,
@@ -1980,6 +2514,7 @@ fn run_bank(
     rec_key: Arc<AtomicU64>,
 ) {
     let mut bank = Bank::new(center, control_hz);
+    let mut meters = MeterClock::new(&live, center);
     // A full playback pipe must not stall this read. hackrf_transfer stops
     // the USB stream when its stdout blocks, and the scope then sticks on
     // the last frame.
@@ -1989,24 +2524,30 @@ fn run_bank(
     let mut buf = [0u8; 16_384];
     let mut voice_out = Vec::new();
     let mut control_out: Vec<Vec<i16>> = vec![Vec::new(); control_hz.len()];
-    let mut last_report = std::time::Instant::now();
-    let mut afc_shown = 0.0f32;
     while !stop.load(Ordering::Relaxed) {
-        if last_report.elapsed() >= std::time::Duration::from_secs(5) {
-            last_report = std::time::Instant::now();
-            for feed in controls.iter().chain(voice.iter()) {
-                report_drops(feed);
+        // A retune is applied here, between reads, on the same stream.
+        let pending = live.retune.lock().expect("hackrf retune").take();
+        if let Some(next) = pending {
+            if let Err(err) = live.ctl.retune(next.center) {
+                eprintln!("commander: {err}");
+                live.log.lock().expect("hackrf lines").push(err);
+                break;
             }
-            // The crystal drifts as the dongle warms. Log each 250 Hz step.
-            let afc = bank.afc_hz();
-            if (afc - afc_shown).abs() >= 250.0 {
-                eprintln!("commander: hackrf frequency error {afc:+.0} Hz corrected");
-                afc_shown = afc;
-            }
+            // Buffers already in flight hold the old frequency.
+            iq.drop_before(std::time::Instant::now() + RETUNE_SETTLE);
+            bank.retune(next.center, &next.slots);
+            center = next.center;
         }
+        meters.tick(&live, &bank, &controls, voice.as_ref(), center, rec_key.load(Ordering::Relaxed));
         let n = match iq.read(&mut buf) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
             Ok(n) => n,
+            // libhackrf: no buffer for 250 ms. Look at the stop flag again.
+            Err(err) if err.kind() == std::io::ErrorKind::TimedOut => continue,
+            Err(err) => {
+                live.log.lock().expect("hackrf lines").push(format!("hackrf read: {err}"));
+                break;
+            }
         };
         let hz = voice_hz.load(Ordering::Relaxed);
         bank.set_voice(if hz == 0 { None } else { Some(hz as f64) });
@@ -2172,7 +2713,8 @@ fn enqueue_pcm(
 }
 
 /// Print any samples a decoder lost since the last report. Never silent.
-fn report_drops(feed: &PcmFeed) {
+/// Returns the count, for the Meters page total.
+fn report_drops(feed: &PcmFeed) -> u64 {
     let lost = feed.dropped.swap(0, Ordering::Relaxed);
     if lost > 0 {
         eprintln!(
@@ -2181,6 +2723,7 @@ fn report_drops(feed: &PcmFeed) {
             lost * 1000 / 48_000
         );
     }
+    lost
 }
 
 /// Write every sample. The fd is blocking. `WouldBlock` is not a drop.
@@ -3604,5 +4147,278 @@ Board ID Number: 4 (HackRF Jawbreaker)
         assert_eq!(got, outside);
         assert_eq!(kept, vec![outside]);
         assert_eq!(scan_freq(center, outside, 18.0), center);
+    }
+
+    // ---- libhackrf path: live retune, live gain, meters -----------------
+
+    fn idle_decoder() -> Decoder {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("sleep");
+        Decoder { child, lines: Arc::new(Mutex::new(Vec::new())) }
+    }
+
+    /// A capture on a live radio with real decoder processes, no USB.
+    fn fake_session(center: f64, controls: &[f64]) -> (Session, Arc<Mutex<Vec<String>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let session = Session {
+            radio: Radio::Fake(Arc::clone(&calls)),
+            play: None,
+            speech: None,
+            controls: controls.iter().map(|_| idle_decoder()).collect(),
+            voice_dec: Some(idle_decoder()),
+            voice_retired: Vec::new(),
+            voice_next: Arc::new(Mutex::new(None)),
+            script: Some("modems/commander-demod-p25.rxpipe".into()),
+            p2_word: None,
+            key_csv: None,
+            voice_hz: Arc::new(AtomicU64::new(0)),
+            voice_empty: Arc::new(AtomicBool::new(false)),
+            rec_key: Arc::new(AtomicU64::new(0)),
+            stop: Arc::new(AtomicBool::new(false)),
+            failed: Arc::new(AtomicBool::new(false)),
+            worker: None,
+            transfer_log: Arc::new(Mutex::new(Vec::new())),
+            transfer_reader: None,
+            retune: Arc::new(Mutex::new(None)),
+            decoder_hz: controls.to_vec(),
+            center,
+            control_hz: controls.to_vec(),
+            serial: "fake".into(),
+            gain: RxGain { lna_db: Some(16), vga_db: Some(20), amp: Some(false) },
+            spec: Arc::new(Mutex::new(SpectrumSnap::default())),
+        };
+        (session, calls)
+    }
+
+    fn want<'a>(center: f64, controls: &'a [f64], gain: RxGain) -> CaptureWant<'a> {
+        CaptureWant { center, controls, serial: "", gain, playing: false }
+    }
+
+    #[test]
+    fn retune_maps_controls_onto_the_decoders_it_has() {
+        let decoders = [857_962_500.0, 858_512_500.0, 858_962_500.0];
+        // Same towers, other order: each decoder keeps its own tower.
+        assert_eq!(
+            retune_slots(&decoders, 858_400_000.0, &[858_962_500.0, 857_962_500.0]),
+            Some(vec![Some(857_962_500.0), None, Some(858_962_500.0)])
+        );
+        // A voice trip: the first decoder follows the voice channel.
+        let voice = 851_012_500.0;
+        assert_eq!(retune_slots(&decoders, voice, &[voice]), Some(vec![Some(voice), None, None]));
+        // A tower the capture has no decoder for needs a restart.
+        assert_eq!(retune_slots(&decoders, 858_400_000.0, &[859_962_500.0]), None);
+        // Dial mode: no decoders either side.
+        assert_eq!(retune_slots(&[], 146_520_000.0, &[]), Some(vec![]));
+        assert_eq!(retune_slots(&[], 146_520_000.0, &[146_520_000.0]), None);
+        assert_eq!(retune_slots(&decoders, 858_400_000.0, &[]), None);
+    }
+
+    #[test]
+    fn a_live_radio_retunes_and_changes_gain_without_a_restart() {
+        let controls = [857_962_500.0, 858_512_500.0];
+        let gain = RxGain { lna_db: Some(16), vga_db: Some(20), amp: Some(false) };
+        let louder = RxGain { lna_db: Some(24), vga_db: Some(30), amp: Some(false) };
+        let have = want(858_200_000.0, &controls, gain);
+        let voice = [851_012_500.0];
+        assert_eq!(plan_change(&have, &controls, true, &have), Change::Same);
+        assert_eq!(
+            plan_change(&have, &controls, true, &want(851_012_500.0, &voice, gain)),
+            Change::Live { retune: true, gain: false }
+        );
+        assert_eq!(
+            plan_change(&have, &controls, true, &want(858_200_000.0, &controls, louder)),
+            Change::Live { retune: false, gain: true }
+        );
+        // hackrf_transfer can do neither on the open stream.
+        assert_eq!(plan_change(&have, &controls, false, &want(851_012_500.0, &voice, gain)), Change::Restart);
+        assert_eq!(plan_change(&have, &controls, false, &want(858_200_000.0, &controls, louder)), Change::Restart);
+        // Another dongle or the speaker coming up is still a restart.
+        let mut other = want(858_200_000.0, &controls, gain);
+        other.serial = "other";
+        assert_eq!(plan_change(&have, &controls, true, &other), Change::Restart);
+    }
+
+    #[test]
+    fn mid_stream_retune_and_gain_keep_every_decoder_process() {
+        let controls = [857_962_500.0, 858_512_500.0];
+        let (mut session, calls) = fake_session(858_200_000.0, &controls);
+        let before = session.child_ids();
+        assert_eq!(before.len(), 3, "two control decoders and the voice decoder");
+
+        let voice = 851_012_500.0;
+        session.retune(voice, &[voice]).expect("live retune");
+        assert_eq!(session.center, voice);
+        assert_eq!(session.control_hz, vec![voice]);
+        assert_eq!(session.decoder_hz(), &controls, "the decoders' own towers do not change");
+        assert_eq!(
+            *session.retune.lock().unwrap(),
+            Some(Retune { center: voice, slots: vec![Some(voice), None] })
+        );
+        // Back to the cluster on the same stream.
+        session.retune(858_200_000.0, &controls).expect("live retune back");
+        let louder = RxGain { lna_db: Some(24), vga_db: Some(30), amp: Some(false) };
+        session.set_gain(louder).expect("live gain");
+        assert_eq!(session.gain, louder);
+
+        assert_eq!(session.child_ids(), before, "no decoder was respawned");
+        assert!(session.alive(), "the capture never stopped");
+        assert_eq!(calls.lock().unwrap().len(), 1, "one gain call and no close: {:?}", calls.lock().unwrap());
+        // A control set with no decoder refuses; the caller restarts.
+        assert!(session.retune(858_200_000.0, &[859_962_500.0]).is_err());
+        session.stop();
+        assert_eq!(calls.lock().unwrap().last().map(String::as_str), Some("close"));
+    }
+
+    /// Bytes as the USB thread hands them over; empty means a quiet stream.
+    struct FakeIq {
+        chunks: std::collections::VecDeque<Vec<u8>>,
+        dropped: Arc<Mutex<Vec<std::time::Instant>>>,
+    }
+
+    impl Read for FakeIq {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.chunks.pop_front() {
+                Some(chunk) => {
+                    let n = chunk.len().min(buf.len());
+                    buf[..n].copy_from_slice(&chunk[..n]);
+                    Ok(n)
+                }
+                None => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "quiet"))
+                }
+            }
+        }
+    }
+
+    impl IqSource for FakeIq {
+        fn drop_before(&mut self, at: std::time::Instant) {
+            self.dropped.lock().unwrap().push(at);
+        }
+    }
+
+    struct FakeCtl {
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl RadioCtl for FakeCtl {
+        fn backend(&self) -> &'static str {
+            "fake"
+        }
+        fn retune(&self, hz: f64) -> Result<(), String> {
+            self.calls.lock().unwrap().push(format!("retune {hz:.0}"));
+            Ok(())
+        }
+        fn handoff_dropped(&self) -> u64 {
+            8_000
+        }
+        fn usb_overruns(&self) -> Option<u64> {
+            Some(3)
+        }
+        fn die_temp(&self) -> crate::libhackrf::DieTemp {
+            crate::libhackrf::DieTemp { src: "none".into(), note: "fake".into(), ..Default::default() }
+        }
+    }
+
+    #[test]
+    fn the_capture_thread_retunes_between_reads_and_reports_its_meters() {
+        let radio = 0x11FE;
+        let (c0, c1) = (858_200_000.0, 851_012_500.0);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let iq = FakeIq {
+            chunks: (0..64).map(|_| vec![0u8; 16_384]).collect(),
+            dropped: Arc::clone(&dropped),
+        };
+        let retune = Arc::new(Mutex::new(Some(Retune { center: c1, slots: vec![] })));
+        let live = Live {
+            ctl: Arc::new(FakeCtl { calls: Arc::clone(&calls) }),
+            retune: Arc::clone(&retune),
+            serial: "fake".into(),
+            log: Arc::new(Mutex::new(Vec::new())),
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let failed = Arc::new(AtomicBool::new(false));
+        let pump = SpecPump {
+            since: 0,
+            seq: 0,
+            slot: Arc::new(Mutex::new(SpectrumSnap::default())),
+            wake: Arc::new(|| {}),
+        };
+        let (stop2, failed2) = (Arc::clone(&stop), Arc::clone(&failed));
+        let worker = std::thread::spawn(move || {
+            run_bank(
+                iq,
+                live,
+                None,
+                Vec::new(),
+                None,
+                Arc::new(Mutex::new(None)),
+                c0,
+                &[],
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicBool::new(false)),
+                stop2,
+                failed2,
+                pump,
+                Arc::new(AtomicU64::new(radio)),
+            )
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut meter = None;
+        while std::time::Instant::now() < deadline {
+            meter = crate::radio_meter::get(radio);
+            if meter.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        stop.store(true, Ordering::Relaxed);
+        worker.join().unwrap();
+        assert!(!failed.load(Ordering::Relaxed), "a stop is not a failure");
+        assert_eq!(*calls.lock().unwrap(), vec![format!("retune {c1:.0}")], "one retune on the open stream");
+        assert_eq!(dropped.lock().unwrap().len(), 1, "samples from the old frequency are skipped once");
+        assert!(retune.lock().unwrap().is_none());
+        let meter = meter.expect("the capture thread reports its meters");
+        assert_eq!(meter.backend, "fake");
+        assert_eq!(meter.center_hz, c1, "the meters follow the retune");
+        assert_eq!(meter.iq_dropped, 8_000);
+        assert!(!meter.afc_locked, "no carrier, no frequency error");
+        crate::radio_meter::forget(radio);
+    }
+
+    #[test]
+    fn a_retuned_bank_matches_a_fresh_capture_at_the_new_center() {
+        let (c0, c1) = (858_200_000.0, 851_200_000.0);
+        let (a, b) = (857_962_500.0, 851_012_500.0);
+        let air = hsrec::dsp::synth_c4fm_cs8(b - c1, 0.0, 0.3, 50.0);
+        let mut bank = Bank::new(c0, &[a, b]);
+        // Quiet air at the old center (zeros keep DC and AFC untouched).
+        let mut voice = Vec::new();
+        let mut outs = vec![Vec::new(), Vec::new()];
+        bank.push(&vec![0u8; 32_768], &mut voice, &mut outs);
+        bank.retune(c1, &[None, Some(b)]);
+        assert_eq!(bank.center(), c1);
+        let mut fresh = Bank::new(c1, &[b]);
+        let (mut got, mut want) = (vec![Vec::new(), Vec::new()], vec![Vec::new()]);
+        for block in air.chunks(16_384) {
+            let mut o = vec![Vec::new(), Vec::new()];
+            let mut f = vec![Vec::new()];
+            bank.push(block, &mut voice, &mut o);
+            fresh.push(block, &mut voice, &mut f);
+            got[0].extend(o[0].drain(..));
+            got[1].extend(o[1].drain(..));
+            want[0].extend(f[0].drain(..));
+        }
+        assert!(got[0].is_empty(), "the tower outside the capture idles and sends nothing");
+        assert!(!got[1].is_empty());
+        assert_eq!(got[1], want[0], "same discriminator as a capture started there");
+        assert_eq!(bank.live_control(), Some(1));
     }
 }

@@ -1027,6 +1027,35 @@ fn face_for(
     })
 }
 
+/// Faces for a HackRF capture: frequency error in Hz and ppm, software
+/// drops, USB overruns and die temperature. The reading is the face name;
+/// a value that is not known shows a dash and a blue lamp, never a guess.
+pub fn hackrf_faces(m: &crate::radio_meter::RadioMeter) -> Vec<MeterFace> {
+    let face = |id: &str, name: String, min: f64, max: f64, value: Option<f64>, red: Option<f32>| {
+        let mut scale = range_scale(&name, min, max);
+        scale.red_from = red;
+        let frac = value.and_then(|v| span_frac(v.clamp(min, max), min, max)).unwrap_or(if min < 0.0 { 0.5 } else { 0.0 });
+        MeterFace {
+            id: id.into(),
+            frac,
+            scale,
+            lamp: if value.is_some() { Lamp::Warm } else { Lamp::Blue },
+        }
+    };
+    let afc = m.afc_locked.then_some(m.afc_hz as f64);
+    let ppm = m.ppm();
+    let drop_ms = m.decoder_dropped as f64 * 1000.0 / 48_000.0 + m.iq_dropped as f64 * 1000.0 / 8_000_000.0;
+    let usb = m.usb_overruns.map(|n| n as f64);
+    let temp = m.temp.c.map(|c| c as f64);
+    vec![
+        face("HACKRF_AFC", afc.map_or("AFC -- Hz".into(), |hz| format!("AFC {hz:+.0} Hz")), -5000.0, 5000.0, afc, None),
+        face("HACKRF_PPM", ppm.map_or("-- ppm".into(), |p| format!("{p:+.2} ppm")), -10.0, 10.0, ppm, None),
+        face("HACKRF_DROPS", format!("DROP {drop_ms:.0} ms"), 0.0, 1000.0, Some(drop_ms), Some(0.5)),
+        face("HACKRF_USB", usb.map_or("USB --".into(), |n| format!("USB {n:.0}")), 0.0, 100.0, usb, Some(0.5)),
+        face("HACKRF_TEMP", temp.map_or("DIE -- \u{b0}C".into(), |c| format!("DIE {c:.1} \u{b0}C")), -40.0, 85.0, temp, Some(0.8)),
+    ]
+}
+
 /// A 0..1 hamlib meter keeps the percent scale. Any other usable range is
 /// labeled with that range. A missing range stays on the percent scale.
 fn unit_or_range(
@@ -1547,6 +1576,31 @@ mod tests {
             .unwrap();
         assert!((plus.frac - 1.0).abs() < 0.001);
         assert!(scale.red_from.unwrap() > nine.frac);
+    }
+
+    #[test]
+    fn hackrf_faces_show_known_values_and_dash_the_unknown() {
+        let mut m = crate::radio_meter::RadioMeter {
+            backend: "hackrf_transfer".into(),
+            center_hz: 857_200_000.0,
+            afc_hz: -1200.0,
+            afc_locked: true,
+            decoder_dropped: 48_000,
+            iq_dropped: 4_000_000,
+            ..Default::default()
+        };
+        let faces = hackrf_faces(&m);
+        let names: Vec<&str> = faces.iter().map(|f| f.scale.name.as_str()).collect();
+        assert_eq!(names, ["AFC -1200 Hz", "-1.40 ppm", "DROP 1500 ms", "USB --", "DIE -- \u{b0}C"]);
+        assert!((faces[0].frac - 0.38).abs() < 0.001, "-1200 Hz on a +/-5 kHz face");
+        assert_eq!(faces[2].frac, 1.0, "drops past the scale pin at full");
+        assert_eq!(faces[3].lamp, Lamp::Blue, "unknown is not zero");
+        assert_eq!(faces[4].lamp, Lamp::Blue);
+        m.afc_locked = false;
+        let faces = hackrf_faces(&m);
+        assert_eq!(faces[0].scale.name, "AFC -- Hz");
+        assert_eq!(faces[1].scale.name, "-- ppm");
+        assert_eq!(faces[0].frac, 0.5, "an unmeasured error rests at zero");
     }
 
     #[test]
