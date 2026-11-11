@@ -1332,8 +1332,9 @@ fn real_page_screenshots_from_a_database_copy() {
 }
 
 /// The Meters page with a HackRF selected shows what its capture thread
-/// measured: frequency error in Hz and ppm, software drops, and an honest
-/// dash for USB overruns and die temperature it could not read.
+/// measured. A reading it does not have gets no face (David: "lets hide the
+/// meters with no data"); the face appears once the reading exists, and a
+/// zero reading is shown. The status line is one short, whole line.
 #[test]
 fn real_meters_page_shows_the_hackrf_readings() {
     if !in_child("real_meters_page_shows_the_hackrf_readings") {
@@ -1347,46 +1348,61 @@ fn real_meters_page_shows_the_hackrf_readings() {
     let mut row = hackrf_row(radio, center);
     row.selected = true;
     h.app.rec.test_rows.push(row);
-    crate::radio_meter::note(
-        radio,
-        crate::radio_meter::RadioMeter {
-            backend: "libhackrf".into(),
-            radio: String::new(),
-            serial: "test".into(),
-            center_hz: center,
-            afc_hz: 2370.0,
-            afc_locked: true,
-            // 100 ms of 48 kHz decoder audio.
-            decoder_dropped: 4_800,
-            iq_dropped: 0,
-            usb_overruns: None,
-            temp: crate::libhackrf::DieTemp {
-                src: "off".into(),
-                note: "off for the test".into(),
-                ..Default::default()
-            },
-            log_error: String::new(),
+    let mut m = crate::radio_meter::RadioMeter {
+        backend: "libhackrf".into(),
+        radio: "board id 2 (Max2837), USB API 0x0104".into(),
+        serial: "test".into(),
+        center_hz: center,
+        afc_hz: 0.0,
+        afc_locked: false,
+        decoder_dropped: 0,
+        iq_dropped: 0,
+        usb_overruns: None,
+        temp: crate::libhackrf::DieTemp {
+            src: "off".into(),
+            note: "off for the test".into(),
+            ..Default::default()
         },
-    );
-    let out = h.settle(6);
-    let shown: Vec<String> = texts(&out).into_iter().map(|(t, _)| t).collect();
-    for want in ["AFC +2370 Hz", "+2.76 ppm", "DROP 100 ms", "USB --", "DIE -- \u{b0}C"] {
-        assert!(shown.iter().any(|t| t == want), "{want:?} not on the page: {shown:?}");
-    }
-    assert!(
-        shown.iter().any(|t| t.starts_with("HackRF via libhackrf")),
-        "status line missing: {shown:?}"
-    );
+        log_error: String::new(),
+    };
+    let shown = |h: &mut Harness, m: &crate::radio_meter::RadioMeter| -> Vec<(String, egui::Rect)> {
+        crate::radio_meter::note(radio, m.clone());
+        texts(&h.settle(6))
+    };
+    let has = |t: &[(String, egui::Rect)], want: &str| t.iter().any(|(s, _)| s == want);
+    let any = |t: &[(String, egui::Rect)], pre: &str| t.iter().any(|(s, _)| s.starts_with(pre));
 
-    // The same radio once the die is read and USB reports.
-    let mut m = crate::radio_meter::get(radio).unwrap();
-    m.usb_overruns = Some(2);
+    // Before a carrier, no USB report, die temperature off: only DROP 0 ms.
+    let t = shown(&mut h, &m);
+    assert!(has(&t, "DROP 0 ms"), "a zero reading is shown: {t:?}");
+    for gone in ["AFC ", "USB", "DIE", "-- ", "ppm"] {
+        assert!(!t.iter().any(|(s, _)| s.contains(gone) && s != "Mic Eq" && !s.starts_with("HackRF via")), "{gone:?} has no reading and no face: {t:?}");
+    }
+    let status = "HackRF via libhackrf \u{b7} board id 2 (Max2837), USB API 0x0104";
+    let lines: Vec<&(String, egui::Rect)> = t.iter().filter(|(s, _)| s.starts_with("HackRF via")).collect();
+    assert_eq!(lines.len(), 1, "one status line: {t:?}");
+    assert_eq!(lines[0].0, status, "whole, not cut");
+    assert!(!any(&t, "die temperature") && !any(&t, "USB overruns"), "no paragraph about hidden meters: {t:?}");
+    // It is the page's bottom line: below every meter face.
+    let drop = t.iter().find(|(s, _)| s == "DROP 0 ms").unwrap().1;
+    assert!(lines[0].1.top() > drop.bottom() + 100.0, "status sits at the bottom: {:?} vs {:?}", lines[0].1, drop);
+
+    // A carrier is heard: the frequency error faces appear.
+    m.afc_hz = 2370.0;
+    m.afc_locked = true;
+    m.decoder_dropped = 4_800;
+    let t = shown(&mut h, &m);
+    for want in ["AFC +2370 Hz", "+2.76 ppm", "DROP 100 ms"] {
+        assert!(has(&t, want), "{want:?} not on the page: {t:?}");
+    }
+    assert!(!any(&t, "USB ") && !any(&t, "DIE"), "{t:?}");
+
+    // USB reports (zero is a reading) and the die is read: both appear.
+    m.usb_overruns = Some(0);
     m.temp = crate::libhackrf::DieTemp { code: Some(15), c: Some(25.0), src: "max2837-die".into(), note: String::new() };
-    crate::radio_meter::note(radio, m);
-    let out = h.settle(4);
-    let shown: Vec<String> = texts(&out).into_iter().map(|(t, _)| t).collect();
-    for want in ["USB 2", "DIE 25.0 \u{b0}C"] {
-        assert!(shown.iter().any(|t| t == want), "{want:?} not on the page: {shown:?}");
+    let t = shown(&mut h, &m);
+    for want in ["USB 0", "DIE 25.0 \u{b0}C"] {
+        assert!(has(&t, want), "{want:?} not on the page: {t:?}");
     }
     crate::radio_meter::forget(radio);
 }

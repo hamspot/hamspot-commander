@@ -11906,33 +11906,33 @@ fn paint_meter_page(
     });
     if let Some(m) = hackrf {
         let (text, warn) = hackrf_meter_status(m);
-        ui.add_space(4.0);
-        tune_style::status_line(ui, &text, warn);
+        // The page's bottom status strip, as on Tune. Unbounded (scrolled)
+        // space puts it right under the meters instead.
+        let rest = ui.available_rect_before_wrap();
+        if rest.height().is_finite() && rest.height() > 2.0 * tune_style::STRIP_H {
+            let (_, strip) = tune_style::status_strip_split(rest);
+            ui.allocate_rect(rest, egui::Sense::hover());
+            let mut bar = ui.new_child(egui::UiBuilder::new().max_rect(strip).id_salt("meters-status"));
+            tune_style::status_line(&mut bar, &text, warn);
+        } else {
+            ui.add_space(4.0);
+            tune_style::status_line(ui, &text, warn);
+        }
     }
 }
 
 /// The Meters page status line for a HackRF: which radio path is in use,
-/// why a reading is empty, and any drift-log failure.
+/// or a drift-log failure. Meters with no reading are hidden, not explained.
 fn hackrf_meter_status(m: &radio_meter::RadioMeter) -> (String, bool) {
-    let mut parts = vec![if m.radio.is_empty() {
+    if !m.log_error.is_empty() {
+        return (m.log_error.clone(), true);
+    }
+    let text = if m.radio.is_empty() {
         format!("HackRF via {}", m.backend)
     } else {
-        format!("HackRF via {}: {}", m.backend, m.radio)
-    }];
-    if !m.afc_locked {
-        parts.push("frequency error: waiting for a carrier".into());
-    }
-    if m.usb_overruns.is_none() {
-        parts.push("USB overruns: not reported by this radio path or firmware".into());
-    }
-    if m.temp.c.is_none() && !m.temp.note.is_empty() {
-        parts.push(format!("die temperature: {}", m.temp.note));
-    }
-    let warn = !m.log_error.is_empty();
-    if warn {
-        parts.push(m.log_error.clone());
-    }
-    (parts.join(" \u{b7} "), warn)
+        format!("HackRF via {} \u{b7} {}", m.backend, m.radio)
+    };
+    (text, false)
 }
 
 /// The grid inside the Meters frame. A locked grid ignores the pointer.
